@@ -207,6 +207,20 @@ export default [
     },
   },
   {
+    // CommonJS files (e.g., Docusaurus config) - allow module.exports and require
+    files: ["docs-site/**/*.js"],
+    languageOptions: {
+      sourceType: "commonjs",
+      globals: {
+        module: "writable",
+        require: "readonly",
+        exports: "writable",
+        __dirname: "readonly",
+        __filename: "readonly",
+      },
+    },
+  },
+  {
     // Ignore patterns
     ignores: [
       "node_modules/**",

@@ -1,3 +1,108 @@
+## [9.4.0](https://github.com/juspay/neurolink/compare/v9.3.0...v9.4.0) (2026-02-09)
+
+### Features
+
+- **(workflow):** implement comprehensive workflow engine for multi-model orchestration ([9257385](https://github.com/juspay/neurolink/commit/9257385e4b961dd14e21f85250b4947be9c0e7b6))
+
+## [9.3.0](https://github.com/juspay/neurolink/compare/v9.2.0...v9.3.0) (2026-02-08)
+
+### Features
+
+- **(rag):** add RAG document processing with generate()/stream() integration ([e595419](https://github.com/juspay/neurolink/commit/e59541962f05efb64a95fd1c6a1e821733232d3c))
+
+## [9.2.0](https://github.com/juspay/neurolink/compare/v9.1.1...v9.2.0) (2026-02-06)
+
+### Features
+
+- **(rag):** add `rag: { files }` option to generate() and stream() for automatic RAG pipeline setup
+- **(rag):** add `--rag-files`, `--rag-strategy`, `--rag-chunk-size`, `--rag-chunk-overlap`, `--rag-top-k` CLI flags
+- **(rag):** add 10 chunking strategies with infinite loop protection and input validation
+- **(rag):** add RerankerFactory/Registry with 5 reranker types (simple, llm, batch, cross-encoder, cohere)
+- **(rag):** add hybrid search with BM25 + vector similarity (RRF and linear combination fusion)
+- **(rag):** migrate createVectorQueryTool parameters from JSON Schema to Zod for Vercel AI SDK compatibility
+- **(streaming):** add central tool merge in BaseProvider.stream() for all 10 providers
+- **(streaming):** fix external tool availability in streaming for openRouter, amazonBedrock, ollama, huggingFace, litellm, mistral, anthropic, openAI providers
+- **(multimodal):** add file processor system with 17+ file types and SVG text injection ([9a7b585](https://github.com/juspay/neurolink/commit/9a7b5851e562f7bd55164d1c3dca42d8f18cc827))
+
+### Bug Fixes
+
+- **(rag):** fix infinite loops in markdown, html, latex, semantic, recursive chunkers with forward progress guarantees
+- **(rag):** fix missing semantic-markdown strategy registration in ChunkerRegistry
+- **(rag):** fix BM25 division-by-zero guard and hybridSearch embed() validation
+- **(rag):** fix overlap >= maxSize validation across all chunkers
+
+## [9.1.1](https://github.com/juspay/neurolink/compare/v9.1.0...v9.1.1) (2026-02-05)
+
+### Bug Fixes
+
+- **(csv-processor):** enhance metadata detection with data types and quality analysis ([2d27c5c](https://github.com/juspay/neurolink/commit/2d27c5cc4cd99b52da079fba741006216c0282ea))
+
+## [9.1.0](https://github.com/juspay/neurolink/compare/v9.0.1...v9.1.0) (2026-02-05)
+
+### Features
+
+- **(ppt):** Implement Orchestration and Assembly layer For PPT Gen ([7e53846](https://github.com/juspay/neurolink/commit/7e53846815a14e6b4793e31048efe121bbc84ef5))
+
+## [9.0.1](https://github.com/juspay/neurolink/compare/v9.0.0...v9.0.1) (2026-02-03)
+
+### Bug Fixes
+
+- **(pdf-processor):** enforce page limits by default with actionable alternatives ([35576aa](https://github.com/juspay/neurolink/commit/35576aa210b5a9a0bce8e6c5df041351905f0c96))
+
+## [9.0.0](https://github.com/juspay/neurolink/compare/v8.43.0...v9.0.0) (2026-02-03)
+
+### ⚠ BREAKING CHANGES
+
+- **(observability):** @opentelemetry/api, @opentelemetry/sdk-trace-node, and
+  @opentelemetry/sdk-trace-base are now peerDependencies. Host applications
+  must install these packages directly.
+
+### Features
+
+- **(observability):** add external TracerProvider support with operation name auto-detection ([25e3230](https://github.com/juspay/neurolink/commit/25e32301269b45b493df17f94b7e38af2bd7ef36))
+
+## [8.43.0](https://github.com/juspay/neurolink/compare/v8.42.0...v8.43.0) (2026-02-02)
+
+### Features
+
+- **(server):** implement multi-framework HTTP server adapters with full CLI support ([1651938](https://github.com/juspay/neurolink/commit/16519387ac4b6480ac779eb7b5cd90eb2cdee6e7))
+
+## [8.42.0](https://github.com/juspay/neurolink/compare/v8.41.1...v8.42.0) (2026-02-02)
+
+### Features
+
+- **(cache):** Implemented LRU cache for image downloads ([6562c45](https://github.com/juspay/neurolink/commit/6562c45605a6031afe41bdfcc5de0a7687127c3f))
+
+## [8.41.1](https://github.com/juspay/neurolink/compare/v8.41.0...v8.41.1) (2026-01-31)
+
+### Bug Fixes
+
+- **(ci):** add fork detection to docs PR validation workflow ([6d1f9eb](https://github.com/juspay/neurolink/commit/6d1f9eb720dea1a5997e53cbcff8d6a5c86282cd))
+
+## [8.41.0](https://github.com/juspay/neurolink/compare/v8.40.1...v8.41.0) (2026-01-29)
+
+### Features
+
+- **(docs):** migrate documentation from MkDocs to Docusaurus v3 ([2f70a32](https://github.com/juspay/neurolink/commit/2f70a32d930eae2756e7785b12ee5912dd4ed5e2))
+
+## [8.40.1](https://github.com/juspay/neurolink/compare/v8.40.0...v8.40.1) (2026-01-28)
+
+### Bug Fixes
+
+- **(orchestration):** changed model identifiers in modelRouter to match new claude identifiers ([e5fb153](https://github.com/juspay/neurolink/commit/e5fb153edbeace4a8fd13d416811ed37c2ea0459))
+
+## [8.40.0](https://github.com/juspay/neurolink/compare/v8.39.0...v8.40.0) (2026-01-28)
+
+### Features
+
+- **(events):** Emit event when title generation is finished ([aab4a1f](https://github.com/juspay/neurolink/commit/aab4a1f9d336a9b1fa20a5b6196155ab1d8673ed))
+
+## [8.39.0](https://github.com/juspay/neurolink/compare/v8.38.0...v8.39.0) (2026-01-27)
+
+### Features
+
+- **(ppt):** Implement SlideGenerator() for PPT Gen ([c804e97](https://github.com/juspay/neurolink/commit/c804e97ceda8d90bfc5ee5b976b1a8b3864f86ef))
+
 ## [8.38.0](https://github.com/juspay/neurolink/compare/v8.37.0...v8.38.0) (2026-01-23)
 
 ### Features

@@ -32,12 +32,6 @@ This section covers everything needed for contributing to NeuroLink, understandi
 
   Guide for upgrading from older architectures to the new unified factory pattern system.
 
-- :material-package-variant: **[Package Overrides](package-overrides.md)**
-
-  ***
-
-  Documentation for package version overrides, security vulnerabilities, and maintenance procedures.
-
 - :material-tag-multiple: **[Documentation Versioning](versioning.md)**
 
   ***

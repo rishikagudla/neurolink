@@ -90,42 +90,42 @@ npm start
 
 **Real command execution with live AI generation**
 
-#### **CLI Help Overview** - [🎬 MP4](./visual-content/cli-videos/cli-01-cli-help.mp4)
+#### **CLI Help Overview** - [🎬 MP4](pathname:///docs/visual-content/cli-videos/cli-01-cli-help.mp4)
 
 - Complete help system demonstration
 - Command reference and usage examples
 - Provider configuration overview
 - **Size**: 44KB - Professional MP4 with comprehensive command overview
 
-#### **Provider Status** - [🎬 MP4](./visual-content/cli-videos/cli-02-provider-status.mp4)
+#### **Provider Status** - [🎬 MP4](pathname:///docs/visual-content/cli-videos/cli-02-provider-status.mp4)
 
 - All provider connectivity verification (now with authentication and model availability checks)
 - Response time measurements
 - Authentication status checking
 - **Size**: 496KB - Professional MP4 showing provider connectivity
 
-#### **Text Generation** - [🎬 MP4](./visual-content/cli-videos/cli-03-text-generation.mp4)
+#### **Text Generation** - [🎬 MP4](pathname:///docs/visual-content/cli-videos/cli-03-text-generation.mp4)
 
 - Text generation with different providers
 - Temperature and token control demonstrations
 - JSON vs text output formats
 - **Size**: 100KB - Professional MP4 with real AI generation
 
-#### **Auto Provider Selection** - [🎬 MP4](./visual-content/cli-videos/cli-04-auto-selection.mp4)
+#### **Auto Provider Selection** - [🎬 MP4](pathname:///docs/visual-content/cli-videos/cli-04-auto-selection.mp4)
 
 - Automatic provider selection algorithm
 - Fallback mechanism demonstration
 - Performance-based selection
 - **Size**: Professional MP4 showing selection logic
 
-#### **Streaming Generation** - [🎬 MP4](./visual-content/cli-videos/cli-05-streaming.mp4)
+#### **Streaming Generation** - [🎬 MP4](pathname:///docs/visual-content/cli-videos/cli-05-streaming.mp4)
 
 - Live AI content streaming demonstration
 - Real-time text generation as it happens
 - Provider performance comparison
 - **Size**: Professional MP4 with live streaming
 
-#### **Advanced Features** - [🎬 MP4](./visual-content/cli-videos/cli-06-advanced-features.mp4)
+#### **Advanced Features** - [🎬 MP4](pathname:///docs/visual-content/cli-videos/cli-06-advanced-features.mp4)
 
 - Verbose diagnostics and debugging
 - Provider-specific command options
@@ -172,7 +172,7 @@ asciinema play docs/cli-recordings/latest/06-advanced-features.cast
 
 **Real external server integration demonstrations**
 
-#### **Server Management** - [🎬 MP4](videos/mcp-server-management-demo.mp4)
+#### **Server Management** - [🎬 MP4](pathname:///docs/videos/mcp-server-management-demo.mp4)
 
 - Installing and configuring MCP servers
 - Server lifecycle management

@@ -123,6 +123,7 @@ For complete documentation, see the [Video Generation Guide](features/video-gene
 const express = require("express");
 const { NeuroLink } = require("@juspay/neurolink");
 const app = express();
+app.use(express.json());
 const neurolink = new NeuroLink();
 
 app.post("/api/generate", async (req, res) => {
@@ -173,6 +174,9 @@ class CostOptimizer {
 ```javascript
 const fs = require("fs");
 const csv = require("csv-parser");
+const { NeuroLink } = require("@juspay/neurolink");
+
+const neurolink = new NeuroLink();
 
 class BatchProcessor {
   async processCSV(inputFile) {

@@ -5,37 +5,38 @@
  */
 
 import type {
-  ChatMessage,
-  MultimodalChatMessage,
-  MessageContent,
-} from "../types/conversation.js";
-import type { TextGenerationOptions } from "../types/index.js";
-import type { StreamOptions } from "../types/streamTypes.js";
-import type { GenerateOptions } from "../types/generateTypes.js";
-import type { Content, ImageWithAltText } from "../types/multimodal.js";
+  CoreAssistantMessage,
+  CoreMessage,
+  CoreSystemMessage,
+  CoreUserMessage,
+  FilePart,
+  ImagePart,
+  TextPart,
+} from "ai";
+import { existsSync, readFileSync } from "fs";
+import { getGlobalDispatcher, interceptors, request } from "undici";
+import {
+  MultimodalLogger,
+  ProviderImageAdapter,
+} from "../adapters/providerImageAdapter.js";
 import {
   CONVERSATION_INSTRUCTIONS,
   STRUCTURED_OUTPUT_INSTRUCTIONS,
 } from "../config/conversationMemory.js";
-import {
-  ProviderImageAdapter,
-  MultimodalLogger,
-} from "../adapters/providerImageAdapter.js";
-import { logger } from "./logger.js";
-import { FileDetector } from "./fileDetector.js";
-import { PDFProcessor, PDFImageConverter } from "./pdfProcessor.js";
-import { urlDownloadRateLimiter } from "./rateLimiter.js";
-import { request, getGlobalDispatcher, interceptors } from "undici";
-import { readFileSync, existsSync } from "fs";
 import type {
-  CoreMessage,
-  CoreUserMessage,
-  CoreAssistantMessage,
-  CoreSystemMessage,
-  TextPart,
-  ImagePart,
-  FilePart,
-} from "ai";
+  ChatMessage,
+  MessageContent,
+  MultimodalChatMessage,
+} from "../types/conversation.js";
+import type { GenerateOptions } from "../types/generateTypes.js";
+import type { TextGenerationOptions } from "../types/index.js";
+import type { Content, ImageWithAltText } from "../types/multimodal.js";
+import type { StreamOptions } from "../types/streamTypes.js";
+import { FileDetector } from "./fileDetector.js";
+import { getImageCache } from "./imageCache.js";
+import { logger } from "./logger.js";
+import { PDFImageConverter, PDFProcessor } from "./pdfProcessor.js";
+import { urlDownloadRateLimiter } from "./rateLimiter.js";
 
 /**
  * Type guard to check if an image input has alt text
@@ -515,7 +516,7 @@ export async function buildMultimodalMessagesArray(
       try {
         const result = await FileDetector.detectAndProcess(file, {
           maxSize,
-          allowedTypes: ["csv", "image", "pdf"],
+          allowedTypes: ["csv", "image", "pdf", "svg"],
           csvOptions: options.csvOptions,
           provider: provider,
         });
@@ -538,6 +539,13 @@ export async function buildMultimodalMessagesArray(
           csvSection += result.content;
           options.input.text += csvSection;
           logger.info(`[FileDetector] ✅ CSV: ${filename}`);
+        } else if (result.type === "svg") {
+          // SVG is processed as text content (sanitized XML markup)
+          // Inject into text prompt instead of sending as image
+          const filename = extractFilename(file);
+          const svgSection = `\n\n## SVG Content from "${filename}":\n\`\`\`xml\n${result.content}\n\`\`\`\n`;
+          options.input.text += svgSection;
+          logger.info(`[FileDetector] ✅ SVG (as text): ${filename}`);
         } else if (result.type === "image") {
           options.input.images = [
             ...(options.input.images || []),
@@ -843,9 +851,18 @@ function isInternetUrl(input: string): boolean {
 /**
  * Download image from URL and convert to base64 data URI
  * Rate-limited to 10 downloads per second to prevent DoS
+ * Uses LRU cache to avoid redundant downloads of the same URL
  */
 async function downloadImageFromUrl(url: string): Promise<string> {
-  // Apply rate limiting before download
+  // Check cache first (before rate limiting)
+  const cache = getImageCache();
+  const cached = cache.get(url);
+  if (cached) {
+    logger.debug("Using cached image for URL", { url: url.substring(0, 50) });
+    return cached.dataUri;
+  }
+
+  // Apply rate limiting only if cache missed
   await urlDownloadRateLimiter.acquire();
 
   try {
@@ -893,6 +910,9 @@ async function downloadImageFromUrl(url: string): Promise<string> {
     // Convert to base64 data URI
     const base64 = buffer.toString("base64");
     const dataUri = `data:${contentType};base64,${base64}`;
+
+    // Store in cache for future use
+    cache.set(url, dataUri, contentType, buffer);
 
     return dataUri;
   } catch (error) {

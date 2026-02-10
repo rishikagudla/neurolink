@@ -15,136 +15,148 @@ try {
   // Environment variables should be set externally in production
 }
 
+import { EventEmitter } from "events";
 import type {
   TextGenerationOptions,
   TextGenerationResult,
   AnalyticsData,
-  ProviderStatus,
 } from "./types/index.js";
-import { AIProviderFactory } from "./core/factory.js";
 import { isNonNullObject } from "./utils/typeUtils.js";
-import { isZodSchema } from "./utils/schemaConversion.js";
 import type { MemoryClient } from "mem0ai";
-import { AIProviderName } from "./constants/enums.js";
-import { mcpLogger } from "./utils/logger.js";
-import { SYSTEM_LIMITS } from "./core/constants.js";
+import pLimit from "p-limit";
+import type { AIProviderName } from "./constants/enums.js";
 import {
-  NANOSECOND_TO_MS_DIVISOR,
-  TOOL_TIMEOUTS,
-  RETRY_ATTEMPTS,
-  RETRY_DELAYS,
   CIRCUIT_BREAKER,
   CIRCUIT_BREAKER_RESET_MS,
   MEMORY_THRESHOLDS,
-  PROVIDER_TIMEOUTS,
+  NANOSECOND_TO_MS_DIVISOR,
   PERFORMANCE_THRESHOLDS,
+  PROVIDER_TIMEOUTS,
+  RETRY_ATTEMPTS,
+  RETRY_DELAYS,
+  TOOL_TIMEOUTS,
 } from "./constants/index.js";
-import pLimit from "p-limit";
-import { MCPToolRegistry } from "./mcp/toolRegistry.js";
-import { logger } from "./utils/logger.js";
-import { getBestProvider } from "./utils/providerUtils.js";
+import { SYSTEM_LIMITS } from "./core/constants.js";
+import type { ConversationMemoryManager } from "./core/conversationMemoryManager.js";
+import { AIProviderFactory } from "./core/factory.js";
+import type { RedisConversationMemoryManager } from "./core/redisConversationMemoryManager.js";
 import { ProviderRegistry } from "./factories/providerRegistry.js";
+import { HITLManager } from "./hitl/hitlManager.js";
+import { ExternalServerManager } from "./mcp/externalServerManager.js";
+// Import direct tools server for automatic registration
+import { directToolsServer } from "./mcp/servers/agent/directToolsServer.js";
+import { MCPToolRegistry } from "./mcp/toolRegistry.js";
+import { initializeMem0, type Mem0Config } from "./memory/mem0Initializer.js";
+import {
+  flushOpenTelemetry,
+  getLangfuseHealthStatus,
+  initializeOpenTelemetry,
+  isOpenTelemetryInitialized,
+  setLangfuseContext,
+  shutdownOpenTelemetry,
+} from "./services/server/ai/observability/instrumentation.js";
+import type {
+  JsonObject,
+  JsonValue,
+  NeuroLinkEvents,
+  TypedEventEmitter,
+  UnknownRecord,
+} from "./types/common.js";
+import type { NeurolinkConstructorConfig } from "./types/configTypes.js";
+import type {
+  ChatMessage,
+  ConversationMemoryConfig,
+  ProviderDetails,
+} from "./types/conversation.js";
+import type {
+  ExternalMCPOperationResult,
+  ExternalMCPServerInstance,
+  ExternalMCPToolInfo,
+} from "./types/externalMcp.js";
 // NEW: Generate function imports
 import type { GenerateOptions, GenerateResult } from "./types/generateTypes.js";
 import type {
-  StreamOptions,
-  StreamResult,
-  ToolCall,
-  ToolResult,
-  AudioChunk,
-} from "./types/streamTypes.js";
-import type { TokenUsage, EvaluationData } from "./types/index.js";
+  ConfirmationResponseEvent,
+  HITLConfig,
+} from "./types/hitlTypes.js";
+import type {
+  EvaluationData,
+  ProviderStatus,
+  TokenUsage,
+} from "./types/index.js";
 import type {
   MCPExecutableTool,
   MCPServerCategory,
   MCPServerInfo,
   MCPStatus,
 } from "./types/mcpTypes.js";
-import type { ToolInfo } from "./types/tools.js";
-import type { NeuroLinkEvents, TypedEventEmitter } from "./types/common.js";
-import {
-  createCustomToolServerInfo,
-  detectCategory,
-} from "./utils/mcpDefaults.js";
+import type { ObservabilityConfig } from "./types/observability.js";
+import type {
+  AudioChunk,
+  StreamOptions,
+  StreamResult,
+  ToolCall,
+  ToolResult,
+} from "./types/streamTypes.js";
 import type {
   ToolExecutionContext,
   ToolExecutionSummary,
+  ToolInfo,
 } from "./types/tools.js";
-import type { JsonValue, JsonObject, UnknownRecord } from "./types/common.js";
 import type {
-  ToolExecutionResult,
   BatchOperationResult,
+  ToolExecutionResult,
 } from "./types/typeAliases.js";
-// Factory processing imports
-import {
-  processFactoryOptions,
-  enhanceTextGenerationOptions,
-  validateFactoryConfig,
-  processStreamingFactoryOptions,
-  createCleanStreamOptions,
-} from "./utils/factoryProcessing.js";
-// Tool detection and execution imports
-// Transformation utilities
-import {
-  transformToolExecutions,
-  transformToolExecutionsForMCP,
-  transformAvailableTools,
-  transformToolsForMCP,
-  transformToolsToExpectedFormat,
-  transformToolsToDescriptions,
-  extractToolNames,
-  transformParamsForLogging,
-  optimizeToolForCollection,
-} from "./utils/transformationUtils.js";
-// Enhanced error handling imports
-import {
-  ErrorFactory,
-  NeuroLinkError,
-  withTimeout,
-  withRetry,
-  isRetriableError,
-  logStructuredError,
-  CircuitBreaker,
-} from "./utils/errorHandling.js";
-import { EventEmitter } from "events";
-import type {
-  ConversationMemoryConfig,
-  ChatMessage,
-  ProviderDetails,
-} from "./types/conversation.js";
-import { ConversationMemoryManager } from "./core/conversationMemoryManager.js";
-import { RedisConversationMemoryManager } from "./core/redisConversationMemoryManager.js";
 import {
   getConversationMessages,
   storeConversationTurn,
 } from "./utils/conversationMemory.js";
-import { ExternalServerManager } from "./mcp/externalServerManager.js";
-import type {
-  HITLConfig,
-  ConfirmationResponseEvent,
-} from "./types/hitlTypes.js";
-import { HITLManager } from "./hitl/hitlManager.js";
-import type {
-  ExternalMCPServerInstance,
-  ExternalMCPOperationResult,
-  ExternalMCPToolInfo,
-} from "./types/externalMcp.js";
-// Import direct tools server for automatic registration
-import { directToolsServer } from "./mcp/servers/agent/directToolsServer.js";
+// Enhanced error handling imports
+import {
+  CircuitBreaker,
+  ErrorFactory,
+  isRetriableError,
+  logStructuredError,
+  NeuroLinkError,
+  withRetry,
+  withTimeout,
+} from "./utils/errorHandling.js";
+// Factory processing imports
+import {
+  createCleanStreamOptions,
+  enhanceTextGenerationOptions,
+  processFactoryOptions,
+  processStreamingFactoryOptions,
+  validateFactoryConfig,
+} from "./utils/factoryProcessing.js";
+import { logger, mcpLogger } from "./utils/logger.js";
+import {
+  createCustomToolServerInfo,
+  detectCategory,
+} from "./utils/mcpDefaults.js";
 // Import orchestration components
 import { ModelRouter } from "./utils/modelRouter.js";
+import { getBestProvider } from "./utils/providerUtils.js";
+import { isZodSchema } from "./utils/schemaConversion.js";
 import { BinaryTaskClassifier } from "./utils/taskClassifier.js";
+// Tool detection and execution imports
+// Transformation utilities
 import {
-  initializeOpenTelemetry,
-  shutdownOpenTelemetry,
-  flushOpenTelemetry,
-  getLangfuseHealthStatus,
-  setLangfuseContext,
-} from "./services/server/ai/observability/instrumentation.js";
-import type { ObservabilityConfig } from "./types/observability.js";
-import type { NeurolinkConstructorConfig } from "./types/configTypes.js";
+  extractToolNames,
+  optimizeToolForCollection,
+  transformAvailableTools,
+  transformParamsForLogging,
+  transformToolExecutions,
+  transformToolExecutionsForMCP,
+  transformToolsForMCP,
+  transformToolsToDescriptions,
+  transformToolsToExpectedFormat,
+} from "./utils/transformationUtils.js";
+import type { WorkflowConfig } from "./workflow/types.js";
+import { runWorkflow } from "./workflow/core/workflowRunner.js";
+import { getWorkflow } from "./workflow/core/workflowRegistry.js";
 
-import { initializeMem0, type Mem0Config } from "./memory/mem0Initializer.js";
+// Core types imported from core/types.js
 
 /**
  * NeuroLink - Universal AI Development Platform
@@ -929,7 +941,12 @@ Current user's request: ${currentInput}`;
     try {
       const langfuseConfig = this.observabilityConfig?.langfuse;
 
-      if (langfuseConfig?.enabled) {
+      // Check if we should use external provider mode - bypass enabled check
+      const useExternalProvider =
+        langfuseConfig?.autoDetectExternalProvider === true ||
+        langfuseConfig?.useExternalTracerProvider === true;
+
+      if (langfuseConfig?.enabled || useExternalProvider) {
         logger.debug(`[NeuroLink] 📊 LOG_POINT_C019_LANGFUSE_INIT_START`, {
           logPoint: "C019_LANGFUSE_INIT_START",
           constructorId,
@@ -1596,9 +1613,23 @@ Current user's request: ${currentInput}`;
   private _extractOriginalPrompt(
     optionsOrPrompt: GenerateOptions | string,
   ): string {
-    return typeof optionsOrPrompt === "string"
-      ? optionsOrPrompt
-      : optionsOrPrompt.input.text;
+    if (typeof optionsOrPrompt === "string") {
+      return optionsOrPrompt;
+    }
+
+    // Handle messages format (for workflow compatibility)
+    const anyOptions = optionsOrPrompt as {
+      messages?: Array<{ content: string | unknown }>;
+    };
+    if (anyOptions.messages && anyOptions.messages.length > 0) {
+      const lastMessage = anyOptions.messages[anyOptions.messages.length - 1];
+      return typeof lastMessage.content === "string"
+        ? lastMessage.content
+        : JSON.stringify(lastMessage.content);
+    }
+
+    // Handle input.text format
+    return optionsOrPrompt.input?.text || "";
   }
 
   /**
@@ -1662,7 +1693,12 @@ Current user's request: ${currentInput}`;
    * Centralized utility to avoid duplication across providers
    */
   isTelemetryEnabled(): boolean {
-    return this.observabilityConfig?.langfuse?.enabled || false;
+    // Check if observability config enables telemetry
+    if (this.observabilityConfig?.langfuse?.enabled) {
+      return true;
+    }
+    // Check if OpenTelemetry was initialized (by this or external app)
+    return isOpenTelemetryInitialized();
   }
 
   /**
@@ -1838,6 +1874,11 @@ Current user's request: ${currentInput}`;
       throw new Error("Input text is required and must be a non-empty string");
     }
 
+    // Check if workflow is requested
+    if (options.workflow || options.workflowConfig) {
+      return await this.generateWithWorkflow(options);
+    }
+
     // Set session and user IDs from context for Langfuse spans and execute with proper async scoping
     return await this.setLangfuseContextFromOptions(options, async () => {
       if (
@@ -1927,6 +1968,48 @@ Current user's request: ${currentInput}`;
         }
       }
 
+      // RAG Integration: If rag config is provided, prepare the RAG search tool
+      if (options.rag?.files?.length) {
+        try {
+          const { prepareRAGTool } = await import("./rag/ragIntegration.js");
+          const ragResult = await prepareRAGTool(
+            options.rag,
+            options.provider as string | undefined,
+          );
+
+          // Inject the RAG tool into the tools record
+          if (!options.tools) {
+            options.tools = {};
+          }
+          (options.tools as Record<string, unknown>)[ragResult.toolName] =
+            ragResult.tool;
+
+          // Inject RAG-aware system prompt so the AI uses the RAG tool first
+          const ragSystemInstruction = [
+            `\n\nIMPORTANT: You have a tool called "${ragResult.toolName}" that searches through`,
+            `${ragResult.filesLoaded} loaded document(s) containing ${ragResult.chunksIndexed} indexed chunks.`,
+            `ALWAYS use the "${ragResult.toolName}" tool FIRST to answer the user's question before using any other tools.`,
+            `This tool searches your local knowledge base of pre-loaded documents and is the primary source of truth.`,
+            `Do NOT use websearchGrounding or any web search tools when the answer can be found in the loaded documents.`,
+          ].join(" ");
+          options.systemPrompt =
+            (options.systemPrompt || "") + ragSystemInstruction;
+
+          logger.info("[RAG] Tool injected into generate()", {
+            toolName: ragResult.toolName,
+            filesLoaded: ragResult.filesLoaded,
+            chunksIndexed: ragResult.chunksIndexed,
+          });
+        } catch (error) {
+          logger.warn(
+            "[RAG] Failed to prepare RAG tool, continuing without RAG",
+            {
+              error: error instanceof Error ? error.message : String(error),
+            },
+          );
+        }
+      }
+
       // 🔧 CRITICAL FIX: Convert to TextGenerationOptions while preserving the input object for multimodal support
       const baseOptions: TextGenerationOptions = {
         prompt: options.input.text,
@@ -1937,6 +2020,7 @@ Current user's request: ${currentInput}`;
         systemPrompt: options.systemPrompt,
         schema: options.schema,
         output: options.output,
+        tools: options.tools, // Includes RAG tools if rag config was provided
         disableTools: options.disableTools,
         enableAnalytics: options.enableAnalytics,
         enableEvaluation: options.enableEvaluation,
@@ -2047,6 +2131,7 @@ Current user's request: ${currentInput}`;
           : undefined,
         audio: textResult.audio,
         video: textResult.video,
+        ppt: textResult.ppt,
       };
 
       if (
@@ -2081,6 +2166,296 @@ Current user's request: ${currentInput}`;
 
       return generateResult;
     });
+  }
+
+  /**
+   * Generate with workflow engine integration
+   * Returns both original and processed responses for AB testing
+   */
+  private async generateWithWorkflow(
+    options: GenerateOptions,
+  ): Promise<GenerateResult> {
+    const workflowStartTime = Date.now();
+
+    logger.debug("[NeuroLink] Executing workflow generation", {
+      workflowId: options.workflow,
+      hasInlineConfig: !!options.workflowConfig,
+      prompt: options.input.text.substring(0, 100),
+      startTime: workflowStartTime,
+    });
+
+    // Determine workflow configuration
+    let workflowConfig: WorkflowConfig | undefined;
+
+    if (options.workflowConfig) {
+      // Use inline config
+      workflowConfig = options.workflowConfig;
+    } else if (options.workflow) {
+      // Look up predefined workflow
+      workflowConfig = getWorkflow(options.workflow);
+      if (!workflowConfig) {
+        throw new Error(`Workflow '${options.workflow}' not found in registry`);
+      }
+    } else {
+      throw new Error("Either workflow or workflowConfig must be provided");
+    }
+
+    // Execute workflow
+    const workflowResult = await runWorkflow(workflowConfig, {
+      prompt: options.input.text,
+      conversationHistory: options.conversationHistory as
+        | Array<{ role: "user" | "assistant"; content: string }>
+        | undefined,
+      timeout: options.timeout as number | undefined,
+      verbose: false,
+      metadata: options.context as Record<string, JsonValue> | undefined,
+    });
+
+    // Build GenerateResult with workflow data
+    const generateResult: GenerateResult = {
+      // Primary output (backward compatible) - use the original best response
+      content: workflowResult.content,
+
+      // Provider info from selected response
+      provider:
+        workflowResult.selectedResponse?.provider ||
+        workflowConfig.models[0]?.provider,
+      model:
+        workflowResult.selectedResponse?.model ||
+        workflowConfig.models[0]?.model,
+
+      // Basic usage info
+      usage: workflowResult.usage
+        ? {
+            input: workflowResult.usage.totalInputTokens,
+            output: workflowResult.usage.totalOutputTokens,
+            total: workflowResult.usage.totalTokens,
+          }
+        : undefined,
+
+      // Performance
+      responseTime: workflowResult.totalTime,
+
+      // Workflow-specific data
+      workflow: {
+        originalResponse:
+          workflowResult.originalContent || workflowResult.content, // Original unmodified best response
+        processedResponse: workflowResult.content, // After conditioning (with metadata)
+        ensembleResponses: workflowResult.ensembleResponses.map((r) => ({
+          provider: r.provider,
+          model: r.model,
+          content: r.content,
+          responseTime: r.responseTime,
+          status: r.status,
+          error: r.error,
+        })),
+        judgeScores: workflowResult.judgeScores
+          ? {
+              scores: workflowResult.judgeScores.scores,
+              reasoning: workflowResult.reasoning,
+              selectedModel: `${workflowResult.selectedResponse?.provider}-${workflowResult.selectedResponse?.model}`,
+            }
+          : undefined,
+        selectedModel: `${workflowResult.selectedResponse?.provider}-${workflowResult.selectedResponse?.model}`,
+        metrics: {
+          totalTime: workflowResult.totalTime,
+          ensembleTime: workflowResult.ensembleTime,
+          judgeTime: workflowResult.judgeTime,
+          conditioningTime: workflowResult.conditioningTime,
+        },
+        workflowId: workflowResult.workflow,
+        workflowName: workflowResult.workflowName,
+      },
+    };
+
+    logger.debug("[NeuroLink] Workflow generation complete", {
+      workflowId: workflowResult.workflow,
+      selectedModel: generateResult.workflow?.selectedModel,
+      score: workflowResult.score,
+      totalTime: workflowResult.totalTime,
+    });
+
+    return generateResult;
+  }
+
+  /**
+   * Stream with workflow engine integration
+   * Progressive streaming: yields preliminary response (first model) then final synthesis
+   */
+  private async streamWithWorkflow(
+    options: StreamOptions,
+    startTime: number,
+  ): Promise<StreamResult> {
+    logger.debug("[NeuroLink] Executing workflow streaming (progressive)", {
+      workflowId: options.workflow,
+      hasInlineConfig: !!options.workflowConfig,
+      prompt: options.input.text.substring(0, 100),
+    });
+
+    // Determine workflow configuration
+    let workflowConfig: WorkflowConfig | undefined;
+
+    if (options.workflowConfig) {
+      workflowConfig = options.workflowConfig;
+    } else if (options.workflow) {
+      workflowConfig = getWorkflow(options.workflow);
+      if (!workflowConfig) {
+        throw new Error(`Workflow '${options.workflow}' not found in registry`);
+      }
+    } else {
+      throw new Error("Either workflow or workflowConfig must be provided");
+    }
+
+    // Import streaming workflow runner
+    const { runWorkflowWithStreaming } = await import(
+      "./workflow/core/workflowRunner.js"
+    );
+
+    // Execute workflow with progressive streaming
+    const workflowStream = runWorkflowWithStreaming(workflowConfig, {
+      prompt: options.input.text,
+      conversationHistory: options.conversationHistory as
+        | Array<{ role: "user" | "assistant"; content: string }>
+        | undefined,
+      timeout: options.timeout as number | undefined,
+      verbose: false,
+      metadata: options.context as Record<string, JsonValue> | undefined,
+      streaming: true,
+    });
+
+    // Store final result for metadata
+    let finalResult: Partial<
+      import("./workflow/types.js").WorkflowResult
+    > | null = null;
+    let preliminaryTime = 0;
+
+    // Create a generator that yields progressive chunks
+    const stream = (async function* (): AsyncGenerator<
+      { content: string; type: "preliminary" | "final" },
+      void,
+      undefined
+    > {
+      for await (const chunk of workflowStream) {
+        if (chunk.type === "preliminary") {
+          preliminaryTime = Date.now() - startTime;
+          logger.debug("[NeuroLink] Streaming preliminary response", {
+            responseTime: preliminaryTime,
+            contentLength: chunk.content.length,
+          });
+          yield {
+            content: chunk.content,
+            type: "preliminary" as const,
+          };
+        } else if (chunk.type === "final") {
+          finalResult = chunk.partialResult ?? null;
+          const finalTime = Date.now() - startTime;
+          logger.debug("[NeuroLink] Streaming final synthesis", {
+            responseTime: finalTime,
+            contentLength: chunk.content.length,
+          });
+          yield {
+            content: chunk.content,
+            type: "final" as const,
+          };
+        }
+      }
+    })();
+
+    const streamResult: StreamResult = {
+      stream,
+
+      // Provider info (will be from final result)
+      provider: workflowConfig.models[0]?.provider,
+      model: workflowConfig.models[0]?.model,
+
+      // Metadata
+      metadata: {
+        streamId: `workflow-${workflowConfig.id}-${Date.now()}`,
+        startTime,
+        responseTime: 0, // Will be updated after stream completes
+      },
+
+      // Note: Workflow data will be populated after stream completes
+      // For now, return placeholder that will be updated via stream metadata
+    };
+
+    // Wrap stream to capture final result and populate metadata
+    const originalStream = streamResult.stream;
+    streamResult.stream = (async function* () {
+      for await (const chunk of originalStream) {
+        yield chunk;
+      }
+
+      // After stream completes, update result with final workflow data
+      if (finalResult) {
+        const result = finalResult as Partial<
+          import("./workflow/types.js").WorkflowResult
+        >;
+        const responseTime = Date.now() - startTime;
+
+        // Update usage if available
+        if (result.usage) {
+          streamResult.usage = {
+            input: result.usage.totalInputTokens,
+            output: result.usage.totalOutputTokens,
+            total: result.usage.totalTokens,
+          };
+        }
+
+        // Update metadata
+        streamResult.metadata = {
+          ...streamResult.metadata,
+          totalChunks: 2, // Preliminary + final
+          responseTime,
+          preliminaryTime,
+        };
+
+        // Build workflow data with proper type safety
+        const ensembleResponses =
+          result.ensembleResponses?.map((r) => ({
+            provider: r.provider,
+            model: r.model,
+            content: r.content,
+            responseTime: r.responseTime,
+            status: r.status,
+            error: r.error,
+          })) ?? [];
+
+        const judgeScores = result.judgeScores
+          ? {
+              scores: result.judgeScores.scores,
+              reasoning: result.reasoning ?? "",
+              selectedModel: result.selectedResponse
+                ? `${result.selectedResponse.provider}-${result.selectedResponse.model}`
+                : "unknown",
+            }
+          : undefined;
+
+        streamResult.workflow = {
+          originalResponse: result.originalContent ?? result.content ?? "",
+          processedResponse: result.content ?? "",
+          ensembleResponses,
+          judgeScores,
+          selectedModel: result.selectedResponse
+            ? `${result.selectedResponse.provider}-${result.selectedResponse.model}`
+            : "unknown",
+          metrics: {
+            totalTime: result.totalTime ?? responseTime,
+            ensembleTime: result.ensembleTime ?? 0,
+            judgeTime: result.judgeTime,
+            conditioningTime: result.conditioningTime,
+          },
+          workflowId: result.workflow ?? workflowConfig.id,
+          workflowName: result.workflowName ?? workflowConfig.name,
+        };
+      }
+    })();
+
+    logger.debug("[NeuroLink] Workflow streaming initialized", {
+      workflowId: workflowConfig.id,
+    });
+
+    return streamResult;
   }
 
   /**
@@ -2531,6 +2906,7 @@ Current user's request: ${currentInput}`;
         ),
         audio: result.audio,
         video: result.video,
+        ppt: result.ppt,
         // Include analytics and evaluation from BaseProvider
         analytics: result.analytics,
         evaluation: result.evaluation,
@@ -2657,6 +3033,7 @@ Current user's request: ${currentInput}`;
           evaluation: result.evaluation,
           audio: result.audio,
           video: result.video,
+          ppt: result.ppt,
           // CRITICAL FIX: Include imageOutput for image generation models
           imageOutput: result.imageOutput,
         };
@@ -2861,6 +3238,11 @@ Current user's request: ${currentInput}`;
     await this.validateStreamInput(options);
     this.emitStreamStartEvents(options, startTime);
 
+    // Check if workflow is requested
+    if (options.workflow || options.workflowConfig) {
+      return await this.streamWithWorkflow(options, startTime);
+    }
+
     // Set session and user IDs from context for Langfuse spans and execute with proper async scoping
     return await this.setLangfuseContextFromOptions(options, async () => {
       let enhancedOptions: StreamOptions;
@@ -2973,6 +3355,48 @@ Current user's request: ${currentInput}`;
                 },
               );
             }
+          }
+        }
+
+        // RAG Integration: If rag config is provided, prepare the RAG search tool (stream)
+        if (options.rag?.files?.length) {
+          try {
+            const { prepareRAGTool } = await import("./rag/ragIntegration.js");
+            const ragResult = await prepareRAGTool(
+              options.rag,
+              options.provider as string | undefined,
+            );
+
+            // Inject the RAG tool into the tools record
+            if (!options.tools) {
+              options.tools = {};
+            }
+            (options.tools as Record<string, unknown>)[ragResult.toolName] =
+              ragResult.tool;
+
+            // Inject RAG-aware system prompt so the AI uses the RAG tool first
+            const ragStreamInstruction = [
+              `\n\nIMPORTANT: You have a tool called "${ragResult.toolName}" that searches through`,
+              `${ragResult.filesLoaded} loaded document(s) containing ${ragResult.chunksIndexed} indexed chunks.`,
+              `ALWAYS use the "${ragResult.toolName}" tool FIRST to answer the user's question before using any other tools.`,
+              `This tool searches your local knowledge base of pre-loaded documents and is the primary source of truth.`,
+              `Do NOT use websearchGrounding or any web search tools when the answer can be found in the loaded documents.`,
+            ].join(" ");
+            options.systemPrompt =
+              (options.systemPrompt || "") + ragStreamInstruction;
+
+            logger.info("[RAG] Tool injected into stream()", {
+              toolName: ragResult.toolName,
+              filesLoaded: ragResult.filesLoaded,
+              chunksIndexed: ragResult.chunksIndexed,
+            });
+          } catch (error) {
+            logger.warn(
+              "[RAG] Failed to prepare RAG tool, continuing without RAG",
+              {
+                error: error instanceof Error ? error.message : String(error),
+              },
+            );
           }
         }
 
@@ -3178,7 +3602,7 @@ Current user's request: ${currentInput}`;
               const userId = (
                 enhancedOptions.context as Record<string, unknown>
               )?.userId as string;
-              let providerDetails: ProviderDetails | undefined = undefined;
+              let providerDetails: ProviderDetails | undefined;
               if (enhancedOptions.model) {
                 providerDetails = {
                   provider: providerName,
@@ -3541,7 +3965,7 @@ Current user's request: ${currentInput}`;
           )?.sessionId as string;
           const userId = (enhancedOptions?.context as Record<string, unknown>)
             ?.userId as string;
-          let providerDetails: ProviderDetails | undefined = undefined;
+          let providerDetails: ProviderDetails | undefined;
           if (options.model) {
             providerDetails = {
               provider: providerName,
@@ -4214,32 +4638,40 @@ Current user's request: ${currentInput}`;
   }
 
   /**
-   * Get all registered in-memory servers
+   * Get all registered in-memory servers as a Map for ID-based lookup.
+   *
+   * This method is primarily used when you need O(1) lookup by server ID,
+   * such as in `testMCPServer()` for checking if a specific server exists.
+   *
    * @returns Map of server IDs to MCPServerInfo
+   * @see {@link getInMemoryServerInfos} for array-based access (useful for iteration/spreading)
    */
   getInMemoryServers(): Map<string, MCPServerInfo> {
-    // Get in-memory servers from toolRegistry
-    const serverInfos = this.toolRegistry.getBuiltInServerInfos();
+    // Reuse getInMemoryServerInfos() to avoid duplicating filter logic
+    const serverInfos = this.getInMemoryServerInfos();
     const serverMap = new Map<string, MCPServerInfo>();
 
     for (const serverInfo of serverInfos) {
-      if (
-        detectCategory({
-          existingCategory: serverInfo.metadata?.category,
-          serverId: serverInfo.id,
-        }) === "in-memory"
-      ) {
-        serverMap.set(serverInfo.id, serverInfo);
-      }
+      serverMap.set(serverInfo.id, serverInfo);
     }
 
     return serverMap;
   }
 
   /**
-   * Get in-memory servers as MCPServerInfo - ZERO conversion needed
-   * Now fetches from centralized tool registry instead of local duplication
-   * @returns Array of MCPServerInfo
+   * Get in-memory servers as an array of MCPServerInfo.
+   *
+   * This method is the canonical source for in-memory server filtering.
+   * It fetches from the centralized tool registry and filters servers
+   * with the "in-memory" category.
+   *
+   * Use this method when you need to:
+   * - Iterate over all in-memory servers
+   * - Spread servers into another array (e.g., in `listMCPServers()`)
+   * - Get a count of in-memory servers
+   *
+   * @returns Array of MCPServerInfo for in-memory servers
+   * @see {@link getInMemoryServers} for Map-based access (useful for ID lookups)
    */
   getInMemoryServerInfos(): MCPServerInfo[] {
     // Get in-memory servers from centralized tool registry
@@ -5220,7 +5652,10 @@ Current user's request: ${currentInput}`;
     try {
       const health = await ProviderHealthChecker.checkProviderHealth(
         providerName as AIProviderName,
-        { includeConnectivityTest: false, cacheResults: false },
+        {
+          includeConnectivityTest: false,
+          cacheResults: false,
+        },
       );
       return health.isConfigured && health.hasApiKey;
     } catch (error) {
@@ -6388,6 +6823,28 @@ Current user's request: ${currentInput}`;
       logger.error("[NeuroLink] Critical error during disposal:", error);
       throw error;
     }
+  }
+
+  // ============================================
+  // Internal Access Methods (for Server Adapters)
+  // ============================================
+
+  /**
+   * Get the tool registry instance
+   * Used internally by server adapters for tool management
+   * @returns The MCPToolRegistry instance
+   */
+  getToolRegistry(): MCPToolRegistry {
+    return this.toolRegistry;
+  }
+
+  /**
+   * Get the external server manager instance
+   * Used internally by server adapters for external MCP server management
+   * @returns The ExternalServerManager instance
+   */
+  getExternalServerManager(): ExternalServerManager {
+    return this.externalServerManager;
   }
 }
 

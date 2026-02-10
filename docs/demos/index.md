@@ -90,7 +90,7 @@ The interactive web demo showcases all features with live AI generation across m
 
 <div class="video-container">
   <video controls width="100%">
-    <source src="../assets/videos/quick-start-demo.mp4" type="video/mp4">
+    <source src="../assets/videos/quick-start-demo.mp4" type="video/mp4" />
     Your browser does not support the video tag.
   </video>
 </div>
@@ -101,7 +101,7 @@ _Complete quick start demonstration from installation to first AI generation_
 
 <div class="video-container">
   <video controls width="100%">
-    <source src="../assets/videos/advanced-features.mp4" type="video/mp4">
+    <source src="../assets/videos/advanced-features.mp4" type="video/mp4" />
     Your browser does not support the video tag.
   </video>
 </div>
@@ -112,7 +112,7 @@ _Analytics, evaluation, custom tools, and MCP integration showcase_
 
 <div class="video-container">
   <video controls width="100%">
-    <source src="../assets/videos/enterprise-workflow.mp4" type="video/mp4">
+    <source src="../assets/videos/enterprise-workflow.mp4" type="video/mp4" />
     Your browser does not support the video tag.
   </video>
 </div>

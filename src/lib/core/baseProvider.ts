@@ -1,39 +1,37 @@
-import type {
-  ZodUnknownSchema,
-  ValidationSchema,
-  StandardRecord,
-} from "../types/typeAliases.js";
-import type { Tool, LanguageModelV1, CoreMessage } from "ai";
-import { generateText } from "ai";
-import type {
-  AIProvider,
-  TextGenerationOptions,
-  TextGenerationResult,
-  EnhancedGenerateResult,
-  AnalyticsData,
-} from "../types/index.js";
-import { AIProviderName } from "../constants/enums.js";
+import type { CoreMessage, generateText, LanguageModelV1, Tool } from "ai";
+import { directAgentTools } from "../agent/directTools.js";
+import type { AIProviderName } from "../constants/enums.js";
+import { IMAGE_GENERATION_MODELS } from "../core/constants.js";
 import type { EvaluationData } from "../index.js";
 import { MiddlewareFactory } from "../middleware/factory.js";
+import type { NeuroLink } from "../neurolink.js";
+import type { JsonValue, UnknownRecord } from "../types/common.js";
+import type {
+  AIProvider,
+  AnalyticsData,
+  EnhancedGenerateResult,
+  TextGenerationOptions,
+  TextGenerationResult,
+} from "../types/index.js";
 import type { MiddlewareFactoryOptions } from "../types/middlewareTypes.js";
 import type { StreamOptions, StreamResult } from "../types/streamTypes.js";
-import type { JsonValue, UnknownRecord } from "../types/common.js";
+import type {
+  StandardRecord,
+  ValidationSchema,
+  ZodUnknownSchema,
+} from "../types/typeAliases.js";
 import { logger } from "../utils/logger.js";
-import { IMAGE_GENERATION_MODELS } from "../core/constants.js";
-import { directAgentTools } from "../agent/directTools.js";
 import { createTimeoutController, TimeoutError } from "../utils/timeout.js";
 import { shouldDisableBuiltinTools } from "../utils/toolUtils.js";
-import type { NeuroLink } from "../neurolink.js";
-import { getKeysAsString, getKeyCount } from "../utils/transformationUtils.js";
-
+import { getKeyCount, getKeysAsString } from "../utils/transformationUtils.js";
+import { TTSProcessor } from "../utils/ttsProcessor.js";
+import { GenerationHandler } from "./modules/GenerationHandler.js";
 // Import modules for composition
 import { MessageBuilder } from "./modules/MessageBuilder.js";
 import { StreamHandler } from "./modules/StreamHandler.js";
-import { GenerationHandler } from "./modules/GenerationHandler.js";
 import { TelemetryHandler } from "./modules/TelemetryHandler.js";
-import { Utilities } from "./modules/Utilities.js";
 import { ToolsManager } from "./modules/ToolsManager.js";
-import { TTSProcessor } from "../utils/ttsProcessor.js";
+import { Utilities } from "./modules/Utilities.js";
 
 /**
  * Abstract base class for all AI providers
@@ -144,7 +142,7 @@ export abstract class BaseProvider implements AIProvider {
     optionsOrPrompt: StreamOptions | string,
     analysisSchema?: ValidationSchema,
   ): Promise<StreamResult> {
-    const options = this.normalizeStreamOptions(optionsOrPrompt);
+    let options = this.normalizeStreamOptions(optionsOrPrompt);
 
     logger.info(`Starting stream`, {
       provider: this.providerName,
@@ -173,6 +171,23 @@ export abstract class BaseProvider implements AIProvider {
 
       // Skip real streaming, go directly to fake streaming
       return await this.executeFakeStreaming(options, analysisSchema);
+    }
+
+    // Central tool merge: Pre-merge base tools (MCP/built-in) with user-provided
+    // tools (e.g. RAG tools) into options.tools. This way, every provider's
+    // executeStream() can simply use options.tools (or getAllTools() + options.tools)
+    // and get the complete tool set without needing per-provider merge logic.
+    if (!options.disableTools && this.supportsTools()) {
+      const baseTools = await this.getAllTools();
+      const externalTools = (options.tools || {}) as Record<string, Tool>;
+      const mergedTools = { ...baseTools, ...externalTools };
+      options = { ...options, tools: mergedTools };
+      logger.debug(`Central tool merge for stream`, {
+        provider: this.providerName,
+        baseToolCount: Object.keys(baseTools).length,
+        externalToolCount: Object.keys(externalTools).length,
+        totalToolCount: Object.keys(mergedTools).length,
+      });
     }
 
     // CRITICAL FIX: Always prefer real streaming over fake streaming
@@ -242,6 +257,7 @@ export abstract class BaseProvider implements AIProvider {
         systemPrompt: options.systemPrompt,
         temperature: options.temperature,
         maxTokens: options.maxTokens,
+        tools: options.tools, // 🔧 FIX: Pass user-provided tools (including RAG tools) to generation pipeline
         disableTools: false,
         maxSteps: options.maxSteps || 5,
         provider: options.provider as AIProviderName | undefined,
@@ -379,6 +395,34 @@ export abstract class BaseProvider implements AIProvider {
 
     const model = await this.getAISDKModelWithMiddleware(options);
     return { tools, model };
+  }
+
+  /**
+   * Get merged tools for streaming: combines base tools (MCP/built-in) with
+   * user-provided tools (e.g., RAG tools passed via options.tools).
+   *
+   * This is the canonical tool-merge pattern for executeStream() implementations.
+   * All providers should call this instead of getAllTools() directly.
+   */
+  protected async getToolsForStream(
+    options: StreamOptions | TextGenerationOptions,
+  ): Promise<Record<string, Tool>> {
+    const shouldUseTools = !options.disableTools && this.supportsTools();
+    if (!shouldUseTools) {
+      return {};
+    }
+    const baseTools = await this.getAllTools();
+    const externalTools = (options.tools || {}) as Record<string, Tool>;
+    const merged = { ...baseTools, ...externalTools };
+
+    logger.debug(`Tools prepared for streaming`, {
+      provider: this.providerName,
+      baseToolCount: Object.keys(baseTools).length,
+      externalToolCount: Object.keys(externalTools).length,
+      totalToolCount: Object.keys(merged).length,
+    });
+
+    return merged;
   }
 
   /**
@@ -709,6 +753,53 @@ export abstract class BaseProvider implements AIProvider {
       evaluation: result.evaluation,
       audio: result.audio,
     };
+  }
+
+  /**
+   * Generate embeddings for text
+   *
+   * This is a default implementation that throws an error.
+   * Providers that support embeddings (OpenAI, Google Vertex, Amazon Bedrock)
+   * should override this method with their specific implementation.
+   *
+   * @param text - The text to embed
+   * @param _modelName - Optional embedding model name (provider-specific)
+   * @returns Promise resolving to the embedding vector (array of numbers)
+   * @throws Error if the provider does not support embeddings
+   *
+   * @example
+   * ```typescript
+   * const provider = await ProviderFactory.createProvider('openai', 'text-embedding-3-small');
+   * const embedding = await provider.embed('Hello world');
+   * console.log(embedding); // [0.123, -0.456, ...]
+   * ```
+   */
+  async embed(text: string, _modelName?: string): Promise<number[]> {
+    logger.warn(
+      `embed() called on ${this.providerName} which does not have a native implementation`,
+      {
+        textLength: text.length,
+      },
+    );
+    throw new Error(
+      `Embedding generation is not supported by the ${this.providerName} provider. ` +
+        `Supported providers: openai, vertex/google, bedrock. ` +
+        `Use an embedding model like text-embedding-3-small (OpenAI), text-embedding-004 (Vertex), ` +
+        `or amazon.titan-embed-text-v2:0 (Bedrock).`,
+    );
+  }
+
+  /**
+   * Get the default embedding model for this provider
+   *
+   * Override in subclasses to provide provider-specific defaults.
+   * Returns undefined for providers that don't support embeddings.
+   *
+   * @returns The default embedding model name, or undefined if not supported
+   */
+  protected getDefaultEmbeddingModel(): string | undefined {
+    // Default implementation returns undefined - providers override this
+    return undefined;
   }
 
   // ===================
@@ -1249,7 +1340,10 @@ export abstract class BaseProvider implements AIProvider {
       throw ErrorFactory.invalidParameters(
         "video-generation",
         new Error(imageValidation.message),
-        { field: "input.images[0]", validation: imageValidation },
+        {
+          field: "input.images[0]",
+          validation: imageValidation,
+        },
       );
     }
 

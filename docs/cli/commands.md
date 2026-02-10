@@ -28,6 +28,8 @@ npm install @juspay/neurolink
 | `config <subcommand>` | Initialise, validate, export, or reset configuration.       | `npx @juspay/neurolink config validate`                                     |
 | `memory <subcommand>` | View, export, or clear conversation history.                | `npx @juspay/neurolink memory history NL_x3yr --format json`                |
 | `mcp <subcommand>`    | Manage Model Context Protocol servers/tools.                | `npx @juspay/neurolink mcp list`                                            |
+| `server <subcommand>` | Manage NeuroLink HTTP server                                |                                                                             |
+| `serve`               | Start server in foreground mode                             |                                                                             |
 | `validate`            | Alias for `config validate`.                                | `npx @juspay/neurolink validate`                                            |
 
 ## Primary Commands
@@ -44,7 +46,10 @@ Key flags:
 
 - `--provider`, `-p` – provider slug (default `auto`).
 - `--model`, `-m` – model name for the chosen provider.
-- `--image`, `-i` – attach one or more files/URLs for multimodal prompts.
+- `--image`, `-i` – attach one or more image files/URLs for multimodal prompts.
+- `--pdf` – attach one or more PDF files for document analysis.
+- `--csv` – attach one or more CSV files for data analysis.
+- `--file` – attach any supported file type (auto-detected: Excel, Word, RTF, JSON, YAML, XML, HTML, SVG, Markdown, code files, and more).
 - `--temperature`, `-t` – creativity (default `0.7`).
 - `--maxTokens` – response limit (default `1000`).
 - `--system`, `-s` – system prompt.
@@ -57,6 +62,24 @@ Key flags:
 - `--timeout` – seconds before aborting the request (default `120`).
 - `--debug` – verbose logging and full JSON payloads.
 - `--quiet` – suppress spinners.
+
+**File Input Examples:**
+
+```bash
+# Attach multiple file types
+npx @juspay/neurolink generate "Analyze this data" \
+  --file ./report.xlsx \
+  --file ./config.yaml \
+  --file ./diagram.svg
+
+# Mix file types with images and PDFs
+npx @juspay/neurolink generate "Compare architecture" \
+  --file ./main.ts \
+  --pdf ./spec.pdf \
+  --image ./screenshot.png
+```
+
+See [File Processors Guide](../features/file-processors.md) for all 17+ supported file types.
 
 **Video Generation (Veo 3.1):**
 
@@ -310,6 +333,244 @@ npx @juspay/neurolink mcp remove myserver
 
 See [MCP HTTP Transport Guide](../mcp-http-transport.md) for complete configuration options.
 
+---
+
+## `serve`
+
+Start the NeuroLink HTTP server in foreground mode.
+
+### Usage
+
+```bash
+neurolink serve [options]
+```
+
+### Options
+
+| Option        | Alias | Type    | Default | Description                                              |
+| ------------- | ----- | ------- | ------- | -------------------------------------------------------- |
+| `--port`      | `-p`  | number  | 3000    | Port to listen on                                        |
+| `--host`      | `-H`  | string  | 0.0.0.0 | Host to bind to                                          |
+| `--framework` | `-f`  | string  | hono    | Web framework: hono, express, fastify, koa               |
+| `--basePath`  |       | string  | /api    | Base path for all routes                                 |
+| `--cors`      |       | boolean | true    | Enable CORS                                              |
+| `--rateLimit` |       | number  | 100     | Rate limit (requests per 15-minute window, 0 to disable) |
+| `--swagger`   |       | boolean | false   | Enable Swagger UI and OpenAPI endpoints                  |
+| `--watch`     | `-w`  | boolean | false   | Enable watch mode                                        |
+| `--config`    | `-c`  | string  |         | Path to config file                                      |
+
+### Swagger/OpenAPI Endpoints
+
+When `--swagger` is enabled, these endpoints become available:
+
+| Endpoint                | Description                              |
+| ----------------------- | ---------------------------------------- |
+| `GET /api/openapi.json` | OpenAPI 3.1 specification in JSON format |
+| `GET /api/openapi.yaml` | OpenAPI 3.1 specification in YAML format |
+| `GET /api/docs`         | Interactive Swagger UI documentation     |
+
+> **Note:** Disable with `--no-swagger` in production to avoid exposing API structure.
+
+### Examples
+
+```bash
+# Start with defaults
+neurolink serve
+
+# Start on specific port with Express
+neurolink serve --port 8080 --framework express
+
+# Start with custom config file
+neurolink serve --config ./server.config.json
+```
+
+---
+
+## `server <subcommand>`
+
+Manage NeuroLink HTTP server for exposing AI agents as REST APIs.
+
+### Subcommands
+
+| Subcommand | Description                         |
+| ---------- | ----------------------------------- |
+| `start`    | Start the HTTP server in background |
+| `stop`     | Stop the running server             |
+| `status`   | Show server status                  |
+| `routes`   | List all registered routes          |
+| `config`   | Show or modify server configuration |
+| `openapi`  | Generate OpenAPI specification      |
+
+---
+
+### `server start`
+
+Start the HTTP server in background mode.
+
+```bash
+neurolink server start [options]
+```
+
+| Option        | Alias | Type    | Default | Description                                              |
+| ------------- | ----- | ------- | ------- | -------------------------------------------------------- |
+| `--port`      | `-p`  | number  | 3000    | Port to listen on                                        |
+| `--host`      | `-H`  | string  | 0.0.0.0 | Host to bind to                                          |
+| `--framework` | `-f`  | string  | hono    | Framework: hono, express, fastify, koa                   |
+| `--basePath`  |       | string  | /api    | Base path for all routes                                 |
+| `--cors`      |       | boolean | true    | Enable CORS                                              |
+| `--rateLimit` |       | number  | 100     | Rate limit (requests per 15-minute window, 0 to disable) |
+
+**Examples:**
+
+```bash
+# Start with defaults
+neurolink server start
+
+# Start on port 8080 with Express
+neurolink server start -p 8080 --framework express
+```
+
+---
+
+### `server stop`
+
+Stop a running background server.
+
+```bash
+neurolink server stop [options]
+```
+
+| Option    | Type    | Default | Description                                 |
+| --------- | ------- | ------- | ------------------------------------------- |
+| `--force` | boolean | false   | Force stop even if server is not responding |
+
+**Examples:**
+
+```bash
+# Stop gracefully
+neurolink server stop
+
+# Force stop
+neurolink server stop --force
+```
+
+---
+
+### `server status`
+
+Show server status information.
+
+```bash
+neurolink server status [options]
+```
+
+| Option     | Type   | Default | Description               |
+| ---------- | ------ | ------- | ------------------------- |
+| `--format` | string | text    | Output format: text, json |
+
+**Examples:**
+
+```bash
+# Text output
+neurolink server status
+
+# JSON output for scripting
+neurolink server status --format json
+```
+
+---
+
+### `server routes`
+
+List all registered server routes.
+
+```bash
+neurolink server routes [options]
+```
+
+| Option     | Type   | Default | Description                                                  |
+| ---------- | ------ | ------- | ------------------------------------------------------------ |
+| `--format` | string | table   | Output format: text, json, table                             |
+| `--group`  | string | all     | Filter by route group: agent, tool, mcp, memory, health, all |
+| `--method` | string | all     | Filter by HTTP method: GET, POST, PUT, DELETE, PATCH, all    |
+
+**Examples:**
+
+```bash
+# List all routes in table format
+neurolink server routes
+
+# List only agent routes
+neurolink server routes --group agent
+
+# List all POST endpoints as JSON
+neurolink server routes --method POST --format json
+```
+
+---
+
+### `server config`
+
+Show or modify server configuration.
+
+```bash
+neurolink server config [options]
+```
+
+| Option     | Type    | Default | Description                            |
+| ---------- | ------- | ------- | -------------------------------------- |
+| `--get`    | string  |         | Get a specific config value            |
+| `--set`    | string  |         | Set a config value (format: key=value) |
+| `--reset`  | boolean | false   | Reset configuration to defaults        |
+| `--format` | string  | text    | Output format: text, json              |
+
+**Examples:**
+
+```bash
+# Show all configuration
+neurolink server config
+
+# Get specific value
+neurolink server config --get defaultPort
+
+# Set a value
+neurolink server config --set defaultPort=8080
+
+# Reset to defaults
+neurolink server config --reset
+```
+
+---
+
+### `server openapi`
+
+Generate OpenAPI specification.
+
+```bash
+neurolink server openapi [options]
+```
+
+| Option       | Alias | Type   | Default | Description               |
+| ------------ | ----- | ------ | ------- | ------------------------- |
+| `--output`   | `-o`  | string | stdout  | Output file path          |
+| `--format`   |       | string | json    | Output format: json, yaml |
+| `--basePath` |       | string | /api    | Base path for all routes  |
+| `--title`    |       | string |         | API title                 |
+| `--version`  |       | string |         | API version               |
+
+**Examples:**
+
+```bash
+# Generate to stdout
+neurolink server openapi
+
+# Save to file
+neurolink server openapi -o openapi.json
+
+# Generate YAML format
+neurolink server openapi --format yaml -o openapi.yaml
+```
+
 ## Global Flags (available on every command)
 
 | Flag                        | Description                                                               |
@@ -326,6 +587,64 @@ See [MCP HTTP Transport Guide](../mcp-http-transport.md) for complete configurat
 - `--format json` returns structured output including analytics, evaluation, tool calls, and response metadata.
 - Combine with `--enableAnalytics --enableEvaluation` to capture usage costs and quality scores in automation pipelines.
 - Use `--output <file>` to persist raw responses alongside JSON logs.
+
+## rag \<subcommand\>
+
+Document processing and RAG pipeline commands.
+
+| Subcommand | Description                                 |
+| ---------- | ------------------------------------------- |
+| `chunk`    | Chunk a document using a specified strategy |
+| `index`    | Index documents into a vector store         |
+| `query`    | Query indexed documents                     |
+
+### rag chunk
+
+Chunk a document file into smaller pieces for RAG processing.
+
+```bash
+neurolink rag chunk <file> [options]
+```
+
+| Option            | Alias | Type   | Default     | Description                |
+| ----------------- | ----- | ------ | ----------- | -------------------------- |
+| `--strategy`      | `-s`  | string | `recursive` | Chunking strategy          |
+| `--chunk-size`    |       | number | `1000`      | Maximum chunk size         |
+| `--chunk-overlap` |       | number | `200`       | Overlap between chunks     |
+| `--output`        | `-o`  | string | stdout      | Output file path           |
+| `--format`        | `-f`  | string | `text`      | Output format (text, json) |
+
+**Chunking Strategies:** `character`, `recursive`, `sentence`, `token`, `markdown`, `html`, `json`, `latex`, `semantic`, `semantic-markdown`
+
+**Examples:**
+
+```bash
+# Default chunking
+neurolink rag chunk ./docs/guide.md
+
+# Markdown-aware chunking with JSON output
+neurolink rag chunk ./docs/guide.md --strategy markdown --format json
+
+# Custom size and overlap
+neurolink rag chunk ./docs/guide.md --chunk-size 512 --chunk-overlap 50 --output chunks.json
+```
+
+### RAG Flags on generate/stream
+
+RAG can also be used directly with `generate` and `stream` commands via `--rag-files`:
+
+```bash
+neurolink generate "What is this about?" --rag-files ./docs/guide.md
+neurolink stream "Summarize" --rag-files ./docs/a.md ./docs/b.md --rag-top-k 10
+```
+
+| Flag                  | Type     | Default       | Description                         |
+| --------------------- | -------- | ------------- | ----------------------------------- |
+| `--rag-files`         | string[] | -             | File paths to load for RAG context  |
+| `--rag-strategy`      | string   | auto-detected | Chunking strategy for RAG documents |
+| `--rag-chunk-size`    | number   | 1000          | Maximum chunk size in characters    |
+| `--rag-chunk-overlap` | number   | 200           | Overlap between adjacent chunks     |
+| `--rag-top-k`         | number   | 5             | Number of top results to retrieve   |
 
 ## Troubleshooting
 

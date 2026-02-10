@@ -35,7 +35,7 @@ See also: [Redis Quick Start](../getting-started/redis-quickstart.md) in Getting
 
 ---
 
-## 🔄 Migration Guides
+## Migration Guides
 
 Migrate from other AI frameworks to NeuroLink.
 
@@ -72,6 +72,22 @@ Model Context Protocol server catalog and integration patterns.
 | **[Server Catalog](mcp/server-catalog.md)** | 58+ MCP servers for file systems, databases, APIs, and more |
 
 See also: [MCP Tools Showcase](../features/mcp-tools-showcase.md) for detailed tool documentation
+
+---
+
+## 🖥️ Server Adapters :material-new-box:{ .new-feature title="New in v8.42" }
+
+Deploy NeuroLink as production-ready HTTP APIs.
+
+| Guide                                                      | Description                                                         |
+| ---------------------------------------------------------- | ------------------------------------------------------------------- |
+| **[Server Adapters Overview](/guides/server-adapters)**    | Quick start guide for exposing AI agents as HTTP APIs               |
+| **[Hono Adapter](/guides/server-adapters/hono)**           | Recommended lightweight adapter for serverless and edge deployments |
+| **[Express Adapter](/guides/server-adapters/express)**     | Integration with existing Express applications                      |
+| **[Fastify Adapter](/guides/server-adapters/fastify)**     | High-performance adapter with built-in schema validation            |
+| **[Koa Adapter](/guides/server-adapters/koa)**             | Modern, minimalist adapter with clean middleware composition        |
+| **[Security Guide](/guides/server-adapters/security)**     | Authentication, authorization, and security best practices          |
+| **[Deployment Guide](/guides/server-adapters/deployment)** | Production deployment patterns with Docker and Kubernetes           |
 
 ---
 

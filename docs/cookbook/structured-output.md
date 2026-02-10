@@ -528,5 +528,5 @@ const user = await generator.extractStructured<z.infer<typeof UserSchema>>(
 
 - [Batch Processing](batch-processing.md)
 - [Error Recovery](error-recovery.md)
-- [API Reference - Generate Method](../sdk/api-reference.md#generate)
+- [API Reference - Generate Method](../sdk/api-reference.md)
 - [Provider Comparison](../reference/provider-comparison.md)

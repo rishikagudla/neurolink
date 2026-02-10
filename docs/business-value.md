@@ -335,7 +335,7 @@ npx @juspay/neurolink generate "Business content" \
 - [ ] Manual review time reduced 70%+
 - [ ] Compliance requirements met consistently
 
-### ✅ Performance Monitoring Achieved:
+### Performance Monitoring Achieved:
 
 - [ ] Real-time performance dashboards
 - [ ] Quality trend analysis
@@ -343,7 +343,7 @@ npx @juspay/neurolink generate "Business content" \
 - [ ] Provider reliability monitoring
 - [ ] Business intelligence reporting
 
-## 🎯 Next Steps
+## Next Steps
 
 1. **Implement Analytics**: Start with cost tracking
 2. **Add Quality Control**: Implement evaluation scoring

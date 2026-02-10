@@ -14,11 +14,11 @@ Thank you for your interest in contributing to NeuroLink! We welcome contributio
 - [Documentation](#documentation)
 - [Community](#community)
 
-## 📜 Code of Conduct
+## Code of Conduct
 
 Please read and follow our [Code of Conduct](../code-of-conduct.md). We are committed to providing a welcoming and inclusive environment for all contributors.
 
-## 🚀 How to Contribute
+## How to Contribute
 
 ### Reporting Issues
 
@@ -40,7 +40,7 @@ Please read and follow our [Code of Conduct](../code-of-conduct.md). We are comm
 4. **Write tests** - Ensure your changes are tested
 5. **Submit a pull request** - Follow our PR template
 
-## 🛠️ Development Setup
+## Development Setup
 
 ### Prerequisites
 
@@ -89,7 +89,7 @@ npm run example:streaming
 cd neurolink-demo && npm start
 ```
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 neurolink/
@@ -114,7 +114,7 @@ neurolink/
 - **CompatibilityFactory** - Handles provider creation and compatibility
 - **MCP Integration** - Built-in and external tool support
 
-## 💻 Coding Standards
+## Coding Standards
 
 ### TypeScript Style Guide
 
@@ -162,7 +162,7 @@ function process(data: any) {
 - **Functions**: `camelCase` (e.g., `createProvider`)
 - **Constants**: `UPPER_SNAKE_CASE` (e.g., `DEFAULT_TIMEOUT`)
 
-## 🧪 Testing Guidelines
+## Testing Guidelines
 
 ### Test Structure
 
@@ -214,7 +214,7 @@ npm run test:coverage
 npm test src/providers/openai.test.ts
 ```
 
-## 🔄 Pull Request Process
+## Pull Request Process
 
 ### Before Submitting
 
@@ -255,7 +255,7 @@ Fixes #123
 3. **Documentation review** - Docs team review if needed
 4. **Testing** - Manual testing for significant changes
 
-## 📚 Documentation
+## Documentation
 
 ### Documentation Standards
 
@@ -304,7 +304,7 @@ Tips for effective usage.
 Known gotchas and solutions.
 ````
 
-## 🌟 Community
+## Community
 
 ### Getting Help
 

@@ -1,0 +1,319 @@
+/**
+ * NeuroLink Server Adapters
+ * Expose NeuroLink capabilities through HTTP APIs
+ *
+ * @example
+ * ```typescript
+ * import { NeuroLink } from "@juspay/neurolink";
+ * import { createServer, createAllRoutes } from "@juspay/neurolink/server";
+ *
+ * const neurolink = new NeuroLink({
+ *   provider: "openai",
+ *   apiKey: process.env.OPENAI_API_KEY,
+ * });
+ *
+ * // Create and start server
+ * const server = await createServer(neurolink, {
+ *   framework: "hono",
+ *   config: { port: 3000 },
+ * });
+ *
+ * await server.initialize();
+ * await server.start();
+ * ```
+ */
+
+// ============================================
+// Abstract Base Class
+// ============================================
+export { BaseServerAdapter } from "./abstract/baseServerAdapter.js";
+export { ExpressServerAdapter } from "./adapters/expressAdapter.js";
+export { FastifyServerAdapter } from "./adapters/fastifyAdapter.js";
+// ============================================
+// Framework Adapters
+// ============================================
+export { HonoServerAdapter } from "./adapters/honoAdapter.js";
+export { KoaServerAdapter } from "./adapters/koaAdapter.js";
+// ============================================
+// Errors
+// ============================================
+export {
+  AlreadyRunningError,
+  // Authentication/Authorization errors
+  AuthenticationError,
+  AuthorizationError,
+  // Configuration errors
+  ConfigurationError,
+  // Error recovery
+  ErrorRecoveryStrategies,
+  // Handler errors
+  HandlerError,
+  InvalidAuthenticationError,
+  // Dependency errors
+  MissingDependencyError,
+  NotRunningError,
+  // Rate limit errors
+  RateLimitError as ServerRateLimitError,
+  RouteConflictError,
+  RouteNotFoundError,
+  // Base error class
+  ServerAdapterError,
+  // Server lifecycle errors
+  ServerStartError,
+  ServerStopError,
+  StreamAbortedError,
+  // Streaming errors
+  StreamingError,
+  // Timeout errors
+  TimeoutError,
+  // Validation errors
+  ValidationError as ServerValidationError,
+  WebSocketConnectionError,
+  // WebSocket errors
+  WebSocketError,
+  // Utilities
+  wrapError,
+} from "./errors.js";
+// ============================================
+// Factory
+// ============================================
+export {
+  createServer,
+  ServerAdapterFactory,
+} from "./factory/serverAdapterFactory.js";
+export {
+  type AbortSignalMiddlewareOptions,
+  createAbortSignalMiddleware,
+  createExpressAbortMiddleware,
+} from "./middleware/abortSignal.js";
+// ============================================
+// Middleware
+// ============================================
+export {
+  type AuthConfig,
+  type AuthResult,
+  createAuthMiddleware,
+  createRoleMiddleware,
+} from "./middleware/auth.js";
+
+export {
+  type CacheConfig,
+  type CacheEntry,
+  type CacheStore,
+  createCacheInvalidator,
+  createCacheMiddleware,
+  InMemoryCacheStore,
+} from "./middleware/cache.js";
+export {
+  createCompressionMiddleware,
+  createErrorHandlingMiddleware,
+  createLoggingMiddleware,
+  createRequestIdMiddleware,
+  createSecurityHeadersMiddleware,
+  createTimingMiddleware,
+} from "./middleware/common.js";
+export {
+  createDeprecationMiddleware,
+  type DeprecationConfig,
+} from "./middleware/deprecation.js";
+export {
+  createMCPBodyAttachmentMiddleware,
+  fastifyMCPBodyHook,
+} from "./middleware/mcpBodyAttachment.js";
+export {
+  createRateLimitMiddleware,
+  createSlidingWindowRateLimitMiddleware,
+  InMemoryRateLimitStore,
+  RateLimitError,
+  type RateLimitMiddlewareConfig,
+  type RateLimitStore,
+} from "./middleware/rateLimit.js";
+export {
+  CommonSchemas,
+  createFieldValidator,
+  createRequestValidationMiddleware,
+  type PropertySchema,
+  type ValidationConfig,
+  ValidationError,
+  type ValidationSchema,
+} from "./middleware/validation.js";
+// ============================================
+// OpenAPI
+// ============================================
+export {
+  AgentExecuteRequestSchema as OpenAPIAgentExecuteRequestSchema,
+  AgentExecuteResponseSchema,
+  AgentInputSchema,
+  ApiKeySecurityScheme,
+  BasicSecurityScheme,
+  BearerSecurityScheme,
+  CommonParameters,
+  ConversationMessageSchema,
+  createApiInfo,
+  createDeleteOperation,
+  createErrorResponse as createOpenAPIErrorResponse,
+  createGetOperation,
+  createHeaderParameter,
+  createOpenAPIGenerator,
+  createPathParameter,
+  createPostOperation,
+  createQueryParameter,
+  createServer as createOpenAPIServer,
+  createStreamingPostOperation,
+  createStreamingResponse,
+  // Templates
+  createSuccessResponse,
+  DefaultServers,
+  // Schemas
+  ErrorResponseSchema,
+  generateOpenAPIFromConfig,
+  generateOpenAPISpec,
+  HealthResponseSchema,
+  MCPServerStatusSchema,
+  MCPServersListResponseSchema,
+  MCPServerToolSchema,
+  MetricsResponseSchema,
+  NeuroLinkApiInfo,
+  // Generator
+  OpenAPIGenerator,
+  type OpenAPIGeneratorConfig,
+  OpenAPISchemas,
+  type OpenAPISpec,
+  ProviderInfoSchema,
+  ReadyResponseSchema,
+  SessionSchema,
+  SessionsListResponseSchema,
+  StandardErrorResponses,
+  StandardTags,
+  TokenUsageSchema,
+  ToolCallSchema,
+  ToolDefinitionSchema,
+  ToolExecuteRequestSchema as OpenAPIToolExecuteRequestSchema,
+  ToolExecuteResponseSchema,
+  ToolListResponseSchema,
+  ToolParameterSchema,
+} from "./openapi/index.js";
+// ============================================
+// Routes
+// ============================================
+export {
+  type CreateRoutesOptions,
+  createAgentRoutes,
+  createAllRoutes,
+  createHealthRoutes,
+  createMCPRoutes,
+  createMemoryRoutes,
+  createOpenApiRoutes,
+  createToolRoutes,
+  registerAllRoutes,
+} from "./routes/index.js";
+// ============================================
+// Streaming
+// ============================================
+export {
+  BaseDataStreamWriter,
+  createDataStreamResponse,
+  createDataStreamWriter,
+  createNDJSONHeaders,
+  createSSEHeaders,
+  type DataEvent,
+  type DataStreamEvent,
+  // Types
+  type DataStreamEventType,
+  DataStreamResponse,
+  // Response
+  type DataStreamResponseConfig,
+  // Writer
+  type DataStreamWriterConfig,
+  type ErrorEvent,
+  type FinishEvent,
+  formatSSEEvent,
+  // Helpers
+  pipeAsyncIterableToDataStream,
+  type SSEEventOptions,
+  type TextDeltaEvent,
+  type TextEndEvent,
+  type TextStartEvent,
+  type ToolCallEvent,
+  type ToolResultEvent,
+  WebStreamWriter,
+} from "./streaming/index.js";
+// ============================================
+// Types
+// ============================================
+export type {
+  AgentExecuteRequest,
+  AgentExecuteResponse,
+  AuthConfig as WebSocketAuthConfig,
+  AuthenticatedUser,
+  AuthStrategy,
+  BodyParserConfig,
+  CORSConfig,
+  DataStreamWriter,
+  // Error Types
+  ErrorCategoryType,
+  ErrorSeverityType,
+  HealthResponse,
+  HttpMethod,
+  LoggingConfig,
+  MCPServerStatusResponse,
+  MiddlewareDefinition,
+  MiddlewareHandler,
+  RateLimitConfig,
+  ReadyResponse,
+  RequiredServerAdapterConfig,
+  RouteDefinition,
+  RouteGroup,
+  RouteHandler,
+  ServerAdapterConfig,
+  ServerAdapterErrorCodeType,
+  ServerAdapterErrorContext,
+  ServerAdapterEvents,
+  ServerAdapterFactoryOptions,
+  ServerContext,
+  ServerFramework,
+  ServerResponse,
+  ServerStatus,
+  SSEWriteOptions,
+  StreamingConfig,
+  ToolExecuteRequest,
+  ToolExecuteResponse,
+  // WebSocket Types
+  WebSocketConfig,
+  WebSocketConnection,
+  WebSocketHandler,
+  WebSocketMessage,
+  WebSocketMessageType,
+} from "./types.js";
+// Export error constants
+export {
+  ErrorCategory,
+  ErrorSeverity,
+  ServerAdapterErrorCode,
+} from "./types.js";
+export { createStreamRedactor, redactStreamChunk } from "./utils/redaction.js";
+// ============================================
+// Validation Utilities
+// ============================================
+export type { ErrorResponse, ValidationResult } from "./utils/validation.js";
+export {
+  AgentExecuteRequestSchema,
+  createErrorResponse,
+  ServerNameParamSchema,
+  SessionIdParamSchema,
+  ToolArgumentsSchema,
+  ToolExecuteRequestSchema,
+  ToolNameParamSchema,
+  ToolSearchQuerySchema,
+  validateParams,
+  validateQuery,
+  validateRequest,
+} from "./utils/validation.js";
+// ============================================
+// WebSocket
+// ============================================
+export {
+  createAgentWebSocketHandler,
+  WebSocketConnectionManager,
+  WebSocketMessageRouter,
+} from "./websocket/index.js";
