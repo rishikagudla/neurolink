@@ -27,16 +27,21 @@ const DEFAULT_LOCATION = "us-central1";
 /**
  * Convert CoreMessage content array to Gemini parts format
  *
- * @param contentArray - Array of content items from CoreMessage
+ * @param messages - Array of CoreMessage objects
  * @returns Array of parts in Gemini API format
  */
 function buildContentParts(
-  frames: CoreMessage,
+  messages: CoreMessage[],
 ): Array<
   { text: string } | { inlineData: { mimeType: string; data: string } }
 > {
-  const contentArray = Array.isArray(frames.content) ? frames.content : [];
-  return contentArray.map((item) => {
+  // Filter for user messages and extract their content
+  const userMessages = messages.filter((msg) => msg.role === "user");
+  const allContent = userMessages.flatMap((msg) =>
+    Array.isArray(msg.content) ? msg.content : [],
+  );
+
+  return allContent.map((item) => {
     if (item.type === "text" && item.text) {
       return { text: item.text };
     } else if (item.type === "image" && item.image) {
@@ -105,7 +110,7 @@ Ensure the final response is fully self-sufficient and does not reference extern
 // ---------------------------------------------------------------------------
 
 export async function analyzeVideoWithVertexAI(
-  frames: CoreMessage,
+  messages: CoreMessage[],
   options: {
     project?: string;
     location?: string;
@@ -121,11 +126,12 @@ export async function analyzeVideoWithVertexAI(
   const location = options.location ?? config.location;
   const model = options.model || DEFAULT_MODEL;
 
-  // Extract content array from CoreMessage
-  const contentArray = Array.isArray(frames.content) ? frames.content : [];
-  const frameCount = contentArray.filter(
-    (item) => item.type === "image",
-  ).length;
+  // Extract content from user messages only
+  const userMessages = messages.filter((msg) => msg.role === "user");
+  const allContent = userMessages.flatMap((msg) =>
+    Array.isArray(msg.content) ? msg.content : [],
+  );
+  const frameCount = allContent.filter((item) => item.type === "image").length;
 
   logger.debug("[GeminiVideoAnalyzer] Analyzing video with Vertex AI", {
     project,
@@ -136,7 +142,7 @@ export async function analyzeVideoWithVertexAI(
   const ai = new GoogleGenAI({ vertexai: true, project, location });
 
   // Convert frames content to parts array for Gemini
-  const parts = buildContentParts(frames);
+  const parts = buildContentParts(messages);
   const response = await ai.models.generateContent({
     model,
     config: buildConfig(),
@@ -164,7 +170,7 @@ export async function analyzeVideoWithVertexAI(
 // ---------------------------------------------------------------------------
 
 export async function analyzeVideoWithGeminiAPI(
-  frames: CoreMessage,
+  messages: CoreMessage[],
   options: {
     apiKey?: string;
     model?: string;
@@ -182,11 +188,12 @@ export async function analyzeVideoWithGeminiAPI(
     );
   }
 
-  // Extract content array from CoreMessage
-  const contentArray = Array.isArray(frames.content) ? frames.content : [];
-  const frameCount = contentArray.filter(
-    (item) => item.type === "image",
-  ).length;
+  // Extract content from user messages only
+  const userMessages = messages.filter((msg) => msg.role === "user");
+  const allContent = userMessages.flatMap((msg) =>
+    Array.isArray(msg.content) ? msg.content : [],
+  );
+  const frameCount = allContent.filter((item) => item.type === "image").length;
 
   logger.debug("[GeminiVideoAnalyzer] Analyzing video with Gemini API", {
     model,
@@ -196,7 +203,7 @@ export async function analyzeVideoWithGeminiAPI(
   const ai = new GoogleGenAI({ apiKey });
 
   // Convert frames content to parts array for Gemini
-  const parts = buildContentParts(frames);
+  const parts = buildContentParts(messages);
 
   logger.debug("[GeminiVideoAnalyzer] Generating analysis with frames");
 
@@ -275,7 +282,7 @@ async function getVertexConfig(): Promise<{
 }
 
 export async function analyzeVideo(
-  frames: CoreMessage,
+  frames: CoreMessage[],
   options: {
     provider?: AIProviderName;
     project?: string;
@@ -285,7 +292,6 @@ export async function analyzeVideo(
   } = {},
 ): Promise<string> {
   const provider = options.provider || AIProviderName.AUTO;
-
   // Vertex — only when GOOGLE_VERTEX_PROJECT is explicitly set
   if (provider === AIProviderName.VERTEX || provider === AIProviderName.AUTO) {
     return analyzeVideoWithVertexAI(frames, options);

@@ -63,7 +63,7 @@ export async function executeVideoAnalysis(
         ? AIProviderName.VERTEX
         : AIProviderName.AUTO;
 
-  const videoAnalysisText = await analyzeVideo(messages[0], {
+  const videoAnalysisText = await analyzeVideo(messages, {
     provider: provider as AIProviderName,
     project: options.region
       ? undefined
