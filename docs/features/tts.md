@@ -12,13 +12,13 @@ NeuroLink provides integrated Text-to-Speech (TTS) capabilities, allowing you to
 
 **Key Features:**
 
-- **High-quality voices** - Neural, Wavenet, and Standard voice types
+- **Multiple providers** - Google Cloud TTS, OpenAI TTS, ElevenLabs, Azure TTS, Fish Audio, Cartesia, and 60db
+- **High-quality voices** - Neural, Wavenet, Standard, and multilingual voice types
 - **Multiple languages** - 50+ voices across 10+ languages
 - **Flexible audio formats** - MP3, WAV, OGG/Opus
 - **Voice customization** - Adjust speed, pitch, and volume
 - **Two synthesis modes** - Direct text-to-speech OR AI response synthesis
-- **Cross-platform playback** - Built-in audio playback support
-- **Production-ready** - Battle-tested Google Cloud TTS integration
+- **Production-ready** - Works with Google Cloud, OpenAI, ElevenLabs, Azure, Fish Audio, Cartesia, and 60db
 
 ---
 
@@ -30,19 +30,37 @@ TTS support is built into NeuroLink. No additional installation required.
 
 ### Environment Setup
 
-TTS requires Google Cloud credentials:
+Set the appropriate environment variables for your chosen TTS provider:
 
 ```bash
-# Option 1: Service account (recommended for production)
+# Google AI Studio (google-ai TTS uses the Google Cloud TTS SDK; ADC / service
+# account is required — there is no API-key auth for the TTS handler itself)
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
+# (GOOGLE_AI_API_KEY is used by the LLM/STT side of `google-ai`, not TTS.)
+
+# Google Vertex AI (vertex) — service account recommended for production
 export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
 
-# Option 2: API key (simpler for development)
-export GOOGLE_AI_API_KEY="your-api-key"
+# OpenAI TTS (openai-tts)
+export OPENAI_API_KEY="your-openai-api-key"
+
+# ElevenLabs (elevenlabs)
+export ELEVENLABS_API_KEY="your-elevenlabs-api-key"
+
+# Azure TTS (azure-tts)
+export AZURE_SPEECH_KEY="your-azure-speech-key"
+export AZURE_SPEECH_REGION="eastus"  # or your Azure region
+
+# Fish Audio TTS (fish-audio) — low-cost, voice cloning, 14 languages
+export FISH_AUDIO_API_KEY="your-fish-audio-api-key"
+
+# Cartesia TTS (cartesia) — low-latency Sonic models, voice cloning
+export CARTESIA_API_KEY="sk_car_..."
 ```
 
-**API Key Configuration:**
+**Google API Key Configuration:**
 
-If using API key authentication, enable both APIs in Google Cloud Console:
+If using API key authentication for Google, enable both APIs in Google Cloud Console:
 
 1. Navigate to "APIs & Services" > "Credentials"
 2. Create or select your API key
@@ -86,25 +104,29 @@ const result = await neurolink.generate({
 });
 
 // Access generated audio
-console.log("Audio size:", result.tts?.size, "bytes");
-console.log("Audio format:", result.tts?.format);
+console.log("Audio size:", result.audio?.size, "bytes");
+console.log("Audio format:", result.audio?.format);
 ```
 
 ---
 
 ## Supported Providers
 
-TTS is currently available through Google Cloud Text-to-Speech API:
+TTS is available through the following providers:
 
-| Provider      | Authentication                                     | Voices     | Notes                                |
-| ------------- | -------------------------------------------------- | ---------- | ------------------------------------ |
-| **google-ai** | API Key (`GOOGLE_AI_API_KEY`)                      | 50+ voices | Simplest setup, good for development |
-| **vertex**    | Service Account (`GOOGLE_APPLICATION_CREDENTIALS`) | 50+ voices | Recommended for production           |
+| Provider       | Authentication                                              | Voices / Models                                                                                  | Notes                                                                                                                                                                                                             |
+| -------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **google-ai**  | Service Account (`GOOGLE_APPLICATION_CREDENTIALS`)          | 50+ voices (Neural2, Wavenet, Standard)                                                          | Same auth as `vertex` (TTS uses Google Cloud Text-to-Speech client)                                                                                                                                               |
+| **vertex**     | Service Account (`GOOGLE_APPLICATION_CREDENTIALS`)          | 50+ voices (Neural2, Wavenet, Standard)                                                          | Recommended for production                                                                                                                                                                                        |
+| **openai-tts** | API Key (`OPENAI_API_KEY`)                                  | 6 voices: alloy, echo, fable, onyx, nova, shimmer; models: tts-1, tts-1-hd                       | Good default quality                                                                                                                                                                                              |
+| **elevenlabs** | API Key (`ELEVENLABS_API_KEY`)                              | Multilingual voices; model: eleven_multilingual_v2                                               | High-quality multilingual synthesis                                                                                                                                                                               |
+| **azure-tts**  | API Key (`AZURE_SPEECH_KEY` + region `AZURE_SPEECH_REGION`) | Neural voices with SSML support                                                                  | Enterprise-grade Azure Speech                                                                                                                                                                                     |
+| **fish-audio** | API Key (`FISH_AUDIO_API_KEY`)                              | 14 languages, voice cloning (15 s reference); models: `s1` (default), `speech-1.6`, `speech-1.5` | Low-cost, ~80% cheaper than ElevenLabs — see [provider guide](../getting-started/providers/fish-audio.md)                                                                                                         |
+| **cartesia**   | API Key (`CARTESIA_API_KEY`)                                | Cartesia voice library, English-first; models: `sonic-3.6` (default)                             | Low-latency Sonic models — see [provider guide](../getting-started/providers/cartesia.md). Synchronous `/tts/bytes`; the WebSocket streaming flow is exposed separately via `CartesiaStream` in the voice server. |
+| **sixtydb**    | Workspace API key (`SIXTYDB_API_KEY`)                       | Quality and fast workspace voice catalogs                                                        | WAV or PCM16 at 24 kHz — see [provider guide](../getting-started/providers/sixtydb.md)                                                                                                                            |
 
-**Coming Soon:**
+**Planned for future releases:**
 
-- OpenAI TTS (GPT-4 voices: alloy, echo, fable, onyx, nova, shimmer)
-- Azure Speech Services
 - AWS Polly
 
 ---
@@ -123,45 +145,38 @@ Google Cloud TTS offers three voice quality tiers:
 
 ### Voice Discovery
 
-**CLI - List All Voices:**
+`--tts-voice` takes a provider-specific identifier, and `neurolink voices`
+prints the ones a provider will accept:
 
 ```bash
-# List all available voices
-neurolink tts voices
-
-# Filter by language
-neurolink tts voices en-US
-
-# JSON format for programmatic use
-neurolink tts voices en-GB --format json
-
-# Table format for easy reading
-neurolink tts voices fr-FR --format table
+neurolink voices --provider openai-tts                  # the six OpenAI voices
+neurolink voices --provider google-ai --language en-US  # filter by language
+neurolink voices --provider elevenlabs --json           # machine-readable
 ```
 
-**SDK - Get Available Voices:**
+`--provider` is required. The list is sorted by name and the count is printed
+at the end. Providers are registered only when their credentials are present,
+so an unconfigured provider is reported the same way a misspelled one is —
+with the set that _is_ registered named in the message, and a non-zero exit.
+
+The same list is available from the SDK:
 
 ```typescript
-import { NeuroLink } from "@juspay/neurolink";
+import { TTSProcessor } from "@juspay/neurolink";
 
-const neurolink = new NeuroLink();
-
-// Get all voices
-const allVoices = await neurolink.getTTSVoices();
-
-// Get voices for specific language
-const usVoices = await neurolink.getTTSVoices("en-US");
-
-// Example voice structure
-type TTSVoice = {
-  id: string; // "en-US-Neural2-C"
-  name: string; // "en-US-Neural2-C"
-  languageCode: string; // "en-US"
-  languageCodes: string[]; // ["en-US"]
-  gender: "male" | "female" | "neutral";
-  type: "neural" | "wavenet" | "standard";
-};
+const voices = await TTSProcessor.getVoices("google-ai", {
+  languageCode: "en-US",
+});
 ```
+
+`languageCode` is passed through to the provider, which decides what filtering
+it means: Google and Azure query their APIs with it, and OpenAI's fixed list
+ignores it. An unregistered provider, or one whose handler does not implement
+voice listing, raises a `TTS_PROVIDER_NOT_SUPPORTED` error.
+
+Google voice identifiers follow Google Cloud TTS naming conventions: `<language>-<variant>-<type>-<name>` (e.g., `en-US-Neural2-C`, `en-GB-Wavenet-D`).
+
+Refer to the [Google Cloud TTS voice list](https://cloud.google.com/text-to-speech/docs/voices) for all available voices.
 
 ### Supported Languages
 
@@ -219,7 +234,17 @@ tts: {
 
 ## TTS Synthesis Modes
 
-NeuroLink supports two TTS synthesis modes:
+NeuroLink supports two TTS synthesis modes, selected with `tts.mode`:
+
+| `tts.mode`           | What is spoken                    | Model call | `usage`   |
+| -------------------- | --------------------------------- | ---------- | --------- |
+| `"direct"` (default) | the input text / prompt, verbatim | none       | all zeros |
+| `"response"`         | the model's generated reply       | yes        | real      |
+
+`result.ttsMetadata.mode` reports which one ran. The older
+`useAiResponse: true` flag still means `mode: "response"` and is still
+honoured, but an explicit `mode` wins when both are present. `stream()`
+always synthesizes the streamed reply and ignores `mode`.
 
 ### Mode 1: Direct Text-to-Speech (Default)
 
@@ -231,14 +256,21 @@ const result = await neurolink.generate({
   provider: "google-ai",
   tts: {
     enabled: true,
-    useAiResponse: false, // Default: synthesize input text
+    mode: "direct", // Default: synthesize input text
     voice: "en-US-Neural2-C",
   },
 });
 
 // Audio contains: "Welcome to our service!"
-// No AI generation occurs
+// No AI generation occurs; result.ttsMetadata.mode === "direct"
 ```
+
+> **Direct mode ignores LLM options.** Because no model is called, `tools`,
+> `systemPrompt`, `conversationMessages`, `schema` and
+> `conversationMemoryConfig` have no effect. If a request carries any of them
+> without an explicit `tts.mode`, NeuroLink logs one warning naming the
+> ignored options — the usual fix is `mode: "response"`. The request is never
+> rejected, so existing "speak this text" callers are unaffected.
 
 **Use cases:**
 
@@ -257,15 +289,22 @@ const result = await neurolink.generate({
   provider: "google-ai",
   tts: {
     enabled: true,
-    useAiResponse: true, // Synthesize AI's response
+    mode: "response", // Synthesize AI's response (legacy: useAiResponse: true)
     voice: "en-US-Neural2-C",
   },
 });
 
 // AI generates joke text
 // TTS synthesizes the joke audio
-// Both text and audio available in result
+// Both text and audio available in result; result.ttsMetadata.mode === "response"
 ```
+
+> **Note:** when `mode: "response"`, NeuroLink synthesizes the chat
+> provider's text response. If your chat provider has no TTS counterpart
+> (e.g. `anthropic`, `bedrock`), set `tts.provider` explicitly — otherwise
+> streaming continues as text-only and logs a provider-resolution warning.
+> Chat providers that double as TTS handlers (e.g. `google-ai`, `vertex`)
+> auto-resolve when `tts.provider` is omitted.
 
 **Use cases:**
 
@@ -273,6 +312,79 @@ const result = await neurolink.generate({
 - Interactive AI conversations
 - Dynamic content narration
 - AI-powered podcasts
+
+### Cleaning text for speech (`tts.sanitize`)
+
+Model output is written for a screen. Read aloud, `**bold**` becomes
+"asterisk asterisk", a URL is spelled out letter by letter, and an emoji is
+announced by name. `tts.sanitize` runs the text through
+`prepareTextForSpeech()` first:
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "Summarise the release notes" },
+  tts: { enabled: true, mode: "response", sanitize: true },
+});
+```
+
+With `sanitize: true` the defaults apply; pass an object to tune them:
+
+| Option            | Default                 | Effect                                                                                                                   |
+| ----------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `markdown`        | `true`                  | Strip headings, emphasis, inline code, bullets, blockquotes, HTML tags; tables become comma-separated rows; links → text |
+| `codeBlocks`      | `"phrase"`              | Fenced code: `"phrase"` speaks `codeBlockPhrase`, `"drop"` removes it, `"keep"` reads the contents                       |
+| `codeBlockPhrase` | `"Code block omitted."` | Spoken stand-in for a fenced block                                                                                       |
+| `urls`            | `"hostname"`            | `https://docs.example.com/a/b` → `docs.example.com` (an IDN host in Unicode, not punycode); `"remove"` drops the URL     |
+| `emoji`           | `true`                  | Remove emoji and pictographs with their skin-tone modifiers, variation selectors and the joiners between them            |
+
+It is **off by default**: existing callers get byte-identical synthesis
+input. The pass is careful about what it does not touch:
+
+- Emphasis is a **pair** around a word run — `**bold**`, `*it*`, `_this_` — so
+  an asterisk between digits is arithmetic and stays: `2*3*4 = 24` is spoken
+  as written, as is `*123*1#`. Backslash escapes are resolved first and the
+  escaped character is kept: `\*not bold\*` becomes `*not bold*`.
+- Only real HTML tag names are stripped (`<b>`, `<br/>`, `<a href>`, …).
+  Angle-bracketed placeholders such as `<Enter>` or `<order-id>`, generics
+  and comparisons are left alone.
+- The zero-width joiner is removed only between or beside pictographs; in
+  Indic and Arabic text, where it shapes letters, it is kept.
+
+In `stream()` the pass runs **per segment** with code blocks kept (fence lines
+stripped), because a segment may hold an unterminated fence. Segments are cut
+at sentence ends with no awareness of markdown spans, so a construct that
+crosses a segment boundary — a link whose `](` lands in the next segment, an
+emphasis run closed two sentences later — is not recognised and its markers
+are spoken. Use `generate()` with `mode: "response"` when the whole reply must
+be cleaned as one text. The function is exported for use on your own text:
+
+```typescript
+import { prepareTextForSpeech } from "@juspay/neurolink";
+
+prepareTextForSpeech(
+  "## Title\n\nSee **this** at https://docs.example.com/x 🎉",
+);
+// → "Title\n\nSee this at docs.example.com"
+```
+
+Every regular expression in the pass is linear-time, and every bounded span
+excludes its own opener so a run of openers cannot walk the bound. Measured
+on one machine (Node 24): 1 MB of ordinary markdown takes about 36 ms, and
+the worst adversarial shapes — 1 MB of `[`, `![`, `**`, `<span ` or
+`<http://` — each take 4–8 ms. Two of those numbers used to be much larger:
+1 MB of `[` cost 2.6 s until the link-label class excluded `[`, and 1 MB of
+`<http://` cost about 380 ms (a reviewer measured 0.5 s) until the autolink
+target class excluded `<` — each unterminated opener had been walking the
+full 2,048-character target bound before failing. Emphasis boundaries are
+Unicode-aware (`\p{P}` / `\p{S}` around the delimiter run), so `**` is
+stripped before a danda, a full-width colon, a curly quote or an em dash as
+well as before ASCII punctuation, and the pair rule still leaves `2*3*4`,
+`x**2` and `Dial *123*1#` alone. In `generate()` the pass always runs when
+`sanitize` is set, whatever the raw length: cleanup can shrink a reply a
+great deal (a fenced block becomes one phrase, a URL becomes its host), so
+text over the provider's cap before cleanup can still fit after it. Text
+that is still over the cap after cleanup is rejected by `TTSProcessor` as
+`TTS_TEXT_TOO_LONG`.
 
 ---
 
@@ -316,11 +428,15 @@ tts: {
 - Auto-converts to WAV when `play: true` on Windows
 - Use MP3 for file output, WAV for immediate playback
 
-**macOS/Linux:**
+**macOS:**
 
-- All formats supported
-- `afplay` (macOS) and `ffplay` (Linux) handle all formats
-- Use MP3 for general purpose
+- `afplay` (built-in) decodes every format — no setup needed.
+
+**Linux:**
+
+- **WAV** requires ALSA (`aplay`) or PulseAudio (`paplay`), but no compressed-format decoder.
+- **Compressed formats (mp3/ogg/opus)** need a real decoder — NeuroLink tries `ffplay` (ffmpeg), then `mpv`, `mpg123` (mp3), then `cvlc` (VLC), in that order. Install any one of them.
+- `paplay`/`aplay` **cannot** decode mp3, so with none of the above installed a default `--tts-play` (which defaults to mp3) will report a clear error naming the decoders — or use `--tts-format wav` when `aplay` or `paplay` is available.
 
 ---
 
@@ -419,7 +535,8 @@ const result = await neurolink.generate({
   provider: "google-ai", // or "vertex"
   tts: {
     enabled: true, // Enable TTS output
-    useAiResponse: false, // false = input text, true = AI response
+    mode: "direct", // "direct" = input text (default), "response" = AI reply
+    sanitize: false, // true | SpeechSanitizeOptions — strip markdown/URLs/emoji first
     voice: "en-US-Neural2-C", // Voice identifier
     format: "mp3", // Audio format: "mp3" | "wav" | "ogg"
     speed: 1.0, // Speaking rate: 0.25-4.0
@@ -433,14 +550,14 @@ const result = await neurolink.generate({
 
 // Access results
 console.log("Text:", result.content);
-console.log("Audio size:", result.tts?.size, "bytes");
-console.log("Audio format:", result.tts?.format);
-console.log("Voice used:", result.tts?.voice);
+console.log("Audio size:", result.audio?.size, "bytes");
+console.log("Audio format:", result.audio?.format);
+console.log("Voice used:", result.audio?.voice);
 
 // Save audio to file
-if (result.tts?.buffer) {
+if (result.audio?.buffer) {
   import { writeFileSync } from "fs";
-  writeFileSync("output.mp3", result.tts.buffer);
+  writeFileSync("output.mp3", result.audio.buffer);
 }
 ```
 
@@ -449,12 +566,49 @@ if (result.tts?.buffer) {
 ```bash
 neurolink generate "Your text" \
   --provider google-ai \
-  --tts-voice <voice-id> \      # Required to enable TTS
-  --tts-format <format> \        # mp3|wav|ogg (default: mp3)
-  --tts-speed <rate> \           # 0.25-4.0 (default: 1.0)
-  --tts-pitch <pitch> \          # -20.0 to 20.0 (default: 0.0)
-  --tts-output <file> \          # Save to file
-  --tts-use-ai-response          # Synthesize AI response instead of input
+  --tts \
+  --tts-provider <provider> \
+  --tts-voice <voice-id> \
+  --tts-format <format> \
+  --tts-speed <rate> \
+  --tts-pitch <pitch> \
+  --tts-output <file> \
+  --tts-use-ai-response
+# --tts                  : enable TTS (boolean flag, required)
+# --tts-provider         : google-ai|vertex|openai-tts|elevenlabs|azure-tts|fish-audio|cartesia|sixtydb
+# --tts-voice            : voice id (optional — provider default applies)
+# --tts-format           : mp3|wav|ogg (default: mp3)
+# --tts-speed            : 0.25-4.0 (default: 1.0)
+# --tts-pitch            : -20.0 to 20.0 (default: 0.0)
+# --tts-output           : save to file
+# --tts-use-ai-response  : synthesize AI response instead of input text
+```
+
+**Discovering voice ids for `--tts-voice`:**
+
+```bash
+neurolink voices --provider <provider> [--language <code>] [--json]
+```
+
+See [Voice Discovery](#voice-discovery).
+
+**Selecting a specific TTS provider:**
+
+```bash
+# Use OpenAI TTS
+neurolink generate "Hello" --tts --tts-provider openai-tts
+
+# Use ElevenLabs
+neurolink generate "Hello" --tts --tts-provider elevenlabs
+
+# Use Azure TTS
+neurolink generate "Hello" --tts --tts-provider azure-tts
+
+# Use Fish Audio
+neurolink generate "Hello" --tts --tts-provider fish-audio
+
+# Use Cartesia
+neurolink generate "Hello" --tts --tts-provider cartesia
 ```
 
 ---
@@ -567,7 +721,7 @@ for (const [lang, config] of Object.entries(translations)) {
       output: `welcome-${lang}.mp3`,
     },
   });
-  console.log(`Generated ${lang} audio (${result.tts?.size} bytes)`);
+  console.log(`Generated ${lang} audio (${result.audio?.size} bytes)`);
 }
 ```
 
@@ -595,8 +749,8 @@ async function generateBatchAudio(
 
     results.push({
       text,
-      audioBuffer: result.tts?.buffer,
-      audioSize: result.tts?.size,
+      audioBuffer: result.audio?.buffer,
+      audioSize: result.audio?.size,
     });
   }
 
@@ -620,39 +774,127 @@ audioFiles.forEach((item, index) => {
 
 ### 7. Streaming Text + Audio
 
-Stream AI-generated text and convert to audio:
+Mode 2 can synthesize sentence-buffered audio while the text response is still
+streaming. `stream()` synthesizes whenever `tts.enabled` is set;
+`useAiResponse` selects input-versus-response synthesis for `generate()` and
+does not apply to `stream()`. `streamingBufferSize` sets the minimum number of
+buffered characters before a completed sentence is flushed (default: 120). A
+provider's `maxTextLength` remains a hard boundary; handlers without an override
+use the 3,000-character default.
+
+Handlers can optionally expose provider-native audio reads for each buffered
+text segment. NeuroLink prefers that capability when it supports the requested
+options and otherwise keeps the existing one-buffer-per-segment synthesis path.
+Custom and built-in handlers without the optional capability remain compatible.
+
+Two handlers currently offer it, each only for the options whose incremental
+delivery has been verified against the live API:
+
+| Handler      | Streams natively for                                                                    | Everything else    |
+| ------------ | --------------------------------------------------------------------------------------- | ------------------ |
+| `openai-tts` | `mp3`, `pcm16`                                                                          | buffered synthesis |
+| `google-ai`  | `pcm16` and `ogg`/`opus`, **and** only for a `Chirp3-HD`, `Chirp-HD` or `Journey` voice | buffered synthesis |
+
+Google's restriction is the streaming endpoint's own, not NeuroLink's: it
+rejects every other voice family (`Neural2`, `Studio`, `Wavenet`, `Standard`)
+with `only Chirp 3: HD voices are supported for streaming synthesis`, and
+rejects `MP3` and `LINEAR16` as unsupported encodings even though
+`synthesizeSpeech` accepts both. SSML is also excluded — the streaming request
+has no SSML field at all, so `<speak>` input stays on the buffered path rather
+than being sent as literal text. Because the default format is `mp3` and the
+default voice is a `Neural2` one, native streaming is strictly opt-in: pass
+both a streaming-capable voice and `format: "pcm16"` (or `"ogg"`) to get it.
+
+```typescript
+// Sentence-buffered audio arrives in many reads instead of one per sentence.
+const streamResult = await neurolink.stream({
+  input: { text: "Summarize the quarterly report." },
+  tts: {
+    enabled: true,
+    provider: "google-ai",
+    voice: "en-US-Chirp3-HD-Aoede",
+    format: "pcm16",
+  },
+});
+```
+
+Note that `pcm16` is headerless: the chunks report `sampleRate: 24000` so a
+consumer can wrap them, and Google's buffered path does not support `pcm16` at
+all, so that format only works for the streaming-capable voices above.
+
+Provider-local chunk indexes and finality are not exposed directly. NeuroLink
+recomputes a single global zero-based index, cumulative byte size, and exactly
+one final chunk across all successful segments. Empty transport reads on the
+native path are dropped and never reach the consumer; the buffered path is
+unchanged and forwards whatever a handler's `synthesize()` returns, so a handler
+that answers with a zero-byte buffer still produces an empty chunk and a
+repeated cumulative size, exactly as it did before native streaming existed.
+Each read is forwarded as soon as the next one arrives — the single one-chunk
+hold is what guarantees the final flag — rather than waiting for the segment to
+complete. A handler that declines the capability for a segment, or that fails while
+NeuroLink is still working out whether the capability is there, falls back to
+buffered synthesis for that segment rather than leaving a gap — as does a
+native stream that completes without producing any audio. That covers every
+step of the question, reads as well as calls, since reading a property can run
+a getter or a proxy trap that throws: reading `synthesizeStream`, a member that
+is not callable, reading or calling `isConfigured`, the call itself throwing,
+and a returned value that is not async-iterable (its `Symbol.asyncIterator`
+being unreadable included). A throwing `isConfigured` falls back the same way
+but then fails on the buffered path as well — shaped, exactly as it would for a
+handler with no native member. A handler that simply reports itself unconfigured
+is not in that list: that segment fails with `TTS_PROVIDER_NOT_CONFIGURED`,
+exactly as it did before native streaming existed. Once the segment's own work
+begins — at the `[Symbol.asyncIterator]()` call — an error fails that segment
+like any other synthesis failure, and its audio is not re-fetched through the
+buffered path.
+If a stream consumer exits
+early, cancellation reaches an active native request rather than waiting for the
+pending response-body read to finish, and the segment that was in flight still
+records its `tts.synthesize` span.
+
+If one segment fails, NeuroLink keeps the text stream and already-yielded audio,
+attempts the remaining segments, and resolves `streamResult.audio` from the
+surviving chunks. After the stream is drained, `streamResult.ttsMetadata` reports
+`success: false` and a structured, sanitized `error` identifying the failed
+segment count and positions. The first segment failure supplies the error detail.
 
 ```typescript
 async function streamAndSpeak(prompt: string, voice: string) {
-  // Step 1: Stream AI response
   const streamResult = await neurolink.stream({
     input: { text: prompt },
     provider: "google-ai",
     model: "gemini-2.0-flash-exp",
+    tts: {
+      enabled: true,
+      provider: "google-ai",
+      voice,
+      streamingBufferSize: 80,
+    },
   });
 
   let fullText = "";
   for await (const chunk of streamResult.stream) {
-    fullText += chunk.content;
-    process.stdout.write(chunk.content);
+    if ("content" in chunk) {
+      fullText += chunk.content;
+      process.stdout.write(chunk.content);
+    } else if ("type" in chunk && chunk.type === "tts_audio") {
+      // Chunks are ordered by index. cumulativeSize grows monotonically,
+      // and exactly the last successful audio chunk has isFinal=true.
+      playAudioChunk(chunk.audio.data);
+    }
   }
 
-  console.log("\n\nConverting to audio...");
-
-  // Step 2: Convert complete text to audio
-  const ttsResult = await neurolink.generate({
-    input: { text: fullText },
-    provider: "google-ai",
-    tts: {
-      enabled: true,
-      voice,
-      play: true,
-    },
-  });
-
+  // After stream iteration, audio resolves to the concatenated TTS result.
+  // Native OpenAI mp3/pcm16 chunks are transport fragments: consume them in
+  // order or use this aggregate; an individual fragment need not be playable.
+  // Buffered providers still contribute one complete buffer per text segment.
+  // Concatenating those segment buffers produces one playable stream for
+  // mp3/mpeg/mpga/pcm16, but NOT a valid file for header-bearing containers
+  // (wav, flac, m4a, mp4, webm), and a chained stream for ogg/opus that some
+  // decoders read only through its first segment.
   return {
     text: fullText,
-    audio: ttsResult.tts,
+    audio: await streamResult.audio,
   };
 }
 
@@ -662,6 +904,13 @@ const result = await streamAndSpeak(
   "en-US-Neural2-C",
 );
 ```
+
+The buffering heuristic recognizes `.`, `!`, or `?` followed by whitespace or
+the end of a text chunk. Short sentences remain buffered until the configured
+boundary or stream completion. Text without sentence punctuation is hard-split
+at the provider limit, so repeated synthesis calls never exceed that cap. The
+same chunk ordering and finality rules apply when a provider falls back to
+synthetic streaming.
 
 ---
 
@@ -690,13 +939,13 @@ async function generateTTSWithRetry(
       });
 
       // Validate audio buffer
-      if (!result.tts || result.tts.size === 0) {
+      if (!result.audio || result.audio.size === 0) {
         throw new Error("Empty audio buffer received");
       }
 
       return {
         success: true,
-        audio: result.tts,
+        audio: result.audio,
         attempt,
       };
     } catch (error) {
@@ -745,14 +994,14 @@ if (result.success && result.audio) {
 
 ### Common Issues
 
-| Issue                            | Cause                    | Solution                                                          |
-| -------------------------------- | ------------------------ | ----------------------------------------------------------------- |
-| **"TTS client not initialized"** | Missing credentials      | Set `GOOGLE_APPLICATION_CREDENTIALS` or `GOOGLE_AI_API_KEY`       |
-| **"Invalid voice name"**         | Voice ID not found       | Run `neurolink tts voices` to see available voices                |
-| **"Text too long"**              | Input exceeds 5000 bytes | Split text into smaller chunks                                    |
-| **"Synthesis failed"**           | Network/API error        | Check network connection and credentials                          |
-| **Audio doesn't play**           | Missing audio player     | Install `afplay` (macOS), `ffplay` (Linux), or use WAV on Windows |
-| **Empty audio buffer**           | API returned no content  | Check API quota and retry                                         |
+| Issue                            | Cause                    | Solution                                                                                     |
+| -------------------------------- | ------------------------ | -------------------------------------------------------------------------------------------- |
+| **"TTS client not initialized"** | Missing credentials      | Set `GOOGLE_APPLICATION_CREDENTIALS` or `GOOGLE_AI_API_KEY`                                  |
+| **"Invalid voice name"**         | Voice ID not found       | Check the [Google Cloud TTS voice list](https://cloud.google.com/text-to-speech/docs/voices) |
+| **"Text too long"**              | Input exceeds 5000 bytes | Split text into smaller chunks                                                               |
+| **"Synthesis failed"**           | Network/API error        | Check network connection and credentials                                                     |
+| **Audio doesn't play**           | Missing audio player     | Install `afplay` (macOS), `ffplay` (Linux), or use WAV on Windows                            |
+| **Empty audio buffer**           | API returned no content  | Check API quota and retry                                                                    |
 
 ### Authentication Issues
 
@@ -771,10 +1020,6 @@ gcloud auth application-default login
 ```bash
 # Verify API key is set
 echo $GOOGLE_AI_API_KEY
-
-# Test in code
-const result = await neurolink.getTTSVoices();
-console.log(`Found ${result.length} voices`);
 ```
 
 ### Audio Playback Issues
@@ -852,6 +1097,7 @@ For detailed pricing, see [Google Cloud TTS Pricing](https://cloud.google.com/te
 - [Multimodal Guide](multimodal.md) - Images, PDFs, CSV inputs
 - [PDF Support](pdf-support.md) - Document processing
 - [Video Generation](video-generation.md) - AI-powered video creation
+- [PPT Generation](ppt-generation.md) - AI-powered PowerPoint presentations
 
 **Advanced Features:**
 
@@ -870,13 +1116,12 @@ For detailed pricing, see [Google Cloud TTS Pricing](https://cloud.google.com/te
 
 NeuroLink's TTS integration provides:
 
-✅ **High-quality voices** - Neural2, Wavenet, and Standard options
-✅ **Multiple languages** - 50+ voices across 10+ languages
-✅ **Flexible synthesis modes** - Direct text or AI response
-✅ **Voice customization** - Speed, pitch, volume control
-✅ **Production-ready** - Google Cloud TTS integration
-✅ **Cross-platform** - Works on macOS, Linux, Windows
-✅ **Easy integration** - Works seamlessly with CLI and SDK
+- **Multiple TTS providers** - Google Cloud TTS, OpenAI TTS, ElevenLabs, Azure TTS, Fish Audio, Cartesia
+- **High-quality voices** - Neural2, Wavenet, Standard, and multilingual options
+- **Multiple languages** - 50+ voices across 10+ languages
+- **Flexible synthesis modes** - Direct text or AI response
+- **Voice customization** - Speed, pitch, volume control
+- **Easy integration** - Works seamlessly with CLI and SDK via `--tts-provider` flag
 
 **Next Steps:**
 

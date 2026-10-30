@@ -1,3 +1,7 @@
+---
+description: Contributing to NeuroLink and extending its capabilities for your specific needs.
+---
+
 # Development
 
 Contributing to NeuroLink and extending its capabilities for your specific needs.
@@ -6,45 +10,13 @@ Contributing to NeuroLink and extending its capabilities for your specific needs
 
 This section covers everything needed for contributing to NeuroLink, understanding its architecture, and extending its functionality.
 
-<div class="grid cards" markdown>
-
-- :material-heart: **[Contributing](contributing.md)**
-
-  ***
-
-  How to contribute to NeuroLink, including setup, coding standards, and submission guidelines.
-
-- :material-test-tube: **[Testing](testing.md)**
-
-  ***
-
-  Comprehensive testing strategies, test suite organization, and validation procedures.
-
-- :material-sitemap: **[Architecture](architecture.md)**
-
-  ***
-
-  Deep dive into NeuroLink's architecture, design patterns, and system organization.
-
-- :material-factory: **[Factory Pattern Migration](factory-migration.md)**
-
-  ***
-
-  Guide for upgrading from older architectures to the new unified factory pattern system.
-
-- :material-tag-multiple: **[Documentation Versioning](versioning.md)**
-
-  ***
-
-  Managing documentation versions across releases using mike for version control and deployment.
-
-- :material-link-variant: **[Automated Link Checking](link-checking.md)**
-
-  ***
-
-  Automated validation of documentation links with CI/CD integration to prevent broken references.
-
-</div>
+- **[Contributing](contributing.md)** — How to contribute to NeuroLink, including setup, coding standards, and submission guidelines.
+- **[Testing](testing.md)** — Comprehensive testing strategies, test suite organization, and validation procedures.
+- **[Logging Guidelines](/docs/development/logging-guidelines)** — Log levels, structured fields, redaction, and per-instance routing.
+- **[Architecture](architecture.md)** — Deep dive into NeuroLink's architecture, design patterns, and system organization.
+- **[Factory Pattern Migration](factory-migration.md)** — Guide for upgrading from older architectures to the new unified factory pattern system.
+- **[Documentation Versioning](versioning.md)** — Managing documentation versions across releases using mike for version control and deployment.
+- **[Automated Link Checking](link-checking.md)** — Automated validation of documentation links with CI/CD integration to prevent broken references.
 
 ## 🚀 Quick Development Setup
 
@@ -84,8 +56,8 @@ This section covers everything needed for contributing to NeuroLink, understandi
     # Start development
     pnpm dev
 
-    # Run quick tests
-    pnpm test:smart
+    # Run the main suite
+    pnpm test
     ```
 
 === "Documentation Only"
@@ -202,19 +174,22 @@ test/
 ### Running Tests
 
 ```bash
-# Smart test runner (recommended)
-pnpm test:adaptive
+# Main suite (orchestrates the full integration run)
+pnpm test
 
-# Full test suite
-pnpm test:run
+# CI pipeline (test + test:client + test:hitl)
+pnpm test:ci
 
-# Specific test categories
-pnpm test:unit
-pnpm test:integration
-pnpm test:e2e
+# Domain-specific suites
+pnpm test:providers       # Provider feature tests
+pnpm test:matrix          # Capability sweep across all providers
+pnpm test:rag             # RAG pipeline
+pnpm test:voice           # Voice (TTS/STT)
+pnpm test:mcp             # MCP HTTP transport
+pnpm test:context         # Context compaction + file handling
 
-# With coverage
-pnpm test:coverage
+# Run a single suite directly
+pnpm exec tsx test/continuous-test-suite-<name>.ts
 ```
 
 ## 🎨 Code Style & Standards

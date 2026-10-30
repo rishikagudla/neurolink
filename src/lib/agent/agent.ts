@@ -1,0 +1,630 @@
+/**
+ * Agent - Core agent implementation for NeuroLink
+ *
+ * An Agent wraps a NeuroLink instance with specialized behavior, instructions,
+ * and tool restrictions. Agents can be composed into networks for multi-agent
+ * orchestration using the agents-as-tools pattern.
+ */
+
+import { EventEmitter } from "events";
+import type { z } from "zod";
+import type { NeuroLink } from "../neurolink.js";
+import type {
+  AgentDefinition,
+  AgentExecutionOptions,
+  AgentInput,
+  AgentInstance,
+  AgentResult,
+  AgentStatus,
+  AgentStreamChunk,
+  GenerateOptions,
+  StreamOptions,
+  StreamResult,
+} from "../types/index.js";
+import { ErrorFactory } from "../utils/errorHandling.js";
+import { logger } from "../utils/logger.js";
+import { toToolExecutionRecords } from "../core/toolExecutionRecorder.js";
+
+/**
+ * Agent - Wraps a NeuroLink instance with specialized behavior
+ *
+ * Features:
+ * - Custom instructions and persona
+ * - Tool restrictions per agent (via toolFilter on generate/stream)
+ * - Input/output schema validation
+ * - Streaming support
+ * - Execution metrics tracking
+ *
+ * @example
+ * ```typescript
+ * const agent = new Agent({
+ *   id: 'researcher',
+ *   name: 'Research Agent',
+ *   description: 'Searches and analyzes information',
+ *   instructions: 'You are a research assistant...',
+ *   tools: ['websearchGrounding', 'readFile'],
+ * }, neurolink);
+ *
+ * const result = await agent.execute('Find information about quantum computing');
+ * ```
+ */
+export class Agent implements AgentInstance {
+  readonly id: string;
+  readonly name: string;
+  readonly description: string;
+  readonly instructions: string;
+  readonly provider?: string;
+  readonly model?: string;
+  readonly tools?: string[];
+  readonly inputSchema?: z.ZodSchema;
+  readonly outputSchema?: z.ZodSchema;
+  readonly maxSteps: number;
+  readonly temperature: number;
+  readonly canDelegate: boolean;
+  readonly metadata?: Record<string, unknown>;
+
+  private neurolink: NeuroLink;
+  private emitter: EventEmitter;
+  private executionCount: number = 0;
+  private lastExecutionTime?: number;
+  private totalExecutionTime: number = 0;
+
+  constructor(definition: AgentDefinition, neurolink: NeuroLink) {
+    // Validate required fields
+    if (!definition.id || typeof definition.id !== "string") {
+      throw ErrorFactory.invalidConfiguration(
+        "AgentDefinition.id",
+        "Agent definition must have a valid id",
+      );
+    }
+    if (!definition.name || typeof definition.name !== "string") {
+      throw ErrorFactory.invalidConfiguration(
+        "AgentDefinition.name",
+        "Agent definition must have a valid name",
+      );
+    }
+    if (!definition.description || typeof definition.description !== "string") {
+      throw ErrorFactory.invalidConfiguration(
+        "AgentDefinition.description",
+        "Agent definition must have a valid description",
+      );
+    }
+    if (
+      !definition.instructions ||
+      typeof definition.instructions !== "string"
+    ) {
+      throw ErrorFactory.invalidConfiguration(
+        "AgentDefinition.instructions",
+        "Agent definition must have valid instructions",
+      );
+    }
+
+    this.id = definition.id;
+    this.name = definition.name;
+    this.description = definition.description;
+    this.instructions = definition.instructions;
+    this.provider = definition.provider;
+    this.model = definition.model;
+    this.tools = definition.tools;
+    this.inputSchema = definition.inputSchema;
+    this.outputSchema = definition.outputSchema;
+    this.maxSteps = definition.maxSteps ?? 10;
+    this.temperature = definition.temperature ?? 0.7;
+    this.canDelegate = definition.canDelegate ?? false;
+    this.metadata = definition.metadata;
+
+    this.neurolink = neurolink;
+    this.emitter = new EventEmitter();
+
+    logger.debug(`[Agent:${this.id}] Created agent: ${this.name}`, {
+      tools: this.tools?.length || 0,
+      maxSteps: this.maxSteps,
+      canDelegate: this.canDelegate,
+    });
+  }
+
+  /**
+   * Execute the agent with given input
+   *
+   * @param input - Text input or structured data
+   * @param options - Execution options
+   * @returns Agent result with content and metadata
+   */
+  async execute(
+    input: AgentInput,
+    options?: AgentExecutionOptions,
+  ): Promise<AgentResult> {
+    const startTime = Date.now();
+    this.executionCount++;
+
+    const traceId = options?.traceId ?? `agent-${this.id}-${Date.now()}`;
+
+    logger.debug(`[Agent:${this.id}] Starting execution`, {
+      traceId,
+      input: typeof input === "string" ? input.slice(0, 100) : "structured",
+      executionCount: this.executionCount,
+    });
+
+    this.emitter.emit("agent:start", {
+      agentId: this.id,
+      traceId,
+      timestamp: startTime,
+    });
+
+    try {
+      // No ghost runs: an already-aborted parent stops the agent before any
+      // model call is made. Typed so callers can branch on the ABORT
+      // category instead of parsing free text.
+      if (options?.abortSignal?.aborted) {
+        throw ErrorFactory.aborted(
+          new Error("Agent execution aborted before start"),
+        );
+      }
+
+      // Validate input if schema provided
+      if (this.inputSchema && typeof input !== "string") {
+        const validation = this.inputSchema.safeParse(input);
+        if (!validation.success) {
+          throw new Error(
+            `Input validation failed: ${validation.error.message}`,
+          );
+        }
+      }
+
+      // Build the prompt with agent context
+      const prompt = this.buildPrompt(input, options?.context);
+
+      // Build generation options
+      const generateOptions = this.buildGenerateOptions(
+        prompt,
+        options,
+        traceId,
+      );
+
+      // Execute via NeuroLink
+      const result = await this.neurolink.generate(generateOptions);
+
+      const duration = Date.now() - startTime;
+      this.lastExecutionTime = duration;
+      this.totalExecutionTime += duration;
+
+      // Parse output if schema provided
+      let parsedOutput: unknown;
+      if (this.outputSchema && result.content) {
+        try {
+          const parsed = JSON.parse(result.content);
+          const validation = this.outputSchema.safeParse(parsed);
+          if (validation.success) {
+            parsedOutput = validation.data;
+          } else {
+            logger.warn(`[Agent:${this.id}] Output schema validation failed`, {
+              error: validation.error.message,
+            });
+          }
+        } catch {
+          logger.warn(`[Agent:${this.id}] Failed to parse output as JSON`);
+        }
+      }
+
+      logger.debug(`[Agent:${this.id}] Execution completed`, {
+        traceId,
+        duration,
+        contentLength: result.content?.length || 0,
+        toolsUsed: result.toolsUsed?.length || 0,
+      });
+
+      const agentResult: AgentResult = {
+        content: result.content || "",
+        object: parsedOutput,
+        usage: result.usage,
+        cost: result.analytics?.cost,
+        toolsUsed: result.toolsUsed,
+        // Real per-call records straight from the tool loop (N2)
+        toolExecutions: result.toolExecutions,
+        stopReason: result.stopReason,
+        duration,
+        status: "success",
+        agentId: this.id,
+      };
+
+      this.emitter.emit("agent:complete", {
+        agentId: this.id,
+        traceId,
+        duration,
+        result: agentResult,
+      });
+
+      return agentResult;
+    } catch (error) {
+      const duration = Date.now() - startTime;
+      this.lastExecutionTime = duration;
+
+      logger.error(`[Agent:${this.id}] Execution failed`, {
+        traceId,
+        error: error instanceof Error ? error.message : String(error),
+        duration,
+      });
+
+      this.emitter.emit("agent:error", {
+        agentId: this.id,
+        traceId,
+        error,
+        duration,
+      });
+
+      return {
+        content: "",
+        error: error instanceof Error ? error.message : String(error),
+        duration,
+        status: "error",
+        agentId: this.id,
+      };
+    }
+  }
+
+  /**
+   * Stream execution results
+   *
+   * @param input - Text input or structured data
+   * @param options - Execution options
+   * @yields Agent stream chunks
+   */
+  async *stream(
+    input: AgentInput,
+    options?: AgentExecutionOptions,
+  ): AsyncIterable<AgentStreamChunk> {
+    const startTime = Date.now();
+    const traceId = options?.traceId ?? `agent-${this.id}-${Date.now()}`;
+    let streamResult: StreamResult | undefined;
+    let fullContent = "";
+
+    this.emitter.emit("agent:start", {
+      agentId: this.id,
+      traceId,
+      timestamp: startTime,
+    });
+
+    yield {
+      type: "agent-start",
+      agentId: this.id,
+      timestamp: startTime,
+      traceId,
+    };
+
+    try {
+      // Mirror execute(): an already-aborted parent never starts the stream.
+      if (options?.abortSignal?.aborted) {
+        throw ErrorFactory.aborted(
+          new Error("Agent stream aborted before start"),
+        );
+      }
+
+      // Validate input if schema provided
+      if (this.inputSchema && typeof input !== "string") {
+        const validation = this.inputSchema.safeParse(input);
+        if (!validation.success) {
+          throw new Error(
+            `Input validation failed: ${validation.error.message}`,
+          );
+        }
+      }
+
+      const prompt = this.buildPrompt(input, options?.context);
+      const streamOptions = this.buildStreamOptions(prompt, options, traceId);
+
+      // Execute via NeuroLink
+      streamResult = await this.neurolink.stream(streamOptions);
+
+      for await (const chunk of streamResult.stream) {
+        // Handle different chunk types from the stream
+        if ("content" in chunk && typeof chunk.content === "string") {
+          fullContent += chunk.content;
+          yield {
+            type: "agent-text",
+            agentId: this.id,
+            content: chunk.content,
+            isPartial: true,
+            timestamp: Date.now(),
+            traceId,
+          };
+        }
+
+        // Handle tool calls if present
+        if ("toolCall" in chunk && chunk.toolCall) {
+          const toolCall = chunk.toolCall as {
+            toolName?: string;
+            args?: unknown;
+            toolCallId?: string;
+          };
+          yield {
+            type: "agent-tool-call",
+            agentId: this.id,
+            toolName: toolCall.toolName || "unknown",
+            args: toolCall.args,
+            toolCallId: toolCall.toolCallId || `tool-${Date.now()}`,
+            timestamp: Date.now(),
+            traceId,
+          };
+        }
+
+        // Handle tool results if present
+        if ("toolResult" in chunk && chunk.toolResult) {
+          const toolResult = chunk.toolResult as {
+            toolName?: string;
+            toolCallId?: string;
+            result?: unknown;
+            success?: boolean;
+          };
+          yield {
+            type: "agent-tool-result",
+            agentId: this.id,
+            toolName: toolResult.toolName || "unknown",
+            toolCallId: toolResult.toolCallId || `tool-${Date.now()}`,
+            result: toolResult.result,
+            success: toolResult.success ?? true,
+            timestamp: Date.now(),
+            traceId,
+          };
+        }
+      }
+
+      const duration = Date.now() - startTime;
+      this.lastExecutionTime = duration;
+      this.executionCount++;
+      this.totalExecutionTime += duration;
+
+      let cost: number | undefined;
+      try {
+        cost = (await streamResult.analytics)?.cost;
+      } catch {
+        logger.warn(`[Agent:${this.id}] Stream cost analytics unavailable`);
+      }
+
+      const stopReason =
+        streamResult.metadata?.stopReason ?? streamResult.stopReason;
+      const error = streamResult.metadata?.error;
+      const status =
+        error || stopReason === "provider-error" ? "error" : "success";
+      const toolExecutions = toToolExecutionRecords(
+        streamResult.toolExecutions,
+        options?.toolExecutionCapture,
+      );
+
+      this.emitter.emit("agent:complete", {
+        agentId: this.id,
+        traceId,
+        duration,
+        content: fullContent,
+        status,
+        toolExecutions,
+        stopReason,
+        error,
+      });
+
+      yield {
+        type: "agent-complete",
+        agentId: this.id,
+        content: fullContent,
+        usage: streamResult.usage,
+        cost,
+        status,
+        toolExecutions,
+        stopReason,
+        error,
+        duration,
+        timestamp: Date.now(),
+        traceId,
+      };
+    } catch (error) {
+      this.emitter.emit("agent:error", {
+        agentId: this.id,
+        traceId,
+        error,
+      });
+
+      yield {
+        type: "agent-error",
+        status: "error",
+        content: fullContent,
+        toolExecutions: toToolExecutionRecords(
+          streamResult?.toolExecutions,
+          options?.toolExecutionCapture,
+        ),
+        stopReason:
+          streamResult?.metadata?.stopReason ?? streamResult?.stopReason,
+        agentId: this.id,
+        error: error instanceof Error ? error.message : String(error),
+        timestamp: Date.now(),
+        traceId,
+      };
+    }
+  }
+
+  /**
+   * Get agent status
+   */
+  getStatus(): AgentStatus {
+    return {
+      id: this.id,
+      name: this.name,
+      executionCount: this.executionCount,
+      lastExecutionTime: this.lastExecutionTime,
+      available: true,
+    };
+  }
+
+  /**
+   * Get average execution time
+   */
+  getAverageExecutionTime(): number {
+    if (this.executionCount === 0) {
+      return 0;
+    }
+    return this.totalExecutionTime / this.executionCount;
+  }
+
+  /**
+   * Subscribe to agent events
+   */
+  on(event: string, handler: (...args: unknown[]) => void): void {
+    this.emitter.on(event, handler);
+  }
+
+  /**
+   * Unsubscribe from agent events
+   */
+  off(event: string, handler: (...args: unknown[]) => void): void {
+    this.emitter.off(event, handler);
+  }
+
+  /**
+   * Build prompt from input and context
+   */
+  private buildPrompt(
+    input: AgentInput,
+    context?: Record<string, unknown>,
+  ): string {
+    let prompt = typeof input === "string" ? input : JSON.stringify(input);
+
+    const promptContext = context
+      ? Object.fromEntries(
+          Object.entries(context).filter(([key]) => key !== "sessionId"),
+        )
+      : undefined;
+    if (promptContext && Object.keys(promptContext).length > 0) {
+      prompt = `Context: ${JSON.stringify(promptContext)}\n\nTask: ${prompt}`;
+    }
+
+    return prompt;
+  }
+
+  /**
+   * Build generation options for NeuroLink.generate()
+   *
+   * Uses toolFilter to delegate tool restriction to BaseProvider.applyToolFiltering()
+   * rather than pre-filtering tools manually.
+   */
+  private buildGenerateOptions(
+    prompt: string,
+    options?: AgentExecutionOptions,
+    traceId?: string,
+  ): GenerateOptions {
+    return {
+      input: { text: prompt },
+      provider: this.provider,
+      model: this.model,
+      temperature: this.temperature,
+      ...(options?.region !== undefined && { region: options.region }),
+      ...(options?.maxTokens !== undefined && { maxTokens: options.maxTokens }),
+      ...(options?.disableTools !== undefined && {
+        disableTools: options.disableTools,
+      }),
+      systemPrompt: this.instructions,
+      // toolFilter delegates to BaseProvider.applyToolFiltering() natively
+      ...(this.tools && this.tools.length > 0 && { toolFilter: this.tools }),
+      maxSteps: options?.maxSteps ?? this.maxSteps,
+      ...(options?.enableAnalytics !== undefined && {
+        enableAnalytics: options.enableAnalytics,
+      }),
+      ...(options?.maxBudgetUsd !== undefined && {
+        maxBudgetUsd: options.maxBudgetUsd,
+      }),
+      ...(options?.disableInternalFallback !== undefined && {
+        disableInternalFallback: options.disableInternalFallback,
+      }),
+      ...(options?.toolExecutionCapture && {
+        toolExecutionCapture: options.toolExecutionCapture,
+      }),
+      requestId: traceId,
+      // Turn budget + cancellation, forwarded verbatim to generate() — the
+      // machinery (wrap-up nudge, stall watchdog, honest stopReason) lives
+      // in the tool loop; the agent layer just passes it through.
+      ...(options?.abortSignal && { abortSignal: options.abortSignal }),
+      ...(options?.timeout !== undefined && { timeout: options.timeout }),
+      ...(options?.turnTimeoutMs !== undefined && {
+        turnTimeoutMs: options.turnTimeoutMs,
+      }),
+      ...(options?.wrapupTimeLeadMs !== undefined && {
+        wrapupTimeLeadMs: options.wrapupTimeLeadMs,
+      }),
+      ...(options?.stallTimeoutMs !== undefined && {
+        stallTimeoutMs: options.stallTimeoutMs,
+      }),
+      ...(options?.useMemory === false && { memory: { enabled: false } }),
+      context: {
+        agentId: this.id,
+        agentName: this.name,
+        ...options?.context,
+        ...(options?.useMemory === false
+          ? { sessionId: undefined }
+          : options?.sessionId !== undefined
+            ? { sessionId: options.sessionId }
+            : {}),
+      },
+    };
+  }
+
+  /**
+   * Build stream options for NeuroLink.stream()
+   *
+   * Uses toolFilter to delegate tool restriction to BaseProvider.applyToolFiltering()
+   * rather than pre-filtering tools manually.
+   */
+  private buildStreamOptions(
+    prompt: string,
+    options?: AgentExecutionOptions,
+    traceId?: string,
+  ): StreamOptions {
+    return {
+      input: { text: prompt },
+      provider: this.provider,
+      model: this.model,
+      temperature: this.temperature,
+      ...(options?.region !== undefined && { region: options.region }),
+      ...(options?.maxTokens !== undefined && { maxTokens: options.maxTokens }),
+      ...(options?.disableTools !== undefined && {
+        disableTools: options.disableTools,
+      }),
+      systemPrompt: this.instructions,
+      // toolFilter delegates to BaseProvider.applyToolFiltering() natively
+      ...(this.tools && this.tools.length > 0 && { toolFilter: this.tools }),
+      maxSteps: options?.maxSteps ?? this.maxSteps,
+      ...(options?.enableAnalytics !== undefined && {
+        enableAnalytics: options.enableAnalytics,
+      }),
+      ...(options?.maxBudgetUsd !== undefined && {
+        maxBudgetUsd: options.maxBudgetUsd,
+      }),
+      ...(options?.disableInternalFallback !== undefined && {
+        disableInternalFallback: options.disableInternalFallback,
+      }),
+      ...(options?.toolExecutionCapture && {
+        toolExecutionCapture: options.toolExecutionCapture,
+      }),
+      // Turn budget + cancellation, forwarded verbatim to stream()
+      ...(options?.abortSignal && { abortSignal: options.abortSignal }),
+      ...(options?.timeout !== undefined && { timeout: options.timeout }),
+      ...(options?.turnTimeoutMs !== undefined && {
+        turnTimeoutMs: options.turnTimeoutMs,
+      }),
+      ...(options?.wrapupTimeLeadMs !== undefined && {
+        wrapupTimeLeadMs: options.wrapupTimeLeadMs,
+      }),
+      ...(options?.stallTimeoutMs !== undefined && {
+        stallTimeoutMs: options.stallTimeoutMs,
+      }),
+      ...(options?.useMemory === false && { memory: { enabled: false } }),
+      context: {
+        agentId: this.id,
+        agentName: this.name,
+        traceId,
+        ...options?.context,
+        ...(options?.useMemory === false
+          ? { sessionId: undefined }
+          : options?.sessionId !== undefined
+            ? { sessionId: options.sessionId }
+            : {}),
+      },
+    };
+  }
+}

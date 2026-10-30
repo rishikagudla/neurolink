@@ -33,30 +33,39 @@
 
 export {
   ARCHIVE_MIME_TYPES,
-  type ArchiveMimeType,
   AUDIO_MIME_TYPES,
-  type AudioMimeType,
   DATA_MIME_TYPES,
-  type DataMimeType,
   DOCUMENT_MIME_TYPES,
-  type DocumentMimeType,
   // Extension-to-MIME mapping
   EXTENSION_MIME_MAP,
   getMimeTypeForExtension,
   // Individual MIME type groups
   IMAGE_MIME_TYPES,
   // Types
-  type ImageMimeType,
   // Combined MIME types
   MIME_TYPES,
-  type MimeType,
   SOURCE_CODE_MIME_TYPES,
-  type SourceCodeMimeType,
+  TEXT_EXTENSION_MIME_MAP,
   TEXT_MIME_TYPES,
-  type TextMimeType,
   VIDEO_MIME_TYPES,
-  type VideoMimeType,
-} from "./mimeTypes.js";
+} from "./mimeConstants.js";
+
+// =============================================================================
+// CANONICAL FILE-TYPE REGISTRY
+// =============================================================================
+
+export {
+  extensionForMimeType,
+  extensionsForModality,
+  FILE_TYPE_REGISTRY,
+  fileTypeForExtension,
+  isModalityExtension,
+  lookupByExtension,
+  lookupByMimeType,
+  mimeTypeForExtension,
+  mimeTypesForModality,
+  normalizeExtension,
+} from "./fileTypeRegistry.js";
 
 // =============================================================================
 // FILE EXTENSIONS
@@ -67,16 +76,13 @@ export {
   AI_VISION_EXTENSIONS,
   // Archive extensions
   ARCHIVE_EXTENSIONS,
-  type ArchiveExtension,
   ASSEMBLY_EXTENSIONS,
   AUDIO_EXTENSIONS,
-  type AudioExtension,
   C_EXTENSIONS,
   CLOJURE_EXTENSIONS,
   COBOL_EXTENSIONS,
   // Config extensions
   CONFIG_EXTENSIONS,
-  type ConfigExtension,
   CPP_EXTENSIONS,
   CRYSTAL_EXTENSIONS,
   CSHARP_EXTENSIONS,
@@ -87,13 +93,11 @@ export {
   DATA_EXTENSIONS,
   // Database extensions
   DATABASE_EXTENSIONS,
-  type DataExtension,
   // Design extensions
   DESIGN_EXTENSIONS,
   DOCKERFILE_EXTENSIONS,
   // Document extensions
   DOCUMENT_EXTENSIONS,
-  type DocumentExtension,
   EJS_EXTENSIONS,
   ELIXIR_EXTENSIONS,
   ERLANG_EXTENSIONS,
@@ -102,7 +106,6 @@ export {
   EXECUTABLE_EXTENSIONS,
   // Combined file extensions
   FILE_EXTENSIONS,
-  type FileExtensions,
   FORTRAN_EXTENSIONS,
   FSHARP_EXTENSIONS,
   GO_EXTENSIONS,
@@ -113,7 +116,6 @@ export {
   // Image extensions
   IMAGE_EXTENSIONS,
   // Types
-  type ImageExtension,
   JAVA_EXTENSIONS,
   // Source code extensions (individual)
   JAVASCRIPT_EXTENSIONS,
@@ -147,25 +149,22 @@ export {
   SCSS_EXTENSIONS,
   SHELL_EXTENSIONS,
   SOURCE_CODE_EXTENSIONS,
-  type SourceCodeExtension,
   SQL_EXTENSIONS,
   STYLUS_EXTENSIONS,
   SVELTE_EXTENSIONS,
   SWIFT_EXTENSIONS,
   // Text extensions
   TEXT_EXTENSIONS,
-  type TextExtension,
   TYPESCRIPT_EXTENSIONS,
   V_EXTENSIONS,
   // Multimedia extensions
   VIDEO_EXTENSIONS,
-  type VideoExtension,
   VUE_EXTENSIONS,
   WORD_EXTENSIONS,
   XML_EXTENSIONS,
   YAML_EXTENSIONS,
   ZIG_EXTENSIONS,
-} from "./fileTypes.js";
+} from "./fileExtensions.js";
 
 // =============================================================================
 // LANGUAGE DETECTION
@@ -175,7 +174,6 @@ export {
   // Functions
   detectLanguageFromFilename,
   EXACT_FILENAME_MAP,
-  type ExactFilenameMap,
   getLanguageIdentifier,
   getSupportedExtensions,
   getSupportedFilenames,
@@ -183,7 +181,6 @@ export {
   // Maps
   LANGUAGE_MAP,
   // Types
-  type LanguageMap,
 } from "./languageMap.js";
 
 // =============================================================================
@@ -201,17 +198,13 @@ export {
   mbToBytes,
   // Processing limits
   PROCESSING_LIMITS,
-  type ProcessingLimitKey,
   // Combined size limits
   SIZE_LIMITS,
   // Size limits in bytes
   SIZE_LIMITS_BYTES,
   // Size limits in MB
   SIZE_LIMITS_MB,
-  type SizeLimitBytesKey,
   // Types
-  type SizeLimitMBKey,
-  type SizeLimits,
   validateFileSize,
   // YAML security limits
   YAML_LIMITS,

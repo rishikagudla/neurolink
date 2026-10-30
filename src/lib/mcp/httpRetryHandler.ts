@@ -5,10 +5,17 @@
  * specifically designed for HTTP-based MCP transport connections.
  */
 
+import { isAbortError } from "../utils/errorHandling.js";
 import { calculateBackoffDelay } from "../utils/retryHandler.js";
 import { logger } from "../utils/logger.js";
-import type { HTTPRetryConfig } from "../types/mcpTypes.js";
-
+import type { HTTPRetryConfig } from "../types/index.js";
+import {
+  SpanSerializer,
+  SpanType,
+  SpanStatus,
+  getMetricsAggregator,
+} from "../observability/index.js";
+import { getActiveTraceContext } from "../telemetry/traceContext.js";
 /**
  * Default HTTP retry configuration
  */
@@ -64,12 +71,16 @@ export function isRetryableHTTPError(
 
   const errorObj = error as Record<string, unknown>;
 
+  // User-initiated aborts are NOT retryable — the caller explicitly cancelled
+  if (isAbortError(error)) {
+    return false;
+  }
+
   // Check for timeout errors
   if (
     errorObj.name === "TimeoutError" ||
     errorObj.code === "TIMEOUT" ||
-    errorObj.code === "ETIMEDOUT" ||
-    errorObj.name === "AbortError"
+    errorObj.code === "ETIMEDOUT"
   ) {
     return true;
   }
@@ -161,11 +172,32 @@ export async function withHTTPRetry<T>(
     ...config,
   };
 
+  const { traceId, parentSpanId } = getActiveTraceContext();
+  const span = SpanSerializer.createSpan(
+    SpanType.MCP_TRANSPORT,
+    "mcp.retry",
+    {
+      "mcp.transport": "http",
+      "mcp.operation": "retry",
+      "mcp.maxAttempts": mergedConfig.maxAttempts,
+    },
+    parentSpanId,
+    traceId,
+  );
+  const startTime = Date.now();
+
   let lastError: unknown;
+  let actualAttempts = 0;
 
   for (let attempt = 1; attempt <= mergedConfig.maxAttempts; attempt++) {
+    actualAttempts = attempt;
     try {
-      return await operation();
+      const result = await operation();
+      span.durationMs = Date.now() - startTime;
+      span.attributes["mcp.retryAttempt"] = attempt;
+      const endedSpan = SpanSerializer.endSpan(span, SpanStatus.OK);
+      getMetricsAggregator().recordSpan(endedSpan);
+      return result;
     } catch (error) {
       lastError = error;
 
@@ -204,6 +236,13 @@ export async function withHTTPRetry<T>(
       await sleep(delay);
     }
   }
+
+  span.durationMs = Date.now() - startTime;
+  span.attributes["mcp.retryAttempt"] = actualAttempts;
+  const endedSpan = SpanSerializer.endSpan(span, SpanStatus.ERROR);
+  endedSpan.statusMessage =
+    lastError instanceof Error ? lastError.message : String(lastError);
+  getMetricsAggregator().recordSpan(endedSpan);
 
   throw lastError;
 }

@@ -1,0 +1,12 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / GoogleLiveAudioQueueItem
+
+# Type Alias: GoogleLiveAudioQueueItem
+
+> **GoogleLiveAudioQueueItem** = \{ `type`: `"audio"`; `audio`: [`AudioChunk`](AudioChunk.md); \} \| \{ `type`: `"end"`; \} \| \{ `type`: `"error"`; `error`: `unknown`; \}
+
+Event pushed through the Google AI Studio voice session's internal queue
+while audio chunks stream back from the Gemini Live API.

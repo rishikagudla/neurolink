@@ -1,0 +1,317 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / AgenticLoopAdapter
+
+# Type Alias: AgenticLoopAdapter\<TConversation, TRaw\>
+
+> **AgenticLoopAdapter**\<`TConversation`, `TRaw`\> = `object`
+
+DESIGN DECISION — mid-turn tool-discovery hydration (Plan 08 blocker 2,
+Task 7): resolved by the single optional `resolveToolOnMiss` field below,
+NOT by a broader `dispatchTools?` full-dispatch override. A full-dispatch
+override would let an adapter replace the engine's entire per-call
+dispatch — breaker bookkeeping, execution, toolExecutions aggregation — so
+every adapter needing hydration would have to reimplement that bookkeeping,
+and any later engine-level fix to dispatch would silently not apply to the
+adapters using the override. `resolveToolOnMiss` plugs into the existing
+dispatch at the one decision point that needs a second lookup, leaving
+breaker bookkeeping, retries and aggregation engine-owned for every
+provider, hydrated or not.
+
+DESIGN DECISION — originalNameMap propagation (blocker 3): needs ZERO
+engine or type change. Google's function-name sanitization is a translation
+concern between the wire (sanitized names out, sanitized names back on
+tool_call.name) and the engine's shape, which only ever sees plain string
+names. An adapter that needs the map threads it as a constructor-time
+closure and translates inside its own `executeStep` /
+`buildToolResultMessages`, before those names cross the engine boundary.
+
+DESIGN DECISION — reserved-step + forced finalization (blocker 1, part 2):
+stays OUTSIDE `runAgenticLoop`, in Vertex+Claude's own wrapper around
+`resultPromise`. The reserved step needs no engine change at all — an
+adapter declaring `maxSteps: requested - 1` means the engine's own loop
+never touches the reserved slot. The forced call is a one-shot action taken
+on the RESULT of a turn, not a repeatable step within one, so folding it in
+would teach the engine a family-specific concept (forced tool_choice, a
+distinguished terminal tool name) that every other adapter would then carry
+and never set.
+
+DESIGN DECISION — terminal tool-call marking (blocker 1, part 1): needs
+ZERO engine or type change. An adapter treats a detected terminal call as
+terminal by omitting it from `toolCalls` and putting its parsed payload in
+`text`. The engine already ends a turn the moment a step yields zero tool
+calls, so such a step is indistinguishable from an ordinary final text
+turn: never looked up in `options.tools`, never reaching TOOL_NOT_FOUND,
+never counted against the breaker. Proven by a case in the loop-engine
+suite rather than asserted here.
+
+## Type Parameters
+
+### TConversation
+
+`TConversation` = `unknown`
+
+### TRaw
+
+`TRaw` = `unknown`
+
+## Properties
+
+### providerLabel
+
+> `readonly` **providerLabel**: `string`
+
+---
+
+### maxSteps
+
+> `readonly` **maxSteps**: `number`
+
+---
+
+### toolFailureBreaker?
+
+> `readonly` `optional` **toolFailureBreaker?**: [`AgenticLoopToolFailureBreaker`](AgenticLoopToolFailureBreaker.md)
+
+Set only for adapter instances whose client has the TOOL_NOT_FOUND strike breaker today: both Gemini adapters (AI Studio, Vertex+Gemini) AND the Vertex+Claude call to createAnthropicLoopAdapter — NOT the native-Anthropic call to that same factory, and not Bedrock. See Verified Fact 4.
+
+---
+
+### appendPlanningNudge?
+
+> `readonly` `optional` **appendPlanningNudge?**: (`conversation`, `text`) => `TConversation`
+
+Append a planning nudge to the conversation, in the provider's own message
+type. Supplied only by adapters whose caller can pass a step-boundary
+callback; the engine skips a nudge it has no way to write.
+
+Provider-supplied for the same reason `buildToolResultMessages` is: the
+engine does not know what a valid user turn looks like on this wire, and
+on Anthropic a nudge appended after a tool-result turn has to merge into
+that turn rather than open a second consecutive user message.
+
+#### Parameters
+
+##### conversation
+
+`TConversation`
+
+##### text
+
+`string`
+
+#### Returns
+
+`TConversation`
+
+---
+
+### resolveToolOnMiss?
+
+> `readonly` `optional` **resolveToolOnMiss?**: (`name`) => \{ `execute`: (`args`, `opts`) => `Promise`\<`unknown`\>; \} \| `undefined`
+
+Second lookup path, consulted when a tool call names nothing executable
+in the caller's `options.tools` — used by adapters supporting mid-turn
+discovery to hydrate a tool the model just found via `search_tools`, or a
+deferred-catalog tool called by its advertised name, before the engine
+falls through to TOOL_NOT_FOUND and the breaker strike. See the design
+decision above for why this is a narrow lookup and not a dispatch
+override.
+
+#### Parameters
+
+##### name
+
+`string`
+
+#### Returns
+
+\{ `execute`: (`args`, `opts`) => `Promise`\<`unknown`\>; \} \| `undefined`
+
+## Methods
+
+### buildStepRequest()
+
+> **buildStepRequest**(`conversation`, `step`): [`AgenticLoopStepRequest`](AgenticLoopStepRequest.md) \| `Promise`\<[`AgenticLoopStepRequest`](AgenticLoopStepRequest.md)\>
+
+May return a promise: an adapter that consults a caller's `prepareStep`
+hook for the step's tool choice has to await it before it can build the
+request. The engine awaits the result either way.
+
+#### Parameters
+
+##### conversation
+
+`TConversation`
+
+##### step
+
+`number`
+
+#### Returns
+
+[`AgenticLoopStepRequest`](AgenticLoopStepRequest.md) \| `Promise`\<[`AgenticLoopStepRequest`](AgenticLoopStepRequest.md)\>
+
+---
+
+### executeStep()
+
+> **executeStep**(`request`, `channel`, `signal`): `Promise`\<[`AgenticLoopStepResult`](AgenticLoopStepResult.md)\<`TRaw`\>\>
+
+#### Parameters
+
+##### request
+
+[`AgenticLoopStepRequest`](AgenticLoopStepRequest.md)
+
+##### channel
+
+###### push
+
+##### signal
+
+`AbortSignal`
+
+#### Returns
+
+`Promise`\<[`AgenticLoopStepResult`](AgenticLoopStepResult.md)\<`TRaw`\>\>
+
+---
+
+### buildToolResultMessages()
+
+> **buildToolResultMessages**(`conversation`, `stepResult`, `toolResults`, `step`): `TConversation`
+
+`step` is the engine's own zero-based step index, not a count of times
+this hook ran. Adapters persist tool activity keyed by it, and the two
+numbers diverge: a malformed-call retry `continue`s before this hook is
+reached and still consumes a step, so an adapter counting its own
+invocations drifts by exactly the number of retries and mislabels every
+row after the first one.
+
+#### Parameters
+
+##### conversation
+
+`TConversation`
+
+##### stepResult
+
+[`AgenticLoopStepResult`](AgenticLoopStepResult.md)\<`TRaw`\>
+
+##### toolResults
+
+[`AgenticLoopToolCallResult`](AgenticLoopToolCallResult.md)[]
+
+##### step
+
+`number`
+
+#### Returns
+
+`TConversation`
+
+---
+
+### mapFinishReason()
+
+> **mapFinishReason**(`rawStopReason`, `hadToolCalls`): `string`
+
+#### Parameters
+
+##### rawStopReason
+
+`string` \| `undefined`
+
+##### hadToolCalls
+
+`boolean`
+
+#### Returns
+
+`string`
+
+---
+
+### observedUsage()?
+
+> `optional` **observedUsage**(`usage`): [`AgenticLoopUsage`](AgenticLoopUsage.md)
+
+Optional: maps a step's usage onto what its generation observation
+prices, where `inputTokens` excludes cache reads and `outputTokens`
+includes reasoning. Only for providers whose API reports otherwise
+(Gemini counts cached tokens inside the prompt count and thinking tokens
+outside the candidate count). The turn totals the engine returns are not
+touched: callers already reconcile those once.
+
+#### Parameters
+
+##### usage
+
+[`AgenticLoopUsage`](AgenticLoopUsage.md)
+
+#### Returns
+
+[`AgenticLoopUsage`](AgenticLoopUsage.md)
+
+---
+
+### planReclaim()?
+
+> `optional` **planReclaim**(`conversation`, `step`): [`AgenticLoopReclaimResult`](AgenticLoopReclaimResult.md)\<`TConversation`\> \| `undefined`
+
+Optional: in-turn context-budget reclaim, called once per step before buildStepRequest.
+
+#### Parameters
+
+##### conversation
+
+`TConversation`
+
+##### step
+
+`number`
+
+#### Returns
+
+[`AgenticLoopReclaimResult`](AgenticLoopReclaimResult.md)\<`TConversation`\> \| `undefined`
+
+---
+
+### isMalformedStep()?
+
+> `optional` **isMalformedStep**(`stepResult`): `boolean`
+
+Optional: Vertex+Gemini-only single-retry-on-malformed-call.
+
+#### Parameters
+
+##### stepResult
+
+[`AgenticLoopStepResult`](AgenticLoopStepResult.md)\<`TRaw`\>
+
+#### Returns
+
+`boolean`
+
+---
+
+### buildMalformedRetryNote()?
+
+> `optional` **buildMalformedRetryNote**(`conversation`, `step`): `TConversation`
+
+#### Parameters
+
+##### conversation
+
+`TConversation`
+
+##### step
+
+`number`
+
+#### Returns
+
+`TConversation`

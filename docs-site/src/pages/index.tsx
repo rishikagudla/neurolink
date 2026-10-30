@@ -1,443 +1,376 @@
+import React from "react";
+import Head from "@docusaurus/Head";
 import Link from "@docusaurus/Link";
-import useDocusaurusContext from "@docusaurus/useDocusaurusContext";
 import Layout from "@theme/Layout";
-import type React from "react";
 import styles from "./index.module.css";
 
-// Icons as inline SVGs for performance
-const ProviderIcon = () => (
-  <svg
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="1.5"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-    aria-hidden="true"
-  >
-    <path d="M12 2L2 7l10 5 10-5-10-5z" />
-    <path d="M2 17l10 5 10-5" />
-    <path d="M2 12l10 5 10-5" />
-  </svg>
-);
-
-const ToolsIcon = () => (
-  <svg
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="1.5"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-    aria-hidden="true"
-  >
-    <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
-  </svg>
-);
-
-const StreamIcon = () => (
-  <svg
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="1.5"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-    aria-hidden="true"
-  >
-    <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
-  </svg>
-);
-
-const ShieldIcon = () => (
-  <svg
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="1.5"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-    aria-hidden="true"
-  >
-    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-    <path d="m9 12 2 2 4-4" />
-  </svg>
-);
-
-const CodeIcon = () => (
-  <svg
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="1.5"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-    aria-hidden="true"
-  >
-    <polyline points="16,18 22,12 16,6" />
-    <polyline points="8,6 2,12 8,18" />
-  </svg>
-);
-
-const TerminalIcon = () => (
-  <svg
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="1.5"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-    aria-hidden="true"
-  >
-    <polyline points="4,17 10,11 4,5" />
-    <line x1="12" y1="19" x2="20" y2="19" />
-  </svg>
-);
-
-const ImageIcon = () => (
-  <svg
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="1.5"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-    aria-hidden="true"
-  >
-    <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
-    <circle cx="8.5" cy="8.5" r="1.5" />
-    <polyline points="21,15 16,10 5,21" />
-  </svg>
-);
-
-const MemoryIcon = () => (
-  <svg
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="1.5"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-    aria-hidden="true"
-  >
-    <rect x="2" y="6" width="20" height="12" rx="2" />
-    <path d="M6 12h.01M10 12h.01M14 12h.01M18 12h.01" />
-    <path d="M6 2v4M10 2v4M14 2v4M18 2v4M6 18v4M10 18v4M14 18v4M18 18v4" />
-  </svg>
-);
-
-const ArrowRightIcon = () => (
-  <svg
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="2"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-    className={styles.arrowIcon}
-    aria-hidden="true"
-  >
-    <line x1="5" y1="12" x2="19" y2="12" />
-    <polyline points="12,5 19,12 12,19" />
-  </svg>
-);
-
-const CheckIcon = () => (
-  <svg
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="2.5"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-    aria-hidden="true"
-  >
-    <polyline points="20,6 9,17 4,12" />
-  </svg>
-);
-
-// Feature data
-const features = [
-  {
-    icon: <ProviderIcon />,
-    title: "13 AI Providers",
-    description:
-      "OpenAI, Anthropic, Google AI, Vertex, Bedrock, Azure, Mistral, and more. Switch providers with a single parameter change.",
-  },
-  {
-    icon: <ToolsIcon />,
-    title: "58+ MCP Tools",
-    description:
-      "Full Model Context Protocol support with GitHub, PostgreSQL, Slack, and 55+ external tool integrations.",
-  },
-  {
-    icon: <StreamIcon />,
-    title: "Streaming & Real-time",
-    description:
-      "First-class streaming support with real-time token delivery, partial responses, and backpressure handling.",
-  },
-  {
-    icon: <ShieldIcon />,
-    title: "Enterprise Security",
-    description:
-      "SOC2, HIPAA, GDPR compliant. Human-in-the-loop workflows, audit trails, and zero credential logging.",
-  },
-  {
-    icon: <ImageIcon />,
-    title: "Multimodal Support",
-    description:
-      "Native support for images, PDFs, and CSV files with automatic file type detection and provider adaptation.",
-  },
-  {
-    icon: <MemoryIcon />,
-    title: "Conversation Memory",
-    description:
-      "Redis-backed distributed memory with session export, auto-summarization, and graceful failover.",
-  },
-];
-
-// Provider logos/names
-const providers = [
+const PROVIDERS = [
   "OpenAI",
   "Anthropic",
   "Google AI",
   "Vertex AI",
   "AWS Bedrock",
-  "Azure OpenAI",
+  "Azure",
   "Mistral",
-  "LiteLLM",
   "Ollama",
-  "Hugging Face",
+  "LiteLLM",
+  "HuggingFace",
   "SageMaker",
+  "OpenRouter",
+  "OpenAI-Compatible",
+  "DeepSeek",
+  "NVIDIA NIM",
+  "LM Studio",
+  "llama.cpp",
+  "ElevenLabs",
+  "Deepgram",
+  "Azure Speech",
+  "OpenAI TTS",
+  "TypeSafe",
+  "Laya",
+  "XOR",
+  "SubQ",
+  "Perplexity Decisions",
+  "Cloudflare Clef",
+  "OpenAI Decisions",
+  "ScaleDown",
 ];
 
-// Stats
-const stats = [
-  { value: "13", label: "AI Providers" },
-  { value: "100+", label: "Models" },
-  { value: "58+", label: "MCP Tools" },
-  { value: "35-40%", label: "Cost Savings" },
+const QUICK_LINKS = [
+  {
+    title: "Decide",
+    description: "Typed, calibrated judgements in ~400ms — no text",
+    href: "/docs/features/decide-inference-type",
+    icon: "🎯",
+  },
+  {
+    title: "SDK Guide",
+    description: "Unified API for supported providers",
+    href: "/docs/sdk",
+    icon: "📦",
+  },
+  {
+    title: "CLI Guide",
+    description: "Professional command-line interface",
+    href: "/docs/cli",
+    icon: "⌨️",
+  },
+  {
+    title: "MCP Tools",
+    description: "58+ connectable external tool servers",
+    href: "/docs/features/mcp-tools-showcase",
+    icon: "🔧",
+  },
+  {
+    title: "Provider Setup",
+    description: "Configure a supported AI provider",
+    href: "/docs/getting-started/provider-setup",
+    icon: "⚡",
+  },
 ];
 
-function HeroSection() {
-  return (
-    <header className={styles.hero}>
-      <div className={styles.heroBackground}>
-        <div className={styles.heroGlow} />
-      </div>
-      <div className={styles.heroContent}>
-        <div className={styles.badge}>
-          <span className={styles.badgeText}>Production-Ready</span>
-          <span className={styles.badgeDivider}>|</span>
-          <span className={styles.badgeVersion}>v8.35+</span>
-        </div>
-        <h1 className={styles.heroTitle}>
-          The Enterprise AI SDK
-          <br />
-          <span className={styles.heroTitleAccent}>
-            for Production Applications
-          </span>
-        </h1>
-        <p className={styles.heroSubtitle}>
-          Universal AI integration platform unifying 13 providers and 100+
-          models under one consistent API. Battle-tested at enterprise scale.
-          Ships as TypeScript SDK and professional CLI.
-        </p>
-        <div className={styles.heroCta}>
-          <Link to="/docs/getting-started" className={styles.ctaPrimary}>
-            Get Started
-            <ArrowRightIcon />
-          </Link>
-          <Link to="/docs" className={styles.ctaSecondary}>
-            Documentation
-          </Link>
-        </div>
-        <div className={styles.heroInstall}>
-          <code className={styles.installCode}>
-            <span className={styles.installPrefix}>$</span>
-            npm install @juspay/neurolink
-          </code>
-        </div>
-      </div>
-    </header>
-  );
-}
+const FEATURES = [
+  {
+    title: "Decide",
+    description:
+      "A third inference type — one state, many typed questions, one calibrated answer each. Confidence gates the decision itself, and every consumer fails open with no key set.",
+    href: "/docs/features/decide-inference-type",
+  },
+  {
+    title: "Multimodal",
+    description: "50+ file types — images, PDFs, video, audio, code",
+    href: "/docs/features/multimodal",
+  },
+  {
+    title: "Streaming",
+    description: "4 streaming patterns with backpressure support",
+    href: "/docs/advanced/streaming",
+  },
+  {
+    title: "RAG Pipeline",
+    description: "10 chunking strategies, hybrid search, reranking",
+    href: "/docs/features/rag",
+  },
+  {
+    title: "Workflows",
+    description: "Multi-model orchestration with checkpointing",
+    href: "/docs/workflows/orchestration",
+  },
+  {
+    title: "Observability",
+    description: "9 exporters, Langfuse integration, custom spans",
+    href: "/docs/observability/telemetry",
+  },
+  {
+    title: "MCP Integration",
+    description: "Connect to 58+ external servers, 4 transports",
+    href: "/docs/mcp/overview",
+  },
+];
 
-function StatsSection() {
-  return (
-    <section className={styles.stats}>
-      <div className={styles.statsContainer}>
-        {stats.map((stat) => (
-          <div key={stat.label} className={styles.statItem}>
-            <span className={styles.statValue}>{stat.value}</span>
-            <span className={styles.statLabel}>{stat.label}</span>
-          </div>
-        ))}
-      </div>
-    </section>
-  );
-}
+const CODE_EXAMPLE = `import { NeuroLink } from "@juspay/neurolink";
 
-function FeaturesSection() {
-  return (
-    <section className={styles.features}>
-      <div className={styles.sectionContainer}>
-        <div className={styles.sectionHeader}>
-          <h2 className={styles.sectionTitle}>
-            Everything You Need for AI Development
-          </h2>
-          <p className={styles.sectionSubtitle}>
-            From rapid prototyping to enterprise deployment, NeuroLink provides
-            the complete toolkit for building production-ready AI applications.
-          </p>
-        </div>
-        <div className={styles.featuresGrid}>
-          {features.map((feature) => (
-            <div key={feature.title} className={styles.featureCard}>
-              <div className={styles.featureIcon}>{feature.icon}</div>
-              <h3 className={styles.featureTitle}>{feature.title}</h3>
-              <p className={styles.featureDescription}>{feature.description}</p>
-            </div>
-          ))}
-        </div>
-      </div>
-    </section>
-  );
-}
+const ai = new NeuroLink();
 
-function ProvidersSection() {
-  return (
-    <section className={styles.providers}>
-      <div className={styles.sectionContainer}>
-        <div className={styles.sectionHeader}>
-          <h2 className={styles.sectionTitle}>One API. Every Provider.</h2>
-          <p className={styles.sectionSubtitle}>
-            Switch between providers instantly. No code changes, no migrations,
-            no vendor lock-in.
-          </p>
-        </div>
-        <div className={styles.providersList}>
-          {providers.map((provider) => (
-            <div key={provider} className={styles.providerBadge}>
-              {provider}
-            </div>
-          ))}
-        </div>
-      </div>
-    </section>
-  );
-}
-
-function CodeExampleSection() {
-  return (
-    <section className={styles.codeExample}>
-      <div className={styles.sectionContainer}>
-        <div className={styles.codeExampleGrid}>
-          <div className={styles.codeExampleContent}>
-            <h2 className={styles.sectionTitle}>Developer-First Experience</h2>
-            <p className={styles.sectionSubtitle}>
-              Full TypeScript support with IntelliSense, streaming responses,
-              tool calling, and framework integrations for Next.js, SvelteKit,
-              and Express.
-            </p>
-            <ul className={styles.checkList}>
-              <li>
-                <CheckIcon /> Full TypeScript type safety
-              </li>
-              <li>
-                <CheckIcon /> Streaming with real-time tokens
-              </li>
-              <li>
-                <CheckIcon /> MCP tool integration
-              </li>
-              <li>
-                <CheckIcon /> Structured output with Zod schemas
-              </li>
-              <li>
-                <CheckIcon /> Extended thinking support
-              </li>
-            </ul>
-            <div className={styles.codeExampleCta}>
-              <Link to="/docs/sdk" className={styles.ctaSecondary}>
-                <CodeIcon />
-                SDK Reference
-              </Link>
-              <Link to="/docs/cli" className={styles.ctaSecondary}>
-                <TerminalIcon />
-                CLI Guide
-              </Link>
-            </div>
-          </div>
-          <div className={styles.codeBlock}>
-            <div className={styles.codeHeader}>
-              <span className={styles.codeFileName}>example.ts</span>
-            </div>
-            <pre className={styles.codeContent}>
-              <code>{`import { NeuroLink } from "@juspay/neurolink";
-
-const ai = new NeuroLink({
+// Generate with any provider
+const result = await ai.generate({
+  prompt: "Explain quantum computing",
   provider: "anthropic",
-  model: "claude-sonnet-4-20250514",
+  model: "claude-sonnet-4-6",
 });
 
-// Stream responses with tool calling
-const stream = await ai.stream({
-  prompt: "Analyze this codebase",
-  tools: ["github", "readFile"],
-});
+console.log(result.content);`;
 
-for await (const chunk of stream) {
-  process.stdout.write(chunk.text);
-}`}</code>
-            </pre>
-          </div>
-        </div>
-      </div>
-    </section>
-  );
-}
+const FAQ_ITEMS = [
+  {
+    question: "What is NeuroLink?",
+    answer:
+      "NeuroLink is an enterprise AI development platform that provides unified access to AI providers (OpenAI, Anthropic, Google AI, AWS Bedrock, Azure, DeepSeek, NVIDIA NIM, LM Studio, llama.cpp, plus voice providers like ElevenLabs, Deepgram, and more) through a single TypeScript SDK and professional CLI — most of them for generate()/stream(), plus TypeSafe, Laya, XOR, SubQ, Perplexity Decisions, Cloudflare Clef, OpenAI Decisions and ScaleDown for calibrated decide() judgements. It is extracted from production systems at Juspay and battle-tested at enterprise scale.",
+  },
+  {
+    question: "How is NeuroLink different from LangChain or Vercel AI SDK?",
+    answer:
+      "NeuroLink focuses on provider unification with zero lock-in. Unlike LangChain, it uses a lightweight factory architecture without heavy abstractions. Compared to Vercel AI SDK, NeuroLink adds built-in MCP integration with 58+ tool servers, RAG pipelines, workflow orchestration, multimodal support for 50+ file types, and a full-featured CLI.",
+  },
+  {
+    question: "Is NeuroLink free to use?",
+    answer:
+      "Yes. NeuroLink is open source and free to use under the MIT license. You only pay for the AI provider API calls you make (e.g., OpenAI, Anthropic). NeuroLink itself adds no additional cost.",
+  },
+  {
+    question: "What AI providers does NeuroLink support?",
+    answer:
+      "Most NeuroLink providers serve generate()/stream(): OpenAI, Anthropic, Google AI Studio, Google Vertex AI, AWS Bedrock, Azure OpenAI, Mistral, Ollama, LiteLLM, HuggingFace, SageMaker, OpenRouter, DeepSeek, NVIDIA NIM (400+ catalog models), LM Studio (local), llama.cpp (local GGUF), any OpenAI-compatible endpoint, and voice providers — OpenAI TTS, ElevenLabs, Google TTS, Azure TTS, Whisper, Deepgram, Azure STT, Google STT. Some serve decide() only — calibrated typed judgements, no text: TypeSafe; Laya, a self-hosted open-weights model (LAYA_API_KEY + LAYA_BASE_URL); XOR, Juspay's open-weights model (XOR_API_KEY + XOR_BASE_URL); SubQ, a hosted API (SUBQ_API_KEY); Perplexity Decisions, a hosted API that also reads images (PERPLEXITY_API_KEY, the same key as Perplexity's text provider); Cloudflare Clef, hosted on Workers AI, which also reads images (CLOUDFLARE_API_KEY + CLOUDFLARE_ACCOUNT_ID, the same two as Cloudflare's text provider); OpenAI Decisions, OpenAI's Decisions API in public beta, which also reads images (OPENAI_API_KEY, the same key as OpenAI's chat provider); and ScaleDown, a hosted API that reads text only (SCALEDOWN_API_KEY, its own key). Switching generate/stream providers requires changing a single parameter.",
+  },
+  {
+    question: "Does NeuroLink support MCP (Model Context Protocol)?",
+    answer:
+      "Yes. NeuroLink has full MCP integration with 58+ external tool servers including GitHub, PostgreSQL, Google Drive, Slack, and more. It supports all four transport protocols: stdio for local servers, HTTP/Streamable HTTP for remote servers, SSE, and WebSocket.",
+  },
+  {
+    question: "Can I use NeuroLink in production?",
+    answer:
+      "Absolutely. NeuroLink is extracted from production systems and includes enterprise features like Redis-backed conversation memory, provider failover, observability with 9 exporters and Langfuse integration, context compaction, and workflow orchestration with checkpointing.",
+  },
+  {
+    question: "What is the `decide` inference type?",
+    answer:
+      "decide() is a third inference type alongside generate() and stream() — a separate modality, not a mode of the other two, so a text-only provider is never reachable from it and a decide-only provider is never reachable from generation fallback. A decision model takes one state plus a set of named, typed questions and returns one typed, calibrated answer per question in a single parallel pass — no text, nothing to parse out of prose. Because the confidence is calibrated rather than self-reported, it can gate action directly: NeuroLink's classifier router uses asymmetric thresholds (0.3 confidence to route a request up to a pricier model, 0.6 to route it down) since routing too cheap and routing too expensive don't cost the same. Six consumers build on it today — model routing, a registry-derived model catalogue (64 models across 7 providers, 132 aliases, added on top of a host's own declared pool rather than replacing it), context budget sizing, compaction quality gating, calibrated MCP/tool-server routing, and RAG retrieval planning — and every one fails open: with no decision provider configured, behavior is byte-for-byte what it was before. Decisions get their own model.decision observability span with independent cost attribution, kept separate from generation metrics, across all 9 supported exporters. TypeSafe's Jev, Laya — an open-weights model you can run yourself — XOR — Juspay's open-weights decision model — Subquadratic's hosted SubQ Snap, Perplexity's hosted Decisions API, Cloudflare's hosted Clef models, OpenAI's Decisions API and ScaleDown's hosted Classify models are the decision providers; enabling TypeSafe, SubQ, Perplexity, OpenAI Decisions or ScaleDown is one environment variable (Perplexity's, PERPLEXITY_API_KEY, is shared with its text provider, and OpenAI's, OPENAI_API_KEY, with the OpenAI chat provider), Cloudflare Clef needs two (CLOUDFLARE_API_KEY and CLOUDFLARE_ACCOUNT_ID, shared with Cloudflare's text provider), and Laya or XOR each also need a base URL.",
+  },
+];
 
-function CTASection() {
-  return (
-    <section className={styles.cta}>
-      <div className={styles.sectionContainer}>
-        <div className={styles.ctaContent}>
-          <h2 className={styles.ctaTitle}>Ready to Build?</h2>
-          <p className={styles.ctaSubtitle}>
-            Start building production-ready AI applications in minutes. Open
-            source and battle-tested at enterprise scale.
-          </p>
-          <div className={styles.ctaButtons}>
-            <Link to="/docs/getting-started" className={styles.ctaPrimary}>
-              Get Started
-              <ArrowRightIcon />
-            </Link>
-            <a
-              href="https://github.com/juspay/neurolink"
-              className={styles.ctaSecondary}
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              View on GitHub
-            </a>
-          </div>
-        </div>
-      </div>
-    </section>
-  );
-}
+const FAQ_JSONLD = {
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  mainEntity: FAQ_ITEMS.map((item) => ({
+    "@type": "Question",
+    name: item.question,
+    acceptedAnswer: {
+      "@type": "Answer",
+      text: item.answer,
+    },
+  })),
+};
 
 export default function Home(): React.JSX.Element {
-  const { siteConfig } = useDocusaurusContext();
   return (
-    <Layout title="Enterprise AI SDK" description={siteConfig.tagline}>
+    <Layout
+      title="NeuroLink - The Nervous System Pipe for AI Streams"
+      description="The pipe layer for the AI nervous system. Stream tokens, data, tools, voice, and context from supported providers through pluggable connectors."
+    >
+      <Head>
+        <script type="application/ld+json">{JSON.stringify(FAQ_JSONLD)}</script>
+      </Head>
       <main className={styles.main}>
-        <HeroSection />
-        <StatsSection />
-        <FeaturesSection />
-        <ProvidersSection />
-        <CodeExampleSection />
-        <CTASection />
+        {/* Hero — nervous system concept first */}
+        <section className={styles.hero}>
+          <div className={styles.heroContent}>
+            <h1 className={styles.heroTitle}>
+              Find your path through the pipe.
+            </h1>
+            <p className={styles.heroSubtitle}>
+              NeuroLink is the pipe layer for the AI nervous system — connecting
+              live streams of tokens, data, tools, and context through pluggable
+              connectors. Choose your entry point.
+            </p>
+            <div className={styles.heroCtas}>
+              <Link className={styles.ctaPrimary} to="/docs/getting-started">
+                Get Started
+              </Link>
+              <Link
+                className={styles.ctaSecondary}
+                href="https://github.com/juspay/neurolink"
+              >
+                View on GitHub
+              </Link>
+            </div>
+            <a
+              href="https://github.com/juspay/neurolink"
+              className={styles.starsBadge}
+              target="_blank"
+              rel="noopener noreferrer"
+              aria-label="Star juspay/neurolink on GitHub"
+            >
+              <img
+                src="https://img.shields.io/github/stars/juspay/neurolink?style=social"
+                alt="GitHub stars"
+                width="100"
+                height="20"
+                loading="lazy"
+              />
+            </a>
+          </div>
+        </section>
+
+        {/* Three routing cards */}
+        <section className={styles.routingSection}>
+          <div className={styles.routingCards}>
+            <a
+              href="/docs/getting-started/quick-start"
+              className={styles.routingCard}
+            >
+              <span className={styles.routingCardLabel}>THE PIPE</span>
+              <p className={styles.routingCardTitle}>Start with the pipe</p>
+              <p className={styles.routingCardDesc}>
+                Unified API for supported AI providers. Token streams, voice,
+                memory, tools, RAG — one consistent interface.
+              </p>
+            </a>
+            <a href="/docs/features/mcp-tools" className={styles.routingCard}>
+              <span className={styles.routingCardLabel}>BUILD CONNECTORS</span>
+              <p className={styles.routingCardTitle}>Build an organ</p>
+              <p className={styles.routingCardDesc}>
+                Every application built on NeuroLink is an organ. Connect to the
+                vascular layer and open a new gateway.
+              </p>
+            </a>
+            <a
+              href="/docs/connectors"
+              className={`${styles.routingCard} ${styles.routingCardAccent}`}
+            >
+              <span className={styles.routingCardLabel}>THE ECOSYSTEM</span>
+              <p className={styles.routingCardTitle}>Explore connectors</p>
+              <p className={styles.routingCardDesc}>
+                Automatic, Tara, Yama — production organs already flowing on
+                NeuroLink. Study them. Build yours.
+              </p>
+            </a>
+          </div>
+        </section>
+
+        {/* Connector ecosystem block — visible immediately */}
+        <section className={styles.connectorsBlock}>
+          <p className={styles.sectionLabel}>CONNECTORS BUILT ON NEUROLINK</p>
+          <div className={styles.connectorRow}>
+            <a
+              href="/docs/connectors/automatic"
+              className={`${styles.chip} ${styles.chipAmber}`}
+            >
+              ● automatic
+            </a>
+            <a
+              href="/docs/connectors/tara"
+              className={`${styles.chip} ${styles.chipAmber}`}
+            >
+              ● tara
+            </a>
+            <a
+              href="/docs/connectors/yama"
+              className={`${styles.chip} ${styles.chipRust}`}
+            >
+              ● yama
+            </a>
+            <span className={`${styles.chip} ${styles.chipDim}`}>○ ···</span>
+          </div>
+        </section>
+
+        {/* Providers */}
+        <section className={styles.providers}>
+          <p className={styles.providersLabel}>
+            Works with your favorite AI providers
+          </p>
+          <div className={styles.providerGrid}>
+            {PROVIDERS.map((name) => (
+              <span key={name} className={styles.providerChip}>
+                {name}
+              </span>
+            ))}
+          </div>
+        </section>
+
+        {/* Quick Links */}
+        <section className={styles.quickLinks}>
+          <h2 className={styles.sectionTitle}>Quick Start</h2>
+          <div className={styles.cardGrid}>
+            {QUICK_LINKS.map((link) => (
+              <Link key={link.href} to={link.href} className={styles.quickCard}>
+                <span className={styles.quickCardIcon}>{link.icon}</span>
+                <h3 className={styles.quickCardTitle}>{link.title}</h3>
+                <p className={styles.quickCardDesc}>{link.description}</p>
+              </Link>
+            ))}
+          </div>
+        </section>
+
+        {/* Features */}
+        <section className={styles.features}>
+          <h2 className={styles.sectionTitle}>Built for Production</h2>
+          <div className={styles.codePreview}>
+            <div className={styles.codeHeader}>
+              <span
+                className={styles.codeDot}
+                style={{ background: "#ff5f57" }}
+              />
+              <span
+                className={styles.codeDot}
+                style={{ background: "#febc2e" }}
+              />
+              <span
+                className={styles.codeDot}
+                style={{ background: "#28c840" }}
+              />
+              <span className={styles.codeFileName}>quickstart.ts</span>
+            </div>
+            <pre className={styles.codeBlock}>
+              <code>{CODE_EXAMPLE}</code>
+            </pre>
+          </div>
+          <div className={styles.featureGrid}>
+            {FEATURES.map((f) => (
+              <Link key={f.href} to={f.href} className={styles.featureCard}>
+                <h3 className={styles.featureTitle}>{f.title}</h3>
+                <p className={styles.featureDesc}>{f.description}</p>
+              </Link>
+            ))}
+          </div>
+        </section>
+
+        {/* FAQ */}
+        <section className={styles.faq}>
+          <h2 className={styles.sectionTitle}>Frequently Asked Questions</h2>
+          <div className={styles.faqList}>
+            {FAQ_ITEMS.map((item) => (
+              <details key={item.question} className={styles.faqItem}>
+                <summary className={styles.faqQuestion}>
+                  {item.question}
+                </summary>
+                <p className={styles.faqAnswer}>{item.answer}</p>
+              </details>
+            ))}
+          </div>
+        </section>
+
+        {/* Production Credentials / Stats — last */}
+        <section className={styles.trustSignal}>
+          <p className={styles.productionCredentialsLabel}>
+            PRODUCTION CREDENTIALS
+          </p>
+          <p className={styles.trustText}>
+            <span className={styles.trustBadge}>Production</span>
+            Extracted from production systems at Juspay — powering
+            enterprise-scale AI applications
+          </p>
+        </section>
       </main>
     </Layout>
   );

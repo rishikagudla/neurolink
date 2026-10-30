@@ -3,26 +3,119 @@
  * Handles configuration merging and conversation memory operations
  */
 
-import type {
-  ConversationMemoryConfig,
-  ChatMessage,
-  SessionMemory,
-  ProviderDetails,
-} from "../types/conversation.js";
-import type { ConversationMemoryManager } from "../core/conversationMemoryManager.js";
-import type { RedisConversationMemoryManager } from "../core/redisConversationMemoryManager.js";
-import type {
-  TextGenerationOptions,
-  TextGenerationResult,
-} from "../types/generateTypes.js";
+import { SpanKind, SpanStatusCode } from "@opentelemetry/api";
+import { tracers } from "../telemetry/tracers.js";
+import { withTimeout } from "./errorHandling.js";
+import { safeDebugSerialize, sanitizeRecord } from "./logSanitize.js";
 import {
+  DEFAULT_FALLBACK_THRESHOLD,
   getConversationMemoryDefaults,
   MEMORY_THRESHOLD_PERCENTAGE,
-  DEFAULT_FALLBACK_THRESHOLD,
 } from "../config/conversationMemory.js";
-import { TokenUtils } from "../constants/tokens.js";
+import { getAvailableInputTokens } from "../constants/contextWindows.js";
+import { buildSummarizationPrompt } from "../context/prompts/summarizationPrompt.js";
+import { repairToolPairs } from "../context/toolPairRepair.js";
+import type { ConversationMemoryManager } from "../core/conversationMemoryManager.js";
+import type { RedisConversationMemoryManager } from "../core/redisConversationMemoryManager.js";
+import type { NeuroLink } from "../neurolink.js";
+import type {
+  ChatMessage,
+  ConversationMemoryConfig,
+  ProviderDetails,
+  SessionMemory,
+  StreamEventSequence,
+  TextGenerationOptions,
+  TextGenerationResult,
+} from "../types/index.js";
 import { logger } from "./logger.js";
-import { NeuroLink } from "../neurolink.js";
+
+const memoryTracer = tracers.memory;
+
+/**
+ * Legacy sentinel string formerly written by the abort branch of
+ * handleGenerateTextInternalFailure (Curator SI-069 / SI-071). The producer is
+ * removed in this fix, but historical Redis sessions may still contain entries
+ * with this content. Filtered at the prompt-builder boundary so they never
+ * reach the provider — sessions self-heal on the next read without any
+ * migration. Keep in sync with any future renames; do not remove without a
+ * cross-repo grep.
+ */
+export const ABORT_LEGACY_SENTINEL = "[generation was interrupted]";
+
+/**
+ * Tracks session IDs that have already emitted the
+ * "Dropped polluted assistant turns" warn log so we log once per session
+ * (not on every retrieval). The span attribute
+ * `neurolink.memory.polluted_turns_dropped` is still set every call, so
+ * Langfuse traces show the cleanup happening continuously even after the
+ * log is suppressed. Bounded to avoid unbounded growth on busy services —
+ * when capacity is reached the set is cleared (cheap) and warning resumes
+ * as if those sessions are new, which is acceptable behaviour.
+ */
+const POLLUTED_WARN_DEDUP_MAX = 1024;
+const pollutedWarnedSessions = new Set<string>();
+
+/**
+ * True if a stored assistant turn looks like it was carrying tool activity
+ * (and is therefore safe to keep even with empty text content). storeTurn
+ * paths historically populate one of several fields depending on which
+ * provider/codepath wrote it, so this checks all of them. Mirrored across
+ * read filter + storage guard for symmetry.
+ *
+ *   - `msg.events` — stream-path event sequence (`tool:start`, `tool:end`)
+ *   - `msg.tool` / `msg.args` — assistant turn that invoked a tool by name
+ *   - `msg.result` — tool result attached to the assistant turn
+ *
+ * If none of these are set, the assistant turn is text-only.
+ *
+ * Named with the `message` prefix to avoid shadowing the local
+ * `hasToolActivity` boolean inside `storeConversationTurn` below — the two
+ * answer different questions (one inspects a stored message, the other
+ * inspects a live result object).
+ */
+function messageHasToolActivity(msg: ChatMessage): boolean {
+  if (msg.tool || msg.args || msg.result) {
+    return true;
+  }
+  const events = msg.events;
+  if (!Array.isArray(events)) {
+    return false;
+  }
+  return events.some((e) => {
+    const type = (e as { type?: unknown })?.type;
+    return type === "tool:start" || type === "tool:end";
+  });
+}
+
+/**
+ * Decides whether an assistant turn loaded from conversation memory is safe to
+ * include in the prompt sent to the provider. Drops:
+ *   - empty / whitespace-only text content with no tool activity
+ *   - the legacy abort sentinel — but only when the turn carries no tool
+ *     activity, mirroring the storeConversationTurn upper-layer guard so a
+ *     hypothetical tool-call-then-aborted turn doesn't lose its tool half
+ * tool_call and tool_result role messages are always preserved — they
+ * legitimately carry empty `content` (see redisConversationMemoryManager.ts:1870
+ * "Can be empty for tool calls"). Filtering them would break tool-pair
+ * semantics that downstream `repairToolPairs` relies on.
+ */
+function isPollutedAssistantTurn(msg: ChatMessage): boolean {
+  if (msg.role !== "assistant") {
+    return false;
+  }
+  const content = typeof msg.content === "string" ? msg.content : "";
+  const trimmed = content.trim();
+  if (trimmed === ABORT_LEGACY_SENTINEL) {
+    return !messageHasToolActivity(msg);
+  }
+  if (trimmed === "") {
+    return !messageHasToolActivity(msg);
+  }
+  return false;
+}
+
+// Cached NeuroLink instance for summarization to avoid creating a new instance per call
+let cachedSummarizer: NeuroLink | null = null;
 
 /**
  * Apply conversation memory defaults to user configuration
@@ -50,9 +143,33 @@ export async function getConversationMessages(
     | undefined,
   options: TextGenerationOptions,
 ): Promise<ChatMessage[]> {
+  // Logger Guard: options carries the full conversation history + tool
+  // outputs; eager JSON.stringify of it can throw RangeError: Invalid string
+  // length and abort the turn. Serialize lazily, bounded, never-throwing,
+  // and redacted (sanitizeRecord strips credential/PII keys).
+  if (logger.shouldLog("debug")) {
+    logger.debug("[conversationMemoryUtils] getConversationMessages called", {
+      hasMemory: !!conversationMemory,
+      memoryType: conversationMemory?.constructor?.name || "NONE",
+      hasContext: !!options.context,
+      enableSummarization: options.enableSummarization ?? false,
+      options: safeDebugSerialize(sanitizeRecord(options)),
+    });
+  }
   if (!conversationMemory || !options.context) {
     logger.warn(
       "[conversationMemoryUtils] No memory or context, returning empty messages",
+      {
+        hasMemory: !!conversationMemory,
+        memoryType: conversationMemory?.constructor?.name || "NONE",
+        hasContext: !!options.context,
+        enableSummarization: options.enableSummarization ?? false,
+        // The options dump is debug-grade detail — don't pay for (or leak)
+        // the serialization on every memory-disabled call at warn level.
+        ...(logger.shouldLog("debug")
+          ? { options: safeDebugSerialize(sanitizeRecord(options)) }
+          : {}),
+      },
     );
     return [];
   }
@@ -69,59 +186,137 @@ export async function getConversationMessages(
     return [];
   }
 
-  try {
-    // Extract userId from context
-    const userId = (options.context as Record<string, unknown>)?.userId as
-      | string
-      | undefined;
-
-    const enableSummarization = options.enableSummarization ?? undefined;
-    const messages = await conversationMemory.buildContextMessages(
-      sessionId,
-      userId,
-      enableSummarization,
-    );
-    logger.debug(
-      "[conversationMemoryUtils] Conversation messages retrieved successfully",
-      {
-        sessionId,
-        messageCount: messages.length,
-        messageTypes: messages.map((m) => m.role),
-        firstMessage:
-          messages.length > 0
-            ? {
-                role: messages[0].role,
-                contentLength: messages[0].content.length,
-                contentPreview: messages[0].content.substring(0, 50),
-              }
-            : null,
-        lastMessage:
-          messages.length > 0
-            ? {
-                role: messages[messages.length - 1].role,
-                contentLength: messages[messages.length - 1].content.length,
-                contentPreview: messages[messages.length - 1].content.substring(
-                  0,
-                  50,
-                ),
-              }
-            : null,
+  return memoryTracer.startActiveSpan(
+    "conversation.getMessages",
+    {
+      kind: SpanKind.INTERNAL,
+      attributes: {
+        "session.id": sessionId,
+        "memory.type": conversationMemory.constructor.name,
       },
-    );
+    },
+    async (span) => {
+      try {
+        // Extract userId from context
+        const userId = (options.context as Record<string, unknown>)?.userId as
+          | string
+          | undefined;
+        if (userId) {
+          span.setAttribute("user.id", userId);
+        }
 
-    return messages;
-  } catch (error) {
-    logger.warn(
-      "[conversationMemoryUtils] Failed to get conversation messages",
-      {
-        sessionId,
-        memoryType: conversationMemory.constructor.name,
-        error: error instanceof Error ? error.message : String(error),
-        stack: error instanceof Error ? error.stack : undefined,
-      },
-    );
-    return [];
-  }
+        const enableSummarization = options.enableSummarization ?? undefined;
+        const rawMessages = await conversationMemory.buildContextMessages(
+          sessionId,
+          userId,
+          enableSummarization,
+        );
+
+        // Read-time filter: drop assistant turns that are empty/whitespace or
+        // carry the legacy abort sentinel before they reach the provider.
+        // Self-heals historical Redis sessions polluted by the now-removed
+        // abort-path memory write (Curator SI-069 / SI-071) and defends
+        // against any future "fabricate-on-error" regression. Telemetry
+        // attributes record how many turns were dropped so polluted sessions
+        // are visible in Langfuse traces.
+        const filtered = rawMessages.filter(
+          (msg) => !isPollutedAssistantTurn(msg),
+        );
+
+        // Pair repair on READ, not just after compaction. buildContextFromPointer
+        // slices the history at the summary pointer, and a session interrupted
+        // mid-tool-batch is stored with calls whose results never arrived —
+        // either way the provider receives an orphan and hard-rejects the turn.
+        // No-ops (single linear scan) when the slice holds no tool messages.
+        const repair = repairToolPairs(filtered);
+        const messages = repair.messages;
+        if (repair.repaired) {
+          span.setAttribute(
+            "memory.tool_pairs_repaired",
+            repair.orphanedCallsFixed + repair.orphanedResultsFixed,
+          );
+          logger.debug(
+            "[conversationMemoryUtils] Repaired orphaned tool pairs on read",
+            {
+              sessionId,
+              orphanedCallsFixed: repair.orphanedCallsFixed,
+              orphanedResultsFixed: repair.orphanedResultsFixed,
+            },
+          );
+        }
+
+        const droppedCount = rawMessages.length - filtered.length;
+        if (droppedCount > 0) {
+          // Span attribute is always set so polluted sessions stay visible in
+          // Langfuse traces on every read — that's the persistent debugging
+          // signal. The warn log is deduped per session so a long-lived
+          // polluted conversation only generates one log line, not one per
+          // turn (would otherwise be noisy at scale).
+          span.setAttribute("memory.polluted_turns_dropped", droppedCount);
+          const alreadyWarned = pollutedWarnedSessions.has(sessionId);
+          if (!alreadyWarned) {
+            if (pollutedWarnedSessions.size >= POLLUTED_WARN_DEDUP_MAX) {
+              pollutedWarnedSessions.clear();
+            }
+            pollutedWarnedSessions.add(sessionId);
+            logger.warn(
+              "[conversationMemoryUtils] Dropped polluted assistant turns from prompt context (logged once per session — span attribute records every read)",
+              {
+                sessionId,
+                droppedCount,
+                remainingCount: messages.length,
+              },
+            );
+          } else {
+            logger.debug(
+              "[conversationMemoryUtils] Dropped polluted assistant turns (warn already logged for this session)",
+              {
+                sessionId,
+                droppedCount,
+                remainingCount: messages.length,
+              },
+            );
+          }
+        }
+
+        span.setAttribute("message.count", messages.length);
+
+        if (logger.shouldLog("debug")) {
+          logger.debug(
+            "[conversationMemoryUtils] Conversation messages retrieved successfully",
+            {
+              sessionId,
+              messageCount: messages.length,
+              droppedPollutedCount: droppedCount,
+              messageTypes: messages.map((m) => m.role),
+            },
+          );
+        }
+
+        return messages;
+      } catch (error) {
+        span.setStatus({
+          code: SpanStatusCode.ERROR,
+          message: error instanceof Error ? error.message : String(error),
+        });
+        span.recordException(
+          error instanceof Error ? error : new Error(String(error)),
+        );
+        logger.warn(
+          "[conversationMemoryUtils] Failed to get conversation messages",
+          {
+            sessionId,
+            memoryType: conversationMemory.constructor.name,
+            error: error instanceof Error ? error.message : String(error),
+            stack: error instanceof Error ? error.stack : undefined,
+          },
+        );
+        return [];
+      } finally {
+        span.end();
+      }
+    },
+  );
 }
 
 /**
@@ -137,8 +332,11 @@ export async function storeConversationTurn(
   originalOptions: TextGenerationOptions,
   result: TextGenerationResult,
   startTimeStamp?: Date | undefined,
+  requestId?: string,
+  skillMessages?: ChatMessage[],
 ): Promise<void> {
   logger.debug("[conversationMemoryUtils] storeConversationTurn called", {
+    requestId,
     hasMemory: !!conversationMemory,
     memoryType: conversationMemory?.constructor?.name || "NONE",
     hasContext: !!originalOptions.context,
@@ -161,6 +359,7 @@ export async function storeConversationTurn(
   logger.debug(
     "[conversationMemoryUtils] Extracted session details from context",
     {
+      requestId,
       sessionId,
       userId,
       contextKeys: Object.keys(context),
@@ -183,43 +382,184 @@ export async function storeConversationTurn(
     originalOptions.originalPrompt || originalOptions.prompt || "";
 
   const aiResponse = result.content ?? "";
-  let providerDetails: ProviderDetails | undefined = undefined;
+
+  // Guard: skip storing conversation turn if AI response is empty AND no tools were used.
+  // Empty assistant messages cause "text content blocks must be non-empty" errors
+  // when loaded as conversation history on the next interaction.
+  // However, tool-only turns (empty text but tools were invoked) must still be stored
+  // to preserve tool-calling conversation history.
+  const hasToolActivity =
+    (result.toolsUsed && result.toolsUsed.length > 0) ||
+    (result.toolExecutions && result.toolExecutions.length > 0);
+
+  if (!aiResponse.trim() && !hasToolActivity) {
+    logger.warn(
+      "[conversationMemoryUtils] Skipping conversation turn storage — AI response is empty and no tool activity",
+      {
+        sessionId,
+        userId,
+        userMessageLength: userMessage.length,
+      },
+    );
+    return;
+  }
+
+  // Belt-and-braces guard against the abort sentinel (Curator SI-069 / SI-071).
+  // The abort path itself was fixed in handleGenerateTextInternalFailure to
+  // never call this function, but we reject the legacy sentinel here too so a
+  // future regression cannot re-introduce the same pollution. Tool-bearing
+  // turns are explicitly preserved (the model may call a tool then abort).
+  if (aiResponse.trim() === ABORT_LEGACY_SENTINEL && !hasToolActivity) {
+    logger.warn(
+      "[conversationMemoryUtils] Refusing to store legacy abort sentinel — see Curator SI-069 / SI-071",
+      {
+        sessionId,
+        userId,
+        userMessageLength: userMessage.length,
+      },
+    );
+    return;
+  }
+
+  let providerDetails: ProviderDetails | undefined;
   if (result.provider && result.model) {
     providerDetails = {
       provider: result.provider,
       model: result.model,
     };
   }
-  try {
-    await conversationMemory.storeConversationTurn({
-      sessionId,
-      userId,
-      userMessage,
-      aiResponse,
-      startTimeStamp,
-      providerDetails,
-      enableSummarization: originalOptions.enableSummarization,
-    });
 
-    logger.debug(
-      "[conversationMemoryUtils] Conversation turn stored successfully",
-      {
-        sessionId,
-        userId,
-        memoryType: conversationMemory.constructor.name,
-        userMessageLength: userMessage.length,
-        aiResponseLength: aiResponse.length,
-      },
-    );
-  } catch (error) {
-    logger.warn("[conversationMemoryUtils] Failed to store conversation turn", {
-      sessionId,
-      userId,
-      memoryType: conversationMemory.constructor.name,
-      error: error instanceof Error ? error.message : String(error),
-      stack: error instanceof Error ? error.stack : undefined,
-    });
+  // Persist a minimal `events` marker only on tool-bearing assistant turns
+  // whose surface text would otherwise trigger the read-time filter (empty /
+  // whitespace-only content). Turns that already have substantive text are
+  // never dropped by isPollutedAssistantTurn, so attaching synthesised events
+  // to them would change the stored shape and token estimation for no
+  // benefit. Sentinel-content turns never reach this point — the upper-layer
+  // guard at line 340 short-circuits them.
+  let toolActivityEvents: StreamEventSequence[] | undefined;
+  if (hasToolActivity && !aiResponse.trim()) {
+    const now = Date.now();
+    const usedNames = new Set<string>();
+    if (Array.isArray(result.toolsUsed)) {
+      for (const t of result.toolsUsed) {
+        if (typeof t === "string" && t) {
+          usedNames.add(t);
+        }
+      }
+    }
+    if (Array.isArray(result.toolExecutions)) {
+      for (const exec of result.toolExecutions) {
+        const name = (exec as { toolName?: unknown })?.toolName;
+        if (typeof name === "string" && name) {
+          usedNames.add(name);
+        }
+      }
+    }
+    toolActivityEvents = [];
+    let seq = 0;
+    for (const name of usedNames) {
+      // Match the canonical ToolExecutionEvent shape (src/lib/types/tools.ts):
+      // `tool` is the required field, `toolName` is the documented compat
+      // alias. Populate both so downstream consumers reading either name
+      // work uniformly.
+      toolActivityEvents.push({
+        type: "tool:start",
+        seq: seq++,
+        timestamp: now,
+        tool: name,
+        toolName: name,
+      });
+    }
+    if (toolActivityEvents.length === 0) {
+      // Tool activity reported but no names extractable — still leave a
+      // marker so retrieval doesn't drop the turn. Both `tool` and
+      // `toolName` are populated for the same compat reason.
+      toolActivityEvents.push({
+        type: "tool:start",
+        seq: 0,
+        timestamp: now,
+        tool: "unknown",
+        toolName: "unknown",
+      });
+    }
   }
+
+  await memoryTracer.startActiveSpan(
+    "conversation.storeTurn",
+    {
+      kind: SpanKind.INTERNAL,
+      attributes: {
+        "session.id": sessionId,
+        "content.length": userMessage.length + aiResponse.length,
+      },
+    },
+    async (span) => {
+      if (userId) {
+        span.setAttribute("user.id", userId);
+      }
+      try {
+        await conversationMemory.storeConversationTurn({
+          sessionId,
+          userId,
+          userMessage,
+          aiResponse,
+          startTimeStamp,
+          providerDetails,
+          enableSummarization: originalOptions.enableSummarization,
+          requestId,
+          events: result.events?.length ? result.events : toolActivityEvents,
+          ...(skillMessages && skillMessages.length > 0
+            ? { skillMessages }
+            : {}),
+          tokenUsage: result.usage
+            ? {
+                inputTokens: result.usage.input,
+                outputTokens: result.usage.output,
+                totalTokens: result.usage.total,
+                cacheReadTokens: result.usage.cacheReadTokens,
+                cacheWriteTokens: result.usage.cacheCreationTokens,
+              }
+            : undefined,
+          thoughtSignature: result.thoughtSignature,
+        });
+
+        logger.debug(
+          "[conversationMemoryUtils] Conversation turn stored successfully",
+          {
+            requestId,
+            sessionId,
+            userId,
+            memoryType: conversationMemory.constructor.name,
+            userMessageLength: userMessage.length,
+            aiResponseLength: aiResponse.length,
+          },
+        );
+      } catch (error) {
+        span.setStatus({
+          code: SpanStatusCode.ERROR,
+          message: error instanceof Error ? error.message : String(error),
+        });
+        span.recordException(
+          error instanceof Error ? error : new Error(String(error)),
+        );
+        const details = (error as { details?: { error?: string } })?.details;
+        logger.warn(
+          "[conversationMemoryUtils] Failed to store conversation turn",
+          {
+            sessionId,
+            userId,
+            memoryType: conversationMemory.constructor.name,
+            error: error instanceof Error ? error.message : String(error),
+            innerError: details?.error || "none",
+            errorCode: (error as { code?: string })?.code || "unknown",
+            stack: error instanceof Error ? error.stack : undefined,
+          },
+        );
+      } finally {
+        span.end();
+      }
+    },
+  );
 }
 
 /**
@@ -228,8 +568,23 @@ export async function storeConversationTurn(
  * @param session - Session memory with pointer
  * @returns Context messages to send to LLM
  */
-export function buildContextFromPointer(session: SessionMemory): ChatMessage[] {
+export function buildContextFromPointer(
+  session: SessionMemory,
+  requestId?: string,
+): ChatMessage[] {
   if (!session.summarizedUpToMessageId || !session.summarizedMessage) {
+    // Log context built for LLM (no summary)
+    const totalChars = session.messages.reduce(
+      (sum, msg) => sum + msg.content.length,
+      0,
+    );
+    logger.info("[ConversationMemory] Context built for LLM", {
+      requestId,
+      sessionId: session.sessionId,
+      contextMessages: session.messages.length,
+      summaryPrepended: false,
+      estimatedTokens: Math.ceil(totalChars / 4),
+    });
     return session.messages;
   }
 
@@ -244,16 +599,35 @@ export function buildContextFromPointer(session: SessionMemory): ChatMessage[] {
       pointer: session.summarizedUpToMessageId,
       totalMessages: session.messages.length,
     });
+    // Log context built for LLM (pointer not found fallback)
+    const totalChars = session.messages.reduce(
+      (sum, msg) => sum + msg.content.length,
+      0,
+    );
+    logger.info("[ConversationMemory] Context built for LLM", {
+      requestId,
+      sessionId: session.sessionId,
+      contextMessages: session.messages.length,
+      summaryPrepended: false,
+      estimatedTokens: Math.ceil(totalChars / 4),
+    });
     return session.messages;
   }
 
   const messagesAfterPointer = session.messages.slice(pointerIndex + 1);
 
+  // Pinned skill instructions must survive summarization: any skill message
+  // that fell behind the pointer is re-included verbatim after the summary,
+  // so an activated skill keeps its full instructions for the whole session.
+  const pinnedSkillMessages = session.messages
+    .slice(0, pointerIndex + 1)
+    .filter((msg) => msg.metadata?.isSkill);
+
   // Construct context: summary message + recent messages
   const summaryMessage: ChatMessage = {
     id: `summary-${session.summarizedUpToMessageId}`,
-    role: "system",
-    content: `Previous conversation summary: ${session.summarizedMessage}`,
+    role: "user",
+    content: `[Previous conversation summary]: ${session.summarizedMessage}`,
     timestamp: new Date().toISOString(),
     metadata: {
       isSummary: true,
@@ -269,7 +643,26 @@ export function buildContextFromPointer(session: SessionMemory): ChatMessage[] {
     summaryLength: session.summarizedMessage.length,
   });
 
-  return [summaryMessage, ...messagesAfterPointer];
+  const contextMessages = [
+    summaryMessage,
+    ...pinnedSkillMessages,
+    ...messagesAfterPointer,
+  ];
+
+  // Log context built for LLM with structural metadata
+  const totalChars = contextMessages.reduce(
+    (sum, msg) => sum + msg.content.length,
+    0,
+  );
+  logger.info("[ConversationMemory] Context built for LLM", {
+    requestId,
+    sessionId: session.sessionId,
+    contextMessages: contextMessages.length,
+    summaryPrepended: true,
+    estimatedTokens: Math.ceil(totalChars / 4),
+  });
+
+  return contextMessages;
 }
 
 /**
@@ -286,54 +679,43 @@ export function createSummarizationPrompt(
     .map((msg) => `${msg.role}: ${msg.content}`)
     .join("\n\n");
 
-  const previousSummarySection = previousSummary
-    ? `Previous Summary:
----
-${previousSummary}
----
+  const structuredPrompt = buildSummarizationPrompt({
+    isIncremental: !!previousSummary,
+    previousSummary,
+  });
 
-`
-    : "";
+  return `${structuredPrompt}
 
-  return `
-You are a context summarization AI. Your task is to condense the following conversation history for another AI assistant.
-${previousSummary ? "Build upon the previous summary and incorporate the new conversation turns below." : ""}
-The summary must be a concise, third-person narrative that retains all critical information, including key entities, technical details, decisions made, and any specific dates or times mentioned.
-Ensure the summary flows logically and is ready to be used as context for the next turn in the conversation.
-
-${previousSummarySection}Conversation History to Summarize:
+Conversation History to Summarize:
 ---
 ${formattedHistory}
----
-`.trim();
+---`;
 }
 
 /**
- * Calculate token threshold based on model's output token limit
- * Uses existing provider token limits as proxy for context window
+ * Calculate token threshold based on model's context window and available input tokens
+ * Uses context window registry for accurate per-provider, per-model limits
  * @param provider - AI provider name
  * @param model - Model name
- * @returns Token threshold (80% of model's token limit)
+ * @param maxTokens - Optional explicit maxTokens for output reserve calculation
+ * @returns Token threshold (80% of available input tokens)
  */
 export function calculateTokenThreshold(
-  provider: string,
-  model: string,
+  provider?: string,
+  model?: string,
+  maxTokens?: number,
 ): number {
-  try {
-    // Get model's token limit from existing TokenUtils
-    const modelTokenLimit = TokenUtils.getProviderTokenLimit(provider, model);
-
-    // Return 80% of token limit for conversation memory
-    // This is conservative since output limits are typically smaller than input limits
-    return Math.floor(modelTokenLimit * MEMORY_THRESHOLD_PERCENTAGE);
-  } catch (error) {
-    logger.warn("Failed to calculate model threshold, using fallback", {
-      provider,
-      model,
-      error: error instanceof Error ? error.message : String(error),
-    });
+  if (!provider) {
     return DEFAULT_FALLBACK_THRESHOLD;
   }
+
+  const availableInput = getAvailableInputTokens(provider, model, maxTokens);
+
+  if (availableInput <= 0) {
+    return DEFAULT_FALLBACK_THRESHOLD;
+  }
+
+  return Math.floor(availableInput * MEMORY_THRESHOLD_PERCENTAGE);
 }
 
 /**
@@ -382,38 +764,111 @@ export function getEffectiveTokenThreshold(
  * @param config - Conversation memory configuration containing provider/model settings
  * @param previousSummary - Optional previous summary to build upon
  * @param logPrefix - Prefix for log messages (e.g., "[ConversationMemory]" or "[RedisConversationMemoryManager]")
+ * @param requestId - Optional request ID for request-scoped tracing
  * @returns Summary text or null if generation fails
  */
 export async function generateSummary(
   messages: ChatMessage[],
-  config: ConversationMemoryConfig,
+  config: Partial<ConversationMemoryConfig>,
   logPrefix = "[ConversationMemory]",
   previousSummary?: string,
+  requestId?: string,
 ): Promise<string | null> {
   const summarizationPrompt = createSummarizationPrompt(
     messages,
     previousSummary,
   );
-  const summarizer = new NeuroLink({
-    conversationMemory: { enabled: false },
-  });
+
+  const SUMMARIZER_INIT_TIMEOUT = 15_000;
+  // Config-driven: a compaction summary of a large conversation routinely
+  // needs more than the old hard-coded 60s, and each overrun silently loses
+  // one summary (non-fatal — the turn continues) with no knob to raise it.
+  const configuredTimeoutMs = config.summarizationTimeoutMs;
+  const SUMMARIZER_GENERATE_TIMEOUT =
+    typeof configuredTimeoutMs === "number" &&
+    Number.isFinite(configuredTimeoutMs) &&
+    configuredTimeoutMs > 0
+      ? configuredTimeoutMs
+      : 60_000;
 
   try {
+    if (!cachedSummarizer) {
+      cachedSummarizer = await withTimeout(
+        (async () => {
+          const { NeuroLink: NeuroLinkClass } = await import("../neurolink.js");
+          return new NeuroLinkClass({
+            conversationMemory: { enabled: false },
+          });
+        })(),
+        SUMMARIZER_INIT_TIMEOUT,
+        new Error("Summarizer initialization timed out"),
+      );
+    }
     if (!config.summarizationProvider || !config.summarizationModel) {
-      logger.error(`${logPrefix} Missing summarization provider`);
+      logger.error(`${logPrefix} Missing summarization provider`, {
+        requestId,
+      });
       return null;
     }
 
-    const summaryResult = await summarizer.generate({
-      input: { text: summarizationPrompt },
-      provider: config.summarizationProvider,
-      model: config.summarizationModel,
-      disableTools: true,
-    });
+    const summaryResult = await withTimeout(
+      cachedSummarizer.generate({
+        input: { text: summarizationPrompt },
+        provider: config.summarizationProvider,
+        model: config.summarizationModel,
+        disableTools: true,
+      }),
+      SUMMARIZER_GENERATE_TIMEOUT,
+      new Error("Summary generation timed out"),
+    );
 
     return summaryResult.content || null;
   } catch (error) {
-    logger.error(`${logPrefix} Error generating summary`, { error });
+    logger.error(`${logPrefix} Error generating summary`, { requestId, error });
     return null;
+  }
+}
+
+/**
+ * Check if Redis is available for conversation memory.
+ * Migrated from the deprecated conversationMemoryUtils.ts.
+ */
+export async function checkRedisAvailability(): Promise<boolean> {
+  const { createRedisClient, getNormalizedConfig } = await import("./redis.js");
+  let testClient = null;
+  try {
+    const testConfig = getNormalizedConfig({
+      host: process.env.REDIS_HOST,
+      port: process.env.REDIS_PORT ? Number(process.env.REDIS_PORT) : undefined,
+      password: process.env.REDIS_PASSWORD,
+      db: process.env.REDIS_DB ? Number(process.env.REDIS_DB) : undefined,
+      keyPrefix: process.env.REDIS_KEY_PREFIX,
+      ttl: process.env.REDIS_TTL ? Number(process.env.REDIS_TTL) : undefined,
+      connectionOptions: {
+        connectTimeout: 5000,
+        maxRetriesPerRequest: 1,
+        retryDelayOnFailover: 100,
+      },
+    });
+    testClient = await createRedisClient(testConfig);
+    await testClient.ping();
+    logger.debug("Redis connection test successful");
+    return true;
+  } catch (error) {
+    logger.debug("Redis connection test failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  } finally {
+    if (testClient) {
+      try {
+        await testClient.quit();
+      } catch (quitError) {
+        logger.debug("Error during Redis test client disconnect", {
+          error:
+            quitError instanceof Error ? quitError.message : String(quitError),
+        });
+      }
+    }
   }
 }

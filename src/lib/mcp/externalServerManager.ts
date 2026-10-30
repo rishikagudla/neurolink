@@ -8,13 +8,21 @@
  */
 
 import { EventEmitter } from "events";
+import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { mcpLogger } from "../utils/logger.js";
-import { MCPClientFactory } from "./mcpClientFactory.js";
+import {
+  MCPClientFactory,
+  terminateLiveStdioServers,
+} from "./mcpClientFactory.js";
 import { ToolDiscoveryService } from "./toolDiscoveryService.js";
 import { toolRegistry } from "./toolRegistry.js";
-import type { HITLManager } from "../types/hitlTypes.js";
-import { HITLUserRejectedError, HITLTimeoutError } from "../hitl/hitlErrors.js";
 import type {
+  HITLManager,
+  JsonValue,
+  JsonObject,
+  UnknownRecord,
+  ServerLoadResult,
   ExternalMCPServerInstance,
   ExternalMCPServerStatus,
   ExternalMCPServerHealth,
@@ -24,51 +32,249 @@ import type {
   ExternalMCPManagerConfig,
   ExternalMCPToolInfo,
   RuntimeMCPServerInfo,
-} from "../types/externalMcp.js";
-import type {
   MCPServerInfo,
   MCPServerCategory,
+  MCPServerReadiness,
   MCPTransportType,
-} from "../types/mcpTypes.js";
-import type { JsonValue, JsonObject, UnknownRecord } from "../types/common.js";
+} from "../types/index.js";
+import { HITLUserRejectedError, HITLTimeoutError } from "../hitl/hitlErrors.js";
 import { detectCategory } from "../utils/mcpDefaults.js";
-import type { ServerLoadResult } from "../types/typeAliases.js";
+
 import { isObject, isNonNullObject } from "../utils/typeUtils.js";
+import { recordMCPToolCall } from "../telemetry/aiMetrics.js";
+import { tracers } from "../telemetry/tracers.js";
+import { SpanStatusCode } from "@opentelemetry/api";
+
+// `@modelcontextprotocol/sdk`'s stdio transport (imported above) does
+// `import process from "node:process"` at module scope. Node's ESM/CJS
+// interop builds a synthetic module facade for that import by walking every
+// property getter on the builtin `process` singleton — including the
+// lazily-initialized `stdin` getter — so merely importing this module
+// creates and permanently refs a stdin handle, whether or not an MCP stdio
+// client is ever constructed. A single ref'd handle is enough to keep the
+// event loop, and the whole process, alive forever. unref() does not close
+// stdin or stop it from being read (a consumer that later actually reads
+// from it — e.g. the CLI's piped-input path — calls `.ref()` again right
+// before it does), it only stops an otherwise-idle stdin from blocking exit.
+//
+// This unref runs at import time, before any consumer of THIS package —
+// this package's own CLI paths and an external SDK caller alike — has had a
+// chance to attach its own stdin listeners. A CLI code path knows to call
+// `ensureStdinRef()` first (see src/cli/utils/stdinRef.ts), but an external
+// script that just does `import { NeuroLink } from "@juspay/neurolink"` and
+// then reads `process.stdin` itself — an ordinary, previously-working
+// pattern — has no reason to know this package touched stdin at all, and
+// without a safety net the process can exit before the piped data ever
+// arrives: silently, with no error, because an unref'd handle simply stops
+// keeping the event loop alive on its own.
+//
+// So: re-ref stdin the first time anything registers a listener that
+// actually consumes it. "data" covers `.on("data", ...)` directly and
+// `.pipe()` (which attaches its own "data" listener internally); "readable"
+// covers paused-mode reads and the async iterator
+// (`for await (const chunk of process.stdin)`, which attaches a "readable"
+// listener under the hood). This restores stdin's normal, non-unref'd
+// behavior for any real consumer — internal or external — while a process
+// that never touches stdin still exits on its own.
+if (process.stdin && typeof process.stdin.unref === "function") {
+  process.stdin.unref();
+  process.stdin.prependListener(
+    "newListener",
+    (event: string | symbol): void => {
+      if (event === "data" || event === "readable") {
+        process.stdin.ref();
+      }
+    },
+  );
+}
+
+const isMCPTransportFetch = (
+  value: unknown,
+): value is typeof globalThis.fetch => typeof value === "function";
+
+const readMCPTransportFetch = (
+  value: unknown,
+): typeof globalThis.fetch | undefined => {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (!isMCPTransportFetch(value)) {
+    throw new Error("MCP fetch hook must be a function");
+  }
+  return value;
+};
+
+const ENV_REFERENCE_PATTERN = /\$\{([^}]*)\}/g;
+const ENV_REFERENCE_PRESENT = /\$\{[^}]*\}/;
+/**
+ * The only shape a `${…}` reference may take. Anything else — lower case,
+ * a leading digit, `${}`, `${a.b}`, `${PATH:-x}` — is left as written, so a
+ * config cannot probe the environment through odd names.
+ */
+const ENV_NAME_PATTERN = /^[A-Z][A-Z0-9_]*$/;
 
 /**
- * Recursively substitute environment variables in strings
- * Replaces ${VAR_NAME} with the value from process.env.VAR_NAME
- * @param value - Value to process (string, object, array, or primitive)
- * @returns Processed value with environment variables substituted
+ * Recursively substitute `${NAME}` references in `value` from `process.env`.
+ *
+ * Applies to a server's `env` and `args` only. `headers` and `url` are sent
+ * to a remote host, so a reference there would ship the variable's value off
+ * the machine; they are passed through unchanged by `warnOnEnvReferences`.
+ *
+ * @param value - string, array, object or primitive
+ * @param field - the config field being processed, for log messages
  */
-function substituteEnvVariables<T>(value: T): T {
+function substituteEnvVariables<T>(value: T, field: string): T {
   if (typeof value === "string") {
-    // Replace ${VAR_NAME} with process.env.VAR_NAME
-    return value.replace(/\$\{([^}]+)\}/g, (match, varName) => {
-      const envValue = process.env[varName.trim()];
-      if (envValue === undefined) {
-        mcpLogger.warn(
-          `[ExternalServerManager] Environment variable ${varName} is not defined, using empty string`,
-        );
-        return "";
-      }
-      return envValue;
-    }) as T;
+    return value.replace(
+      ENV_REFERENCE_PATTERN,
+      (match: string, rawName: string) => {
+        const varName = rawName.trim();
+        if (!ENV_NAME_PATTERN.test(varName)) {
+          mcpLogger.warn(
+            `[ExternalServerManager] ${field}: "${match}" is not a valid environment variable reference (names must match ^[A-Z][A-Z0-9_]*$); left as written`,
+          );
+          return match;
+        }
+        const envValue = process.env[varName];
+        if (envValue === undefined) {
+          mcpLogger.warn(
+            `[ExternalServerManager] ${field}: environment variable ${varName} is not defined, using empty string`,
+          );
+          return "";
+        }
+        return envValue;
+      },
+    ) as T;
   }
 
   if (Array.isArray(value)) {
-    return value.map((item) => substituteEnvVariables(item)) as T;
+    return value.map((item) => substituteEnvVariables(item, field)) as T;
   }
 
   if (isNonNullObject(value)) {
     const result: Record<string, unknown> = {};
     for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
-      result[key] = substituteEnvVariables(val);
+      result[key] = substituteEnvVariables(val, field);
     }
     return result as T;
   }
 
   return value;
+}
+
+/**
+ * Warn about `${NAME}` references in a field that is never expanded. The
+ * value is used exactly as written: a header reading `Bearer ${TOKEN}` is
+ * sent literally, which fails authentication loudly instead of leaking.
+ */
+function warnOnEnvReferences(value: unknown, field: string): void {
+  if (typeof value === "string") {
+    if (ENV_REFERENCE_PRESENT.test(value)) {
+      mcpLogger.warn(
+        `[ExternalServerManager] ${field} contains a \${VAR} reference; environment variables are never expanded in ${field} (only in env and args). The value is used as written.`,
+      );
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      warnOnEnvReferences(item, field);
+    }
+    return;
+  }
+  if (isNonNullObject(value)) {
+    for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+      warnOnEnvReferences(val, `${field}.${key}`);
+    }
+  }
+}
+
+/**
+ * The two messages the MCP SDK produces when the transport underneath a
+ * request is gone: `Protocol._onclose` rejects every pending request with
+ * `MCP error -32000: Connection closed`, and `StdioClientTransport.send`
+ * throws a bare `Not connected` once the child has closed. Both are matched
+ * on the SDK's exact text so a tool's own error output that happens to
+ * mention a closed connection cannot be mistaken for the server dying.
+ */
+const CONNECTION_LOST_PATTERN =
+  /^Not connected$|MCP error -32000: Connection closed/;
+
+function isConnectionLostError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return CONNECTION_LOST_PATTERN.test(message);
+}
+
+/**
+ * Thrown by `startServer` when a server's discovered tool count falls below
+ * its configured `minTools` floor. Deliberately thrown *inside* the same
+ * try/catch that already handles every other start failure, so the existing
+ * machinery (status -> "failed", `lastError`, span exception recording,
+ * rethrow to `addServer`'s own catch) applies unchanged; `addServer`
+ * recognizes this specific error via `instanceof` to attach the
+ * `readiness: "insufficient_tools"` + `toolsDiscovered` metadata that a
+ * generic start failure does not carry.
+ */
+class InsufficientToolsError extends Error {
+  readonly readiness: MCPServerReadiness = "insufficient_tools";
+
+  constructor(
+    readonly serverId: string,
+    readonly toolsDiscovered: number,
+    readonly minTools: number,
+  ) {
+    super(
+      `Server '${serverId}' discovered ${toolsDiscovered} tool(s), below the configured minTools=${minTools}`,
+    );
+    this.name = "InsufficientToolsError";
+  }
+}
+
+/**
+ * Consecutive idle health checks a server may fail to answer before it is
+ * treated as hung and restarted. Two, not one: a single missed ping right
+ * after a long tool call is the server draining its queue, not a wedge.
+ */
+const UNRESPONSIVE_CHECKS_BEFORE_RESTART = 2;
+
+/**
+ * Sensitive CLI flag patterns whose following value should be masked in logs.
+ */
+const SENSITIVE_ARG_PATTERNS =
+  /^--(api-key|token|secret|password|key|figma-api-key|access-token|auth|credential)$/i;
+
+/**
+ * Redact values that follow sensitive flags in a CLI args array.
+ * Handles: "--api-key sk-abc", "--api-key=sk-abc", consecutive flags.
+ * E.g. ["--api-key", "sk-abc123"] → ["--api-key", "[REDACTED]"]
+ *      ["--api-key=sk-abc123"]    → ["--api-key=[REDACTED]"]
+ */
+function redactSensitiveArgs(args?: string[]): string[] | undefined {
+  if (!args || args.length === 0) {
+    return args;
+  }
+  const redacted = [...args];
+  for (let i = 0; i < redacted.length; i++) {
+    // Handle --flag=value inline form
+    const eqIdx = redacted[i].indexOf("=");
+    if (eqIdx !== -1) {
+      const flag = redacted[i].substring(0, eqIdx);
+      if (SENSITIVE_ARG_PATTERNS.test(flag)) {
+        redacted[i] = `${flag}=[REDACTED]`;
+      }
+      continue;
+    }
+    // Handle --flag value (two-part form)
+    if (
+      SENSITIVE_ARG_PATTERNS.test(redacted[i]) &&
+      i + 1 < redacted.length &&
+      !redacted[i + 1].startsWith("--")
+    ) {
+      redacted[i + 1] = "[REDACTED]";
+      i++; // skip the redacted value
+    }
+  }
+  return redacted;
 }
 
 /**
@@ -164,18 +370,291 @@ function isValidExternalMCPServerConfig(
     (record.retryConfig === undefined || isNonNullObject(record.retryConfig)) &&
     (record.rateLimiting === undefined ||
       isNonNullObject(record.rateLimiting)) &&
+    (record.inheritParentEnv === undefined ||
+      typeof record.inheritParentEnv === "boolean") &&
+    (record.allowPrivateNetwork === undefined ||
+      typeof record.allowPrivateNetwork === "boolean") &&
     (record.metadata === undefined || isNonNullObject(record.metadata))
   );
+}
+
+/**
+ * Convert one `mcpServers` entry of a project config into an `MCPServerInfo`.
+ *
+ * Shared by the parallel and sequential loaders so the two cannot drift.
+ * `${NAME}` references are expanded in `env` and `args` only; `headers` and
+ * `url` are passed through as written (see `warnOnEnvReferences`).
+ *
+ * @throws when the entry fails `isValidExternalMCPServerConfig`
+ */
+function toExternalServerInfo(
+  serverId: string,
+  serverConfig: unknown,
+): MCPServerInfo {
+  if (!isValidExternalMCPServerConfig(serverConfig)) {
+    throw new Error(
+      `Invalid server config for ${serverId}: missing required properties or wrong types`,
+    );
+  }
+
+  if (serverConfig.headers !== undefined) {
+    warnOnEnvReferences(serverConfig.headers, `${serverId}.headers`);
+  }
+  if (serverConfig.url !== undefined) {
+    warnOnEnvReferences(serverConfig.url, `${serverId}.url`);
+  }
+
+  return {
+    id: serverId,
+    name: serverId,
+    description:
+      typeof serverConfig.description === "string"
+        ? serverConfig.description
+        : `External MCP server: ${serverId}`,
+    transport:
+      typeof serverConfig.transport === "string"
+        ? (serverConfig.transport as MCPTransportType)
+        : "stdio",
+    status: "initializing" as const,
+    tools: [],
+    command:
+      typeof serverConfig.command === "string"
+        ? serverConfig.command
+        : undefined,
+    args: Array.isArray(serverConfig.args)
+      ? substituteEnvVariables(
+          serverConfig.args.map((arg) => String(arg)),
+          `${serverId}.args`,
+        )
+      : [],
+    env: isNonNullObject(serverConfig.env)
+      ? substituteEnvVariables(
+          serverConfig.env as Record<string, string>,
+          `${serverId}.env`,
+        )
+      : {},
+    inheritParentEnv:
+      typeof serverConfig.inheritParentEnv === "boolean"
+        ? serverConfig.inheritParentEnv
+        : undefined,
+    allowPrivateNetwork:
+      typeof serverConfig.allowPrivateNetwork === "boolean"
+        ? serverConfig.allowPrivateNetwork
+        : undefined,
+    timeout:
+      typeof serverConfig.timeout === "number"
+        ? serverConfig.timeout
+        : undefined,
+    retries:
+      typeof serverConfig.retries === "number"
+        ? serverConfig.retries
+        : undefined,
+    healthCheckInterval:
+      typeof serverConfig.healthCheckInterval === "number"
+        ? serverConfig.healthCheckInterval
+        : undefined,
+    autoRestart:
+      typeof serverConfig.autoRestart === "boolean"
+        ? serverConfig.autoRestart
+        : undefined,
+    cwd: typeof serverConfig.cwd === "string" ? serverConfig.cwd : undefined,
+    url: typeof serverConfig.url === "string" ? serverConfig.url : undefined,
+    // HTTP transport-specific fields — never expanded, see above.
+    headers: isNonNullObject(serverConfig.headers)
+      ? (serverConfig.headers as Record<string, string>)
+      : undefined,
+    fetch: readMCPTransportFetch(serverConfig.fetch),
+    httpOptions: isNonNullObject(serverConfig.httpOptions)
+      ? (serverConfig.httpOptions as MCPServerInfo["httpOptions"])
+      : undefined,
+    retryConfig: isNonNullObject(serverConfig.retryConfig)
+      ? (serverConfig.retryConfig as MCPServerInfo["retryConfig"])
+      : undefined,
+    rateLimiting: isNonNullObject(serverConfig.rateLimiting)
+      ? (serverConfig.rateLimiting as MCPServerInfo["rateLimiting"])
+      : undefined,
+    blockedTools: Array.isArray(serverConfig.blockedTools)
+      ? (serverConfig.blockedTools as string[])
+      : undefined,
+    metadata: safeMetadataConversion(serverConfig.metadata),
+  };
 }
 
 /**
  * ExternalServerManager
  * Core class for managing external MCP servers
  */
+/**
+ * Process-signal cleanup, shared across every manager instance.
+ *
+ * Each delegated worker constructs its own NeuroLink and therefore its own
+ * manager; registering SIGINT/SIGTERM/beforeExit per instance leaked listeners
+ * (never removed) and crossed Node's 10-listener default on multi-worker runs.
+ * One process-level trio walks the live set instead; `shutdown()` removes the
+ * instance from the set, so a disposed manager costs nothing.
+ */
+const liveManagers = new Set<ExternalServerManager>();
+let processCleanupInstalled = false;
+
+const cleanupLiveManagers = async (): Promise<void> => {
+  // Concurrent across managers, matching the pattern one level down: a
+  // single manager's own shutdown() already fans its servers out via
+  // Promise.all rather than awaiting them one at a time. A sequential
+  // for-await here would make total SIGTERM/beforeExit cleanup time scale
+  // with the number of concurrently-alive managers instead of being bounded
+  // by the slowest one — real for this codebase, since the shared handler
+  // set above exists specifically because multiple managers are commonly
+  // alive at once (one per worker an agent delegates to).
+  await Promise.all(
+    Array.from(liveManagers).map((manager) =>
+      manager.shutdown().catch((error) => {
+        mcpLogger.error(
+          "[ExternalServerManager] Error during process-exit cleanup:",
+          error,
+        );
+      }),
+    ),
+  );
+};
+
+/**
+ * beforeExit fires when the event loop is about to go idle. The cleanup it
+ * kicks off does its own async I/O, so this cycle will not drain — Node
+ * fires beforeExit again once that work resolves and finds nothing left,
+ * which is how the process is meant to exit on its own here, without an
+ * explicit process.exit() call.
+ */
+const shutdownOnBeforeExit = (): void => {
+  void cleanupLiveManagers();
+};
+
+/**
+ * signal-exit@4 (reached at runtime through `ora` -> `cli-cursor` ->
+ * `restore-cursor`, a direct dependency this package's CLI spinners use)
+ * makes the mirror-image decision to the gate below: it skips its own
+ * post-cleanup re-raise whenever it sees another listener for the signal
+ * still registered. Counting signal-exit's listener as host-owned here means
+ * both sides defer to the other and neither ever re-raises — a live
+ * spinner's cursor-restore listener would silently reintroduce the exact
+ * defect this file exists to fix.
+ *
+ * There's no reference to signal-exit's own listener function to compare
+ * against (it's private state inside that package), so it's detected the
+ * same way signal-exit's v3/v4 majors detect each other: a shared marker
+ * signal-exit itself defines. Every signal-exit v4 instance is a
+ * `globalThis`-wide singleton keyed by `Symbol.for("signal-exit emitter")`
+ * — but that key is shared across ANY number of distinct resolved copies of
+ * the package, not just identical ones. If two transitive dependencies pin
+ * non-overlapping signal-exit@4 ranges, npm/pnpm will not dedupe them, and
+ * each loaded copy independently increments the shared emitter's `count` by
+ * one AND registers its own real, distinct listener per signal it covers
+ * (SIGINT and SIGTERM both are, in every signal-exit v4 release). So `count`
+ * is a faithful running total of real signal-exit-owned listeners on
+ * `process` — one per loaded copy — and has to be discounted in full,
+ * never clamped to at most one, or a second loaded copy's very real
+ * listener gets miscounted as a host's own and silently defeats the
+ * re-raise this file exists to perform.
+ */
+const SIGNAL_EXIT_EMITTER: unique symbol = Symbol.for("signal-exit emitter");
+const getSignalExitOwnedListenerCount = (): number => {
+  const globalWithSignalExit = globalThis as {
+    [SIGNAL_EXIT_EMITTER]?: { count?: unknown };
+  };
+  const count = globalWithSignalExit[SIGNAL_EXIT_EMITTER]?.count;
+  return typeof count === "number" && count > 0 ? count : 0;
+};
+
+/**
+ * SIGINT/SIGTERM: registering a listener for either suppresses Node's
+ * default immediate-termination behavior for that signal. The previous
+ * handler ran cleanup fire-and-forget and never terminated the process
+ * afterward, so the process survived a signal it claimed to handle and
+ * needed SIGKILL to actually stop.
+ *
+ * This must NOT call process.exit() itself — this is library code that can
+ * run inside a host application, and unilaterally choosing the process's
+ * exit code/timing pre-empts whatever shutdown behavior the host installed
+ * for this same signal. Instead, once cleanup settles, remove our own
+ * listener and re-send the signal: if the host registered its own handler
+ * it now runs (we are no longer in front of it), and if nothing else is
+ * listening, Node's default terminate-on-signal behavior applies and the
+ * exit code is the correct signal-based one without us deciding it. Either
+ * way the process actually stops in response to the signal, which is the
+ * behavior this fixes — we just stop being the one that forces it down.
+ */
+const shutdownOnSignal = (signal: NodeJS.Signals): void => {
+  // Whether anyone ELSE is listening has to be decided HERE, synchronously, at
+  // the top of the dispatch — not after cleanup resolves. Node removes a
+  // `process.once` listener as it dispatches to it, so a host using the very
+  // common one-shot shutdown shape leaves a listener count of zero behind
+  // while its own async drain is still running. Reading the count later would
+  // see that zero, conclude nobody was listening, re-raise, and kill the host
+  // mid-shutdown — the exact harm this gate exists to prevent, reached from
+  // the other side. Pairing this snapshot with `prependListener` at
+  // registration is what makes it correct: we run before any other listener,
+  // so nothing has been consumed yet and every host listener is still counted.
+  //
+  // signal-exit's own listener (if loaded) is subtracted out first: it is a
+  // cursor-restore helper, not a host that owns this process's shutdown
+  // decision, and counting it as one would defer to it forever (see above).
+  const hadOtherListeners =
+    process.listenerCount(signal) - getSignalExitOwnedListenerCount() > 1;
+  void cleanupLiveManagers().finally(() => {
+    // With a host handler present, that handler already received this delivery
+    // and already made its own keep-alive/exit decision; re-sending would run
+    // it a second time it never asked for, and for the common "first signal
+    // drains, second one forces" shape that tears it down early.
+    //
+    // Note what is NOT done in that case: the listener stays registered. A
+    // host that owns the signal may well decide to keep running, and
+    // `processCleanupInstalled` is a one-shot latch — so a listener removed
+    // here is never reinstalled, and any manager constructed afterwards would
+    // silently lose signal cleanup for the rest of the process's life. The
+    // removal exists for exactly one purpose, to let the re-raise reach Node's
+    // default disposition instead of coming back to us, so it belongs with the
+    // re-raise and nowhere else.
+    if (!hadOtherListeners) {
+      process.removeListener(signal, shutdownOnSignal);
+      // Dying of a signal runs no `exit` handler, and the cleanup above reaches
+      // only the servers a manager has recorded and that close when asked.
+      terminateLiveStdioServers();
+      process.kill(process.pid, signal);
+    }
+  });
+};
+
+const registerManagerForProcessCleanup = (
+  manager: ExternalServerManager,
+): void => {
+  liveManagers.add(manager);
+  if (!processCleanupInstalled) {
+    processCleanupInstalled = true;
+    // prependListener, not on: the gate above counts listeners at dispatch, and
+    // that count is only trustworthy if nothing has been consumed yet. Running
+    // first guarantees that. It also costs a host nothing — our handler only
+    // starts async cleanup and never blocks the listeners behind it.
+    process.prependListener("SIGINT", shutdownOnSignal);
+    process.prependListener("SIGTERM", shutdownOnSignal);
+    process.on("beforeExit", shutdownOnBeforeExit);
+  }
+};
+
 export class ExternalServerManager extends EventEmitter {
   private servers: Map<string, RuntimeMCPServerInfo> = new Map();
   private config: Required<ExternalMCPManagerConfig>;
   private isShuttingDown = false;
+  /** Servers whose previous ping has not returned; the interval must not stack. */
+  private healthChecksInFlight = new Set<string>();
+  /** Tool calls currently executing per server; a busy server is not a hung one. */
+  private inFlightToolCalls = new Map<string, number>();
+  /** Consecutive pings missed while idle, per server. */
+  private unresponsiveChecks = new Map<string, number>();
+  private consecutiveFailures = new Map<string, number>();
+  private retryDeadlines = new Map<string, Date>();
+  private lastHealth = new Map<string, ExternalMCPServerHealth>();
+  private lifecycleStates = new Map<string, ExternalMCPServerStatus>();
+  /** Closed clients must never publish readiness after an awaited startup phase. */
+  private closedClients = new WeakSet<Client>();
   private toolDiscovery: ToolDiscoveryService;
   private enableMainRegistryIntegration: boolean;
   private hitlManager?: HITLManager; // Optional HITL manager for safety mechanisms
@@ -187,9 +666,15 @@ export class ExternalServerManager extends EventEmitter {
     super();
 
     // Set defaults for configuration
+    // Default timeout increased to 60s and made configurable via MCP_CLIENT_TIMEOUT
+    // to accommodate MCP server startup latency (especially concurrent stdio servers)
+    const defaultMcpTimeout = Math.max(
+      5000,
+      Number(process.env.MCP_CLIENT_TIMEOUT) || 60000,
+    );
     this.config = {
       maxServers: config.maxServers ?? 10,
-      defaultTimeout: config.defaultTimeout ?? 10000,
+      defaultTimeout: config.defaultTimeout ?? defaultMcpTimeout,
       defaultHealthCheckInterval: config.defaultHealthCheckInterval ?? 30000,
       enableAutoRestart: config.enableAutoRestart ?? true,
       maxRestartAttempts: config.maxRestartAttempts ?? 3,
@@ -207,17 +692,39 @@ export class ExternalServerManager extends EventEmitter {
 
     // Forward tool discovery events
     this.toolDiscovery.on("toolRegistered", (event) => {
-      this.emit("toolDiscovered", event);
+      this.emit("toolDiscovered", {
+        ...event,
+        serverName: this.getServerName(event.serverId),
+      });
     });
 
     this.toolDiscovery.on("toolUnregistered", (event) => {
-      this.emit("toolRemoved", event);
+      this.emit("toolRemoved", {
+        ...event,
+        serverName: this.getServerName(event.serverId),
+      });
     });
 
-    // Handle process cleanup
-    process.on("SIGINT", () => this.shutdown());
-    process.on("SIGTERM", () => this.shutdown());
-    process.on("beforeExit", () => this.shutdown());
+    // Handle process cleanup through the SHARED handler set: one trio of process
+    // listeners for every manager, however many instances a run constructs.
+    // Per-instance `process.on(...)` here crossed Node's 10-listener default as
+    // soon as an agent delegated to a handful of workers (each worker builds its
+    // own NeuroLink, which builds its own manager) and warned MaxListenersExceeded.
+    registerManagerForProcessCleanup(this);
+  }
+
+  /**
+   * Attach a McpOutputNormalizer to the underlying ToolDiscoveryService.
+   * All tool outputs will be measured and (if oversized) replaced with compact
+   * surrogates before being returned to callers.
+   */
+  setOutputNormalizer(
+    normalizer: import("./mcpOutputNormalizer.js").McpOutputNormalizer,
+  ): void {
+    this.toolDiscovery.setOutputNormalizer(normalizer);
+    mcpLogger.debug(
+      "[ExternalServerManager] MCP output normalizer attached to ToolDiscoveryService",
+    );
   }
 
   /**
@@ -245,9 +752,28 @@ export class ExternalServerManager extends EventEmitter {
   }
 
   /**
-   * Load MCP server configurations from .mcp-config.json file with parallel loading support
-   * Automatically registers servers found in the configuration
-   * @param configPath Optional path to config file (defaults to .mcp-config.json in cwd)
+   * Resolve the human-readable server name for an event payload.
+   * Falls back to serverId if the instance or config.name isn't available.
+   */
+  getServerName(serverId: string): string {
+    const instance = this.servers.get(serverId);
+    return instance?.config?.name || serverId;
+  }
+
+  /**
+   * Load MCP server configurations from a `.mcp-config.json`-shaped file and
+   * register every server it names.
+   *
+   * Calling this is an explicit decision to run that file's servers. With no
+   * `configPath` it reads `.mcp-config.json` from the working directory, so
+   * a host must only omit the path when it controls that directory; the SDK
+   * itself never calls this without a path it resolved through
+   * `resolveProjectMcpConfigPath` (see `projectConfigTrust.ts`).
+   *
+   * `${NAME}` references in each server's `env` and `args` are expanded from
+   * `process.env`; `headers` and `url` are used as written.
+   *
+   * @param configPath Path to the config file (defaults to .mcp-config.json in cwd)
    * @param options Loading options including parallel support
    * @returns Promise resolving to { serversLoaded, errors }
    */
@@ -301,90 +827,16 @@ export class ExternalServerManager extends EventEmitter {
       const serverPromises = Object.entries(config.mcpServers).map(
         async ([serverId, serverConfig]) => {
           try {
-            // Validate and convert config format to MCPServerInfo
-            if (!isValidExternalMCPServerConfig(serverConfig)) {
-              throw new Error(
-                `Invalid server config for ${serverId}: missing required properties or wrong types`,
-              );
-            }
-
-            const externalConfig: MCPServerInfo = {
-              id: serverId,
-              name: serverId,
-              description:
-                typeof serverConfig.description === "string"
-                  ? serverConfig.description
-                  : `External MCP server: ${serverId}`,
-              transport:
-                typeof serverConfig.transport === "string"
-                  ? (serverConfig.transport as MCPTransportType)
-                  : "stdio",
-              status: "initializing" as const,
-              tools: [],
-              command:
-                typeof serverConfig.command === "string"
-                  ? serverConfig.command
-                  : undefined,
-              args: Array.isArray(serverConfig.args)
-                ? (serverConfig.args as string[])
-                : [],
-              env: isNonNullObject(serverConfig.env)
-                ? substituteEnvVariables(
-                    serverConfig.env as Record<string, string>,
-                  )
-                : {},
-              timeout:
-                typeof serverConfig.timeout === "number"
-                  ? serverConfig.timeout
-                  : undefined,
-              retries:
-                typeof serverConfig.retries === "number"
-                  ? serverConfig.retries
-                  : undefined,
-              healthCheckInterval:
-                typeof serverConfig.healthCheckInterval === "number"
-                  ? serverConfig.healthCheckInterval
-                  : undefined,
-              autoRestart:
-                typeof serverConfig.autoRestart === "boolean"
-                  ? serverConfig.autoRestart
-                  : undefined,
-              cwd:
-                typeof serverConfig.cwd === "string"
-                  ? serverConfig.cwd
-                  : undefined,
-              url:
-                typeof serverConfig.url === "string"
-                  ? serverConfig.url
-                  : undefined,
-              // HTTP transport-specific fields
-              headers: isNonNullObject(serverConfig.headers)
-                ? substituteEnvVariables(
-                    serverConfig.headers as Record<string, string>,
-                  )
-                : undefined,
-              httpOptions: isNonNullObject(serverConfig.httpOptions)
-                ? (serverConfig.httpOptions as MCPServerInfo["httpOptions"])
-                : undefined,
-              retryConfig: isNonNullObject(serverConfig.retryConfig)
-                ? (serverConfig.retryConfig as MCPServerInfo["retryConfig"])
-                : undefined,
-              rateLimiting: isNonNullObject(serverConfig.rateLimiting)
-                ? (serverConfig.rateLimiting as MCPServerInfo["rateLimiting"])
-                : undefined,
-              blockedTools: Array.isArray(serverConfig.blockedTools)
-                ? (serverConfig.blockedTools as string[])
-                : undefined,
-              metadata: safeMetadataConversion(serverConfig.metadata),
-            };
-
+            const externalConfig = toExternalServerInfo(serverId, serverConfig);
             const result = await this.addServer(serverId, externalConfig);
             return { serverId, result };
           } catch (error) {
             const errorMsg = `Failed to load MCP server ${serverId}: ${
               error instanceof Error ? error.message : String(error)
             }`;
-            mcpLogger.warn(`[ExternalServerManager] ${errorMsg}`);
+            // No log here: the result-processing loop below owns the single
+            // ERROR record for this failure (logging in both places
+            // double-counted every parallel-load failure).
             return { serverId, error: errorMsg };
           }
         },
@@ -407,10 +859,17 @@ export class ExternalServerManager extends EventEmitter {
             );
           } else if (error) {
             errors.push(error);
+            // Config-loaded servers never pass through
+            // NeuroLink.addExternalMCPServer, so this is the outermost point
+            // for them — it owns the single ERROR record per failed server.
+            mcpLogger.error(
+              `[ExternalServerManager] Failed to load server ${serverId}: ${error}`,
+            );
           } else if (serverResult && !serverResult.success) {
             const errorMsg = `Failed to load server ${serverId}: ${serverResult.error}`;
             errors.push(errorMsg);
-            mcpLogger.warn(`[ExternalServerManager] ${errorMsg}`);
+            // See above: outermost point for config-loaded servers.
+            mcpLogger.error(`[ExternalServerManager] ${errorMsg}`);
           }
         } else {
           // Promise.allSettled rejected - this shouldn't happen with our error handling
@@ -477,81 +936,7 @@ export class ExternalServerManager extends EventEmitter {
         config.mcpServers,
       )) {
         try {
-          // Validate and convert config format to MCPServerInfo
-          if (!isValidExternalMCPServerConfig(serverConfig)) {
-            throw new Error(
-              `Invalid server config for ${serverId}: missing required properties or wrong types`,
-            );
-          }
-          const externalConfig: MCPServerInfo = {
-            id: serverId,
-            name: serverId,
-            description:
-              typeof serverConfig.description === "string"
-                ? serverConfig.description
-                : `External MCP server: ${serverId}`,
-            transport:
-              typeof serverConfig.transport === "string"
-                ? (serverConfig.transport as MCPTransportType)
-                : "stdio",
-            status: "initializing" as const,
-            tools: [],
-            command:
-              typeof serverConfig.command === "string"
-                ? serverConfig.command
-                : undefined,
-            args: Array.isArray(serverConfig.args)
-              ? (serverConfig.args as string[])
-              : [],
-            env: isNonNullObject(serverConfig.env)
-              ? substituteEnvVariables(
-                  serverConfig.env as Record<string, string>,
-                )
-              : {},
-            timeout:
-              typeof serverConfig.timeout === "number"
-                ? serverConfig.timeout
-                : undefined,
-            retries:
-              typeof serverConfig.retries === "number"
-                ? serverConfig.retries
-                : undefined,
-            healthCheckInterval:
-              typeof serverConfig.healthCheckInterval === "number"
-                ? serverConfig.healthCheckInterval
-                : undefined,
-            autoRestart:
-              typeof serverConfig.autoRestart === "boolean"
-                ? serverConfig.autoRestart
-                : undefined,
-            cwd:
-              typeof serverConfig.cwd === "string"
-                ? serverConfig.cwd
-                : undefined,
-            url:
-              typeof serverConfig.url === "string"
-                ? serverConfig.url
-                : undefined,
-            // HTTP transport-specific fields
-            headers: isNonNullObject(serverConfig.headers)
-              ? substituteEnvVariables(
-                  serverConfig.headers as Record<string, string>,
-                )
-              : undefined,
-            httpOptions: isNonNullObject(serverConfig.httpOptions)
-              ? (serverConfig.httpOptions as MCPServerInfo["httpOptions"])
-              : undefined,
-            retryConfig: isNonNullObject(serverConfig.retryConfig)
-              ? (serverConfig.retryConfig as MCPServerInfo["retryConfig"])
-              : undefined,
-            rateLimiting: isNonNullObject(serverConfig.rateLimiting)
-              ? (serverConfig.rateLimiting as MCPServerInfo["rateLimiting"])
-              : undefined,
-            blockedTools: Array.isArray(serverConfig.blockedTools)
-              ? (serverConfig.blockedTools as string[])
-              : undefined,
-            metadata: safeMetadataConversion(serverConfig.metadata),
-          };
+          const externalConfig = toExternalServerInfo(serverId, serverConfig);
 
           const result = await this.addServer(serverId, externalConfig);
 
@@ -563,14 +948,18 @@ export class ExternalServerManager extends EventEmitter {
           } else {
             const error = `Failed to load server ${serverId}: ${result.error}`;
             errors.push(error);
-            mcpLogger.warn(`[ExternalServerManager] ${error}`);
+            // Config-loaded servers never pass through
+            // NeuroLink.addExternalMCPServer — this sequential-load branch is
+            // their outermost point and owns the single ERROR record.
+            mcpLogger.error(`[ExternalServerManager] ${error}`);
           }
         } catch (error) {
           const errorMsg = `Failed to load MCP server ${serverId}: ${
             error instanceof Error ? error.message : String(error)
           }`;
           errors.push(errorMsg);
-          mcpLogger.warn(`[ExternalServerManager] ${errorMsg}`);
+          // See above: outermost point for config-loaded servers.
+          mcpLogger.error(`[ExternalServerManager] ${errorMsg}`);
           // Continue with other servers - don't let one failure break everything
         }
       }
@@ -604,6 +993,18 @@ export class ExternalServerManager extends EventEmitter {
 
     if (!["stdio", "sse", "websocket", "http"].includes(config.transport)) {
       errors.push("Transport must be one of: stdio, sse, websocket, http");
+    }
+
+    if (config.fetch !== undefined && !isMCPTransportFetch(config.fetch)) {
+      errors.push("MCP fetch hook must be a function");
+    }
+    for (const [name, value] of Object.entries({
+      connectionTimeout: config.httpOptions?.connectionTimeout,
+      requestTimeout: config.httpOptions?.requestTimeout,
+    })) {
+      if (value !== undefined && (!Number.isFinite(value) || value <= 0)) {
+        errors.push(`${name} must be a positive finite number`);
+      }
     }
 
     // Transport-specific validation
@@ -675,15 +1076,24 @@ export class ExternalServerManager extends EventEmitter {
       env: config.env,
       tools: [], // Will be populated after server connection
       blockedTools: config.blockedTools,
+      // Preserve top-level operational fields so startServer can read them
+      timeout: config.timeout,
+      retries: config.retries,
+      healthCheckInterval: config.healthCheckInterval,
+      autoRestart: config.autoRestart,
+      minTools: config.minTools,
+      cwd: config.cwd,
+      inheritParentEnv: config.inheritParentEnv,
+      allowPrivateNetwork: config.allowPrivateNetwork,
+      url: config.url,
+      headers: config.headers,
+      fetch: config.fetch,
+      httpOptions: config.httpOptions,
+      retryConfig: config.retryConfig,
+      rateLimiting: config.rateLimiting,
+      auth: config.auth,
       metadata: {
         category: "external" as MCPServerCategory,
-        // Store additional ExternalMCPServerConfig fields in metadata
-        timeout: config.timeout,
-        retries: config.retries,
-        healthCheckInterval: config.healthCheckInterval,
-        autoRestart: config.autoRestart,
-        cwd: config.cwd,
-        url: config.url,
         ...(safeMetadataConversion(config.metadata) || {}),
       },
     };
@@ -710,6 +1120,7 @@ export class ExternalServerManager extends EventEmitter {
     configOrServerInfo: MCPServerInfo,
   ): Promise<ExternalMCPOperationResult<ExternalMCPServerInstance>> {
     const startTime = Date.now();
+    let ownedInstance: RuntimeMCPServerInfo | undefined;
 
     try {
       // Use MCPServerInfo directly (zero-conversion architecture)
@@ -748,12 +1159,17 @@ export class ExternalServerManager extends EventEmitter {
         retries: serverInfo.retries,
         healthCheckInterval: serverInfo.healthCheckInterval,
         autoRestart: serverInfo.autoRestart,
+        minTools: serverInfo.minTools,
         cwd: serverInfo.cwd,
+        inheritParentEnv: serverInfo.inheritParentEnv,
+        allowPrivateNetwork: serverInfo.allowPrivateNetwork,
         url: serverInfo.url,
         blockedTools: serverInfo.blockedTools,
         metadata: safeMetadataConversion(serverInfo.metadata),
         // HTTP transport-specific fields
         headers: serverInfo.headers,
+        auth: serverInfo.auth,
+        fetch: serverInfo.fetch,
         httpOptions: serverInfo.httpOptions,
         retryConfig: serverInfo.retryConfig,
         rateLimiting: serverInfo.rateLimiting,
@@ -805,7 +1221,8 @@ export class ExternalServerManager extends EventEmitter {
         config: tempConfig,
       };
 
-      // Store the instance
+      // Store the captured instance; failure cleanup may only remove this owner.
+      ownedInstance = instance;
       this.servers.set(serverId, instance);
 
       // Start the server
@@ -820,6 +1237,7 @@ export class ExternalServerManager extends EventEmitter {
       const convertedInstance: ExternalMCPServerInstance = {
         config: finalInstance.config,
         process: finalInstance.process,
+        pid: finalInstance.pid,
         client: finalInstance.client,
         transport: finalInstance.transportInstance,
         status: finalInstance.status as ExternalMCPServerStatus,
@@ -844,17 +1262,48 @@ export class ExternalServerManager extends EventEmitter {
         metadata: {
           timestamp: Date.now(),
           operation: "addServer",
+          readiness: "ready",
           toolsDiscovered: finalInstance.tools.length,
         },
       };
     } catch (error) {
-      mcpLogger.error(
+      // debug, not error: NeuroLink.addExternalMCPServer (the public entry
+      // point) emits the single ERROR record for a failed registration.
+      mcpLogger.debug(
         `[ExternalServerManager] Failed to add server ${serverId}:`,
         error,
       );
 
-      // Clean up if instance was created
-      this.servers.delete(serverId);
+      // A removed/replaced startup must not delete its successor's slot or health.
+      if (
+        ownedInstance !== undefined &&
+        this.servers.get(serverId) === ownedInstance &&
+        ownedInstance.status !== "stopping"
+      ) {
+        this.servers.delete(serverId);
+        this.consecutiveFailures.delete(serverId);
+        this.retryDeadlines.delete(serverId);
+        this.lastHealth.delete(serverId);
+        this.lifecycleStates.delete(serverId);
+      }
+
+      // The minTools readiness gate carries structured metadata a generic
+      // start failure does not: how many tools were actually discovered, so
+      // a caller can distinguish "too few tools" from "could not connect".
+      if (error instanceof InsufficientToolsError) {
+        return {
+          success: false,
+          error: error.message,
+          serverId,
+          duration: Date.now() - startTime,
+          metadata: {
+            timestamp: Date.now(),
+            operation: "addServer",
+            readiness: error.readiness,
+            toolsDiscovered: error.toolsDiscovered,
+          },
+        };
+      }
 
       return {
         success: false,
@@ -886,18 +1335,26 @@ export class ExternalServerManager extends EventEmitter {
 
       mcpLogger.info(`[ExternalServerManager] Removing server: ${serverId}`);
 
+      // Capture name before deletion removes the instance
+      const serverName = this.getServerName(serverId);
+
       // Stop the server
       await this.stopServer(serverId);
 
       // Remove from registry
-      this.servers.delete(serverId);
-
-      // Emit event
-      this.emit("disconnected", {
-        serverId,
-        reason: "Manually removed",
-        timestamp: new Date(),
-      } satisfies ExternalMCPServerEvents["disconnected"]);
+      if (this.servers.get(serverId) === instance) {
+        this.servers.delete(serverId);
+        this.consecutiveFailures.delete(serverId);
+        this.retryDeadlines.delete(serverId);
+        this.lastHealth.delete(serverId);
+        this.lifecycleStates.delete(serverId);
+        this.emit("disconnected", {
+          serverId,
+          serverName,
+          reason: "Manually removed",
+          timestamp: new Date(),
+        } satisfies ExternalMCPServerEvents["disconnected"]);
+      }
 
       return {
         success: true,
@@ -934,12 +1391,27 @@ export class ExternalServerManager extends EventEmitter {
 
     const config = instance.config;
 
+    const span = tracers.mcp.startSpan("mcp.server.start", {
+      attributes: {
+        "mcp.server_id": serverId,
+        "mcp.transport": config.transport,
+        "mcp.command_name": config.command
+          ? config.command.split(/[\\/]/).pop() || ""
+          : "",
+        "mcp.command_present": Boolean(config.command),
+      },
+    });
+
     try {
       this.updateServerStatus(serverId, "connecting");
+      this.toolDiscovery.clearServerTools(serverId);
+      instance.toolsMap.clear();
+      instance.toolsArray = undefined;
+      instance.tools = [];
 
       mcpLogger.debug(`[ExternalServerManager] Starting server: ${serverId}`, {
         command: config.command,
-        args: config.args,
+        args: redactSensitiveArgs(config.args),
         transport: config.transport,
       });
 
@@ -957,84 +1429,218 @@ export class ExternalServerManager extends EventEmitter {
         throw new Error(`Failed to create MCP client: ${clientResult.error}`);
       }
 
+      // Client creation is awaited: a host can remove and replace this slot meanwhile.
+      if (this.servers.get(serverId) !== instance || this.isShuttingDown) {
+        await MCPClientFactory.closeClient(
+          clientResult.client,
+          clientResult.transport,
+          clientResult.process ?? undefined,
+        );
+        throw new Error(`MCP startup for '${serverId}' was superseded`);
+      }
       // Store client components
       instance.client = clientResult.client;
       instance.transportInstance = clientResult.transport;
       instance.process = clientResult.process || null;
+      const { StdioClientTransport } =
+        await import("@modelcontextprotocol/sdk/client/stdio.js");
+      instance.pid =
+        clientResult.transport instanceof StdioClientTransport
+          ? (clientResult.transport.pid ?? undefined)
+          : undefined;
       instance.capabilities = safeMetadataConversion(clientResult.capabilities);
       instance.startTime = new Date();
       instance.lastHealthCheck = new Date();
       instance.metrics.totalConnections++;
+      this.unresponsiveChecks.delete(serverId);
 
-      // Handle process events if there's a process
-      if (instance.process) {
-        instance.process.on("error", (error) => {
-          mcpLogger.error(
-            `[ExternalServerManager] Process error for ${serverId}:`,
-            error,
+      this.attachClientLifecycle(
+        serverId,
+        clientResult.client,
+        clientResult.transport,
+      );
+
+      const assertStartupConnection = (): void => {
+        if (
+          this.servers.get(serverId) !== instance ||
+          instance.client !== clientResult.client ||
+          clientResult.client.transport !== clientResult.transport ||
+          this.closedClients.has(clientResult.client) ||
+          instance.status !== "initializing" ||
+          this.isShuttingDown
+        ) {
+          throw new Error(
+            `MCP connection for '${serverId}' was lost during startup`,
           );
-          this.handleServerError(serverId, error);
-        });
-
-        instance.process.on("exit", (code, signal) => {
-          mcpLogger.warn(
-            `[ExternalServerManager] Process exited for ${serverId}`,
-            {
-              code,
-              signal,
-            },
-          );
-          this.handleServerDisconnection(
-            serverId,
-            `Process exited with code ${code}`,
-          );
-        });
-
-        // Log stderr for debugging
-        instance.process.stderr?.on("data", (data) => {
-          const message = data.toString().trim();
-          if (message) {
-            mcpLogger.debug(
-              `[ExternalServerManager] ${serverId} stderr:`,
-              message,
-            );
-          }
-        });
-      }
-
-      this.updateServerStatus(serverId, "connected");
-
-      // Discover tools from the server
+        }
+      };
+      assertStartupConnection();
+      // Readiness belongs to this live client generation and successful discovery.
       await this.discoverServerTools(serverId);
+      assertStartupConnection();
+
+      // Readiness gate: a server whose discovered tool count falls below
+      // its configured minTools (default 0 — no minimum, so resource/prompt
+      // -only servers stay valid) is torn back down instead of being marked
+      // connected/healthy. Thrown here — before tools are registered with
+      // the main registry and before health monitoring starts — so a
+      // rejected server is never marked ready even transiently, and the
+      // throw is caught by this method's own catch below, which sets status
+      // "failed" and rethrows to addServer's catch the same way any other
+      // start failure does.
+      const minTools = config.minTools ?? 0;
+      if (instance.toolsMap.size < minTools) {
+        const toolsDiscovered = instance.toolsMap.size;
+        mcpLogger.warn(
+          `[ExternalServerManager] Server '${serverId}' discovered ${toolsDiscovered} tool(s), below the configured minTools=${minTools}; tearing the connection back down`,
+        );
+        await this.closeInstanceConnection(serverId, instance);
+        throw new InsufficientToolsError(serverId, toolsDiscovered, minTools);
+      }
 
       // Register tools with main registry if integration is enabled
       if (this.enableMainRegistryIntegration) {
         await this.registerServerToolsWithMainRegistry(serverId);
       }
 
+      assertStartupConnection();
       // Start health monitoring
+      this.consecutiveFailures.delete(serverId);
+      this.lastHealth.delete(serverId);
+      this.retryDeadlines.delete(serverId);
+      instance.lastError = undefined;
+      this.updateServerStatus(serverId, "connected");
       this.startHealthMonitoring(serverId);
 
       // Emit connected event
       this.emit("connected", {
         serverId,
+        serverName: this.getServerName(serverId),
         toolCount: instance.toolsMap.size,
         timestamp: new Date(),
       } satisfies ExternalMCPServerEvents["connected"]);
+
+      span.setAttribute("mcp.tool_count", instance.toolsMap.size);
+      span.setStatus({ code: SpanStatusCode.OK });
 
       mcpLogger.info(
         `[ExternalServerManager] Server started successfully: ${serverId}`,
       );
     } catch (error) {
-      mcpLogger.error(
+      // debug, not error: the failure is rethrown below and surfaces once at
+      // the NeuroLink.addExternalMCPServer entry point.
+      mcpLogger.debug(
         `[ExternalServerManager] Failed to start server ${serverId}:`,
         error,
       );
-      this.updateServerStatus(serverId, "failed");
-      instance.lastError =
-        error instanceof Error ? error.message : String(error);
+      if (
+        this.servers.get(serverId) === instance &&
+        instance.status !== "stopping"
+      ) {
+        await this.closeInstanceConnection(serverId, instance);
+        // Closing is asynchronous; removal or shutdown can revoke this owner.
+        const retainedOwner = this.servers.get(serverId);
+        if (
+          retainedOwner === instance &&
+          retainedOwner.status !== "stopping" &&
+          !this.isShuttingDown
+        ) {
+          this.updateServerStatus(serverId, "failed", instance);
+          instance.lastError =
+            error instanceof Error ? error.message : String(error);
+          this.consecutiveFailures.set(
+            serverId,
+            (this.consecutiveFailures.get(serverId) ?? 0) + 1,
+          );
+          this.emit("failed", {
+            serverId,
+            serverName: this.getServerName(serverId),
+            error: instance.lastError,
+            timestamp: new Date(),
+          } satisfies ExternalMCPServerEvents["failed"]);
+        }
+      } else if (
+        this.servers.get(serverId) !== instance &&
+        instance.client &&
+        instance.transportInstance
+      ) {
+        // Dispose only this superseded client's handles; shared maps belong to its successor.
+        instance.client.onclose = undefined;
+        instance.client.onerror = undefined;
+        await MCPClientFactory.closeClient(
+          instance.client,
+          instance.transportInstance,
+          instance.process ?? undefined,
+        );
+        instance.client = null;
+        instance.transportInstance = null;
+        instance.process = null;
+      }
+
+      span.recordException(
+        error instanceof Error ? error : new Error(String(error)),
+      );
+      span.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: error instanceof Error ? error.message : String(error),
+      });
+
       throw error;
+    } finally {
+      span.end();
     }
+  }
+
+  /**
+   * Close a live client/transport pair, clearing the lifecycle hooks first
+   * so the `onclose` they would otherwise trigger cannot schedule a restart
+   * of a connection being torn down deliberately. Shared by `stopServer` and
+   * the minTools readiness gate in `startServer`, which rejects a server
+   * before it is ever registered as connected. Leaves status untouched —
+   * callers set whatever status fits their case.
+   */
+  private async closeInstanceConnection(
+    serverId: string,
+    instance: RuntimeMCPServerInfo,
+  ): Promise<void> {
+    // A failed or stopped client cannot retain metadata from its own or an older discovery.
+    if (this.enableMainRegistryIntegration) {
+      this.unregisterServerToolsFromMainRegistry(serverId);
+    }
+    this.toolDiscovery.clearServerTools(serverId);
+    instance.toolsMap.clear();
+    instance.toolsArray = undefined;
+    instance.tools = [];
+    if (!instance.client || !instance.transportInstance) {
+      return;
+    }
+    instance.client.onclose = undefined;
+    instance.client.onerror = undefined;
+    try {
+      // Forward the child handle so the factory's SIGKILL escalation can run
+      // when the transport's own close does not bring the process down.
+      // NOTE: `instance.process` is currently always null for stdio servers —
+      // MCPClientFactory.createStdioTransport returns only `{ transport }`, so
+      // `clientResult.process` is never populated and the escalation inside
+      // closeClient remains unreachable. Surfacing the spawned child from the
+      // transport is a separate change; this argument is wired so that it
+      // starts working the moment it is.
+      await MCPClientFactory.closeClient(
+        instance.client,
+        instance.transportInstance,
+        instance.process ?? undefined,
+      );
+    } catch (error) {
+      mcpLogger.debug(
+        `[ExternalServerManager] Error closing client for ${serverId}:`,
+        error,
+      );
+    }
+
+    instance.client = null;
+    instance.transportInstance = null;
+    instance.process = null;
+    instance.pid = undefined;
   }
 
   /**
@@ -1046,8 +1652,14 @@ export class ExternalServerManager extends EventEmitter {
       return;
     }
 
+    const span = tracers.mcp.startSpan("mcp.server.stop", {
+      attributes: {
+        "mcp.server_id": serverId,
+      },
+    });
+
     try {
-      this.updateServerStatus(serverId, "stopping");
+      this.updateServerStatus(serverId, "stopping", instance);
 
       // Clear timers
       if (instance.healthTimer) {
@@ -1068,26 +1680,14 @@ export class ExternalServerManager extends EventEmitter {
       // Clear server tools from discovery service
       this.toolDiscovery.clearServerTools(serverId);
 
-      // Close MCP client using factory cleanup
-      if (instance.client && instance.transportInstance) {
-        try {
-          await MCPClientFactory.closeClient(
-            instance.client,
-            instance.transportInstance,
-            instance.process || undefined,
-          );
-        } catch (error) {
-          mcpLogger.debug(
-            `[ExternalServerManager] Error closing client for ${serverId}:`,
-            error,
-          );
-        }
+      // Close MCP client using factory cleanup. This close is ours, not a
+      // crash: closeInstanceConnection drops the lifecycle hooks first so
+      // the onclose it triggers cannot schedule a restart of a server we
+      // are deliberately stopping.
+      await this.closeInstanceConnection(serverId, instance);
+      this.updateServerStatus(serverId, "stopped", instance);
 
-        instance.client = null;
-        instance.transportInstance = null;
-        instance.process = null;
-      }
-      this.updateServerStatus(serverId, "stopped");
+      span.setStatus({ code: SpanStatusCode.OK });
 
       mcpLogger.info(`[ExternalServerManager] Server stopped: ${serverId}`);
     } catch (error) {
@@ -1095,7 +1695,17 @@ export class ExternalServerManager extends EventEmitter {
         `[ExternalServerManager] Error stopping server ${serverId}:`,
         error,
       );
-      this.updateServerStatus(serverId, "failed");
+      this.updateServerStatus(serverId, "failed", instance);
+
+      span.recordException(
+        error instanceof Error ? error : new Error(String(error)),
+      );
+      span.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      span.end();
     }
   }
 
@@ -1105,13 +1715,15 @@ export class ExternalServerManager extends EventEmitter {
   private updateServerStatus(
     serverId: string,
     newStatus: ExternalMCPServerStatus,
+    owner?: RuntimeMCPServerInfo,
   ): void {
     const instance = this.servers.get(serverId);
-    if (!instance) {
+    if (!instance || (owner !== undefined && instance !== owner)) {
       return;
     }
 
     const oldStatus = instance.status;
+    this.lifecycleStates.set(serverId, newStatus);
     // Map ExternalMCPServerStatus to MCPServerInfo status
     const mappedStatus: MCPServerInfo["status"] =
       newStatus === "connecting" || newStatus === "restarting"
@@ -1129,6 +1741,7 @@ export class ExternalServerManager extends EventEmitter {
     // Emit status change event
     this.emit("statusChanged", {
       serverId,
+      serverName: this.getServerName(serverId),
       oldStatus,
       newStatus,
       timestamp: new Date(),
@@ -1137,6 +1750,84 @@ export class ExternalServerManager extends EventEmitter {
     mcpLogger.debug(
       `[ExternalServerManager] Status changed for ${serverId}: ${oldStatus} -> ${newStatus}`,
     );
+  }
+
+  /**
+   * Hook the SDK client's lifecycle so the manager learns about the server
+   * dying from the object that actually owns the process.
+   *
+   * `client.onclose` fires when the stdio child closes or a network
+   * transport drops. It also fires during our own `stopServer()`, which is
+   * why every path into `handleConnectionLost` checks that the client is
+   * still the instance's current one and the status is still "connected":
+   * a close that arrives while stopping or restarting is intentional.
+   */
+  private attachClientLifecycle(
+    serverId: string,
+    client: Client,
+    transport: Transport,
+  ): void {
+    client.onclose = () => {
+      this.closedClients.add(client);
+      const instance = this.servers.get(serverId);
+      const pidNote = instance?.pid ? ` (pid ${instance.pid})` : "";
+      const stderrTail = MCPClientFactory.getStderrTail(transport);
+      const reason =
+        stderrTail.length > 0
+          ? `Server process closed${pidNote}; last stderr: ${stderrTail.slice(-5).join(" | ")}`
+          : `Server process closed${pidNote}`;
+      this.handleConnectionLost(serverId, client, reason, stderrTail);
+    };
+
+    client.onerror = (error: Error) => {
+      // Transport-level noise: a stdin EPIPE after the child died, a line on
+      // stdout that is not JSON-RPC. Diagnostic only — a fatal error is
+      // followed by onclose, and that is where state changes.
+      mcpLogger.warn(
+        `[ExternalServerManager] Transport error for ${serverId}: ${error.message}`,
+      );
+    };
+  }
+
+  /**
+   * Transition a server whose connection is gone, exactly once.
+   *
+   * Reached from three places that can all observe the same death — the
+   * client's onclose, a failed health-check ping, and a tool call rejected
+   * with the SDK's connection-closed error — so it is idempotent on the
+   * (client, status) pair rather than trusting any one caller to be first.
+   */
+  private handleConnectionLost(
+    serverId: string,
+    client: Client,
+    reason: string,
+    stderrTail: string[] = [],
+    failureAlreadyCounted = false,
+  ): void {
+    const instance = this.servers.get(serverId);
+    if (
+      !instance ||
+      instance.client !== client ||
+      instance.status !== "connected"
+    ) {
+      return;
+    }
+
+    mcpLogger.warn(
+      `[ExternalServerManager] Connection lost for ${serverId}: ${reason}`,
+      stderrTail.length > 0 ? { stderrTail } : undefined,
+    );
+    instance.lastError = reason;
+    this.handleServerDisconnection(serverId, reason, failureAlreadyCounted);
+  }
+
+  private trackToolCall(serverId: string, delta: 1 | -1): void {
+    const next = (this.inFlightToolCalls.get(serverId) ?? 0) + delta;
+    if (next <= 0) {
+      this.inFlightToolCalls.delete(serverId);
+    } else {
+      this.inFlightToolCalls.set(serverId, next);
+    }
   }
 
   /**
@@ -1150,6 +1841,10 @@ export class ExternalServerManager extends EventEmitter {
 
     instance.lastError = error.message;
     instance.metrics.totalErrors++;
+    this.consecutiveFailures.set(
+      serverId,
+      (this.consecutiveFailures.get(serverId) ?? 0) + 1,
+    );
 
     mcpLogger.error(
       `[ExternalServerManager] Server error for ${serverId}:`,
@@ -1159,12 +1854,16 @@ export class ExternalServerManager extends EventEmitter {
     // Emit failed event
     this.emit("failed", {
       serverId,
+      serverName: this.getServerName(serverId),
       error: error.message,
       timestamp: new Date(),
     } satisfies ExternalMCPServerEvents["failed"]);
 
     // Attempt restart if enabled
-    if (this.config.enableAutoRestart && !this.isShuttingDown) {
+    if (
+      (instance.config.autoRestart ?? this.config.enableAutoRestart) &&
+      !this.isShuttingDown
+    ) {
       this.scheduleRestart(serverId);
     } else {
       this.updateServerStatus(serverId, "failed");
@@ -1174,13 +1873,23 @@ export class ExternalServerManager extends EventEmitter {
   /**
    * Handle server disconnection
    */
-  private handleServerDisconnection(serverId: string, reason: string): void {
+  private handleServerDisconnection(
+    serverId: string,
+    reason: string,
+    failureAlreadyCounted = false,
+  ): void {
     const instance = this.servers.get(serverId);
     if (!instance) {
       return;
     }
 
     instance.metrics.totalDisconnections++;
+    if (!failureAlreadyCounted) {
+      this.consecutiveFailures.set(
+        serverId,
+        (this.consecutiveFailures.get(serverId) ?? 0) + 1,
+      );
+    }
 
     mcpLogger.warn(
       `[ExternalServerManager] Server disconnected ${serverId}: ${reason}`,
@@ -1189,12 +1898,16 @@ export class ExternalServerManager extends EventEmitter {
     // Emit disconnected event
     this.emit("disconnected", {
       serverId,
+      serverName: this.getServerName(serverId),
       reason,
       timestamp: new Date(),
     } satisfies ExternalMCPServerEvents["disconnected"]);
 
-    // Attempt restart if enabled
-    if (this.config.enableAutoRestart && !this.isShuttingDown) {
+    // Attempt restart if enabled — prefer server-specific setting, fall back to global
+    if (
+      (instance.config.autoRestart ?? this.config.enableAutoRestart) &&
+      !this.isShuttingDown
+    ) {
       this.scheduleRestart(serverId);
     } else {
       this.updateServerStatus(serverId, "disconnected");
@@ -1210,11 +1923,16 @@ export class ExternalServerManager extends EventEmitter {
       return;
     }
 
+    if (instance.restartTimer) {
+      return;
+    }
+
     if (instance.reconnectAttempts >= instance.maxReconnectAttempts) {
       mcpLogger.error(
         `[ExternalServerManager] Max restart attempts reached for ${serverId}`,
       );
       this.updateServerStatus(serverId, "failed");
+      this.retryDeadlines.delete(serverId);
       return;
     }
 
@@ -1234,22 +1952,63 @@ export class ExternalServerManager extends EventEmitter {
       `[ExternalServerManager] Scheduling restart for ${serverId} in ${delay}ms (attempt ${instance.reconnectAttempts})`,
     );
 
-    if (instance.restartTimer) {
-      return;
-    } // already scheduled
+    this.retryDeadlines.set(serverId, new Date(Date.now() + delay));
+    const health = this.getServerStatuses().find(
+      (status) => status.serverId === serverId,
+    );
+    if (health) {
+      this.emit("healthCheck", {
+        serverId,
+        serverName: this.getServerName(serverId),
+        health,
+        timestamp: new Date(),
+      } satisfies ExternalMCPServerEvents["healthCheck"]);
+    }
     instance.restartTimer = setTimeout(async () => {
+      this.retryDeadlines.delete(serverId);
+      const restartSpan = tracers.mcp.startSpan("mcp.server.restart", {
+        attributes: {
+          "mcp.server_id": serverId,
+          "mcp.restart_attempt": instance.reconnectAttempts,
+          "mcp.restart_delay_ms": delay,
+        },
+      });
+
       try {
+        if (this.servers.get(serverId) !== instance) {
+          return;
+        }
         await this.stopServer(serverId);
+        if (this.servers.get(serverId) !== instance) {
+          return;
+        }
         await this.startServer(serverId);
+        if (this.servers.get(serverId) !== instance) {
+          return;
+        }
 
         // Reset restart attempts on successful restart
         instance.reconnectAttempts = 0;
+        restartSpan.setStatus({ code: SpanStatusCode.OK });
       } catch (error) {
         mcpLogger.error(
           `[ExternalServerManager] Restart failed for ${serverId}:`,
           error,
         );
-        this.scheduleRestart(serverId); // Try again
+
+        restartSpan.recordException(
+          error instanceof Error ? error : new Error(String(error)),
+        );
+        restartSpan.setStatus({
+          code: SpanStatusCode.ERROR,
+          message: error instanceof Error ? error.message : String(error),
+        });
+
+        if (this.servers.get(serverId) === instance) {
+          this.scheduleRestart(serverId); // Try again only for this retained owner.
+        }
+      } finally {
+        restartSpan.end();
       }
     }, delay);
   }
@@ -1270,27 +2029,95 @@ export class ExternalServerManager extends EventEmitter {
     instance.healthTimer = setInterval(async () => {
       await this.performHealthCheck(serverId);
     }, interval);
+    // Unref'd so a live health check on a connected server doesn't itself
+    // keep an otherwise-idle process alive — a caller that never calls
+    // shutdown()/stopServer() (e.g. a script that just uses the SDK and
+    // lets the process exit naturally) shouldn't be forced to wait out
+    // this interval. stopServer() still clearInterval()s it for explicit
+    // lifecycle management.
+    if (instance.healthTimer.unref) {
+      instance.healthTimer.unref();
+    }
   }
 
   /**
-   * Perform health check on a server
+   * Perform a health check by pinging the server over its live transport.
+   *
+   * The previous check read `process.killed` — a flag Node sets only when we
+   * call `kill()` ourselves, on a process handle that was not even the
+   * server's — so it could never observe a server that died on its own.
+   *
+   * A ping that comes back with the SDK's connection-closed error is a
+   * definitive death and is handled immediately. A ping that merely times
+   * out is ambiguous: single-threaded servers (a Python MCP server running a
+   * synchronous tool) cannot answer while a tool call is executing, and
+   * restarting one mid-call would destroy the work in flight. So a timeout
+   * counts toward a restart only while the server has no tool call in
+   * flight, and only after UNRESPONSIVE_CHECKS_BEFORE_RESTART consecutive
+   * misses.
    */
   private async performHealthCheck(serverId: string): Promise<void> {
     const instance = this.servers.get(serverId);
-    if (!instance || instance.status !== "connected") {
+    if (!instance || instance.status !== "connected" || !instance.client) {
       return;
     }
+    if (this.healthChecksInFlight.has(serverId)) {
+      return;
+    }
+    this.healthChecksInFlight.add(serverId);
 
+    const client = instance.client;
+    const interval =
+      instance.config.healthCheckInterval ??
+      this.config.defaultHealthCheckInterval;
+    const pingTimeoutMs = Math.max(
+      1,
+      Math.min(instance.config.timeout || this.config.defaultTimeout, interval),
+    );
     const startTime = Date.now();
+    const issues: string[] = [];
+    let isHealthy = true;
+    let connectionLost = false;
+    let unresponsive = false;
 
     try {
-      // For now, simple process check
-      let isHealthy = true;
-      const issues: string[] = [];
-
-      if (instance.process && instance.process.killed) {
+      try {
+        await client.ping({ timeout: pingTimeoutMs });
+        if (instance.client !== client || instance.status !== "connected") {
+          return;
+        }
+        this.unresponsiveChecks.delete(serverId);
+        this.consecutiveFailures.delete(serverId);
+        instance.lastError = undefined;
+      } catch (error) {
+        if (instance.client !== client || instance.status !== "connected") {
+          return;
+        }
         isHealthy = false;
-        issues.push("Process is killed");
+        this.consecutiveFailures.set(
+          serverId,
+          (this.consecutiveFailures.get(serverId) ?? 0) + 1,
+        );
+        instance.lastError =
+          error instanceof Error ? error.message : String(error);
+        if (isConnectionLostError(error)) {
+          connectionLost = true;
+          issues.push("connection closed");
+        } else {
+          const inFlight = this.inFlightToolCalls.get(serverId) ?? 0;
+          if (inFlight > 0) {
+            issues.push(
+              `ping timed out after ${pingTimeoutMs}ms while ${inFlight} tool call(s) in flight`,
+            );
+          } else {
+            const misses = (this.unresponsiveChecks.get(serverId) ?? 0) + 1;
+            this.unresponsiveChecks.set(serverId, misses);
+            issues.push(
+              `ping timed out after ${pingTimeoutMs}ms while idle (${misses}/${UNRESPONSIVE_CHECKS_BEFORE_RESTART})`,
+            );
+            unresponsive = misses >= UNRESPONSIVE_CHECKS_BEFORE_RESTART;
+          }
+        }
       }
 
       const responseTime = Date.now() - startTime;
@@ -1299,11 +2126,14 @@ export class ExternalServerManager extends EventEmitter {
       const health: ExternalMCPServerHealth = {
         serverId,
         isHealthy,
-        status: instance.status,
+        status: this.lifecycleStates.get(serverId) ?? instance.status,
         checkedAt: new Date(),
         responseTime,
         toolCount: instance.toolsMap.size,
         issues,
+        consecutiveFailures: this.consecutiveFailures.get(serverId) ?? 0,
+        lastError: instance.lastError,
+        nextRetryAt: this.retryDeadlines.get(serverId),
         performance: {
           uptime: instance.startTime
             ? Date.now() - instance.startTime.getTime()
@@ -1313,20 +2143,26 @@ export class ExternalServerManager extends EventEmitter {
       };
 
       // Emit health check event
+      this.lastHealth.set(serverId, health);
       this.emit("healthCheck", {
         serverId,
+        serverName: this.getServerName(serverId),
         health,
         timestamp: new Date(),
       } satisfies ExternalMCPServerEvents["healthCheck"]);
 
-      if (!isHealthy) {
+      if (connectionLost || unresponsive) {
+        this.handleConnectionLost(
+          serverId,
+          client,
+          `Health check failed: ${issues.join(", ")}`,
+          [],
+          true,
+        );
+      } else if (!isHealthy) {
         mcpLogger.warn(
           `[ExternalServerManager] Health check failed for ${serverId}:`,
           issues,
-        );
-        this.handleServerError(
-          serverId,
-          new Error(`Health check failed: ${issues.join(", ")}`),
         );
       }
     } catch (error) {
@@ -1334,10 +2170,8 @@ export class ExternalServerManager extends EventEmitter {
         `[ExternalServerManager] Health check error for ${serverId}:`,
         error,
       );
-      this.handleServerError(
-        serverId,
-        error instanceof Error ? error : new Error(String(error)),
-      );
+    } finally {
+      this.healthChecksInFlight.delete(serverId);
     }
   }
 
@@ -1353,6 +2187,7 @@ export class ExternalServerManager extends EventEmitter {
     return {
       config: runtime.config,
       process: runtime.process,
+      pid: runtime.pid,
       client: runtime.client,
       transport: runtime.transportInstance,
       status: runtime.status as ExternalMCPServerStatus,
@@ -1379,6 +2214,7 @@ export class ExternalServerManager extends EventEmitter {
       converted.set(serverId, {
         config: runtime.config,
         process: runtime.process,
+        pid: runtime.pid,
         client: runtime.client,
         transport: runtime.transportInstance,
         status: runtime.status as ExternalMCPServerStatus,
@@ -1418,11 +2254,16 @@ export class ExternalServerManager extends EventEmitter {
 
       statuses.push({
         serverId,
-        isHealthy: instance.status === "connected",
-        status: instance.status,
+        isHealthy:
+          instance.status === "connected" &&
+          (this.lastHealth.get(serverId)?.isHealthy ?? true),
+        status: this.lifecycleStates.get(serverId) ?? instance.status,
         checkedAt: instance.lastHealthCheck || new Date(),
         toolCount: instance.toolsMap.size,
         issues: instance.lastError ? [instance.lastError] : [],
+        consecutiveFailures: this.consecutiveFailures.get(serverId) ?? 0,
+        lastError: instance.lastError,
+        nextRetryAt: this.retryDeadlines.get(serverId),
         performance: {
           uptime,
           averageResponseTime: instance.metrics.averageResponseTime,
@@ -1443,6 +2284,7 @@ export class ExternalServerManager extends EventEmitter {
     }
 
     this.isShuttingDown = true;
+    liveManagers.delete(this);
     mcpLogger.info("[ExternalServerManager] Shutting down all servers...");
 
     const shutdownPromises = Array.from(this.servers.keys()).map((serverId) =>
@@ -1525,16 +2367,33 @@ export class ExternalServerManager extends EventEmitter {
       throw new Error(`Server '${serverId}' not found or not connected`);
     }
 
+    // Resource/prompt-only servers legitimately advertise no tools capability.
+    if (instance.client.getServerCapabilities()?.tools === undefined) {
+      return;
+    }
     try {
       mcpLogger.debug(
         `[ExternalServerManager] Discovering tools for server: ${serverId}`,
       );
 
+      const client = instance.client;
+      const isCurrentDiscovery = (): boolean =>
+        this.servers.get(serverId) === instance &&
+        instance.client === client &&
+        instance.status === "initializing" &&
+        client.transport === instance.transportInstance &&
+        !this.closedClients.has(client) &&
+        !this.isShuttingDown;
       const discoveryResult = await this.toolDiscovery.discoverTools(
         serverId,
-        instance.client,
+        client,
         instance.config.timeout || this.config.defaultTimeout,
+        isCurrentDiscovery,
+        true,
       );
+      if (!isCurrentDiscovery()) {
+        throw new Error(`MCP discovery for '${serverId}' was superseded`);
+      }
 
       if (discoveryResult.success) {
         instance.toolsMap.clear();
@@ -1566,8 +2425,8 @@ export class ExternalServerManager extends EventEmitter {
           `[ExternalServerManager] Discovered ${discoveryResult.toolCount} tools for ${serverId} (${blockedCount} blocked, ${instance.toolsMap.size} available)`,
         );
       } else {
-        mcpLogger.warn(
-          `[ExternalServerManager] Tool discovery failed for ${serverId}: ${discoveryResult.error}`,
+        throw new Error(
+          `Tool discovery failed for ${serverId}: ${discoveryResult.error ?? "unknown failure"}`,
         );
       }
     } catch (error) {
@@ -1575,6 +2434,7 @@ export class ExternalServerManager extends EventEmitter {
         `[ExternalServerManager] Tool discovery error for ${serverId}:`,
         error,
       );
+      throw error;
     }
   }
 
@@ -1704,7 +2564,8 @@ export class ExternalServerManager extends EventEmitter {
       throw new Error(`Server '${serverId}' not found`);
     }
 
-    if (!instance.client) {
+    const client = instance.client;
+    if (!client) {
       throw new Error(`Server '${serverId}' is not connected`);
     }
 
@@ -1788,6 +2649,7 @@ export class ExternalServerManager extends EventEmitter {
               );
               throw new Error(
                 `HITL confirmation failed: ${error instanceof Error ? error.message : String(error)}`,
+                { cause: error },
               );
             }
           }
@@ -1799,18 +2661,24 @@ export class ExternalServerManager extends EventEmitter {
       }
 
       // Execute tool through discovery service (with potentially modified parameters)
-      const result = await this.toolDiscovery.executeTool(
-        toolName,
-        serverId,
-        instance.client,
-        finalParameters,
-        {
-          timeout:
-            options?.timeout ||
-            instance.config.timeout ||
-            this.config.defaultTimeout,
-        },
-      );
+      this.trackToolCall(serverId, 1);
+      let result: Awaited<ReturnType<ToolDiscoveryService["executeTool"]>>;
+      try {
+        result = await this.toolDiscovery.executeTool(
+          toolName,
+          serverId,
+          client,
+          finalParameters,
+          {
+            timeout:
+              options?.timeout ||
+              instance.config.timeout ||
+              this.config.defaultTimeout,
+          },
+        );
+      } finally {
+        this.trackToolCall(serverId, -1);
+      }
 
       const duration = Date.now() - startTime;
 
@@ -1827,23 +2695,47 @@ export class ExternalServerManager extends EventEmitter {
         totalTime / instance.metrics.totalToolCalls;
 
       if (result.success) {
+        // A resolved `{ isError: true }` still comes back with success:true so
+        // the caller receives the MCP error payload as-is, but it is a failed
+        // call for telemetry: count it in the server's totalErrors and as
+        // success=false in mcp_tool_calls_total instead of counting every
+        // resolved error as a success.
+        const resolvedError = result.isErrorResult === true;
+        if (resolvedError) {
+          instance.metrics.totalErrors++;
+        }
         mcpLogger.debug(
-          `[ExternalServerManager] Tool executed successfully: ${toolName} on ${serverId}`,
+          resolvedError
+            ? `[ExternalServerManager] Tool returned a resolved MCP error: ${toolName} on ${serverId}`
+            : `[ExternalServerManager] Tool executed successfully: ${toolName} on ${serverId}`,
           {
             duration,
           },
         );
+        recordMCPToolCall(toolName, duration, !resolvedError);
         return result.data;
       } else {
         throw new Error(result.error || "Tool execution failed");
       }
     } catch (error) {
       instance.metrics.totalErrors++;
+      recordMCPToolCall(toolName, Date.now() - startTime, false);
 
       mcpLogger.error(
         `[ExternalServerManager] Tool execution failed: ${toolName} on ${serverId}`,
         error,
       );
+
+      // The SDK rejects with its connection-closed error when the server is
+      // gone. Without this transition the instance stayed "connected" and
+      // every later call failed the same way with no restart ever scheduled.
+      if (isConnectionLostError(error)) {
+        this.handleConnectionLost(
+          serverId,
+          client,
+          `Connection lost during tool call '${toolName}': ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
       throw error;
     }
   }

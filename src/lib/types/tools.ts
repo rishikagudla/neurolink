@@ -15,13 +15,34 @@ import type {
   StandardRecord,
   StringArray,
   ZodUnknownSchema,
-} from "./typeAliases.js";
+} from "./aliases.js";
 import type { ValidationError } from "../utils/parameterValidation.js";
+import type { MCPToolAnnotations } from "./mcp.js";
+import type { Logger } from "./utilities.js";
+import type { HITLExecutionState } from "./hitl.js";
+
+// Tool + schema primitives. Declared locally in ./aiCompat.js; this file stays
+// the public path for them so the barrel keeps exporting exactly one binding
+// per name (two `export *` sources for the same name silently drop it).
+import type { Tool } from "./aiCompat.js";
+export type {
+  Tool,
+  ToolSet,
+  ToolChoice,
+  ToolExecuteFunction,
+  ToolApprovalRequest,
+  ToolApprovalResponse,
+  InferToolInput,
+  InferToolOutput,
+  Schema,
+  FlexibleSchema,
+  InferSchema,
+} from "./aiCompat.js";
 
 /**
  * Commonly used Zod schema type aliases for cleaner type declarations
  */
-export type { ZodUnknownSchema } from "./typeAliases.js";
+export type { ZodUnknownSchema, ZodToJsonSchemaInput } from "./aliases.js";
 export type ZodAnySchema = z.ZodSchema<unknown>;
 export type ZodObjectSchema = z.ZodObject<z.ZodRawShape>;
 export type ZodStringSchema = z.ZodString;
@@ -65,7 +86,9 @@ export type ExecutionContext<T = StandardRecord> = {
   cacheOptions?: CacheOptions;
   fallbackOptions?: FallbackOptions;
   timeoutMs?: number;
+  maxRetries?: number;
   startTime?: number;
+  hitlState?: HITLExecutionState;
 };
 
 /**
@@ -100,6 +123,17 @@ export type ToolInfo = {
   serverId?: string;
   inputSchema?: StandardRecord;
   outputSchema?: StandardRecord;
+  /** MCP tool annotations (safety hints, metadata). Auto-inferred when mcp.annotations.autoInfer is enabled. */
+  annotations?: MCPToolAnnotations;
+  /** Per-tool timeout in milliseconds, set at registration time */
+  timeoutMs?: number;
+  maxRetries?: number;
+  /**
+   * Ceiling on the WHOLE execution — every attempt plus the delays between
+   * them. Declared explicitly rather than left to the index signature below,
+   * which would type it `unknown` and silently defeat the default.
+   */
+  totalTimeoutMs?: number;
   [key: string]: unknown; // Generic extensibility
 };
 
@@ -117,6 +151,16 @@ export type ToolImplementation = {
   outputSchema?: unknown;
   category?: string;
   permissions?: string[];
+  /** Per-tool timeout in milliseconds, set at registration time */
+  timeoutMs?: number;
+  maxRetries?: number;
+  /**
+   * Ceiling on the WHOLE execution — every attempt plus the delays between
+   * them — in milliseconds. `timeoutMs` bounds one attempt; without this, a
+   * tool that reliably hangs burns `timeoutMs * (maxRetries + 1)`.
+   * Defaults to exactly that product, so behaviour is unchanged unless set.
+   */
+  totalTimeoutMs?: number;
 };
 
 /**
@@ -124,13 +168,72 @@ export type ToolImplementation = {
  * Extracted from toolRegistry.ts for centralized type management
  */
 export type ToolExecutionOptions = {
+  /**
+   * Caller-specified execution timeout in milliseconds.
+   * Used by executeTool() callers to override the default timeout for a
+   * single invocation. Takes precedence over `timeoutMs` when both are set.
+   */
   timeout?: number;
   retries?: number;
   context?: unknown;
   preferredSource?: string;
   fallbackEnabled?: boolean;
   validateBeforeExecution?: boolean;
+  /**
+   * Per-tool timeout in milliseconds, copied from ToolInfo at registration
+   * time. Acts as the tool-level default; overridden by `timeout` when the
+   * caller supplies an explicit value.
+   * @deprecated Prefer using `timeout` for caller-specified overrides.
+   *             This field exists for internal forwarding from ToolInfo and
+   *             may be consolidated in a future release.
+   */
   timeoutMs?: number;
+  maxRetries?: number;
+  /**
+   * Ceiling on the WHOLE execution — every attempt plus the delays between
+   * them. `timeout` bounds one attempt. Defaults to
+   * `timeout * (maxRetries + 1)`, which is what the retry loop already spent,
+   * so supplying nothing changes nothing.
+   */
+  totalTimeoutMs?: number;
+};
+
+/**
+ * Options for tool registration via registerTool()
+ *
+ * These options configure per-tool execution behavior. When not provided,
+ * the SDK's global defaults are used (30s timeout, 2 retries), preserving
+ * backward compatibility with existing production systems.
+ *
+ * @example
+ * // Register with custom timeout and no retries
+ * sdk.registerTool("myTool", tool, { timeout: 5000, maxRetries: 0 });
+ *
+ * // Register with defaults (same as before — no behavior change)
+ * sdk.registerTool("myTool", tool);
+ */
+export type ToolRegistrationOptions = {
+  /** Per-tool execution timeout in milliseconds. Only applied when explicitly set.
+   *  When omitted, the SDK's global default (30s) is used. */
+  timeout?: number;
+  /** Maximum retry attempts on failure. Only applied when explicitly set.
+   *  When omitted, the SDK's global default (2 retries) is used.
+   *  Set to 0 to disable retries for this tool. */
+  maxRetries?: number;
+  /** Ceiling on the whole execution across every attempt and the delays
+   *  between them. When omitted, `timeout * (maxRetries + 1)` is used. */
+  totalTimeoutMs?: number;
+  /**
+   * Whether this tool's result may be served from the tool-result cache
+   * (default true).
+   *
+   * Set to `false` for a tool whose result is NOT a function of its arguments
+   * — anything reading or mutating live state. The cache is keyed by tool name
+   * plus arguments, so a stateful tool called twice with the same arguments
+   * replays its first answer for the whole TTL: a checklist that never updates,
+   * a queue that hands out the same item twice.
+   */
+  cacheable?: boolean;
 };
 
 /**
@@ -209,7 +312,7 @@ export type SDKToolContext = ToolContext & {
   /**
    * Logger instance
    */
-  logger: import("./utilities.js").Logger;
+  logger: Logger;
 };
 
 /**
@@ -298,12 +401,33 @@ export type ToolExecutionContext = {
 export type ToolExecutionEvent = {
   type: "tool:start" | "tool:end";
   tool: string;
+  /** Compatibility alias for older consumers that expect `toolName`. */
+  toolName?: string;
   input?: unknown;
   result?: unknown;
   error?: string;
   timestamp: number;
   duration?: number;
   executionId: string;
+};
+
+/**
+ * Payload emitted for tool:start and tool:end events.
+ * Always includes both `tool` and `toolName` for backward compatibility.
+ */
+export type ToolEventPayload = {
+  tool: string;
+  toolName: string;
+  input?: unknown;
+  result?: unknown;
+  error?: string;
+  success?: boolean;
+  responseTime?: number;
+  timestamp?: number;
+  duration?: number;
+  executionId?: string;
+  /** The model's tool-call id when the loop supplied one, for pairing start/end. */
+  toolCallId?: string;
 };
 
 /**
@@ -349,6 +473,116 @@ export type SimpleTool<TArgs = ToolArgs, TResult = JsonValue> = {
 };
 
 /**
+ * Simple tool type accepted by the SDK registerTool() helper. Uses
+ * SDKToolContext (richer tool context with request metadata).
+ */
+export type SdkSimpleTool<TArgs = ToolArgs, TResult = JsonValue> = Omit<
+  SimpleTool<TArgs, TResult>,
+  "execute"
+> & {
+  description: string;
+  parameters?: ZodUnknownSchema;
+  execute: (params: TArgs, context?: SDKToolContext) => Promise<TResult>;
+  metadata?: {
+    category?: string;
+    version?: string;
+    author?: string;
+    tags?: string[];
+    documentation?: string;
+    [key: string]: JsonValue | undefined;
+  };
+};
+
+// =============================================================================
+// DIRECT TOOLS CATEGORIES (from agent/directTools.ts)
+// =============================================================================
+
+/** Arguments of the built-in analyzeCSV tool, after schema defaults. */
+export type AnalyzeCsvToolArgs = {
+  filePath: string;
+  operation:
+    | "count_by_column"
+    | "sum_by_column"
+    | "average_by_column"
+    | "min_max_by_column"
+    | "describe";
+  column: string;
+  maxRows?: number;
+};
+
+/** Subset of directAgentTools exposing only the "basic" category. */
+export type BasicToolsMap = {
+  getCurrentTime: Tool;
+  calculateMath: Tool;
+};
+
+/** Subset of directAgentTools exposing only the "filesystem" category. */
+export type FilesystemToolsMap = {
+  readFile: Tool;
+  listDirectory: Tool;
+  writeFile: Tool;
+};
+
+/** Subset of directAgentTools exposing the "utility" category. */
+export type UtilityToolsMap = {
+  getCurrentTime: Tool;
+  calculateMath: Tool;
+  listDirectory: Tool;
+};
+
+/** Full directAgentTools map, with the opt-in bashTool appended. */
+export type AllToolsMap = {
+  getCurrentTime: Tool;
+  calculateMath: Tool;
+  readFile: Tool;
+  listDirectory: Tool;
+  writeFile: Tool;
+  executeBashCommand?: Tool;
+};
+
+/**
+ * Outcome of evaluating a `calculateMath` expression with the built-in
+ * arithmetic parser (no dynamic code). A result that is not a finite number
+ * is reported as an error rather than as `Infinity`/`NaN`.
+ */
+export type ArithmeticEvaluation =
+  | { ok: true; value: number }
+  | { ok: false; error: string };
+
+/** One lexical token of a `calculateMath` expression (`at` is its offset). */
+export type ArithmeticToken =
+  | { kind: "number"; value: number; at: number }
+  | { kind: "identifier"; name: string; at: number }
+  | { kind: "operator"; value: "+" | "-" | "*" | "/" | "%" | "**"; at: number }
+  | { kind: "paren"; value: "(" | ")"; at: number }
+  | { kind: "comma"; at: number }
+  | { kind: "end"; at: number };
+
+/** A JSON Schema node as the JSON-Schema-to-Zod converter walks it. */
+export type SchemaConversionNode = Record<string, unknown>;
+
+/** State threaded through one JSON-Schema-to-Zod conversion. */
+export type SchemaConversionContext = {
+  /** The document root, for resolving local `$ref`s. */
+  root: SchemaConversionNode;
+  /** `$ref` targets on the current path, so a self-referential schema terminates. */
+  refStack: Set<string>;
+  /** Called for each `pattern` the converter refused to compile. */
+  onRegexDrop: (drop: SchemaRegexDrop) => void;
+};
+
+/**
+ * One regular expression removed from a JSON Schema before the schema is
+ * compiled, because `vetRegexPattern` judged it able to stall the process.
+ * `path` is the JSON-pointer-like location of the keyword (`properties/name/pattern`).
+ */
+export type SchemaRegexDrop = {
+  path: string;
+  pattern: string;
+  reason: string;
+};
+
+/**
  * Tool registry entry
  */
 export type ToolRegistryEntry = {
@@ -381,13 +615,18 @@ export type PendingToolExecution = {
     toolName?: string;
     args?: Record<string, unknown>;
     timestamp?: Date;
+    thoughtSignature?: string;
+    stepIndex?: number;
     [key: string]: unknown;
   }>;
   toolResults: Array<{
     toolCallId?: string;
+    toolName?: string;
+    output?: unknown;
     result?: unknown;
     error?: string;
     timestamp?: Date;
+    stepIndex?: number;
     [key: string]: unknown;
   }>;
   timestamp: number;
@@ -484,3 +723,31 @@ export function isToolDefinition(value: unknown): value is ToolDefinition {
     typeof (value as ToolDefinition).execute === "function"
   );
 }
+
+/**
+ * Result shape returned by the built-in `bashTool` execute function in
+ * `src/lib/agent/directTools.ts`. Centralised here per CLAUDE.md rule 2
+ * so callers (incl. the mcp-bash test suite) don't need to declare a
+ * local re-shaping of the runtime contract.
+ */
+export type BashToolResult = {
+  success: boolean;
+  code: number;
+  stdout: string;
+  stderr: string;
+  error?: string;
+};
+
+/**
+ * Own property stamped on a tool object whose `execute` already emits one
+ * `tool:start` / `tool:end` pair per execution. It lives on the OBJECT, not
+ * the function: later layers (the execution recorder, discovery) replace
+ * `execute` via `{ ...tool, execute }`, which drops a function-identity check
+ * but carries a symbol-keyed own property along.
+ */
+export const TOOL_EVENTS_WRAPPED: unique symbol = Symbol.for(
+  "neurolink.toolEventsWrapped",
+);
+
+/** A `Tool` that may carry the {@link TOOL_EVENTS_WRAPPED} marker. */
+export type EventWrappedTool = Tool & { [TOOL_EVENTS_WRAPPED]?: true };

@@ -1,249 +1,139 @@
 /**
- * Centralized type exports for NeuroLink
+ * Centralized type exports for NeuroLink.
+ * Every type file uses wildcard export. Zero selective exports, zero aliases.
  */
 
-// Constants and enums
-export { AIProviderName } from "../constants/enums.js";
-// CLI types
+// All type files (alphabetical)
+export * from "./enums.js";
+export * from "./action.js";
+export * from "./agentMode.js";
+export * from "./aliases.js";
+export * from "./analytics.js";
+export * from "./artifact.js";
+export * from "./attachments.js";
+export * from "./auth.js";
+export * from "./autoresearch.js";
+export * from "./circuitBreakerErrors.js";
+export * from "./claudeProxy.js";
 export * from "./cli.js";
-// Common utility types
+export * from "./client.js";
+export * from "./codex.js";
 export * from "./common.js";
-// Configuration types
-export type {
-  AnalyticsConfig,
-  BackupInfo,
-  BackupMetadata,
-  CacheConfig,
-  ConfigUpdateOptions,
-  ConfigValidationResult,
-  FallbackConfig,
-  NeuroLinkConfig,
-  PerformanceConfig,
-  RetryConfig,
-  ToolConfig,
-} from "./configTypes.js";
-// External MCP types
-export type {
-  ExternalMCPConfigValidation,
-  ExternalMCPManagerConfig,
-  ExternalMCPOperationResult,
-  ExternalMCPServerEvents,
-  ExternalMCPServerHealth,
-  ExternalMCPServerInstance,
-  ExternalMCPServerStatus,
-  ExternalMCPToolContext,
-  ExternalMCPToolInfo,
-  ExternalMCPToolResult,
-} from "./externalMcp.js";
-// MCP domain types
-export type {
-  AuthorizationUrlResult,
-  CircuitBreakerConfig,
-  CircuitBreakerEvents,
-  CircuitBreakerState,
-  CircuitBreakerStats,
-  DiscoveredMcp,
-  ExternalToolExecutionOptions,
-  FlexibleValidationResult,
-  HTTPRetryConfig,
-  MCPClientResult,
-  MCPConnectedServer,
-  MCPDiscoveredServer,
-  MCPExecutableTool,
-  MCPOAuthConfig,
-  MCPServerCategory,
-  MCPServerConfig,
-  MCPServerConnectionStatus,
-  MCPServerMetadata,
-  MCPServerRegistryEntry,
-  MCPServerStatus,
-  MCPToolInfo,
-  MCPToolMetadata,
-  MCPTransportType,
-  McpMetadata,
-  McpRegistry,
-  NeuroLinkExecutionContext,
-  NeuroLinkMCPServer,
-  // Additional MCP types (moved from individual MCP files)
-  NeuroLinkMCPTool,
-  OAuthClientInformation,
-  // HTTP Transport types (OAuth, Rate Limiting, Retry)
-  OAuthTokens,
-  RateLimitConfig,
-  TokenBucketRateLimitConfig,
-  TokenExchangeRequest,
-  TokenStorage,
-  ToolDiscoveryResult,
-  ToolRegistryEvents,
-  ToolValidationResult,
-} from "./mcpTypes.js";
-// Model/Provider domain types
-export type {
-  ModelCapability,
-  ModelFilter,
-  ModelPricing,
-  ModelResolutionContext,
-  ModelStats,
-  ModelUseCase,
-} from "./providers.js";
-// Provider types
-export * from "./providers.js";
-// Task classification types
-export * from "./taskClassificationTypes.js";
-// Tool system types
-export * from "./tools.js";
-// Type aliases - only export non-duplicate types that are commonly used
-export type {
-  OptionalStandardRecord,
-  OptionalValidationSchema,
-  StandardRecord,
-  ValidationSchema,
-  ZodUnknownSchema,
-} from "./typeAliases.js";
+export * from "./config.js";
+export * from "./context.js";
+export * from "./conversation.js";
+export * from "./conversationMemoryInterface.js";
+export * from "./delegation.js";
 
-// Stream/Tool domain types are exported via wildcard from ./streamTypes.js
+// Background commands (N4) — detached execution, banked output, monitors
+export * from "./backgroundCommand.js";
 
-// File processor types — re-exported from the single source of truth (processors/base/types.ts)
-// Note: RetryConfig renamed to avoid conflict with configTypes.ts RetryConfig
-// Note: FileProcessingResult renamed to avoid conflict with fileTypes.ts FileProcessingResult
-export type {
-  BatchProcessingSummary,
-  ExcelWorksheet,
-  FailedFileInfo,
-  FileInfo,
-  FileProcessingError,
-  FileProcessingResult as ProcessorFileResult,
-  FileProcessorConfig,
-  FileWarning,
-  JsonTypeGuard,
-  OperationResult,
-  ProcessedConfig,
-  ProcessedExcel,
-  ProcessedFileBase,
-  ProcessedFileInfo,
-  ProcessedHtml,
-  ProcessedJson,
-  ProcessedMarkdown,
-  ProcessedOpenDocument,
-  ProcessedRtf,
-  ProcessedSourceCode,
-  ProcessedSvg,
-  ProcessedText,
-  ProcessedWord,
-  ProcessedYaml,
-  ProcessOptions,
-  ProcessorInfo,
-  ProcessorMatch,
-  ProcessorPriorityKey,
-  ProcessorPriorityValue,
-  RegistryOptions,
-  RegistryProcessResult,
-  RetryConfig as ProcessorRetryConfig,
-  SkippedFileInfo,
-  UnsupportedFileError,
-} from "../processors/base/types.js";
-export { PROCESSOR_PRIORITIES } from "../processors/base/types.js";
-// Action types
-export type {
-  ActionAWSConfig,
-  ActionCommentResult,
-  ActionEvaluation,
-  ActionExecutionResult,
-  ActionGoogleCloudConfig,
-  ActionInputs,
-  ActionInputValidation,
-  ActionMultimodalInputs,
-  ActionOutput,
-  ActionProviderKeys,
-  ActionThinkingConfig,
-  ActionTokenUsage,
-  CliAnalytics,
-  CliEvaluation,
-  CliResponse,
-  CliTokenUsage,
-  ProviderKeyMapping,
-} from "./actionTypes.js";
-// Analytics types - NEW (selective export to avoid ErrorInfo conflict with common.js)
-export type {
-  AnalyticsData,
-  ErrorInfo as AnalyticsErrorInfo, // Renamed to avoid conflict with common.js ErrorInfo
-  PerformanceMetrics,
-  StreamAnalyticsData,
-  TokenUsage,
-} from "./analytics.js";
-// Content types for multimodal support (includes multimodal re-exports for backward compatibility)
-export * from "./content.js";
-// Domain factory types
-export type {
-  DomainConfig,
-  DomainConfigOptions,
-  DomainEvaluationCriteria,
-  DomainTemplate,
-  DomainType,
-  DomainValidationRule,
-} from "./domainTypes.js";
-// Evaluation types - NEW
+// Read-only git toolset (N4.4) built on the background-command runner
+export * from "./gitTools.js";
+
+// Path containment guard shared by the sandboxed execution paths
+export * from "./pathSandbox.js";
+export * from "./fileToolRoots.js";
+export * from "./domain.js";
+export * from "./errors.js";
 export * from "./evaluation.js";
-// Evaluation provider types - NEW
 export * from "./evaluationProviders.js";
-// File detection and processing types
-export * from "./fileTypes.js";
-// Generate types - NEW (selective export to avoid GenerateResult conflict with cli.js)
-export type {
-  EnhancedGenerateResult,
-  EnhancedProvider,
-  FactoryEnhancedProvider,
-  GenerateOptions,
-  GenerateResult as GenerateApiResult, // Renamed to avoid conflict with cli.js GenerateResult
-  TextGenerationOptions,
-  TextGenerationResult,
-  UnifiedGenerationOptions,
-} from "./generateTypes.js";
-// HITL (Human-in-the-Loop) types
-export * from "./hitlTypes.js";
-// Middleware Types - Middleware system types
-export * from "./middlewareTypes.js";
-// Model types - NEW
-export * from "./modelTypes.js";
-// SDK Types - Core types for external developers
-// Note: sdkTypes.ts uses selective re-exports internally, so we use wildcard here
-// The conflicts were from generateTypes and analytics which are now handled above
-export * from "./sdkTypes.js";
-// Service types - NEW
-export * from "./serviceTypes.js";
-// Stream types - NEW (selective export to avoid conflicts)
-export type {
-  EnhancedStreamProvider,
-  ProgressCallback,
-  StreamingMetadata,
-  StreamingOptions,
-  StreamingProgressData,
-  StreamOptions,
-  StreamResult,
-  ToolCall as StreamToolCall, // Renamed to avoid conflict with tools.js ToolCall
-  ToolCallResults,
-  ToolCalls,
-  ToolResult as StreamToolResult, // Renamed to avoid conflict with tools.js ToolResult
-} from "./streamTypes.js";
-// TTS (Text-to-Speech) types
-export * from "./ttsTypes.js";
-// Utilities Types - Utility module types (selective export to avoid conflicts)
+export * from "./externalMcp.js";
+export * from "./file.js";
+export * from "./fileReference.js";
+export * from "./generate.js";
+export * from "./grounding.js";
+export * from "./guardrails.js";
+export * from "./hitl.js";
+export * from "./isolatedAgent.js";
+export * from "./knowledge.js";
+export * from "./livekit.js";
+export * from "./loopEngine.js";
+export * from "./mcp.js";
+export * from "./mcpOutput.js";
+export * from "./memory.js";
+export * from "./middleware.js";
+export * from "./model.js";
+export * from "./multimodal.js";
+export * from "./nativeTools.js";
+export * from "./observability.js";
+export * from "./openaiCompatible.js";
+export * from "./ppt.js";
+export * from "./processor.js";
+export * from "./providerCatalog.js";
+export * from "./providerCatalog.generated.js";
+export * from "./providers.js";
+export * from "./proxy.js";
+export * from "./proxyIR.js";
+export * from "./proxyClient.js";
+export * from "./proxyContext.js";
+export * from "./rag.js";
+export * from "./scorer.js";
+export * from "./sdk.js";
+export * from "./server.js";
+export * from "./service.js";
+export * from "./skills.js";
+export * from "./stream.js";
+export * from "./streaming.js";
+export * from "./subscription.js";
+export * from "./task.js";
+export * from "./taskClassification.js";
+export * from "./tasks.js";
+export * from "./toolDedup.js";
+export * from "./toolResolution.js";
+export * from "./toolRouting.js";
+export * from "./tools.js";
+export * from "./vectorStoreChroma.js";
+export * from "./vectorStorePinecone.js";
+export * from "./voice.js";
+export * from "./transcribe.js";
 export * from "./utilities.js";
+export * from "./workflow.js";
 
-// Middleware Types - Middleware system types
-export * from "./middlewareTypes.js";
+// Processor base types are re-exported via ./processor.js
+export * from "./ioProcessor.js";
+export * from "./exporter.js";
+export * from "./span.js";
+export * from "./imageGen.js";
+export * from "./elicitation.js";
 
-// File detection and processing types
-export * from "./fileTypes.js";
+// Dynamic Arguments types
+export * from "./dynamic.js";
 
-// Content types for multimodal support (includes multimodal re-exports for backward compatibility)
-export * from "./content.js";
+// Curator P2-4 dedup: per-stream AsyncLocalStorage context
+export * from "./streamDedup.js";
 
-// TTS (Text-to-Speech) types
-export * from "./ttsTypes.js";
+// Curator P3-6: NoOutputGeneratedError sentinel chunk shape
+export * from "./noOutputSentinel.js";
 
-// HITL (Human-in-the-Loop) types
-export * from "./hitlTypes.js";
+// New modality categories (M9.1+)
+export * from "./video.js";
+export * from "./avatar.js";
+export * from "./music.js";
+export * from "./replicate.js";
+export * from "./mediaCatalog.js";
 
-// Workflow types
-export * from "./workflowTypes.js";
+// Safe-fetch helper types (SSRF-hardened download)
+export * from "./safeFetch.js";
+
+// ModelPool — multi-provider failover with per-member cooldown (M9.x+)
+export * from "./modelPool.js";
+
+// RequestRouter — pluggable pre-call provider/model selection (M9.x+)
+export * from "./requestRouter.js";
+
+// ClassifierRouter — classify → pick model + tools from a base pool (M9.x+)
+export * from "./classifierRouter.js";
+// Multi-Agent orchestration types
+export * from "./agentNetwork.js";
+export * from "./localUsage.js";
+
+// resolveRequestKind() dispatch-decision types
+export * from "./dispatch.js";
+export * from "./proxyRestart.js";
+export * from "./proxyBudget.js";
+
+// `decide` inference-type contracts (TypeSafe Jev is the first provider)
+export * from "./decision.js";
+
+export * from "./ollamaDiagnostics.js";

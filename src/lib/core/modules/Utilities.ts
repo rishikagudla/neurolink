@@ -21,13 +21,17 @@ import { z } from "zod";
 import type {
   AIProviderName,
   TextGenerationOptions,
+  StreamOptions,
+  MiddlewareFactoryOptions,
+  ZodUnknownSchema,
 } from "../../types/index.js";
-import type { StreamOptions } from "../../types/streamTypes.js";
-import type { MiddlewareFactoryOptions } from "../../types/middlewareTypes.js";
-import type { ZodUnknownSchema } from "../../types/typeAliases.js";
 import { logger } from "../../utils/logger.js";
 import { getSafeMaxTokens } from "../../utils/tokenLimits.js";
-import { TimeoutError } from "../../utils/timeout.js";
+import {
+  TimeoutError,
+  getDefaultTimeout,
+  parseTimeout,
+} from "../../utils/timeout.js";
 import {
   validateStreamOptions as validateStreamOpts,
   validateTextGenerationOptions,
@@ -226,27 +230,45 @@ export class Utilities {
    * Supports number or string formats (e.g., '30s', '2m', '1h')
    */
   getTimeout(options: TextGenerationOptions | StreamOptions): number {
-    if (!options.timeout) {
-      return this.defaultTimeout;
+    // If caller specified a timeout, use it (supports number ms and string formats)
+    if (options.timeout !== undefined && options.timeout !== null) {
+      const parsed = parseTimeout(options.timeout);
+      if (parsed !== undefined) {
+        return parsed;
+      }
     }
 
-    if (typeof options.timeout === "number") {
-      return options.timeout;
+    // Use per-provider default (e.g., vertex=60s, ollama=5m) instead of global 30s.
+    // Always use "generate" operation here — streaming operations have their own
+    // longer timeout (DEFAULT_TIMEOUTS.streaming = 2m) applied by the streaming
+    // infrastructure in BaseProvider.stream(). Both TextGenerationOptions and
+    // StreamOptions share the same `input` property, so there is no reliable
+    // discriminator to detect streaming at this level.
+    const providerDefault = parseTimeout(
+      getDefaultTimeout(this.providerName, "generate"),
+    );
+    return providerDefault ?? this.defaultTimeout;
+  }
+
+  /**
+   * Get timeout scaled by estimated input token count.
+   * For large contexts (>100K tokens), increase timeout proportionally.
+   */
+  getContextAwareTimeout(
+    options: TextGenerationOptions | StreamOptions,
+    estimatedTokens?: number,
+  ): number {
+    const baseTimeout = this.getTimeout(options);
+
+    if (!estimatedTokens || estimatedTokens <= 100_000) {
+      return baseTimeout;
     }
 
-    // Parse string timeout (e.g., '30s', '2m', '1h')
-    const timeoutStr = options.timeout.toLowerCase();
-    const value = parseInt(timeoutStr);
-
-    if (timeoutStr.includes("h")) {
-      return value * 60 * 60 * 1000;
-    } else if (timeoutStr.includes("m")) {
-      return value * 60 * 1000;
-    } else if (timeoutStr.includes("s")) {
-      return value * 1000;
-    }
-
-    return this.defaultTimeout;
+    // Scale: >100K → 1.5x, >200K → 2x, >300K → 2.5x (capped at 4x)
+    // Use (estimatedTokens - 1) so exact multiples stay in the lower tier
+    // (e.g., 100_000 → 1x, 100_001 → 1.5x)
+    const scale = 1 + Math.floor((estimatedTokens - 1) / 100_000) * 0.5;
+    return Math.round(baseTimeout * Math.min(scale, 4));
   }
 
   /**
@@ -274,7 +296,11 @@ export class Utilities {
         error?: unknown;
       };
       if (mcpResult.success) {
-        return mcpResult.data;
+        // If `data` field exists, return it (standard MCP format).
+        // Otherwise fall back to the full result object so the LLM
+        // receives the actual payload instead of `undefined`, which
+        // would cause it to re-call the tool in a loop.
+        return mcpResult.data !== undefined ? mcpResult.data : result;
       } else {
         // Instead of throwing, return a structured error result
         // This prevents tool failures from terminating streams
@@ -308,10 +334,12 @@ export class Utilities {
   createPermissiveZodSchema(): ZodUnknownSchema {
     // Create a permissive record that accepts any object structure
     // This allows all parameters to pass through without validation issues
-    return z.record(z.unknown()).transform((data: Record<string, unknown>) => {
-      // Return the data as-is to preserve all parameter information
-      return data;
-    });
+    return z
+      .record(z.string(), z.unknown())
+      .transform((data: Record<string, unknown>) => {
+        // Return the data as-is to preserve all parameter information
+        return data;
+      });
   }
 
   /**

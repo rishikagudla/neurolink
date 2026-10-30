@@ -11,8 +11,13 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 /**
  * Supported MCP transport protocols - imported from mcpTypes.js (canonical definition)
  */
-import type { MCPTransportType } from "./mcpTypes.js";
-export type { MCPTransportType } from "./mcpTypes.js";
+import type {
+  MCPTransportType,
+  MCPServerInfo,
+  MCPServerReadiness,
+  MCPToolAnnotations,
+} from "./mcp.js";
+export type { MCPTransportType } from "./mcp.js";
 
 /**
  * External MCP server configuration for process spawning
@@ -54,6 +59,9 @@ export type ExternalMCPServerConfig = {
   /** HTTP headers for authentication and configuration (HTTP/SSE/WebSocket) */
   headers?: Record<string, string>;
 
+  /** Trusted HTTP/SSE egress hook, retained for every connection and request. */
+  fetch?: typeof globalThis.fetch;
+
   /** List of tool names to block/blacklist from this server */
   blockedTools?: string[];
 
@@ -68,8 +76,14 @@ export type ExternalMCPServerInstance = {
   /** Server configuration */
   config: ExternalMCPServerConfig;
 
-  /** Child process (for stdio transport) */
+  /**
+   * Child process handle. Always null for stdio servers: the SDK transport
+   * owns the process and does not expose the handle. Use `pid`.
+   */
   process: ChildProcess | null;
+
+  /** OS process id of the stdio server, once connected */
+  pid?: number;
 
   /** MCP client instance */
   client: Client | null;
@@ -154,6 +168,9 @@ export type ExternalMCPToolInfo = {
   /** Input schema (JSON Schema) */
   inputSchema?: JsonObject;
 
+  /** Server-supplied behavior hints; absent annotations remain absent. */
+  annotations?: MCPToolAnnotations;
+
   /** Whether the tool is currently available */
   isAvailable: boolean;
 
@@ -197,6 +214,15 @@ export type ExternalMCPServerHealth = {
 
   /** Any health issues detected */
   issues: string[];
+
+  /** Consecutive failed connections or live health checks, reset on recovery. */
+  consecutiveFailures?: number;
+
+  /** Most recent connection/health error, absent after successful recovery. */
+  lastError?: string;
+
+  /** Next automatic retry deadline, absent when no retry is scheduled. */
+  nextRetryAt?: Date;
 
   /** Performance metrics */
   performance: {
@@ -243,12 +269,28 @@ export type ExternalMCPOperationResult<T = unknown> = {
   /** Operation duration in milliseconds */
   duration?: number;
 
-  /** Additional metadata */
+  /**
+   * Additional metadata.
+   *
+   * The two typed optional fields are intersected with the pre-existing
+   * `JsonValue` index signature rather than declared inside it: declaring an
+   * optional property next to a `JsonValue` index signature does not compile
+   * (its type includes `undefined`), and widening the index signature to
+   * `JsonValue | undefined` would change the read type of every other key
+   * for every existing consumer — a backward-incompatible public change.
+   */
   metadata?: {
     timestamp: number;
     operation: string;
-    [key: string]: JsonValue;
-  };
+    /**
+     * Set on `addServer` results: whether the registration discovered
+     * enough tools to be considered ready (see `MCPServerInfo.minTools`).
+     * Absent on operations the minTools gate does not apply to.
+     */
+    readiness?: MCPServerReadiness;
+    /** Set alongside `readiness` on `addServer` results — tools discovered, post block-list. */
+    toolsDiscovered?: number;
+  } & { [key: string]: JsonValue };
 };
 
 /**
@@ -287,6 +329,14 @@ export type ExternalMCPToolResult = {
   /** Error message if failed */
   error?: string;
 
+  /**
+   * True when the call completed at the transport level but the MCP result
+   * itself is `{ isError: true }`. `success` stays true for such results so
+   * the resolved MCP error payload still reaches the caller unchanged; this
+   * flag is what lets stats and telemetry count the call as a failure.
+   */
+  isErrorResult?: boolean;
+
   /** Execution duration in milliseconds */
   duration: number;
 
@@ -306,6 +356,7 @@ export type ExternalMCPServerEvents = {
   /** Server status changed */
   statusChanged: {
     serverId: string;
+    serverName: string;
     oldStatus: ExternalMCPServerStatus;
     newStatus: ExternalMCPServerStatus;
     timestamp: Date;
@@ -314,6 +365,7 @@ export type ExternalMCPServerEvents = {
   /** Server connected successfully */
   connected: {
     serverId: string;
+    serverName: string;
     toolCount: number;
     timestamp: Date;
   };
@@ -321,6 +373,7 @@ export type ExternalMCPServerEvents = {
   /** Server disconnected */
   disconnected: {
     serverId: string;
+    serverName: string;
     reason?: string;
     timestamp: Date;
   };
@@ -328,6 +381,7 @@ export type ExternalMCPServerEvents = {
   /** Server failed */
   failed: {
     serverId: string;
+    serverName: string;
     error: string;
     timestamp: Date;
   };
@@ -335,6 +389,7 @@ export type ExternalMCPServerEvents = {
   /** Tool discovered */
   toolDiscovered: {
     serverId: string;
+    serverName: string;
     toolName: string;
     toolInfo: ExternalMCPToolInfo;
     timestamp: Date;
@@ -343,6 +398,7 @@ export type ExternalMCPServerEvents = {
   /** Tool removed */
   toolRemoved: {
     serverId: string;
+    serverName: string;
     toolName: string;
     timestamp: Date;
   };
@@ -350,6 +406,7 @@ export type ExternalMCPServerEvents = {
   /** Health check completed */
   healthCheck: {
     serverId: string;
+    serverName: string;
     health: ExternalMCPServerHealth;
     timestamp: Date;
   };
@@ -392,9 +449,14 @@ export type ExternalMCPManagerConfig = {
  * configuration fields from MCPServerInfo with runtime-only state needed for
  * active server management (process handles, clients, metrics, etc.)
  */
-export type RuntimeMCPServerInfo = import("./mcpTypes.js").MCPServerInfo & {
-  /** Child process handle (for stdio transport, null for HTTP transports) */
+export type RuntimeMCPServerInfo = MCPServerInfo & {
+  /**
+   * Child process handle. Always null for stdio servers: the SDK transport
+   * owns the process and does not expose the handle. Use `pid`.
+   */
   process: import("child_process").ChildProcess | null;
+  /** OS process id of the stdio server, once connected */
+  pid?: number;
   /** MCP client instance for communication */
   client: Client | null;
   /** Transport instance (renamed from 'transport' to avoid conflict with MCPServerInfo.transport) */
@@ -433,5 +495,5 @@ export type RuntimeMCPServerInfo = import("./mcpTypes.js").MCPServerInfo & {
     inputSchema?: object;
   }>;
   /** Compatibility field for existing code - stores MCPServerInfo config */
-  config: import("./mcpTypes.js").MCPServerInfo;
+  config: MCPServerInfo;
 };

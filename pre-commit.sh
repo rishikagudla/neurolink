@@ -22,39 +22,133 @@ BRANCH_NAME="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
 if [[ "$BRANCH_NAME" != "HEAD" ]]; then
   echo "🔍 Running pre-commit checks on branch: $BRANCH_NAME"
   
-  echo "📋 Running check..."
-  npm run check
+  # `check` (svelte-check + tsc) and `validate:all` (validate + lint +
+  # validate:env + validate:security) touch no shared state: `.svelte-kit/**`,
+  # the only thing `check` writes, is ignored by eslint (eslint.config.js) and
+  # by prettier (.prettierignore). So they run concurrently.
+  #
+  # Measured: 59s + 110s sequential -> 48s together.
+  #
+  # `format:staged` still runs first and alone — it REWRITES staged files, and
+  # linting them while they are being rewritten is a race.
   
+  # Files that already carry unstaged edits, recorded BEFORE `format:staged`
+  # rewrites anything: the re-add step below must not stage them. The list is
+  # NUL-delimited so a path with a space or a newline survives, and it goes
+  # through a file because a shell variable cannot hold NUL and a failed
+  # `git diff` inside `< <(...)` would be swallowed, silently restoring the
+  # old stage-everything behaviour.
+  unstaged_before_log="$(mktemp)"
+  git diff --name-only --diff-filter=d -z > "$unstaged_before_log"
+  unstaged_before=()
+  while IFS= read -r -d '' f; do
+    unstaged_before+=("$f")
+  done < "$unstaged_before_log"
+  rm -f "$unstaged_before_log"
+
   echo "🎨 Running format..."
   npm run format:staged
-  
-  echo "🔧 Running lint..."
-  npm run lint
-  
-  echo "🔐 Running validate..."
-  npm run validate:all
 
-  echo "🏗️  Running build..."
-  npm run build
+  # Provider-catalog codegen freshness — fails fast, before the longer
+  # check/validate stages, if the per-provider JSON changed but the
+  # generated enums/types/index were not regenerated to match.
+  echo "🧬 Checking provider catalog codegen is current..."
+  npm run codegen:catalog -- --check
 
-  # Check if running in CI environment
-  if [[ -n "$CI" ]] || [[ -n "$GITHUB_ACTIONS" ]] || [[ -n "$JENKINS_HOME" ]] || [[ -n "$TRAVIS" ]] || [[ -n "$CIRCLECI" ]]; then
-    # TODO: Re-enable after test suite reorganization is complete
-    # Tests temporarily disabled in CI pending test infrastructure refactoring
-    # Tracked in: [Add GitHub issue number if available]
-    echo "⏭️  Skipping tests in CI environment (pending test suite reorganization)"
-    echo "ℹ️  Local developers: tests still run on your machine"
-  else
-    # Local development - tests still run
-    echo "🧪 Running tests..."
-    npm run test
+  # `validate:all` is `validate && lint && validate:env && validate:security`,
+  # so calling `lint` separately above ran the repo-wide prettier+eslint
+  # twice. Measured here: lint 115s, validate:all 110s — validate:all is
+  # almost entirely that second lint. Nothing is checked less, just once.
+  #
+  # The build that used to follow is gone too: pre-push builds, and nothing
+  # about the tree changes between commit and push, so it was a second full
+  # `vite build` + `prepack` (69s) for an artifact the push rebuilt anyway.
+  echo "📋 Running check and validate in parallel..."
+  check_log="$(mktemp)"
+  validate_log="$(mktemp)"
+  # `wait` must sit in a condition context. This script installs `trap finish
+  # ERR`, and bash fires the ERR trap on a failing command even under `set +e`
+  # — so a bare `wait "$pid"; rc=$?` aborted the hook the moment a stage
+  # failed, before either log was printed. The exit code looked right and the
+  # diagnostics were gone.
+  check_rc=0
+  validate_rc=0
+  npm run check        > "$check_log"    2>&1 &
+  check_pid=$!
+  npm run validate:all > "$validate_log" 2>&1 &
+  validate_pid=$!
+  wait "$check_pid"    || check_rc=$?
+  wait "$validate_pid" || validate_rc=$?
+
+  # Print both logs whatever happens, so a failure is never hidden behind the
+  # other stage's output and a passing run still shows what ran.
+  echo "--- check ---";    cat "$check_log"
+  echo "--- validate ---"; cat "$validate_log"
+  rm -f "$check_log" "$validate_log"
+
+  if [ "$check_rc" -ne 0 ] || [ "$validate_rc" -ne 0 ]; then
+    echo "❌ check exited $check_rc, validate exited $validate_rc"
+    exit 1
   fi
 
+  # Continuous test suites require API keys and run separately
+  echo "⏭️  Skipping tests (continuous test suites require API keys - run manually with pnpm test)"
+
   # Adding formatted files to git stage.
+  #
+  # `git diff --name-only` (worktree vs index) lists every file prettier just
+  # reformatted on disk, but ALSO any unrelated file with in-progress edits
+  # that were never staged for this commit. Re-adding that raw list sweeps
+  # unrelated WIP into the commit. Only files that are BOTH just-reformatted
+  # AND already staged for this commit (index vs HEAD) are re-added.
+  #
+  # A file that is staged AND already carried unstaged edits before formatting
+  # (a partial stage, `git add -p`) is NOT re-added: prettier rewrote the whole
+  # working-tree copy, and `git add` would stage every unstaged hunk with it.
+  # Such a file keeps exactly the content that was staged; its formatting
+  # stays in the working tree, and the warning below says so.
   echo "📝 Adding formatted files to git stage..."
-  files="$(git diff --name-only --diff-filter=d)"
-  if [[ -n "$files" ]]; then
-    git add -- $files
+  staged_files=()
+  while IFS= read -r -d '' f; do
+    staged_files+=("$f")
+  done < <(git diff --cached --name-only --diff-filter=d -z)
+
+  if [[ ${#staged_files[@]} -gt 0 ]]; then
+    files_to_add=()
+    left_unstaged=()
+    while IFS= read -r -d '' f; do
+      for s in "${staged_files[@]}"; do
+        if [[ "$f" == "$s" ]]; then
+          is_partial=0
+          if [[ ${#unstaged_before[@]} -gt 0 ]]; then
+            for u in "${unstaged_before[@]}"; do
+              if [[ "$f" == "$u" ]]; then
+                is_partial=1
+                break
+              fi
+            done
+          fi
+          if [[ "$is_partial" -eq 1 ]]; then
+            left_unstaged+=("$f")
+          else
+            files_to_add+=("$f")
+          fi
+          break
+        fi
+      done
+    done < <(git diff --name-only --diff-filter=d -z)
+
+    if [[ ${#files_to_add[@]} -gt 0 ]]; then
+      git add -- "${files_to_add[@]}"
+    fi
+
+    if [[ ${#left_unstaged[@]} -gt 0 ]]; then
+      echo "⚠️  Formatted in the working tree only, NOT staged: these files also have unstaged changes, and staging them would commit those too:"
+      for f in "${left_unstaged[@]}"; do
+        printf '    %s\n' "$f"
+      done
+      echo "    Stage them yourself (git add -p) if you want the formatted version committed."
+    fi
   fi
 
   echo "🎉 All pre-commit checks passed!"

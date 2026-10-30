@@ -1,15 +1,17 @@
-import type { AnalyticsData, TokenUsage } from "../types/analytics.js";
-import { createAnalytics } from "./analytics.js";
-import { logger } from "../utils/logger.js";
 import type {
+  AnalyticsData,
+  TokenUsage,
   StreamTextResult,
   StreamAnalyticsCollector,
   ResponseMetadata,
-} from "../types/streamTypes.js";
+} from "../types/index.js";
+import { createAnalytics } from "./analytics.js";
+import { logger } from "../utils/logger.js";
 import {
   extractTokenUsage,
   createEmptyTokenUsage,
 } from "../utils/tokenUtils.js";
+import { NoOutputGeneratedError } from "../utils/generationErrors.js";
 
 /**
  * Base implementation for collecting analytics from Vercel AI SDK stream results
@@ -33,7 +35,11 @@ export class BaseStreamAnalyticsCollector implements StreamAnalyticsCollector {
       // and cache savings calculation
       return extractTokenUsage(usage);
     } catch (error) {
-      logger.warn("Failed to collect usage from stream result", { error });
+      if (NoOutputGeneratedError.isInstance(error)) {
+        logger.debug("No output generated from stream — returning empty usage");
+      } else {
+        logger.warn("Failed to collect usage from stream result", { error });
+      }
       return createEmptyTokenUsage();
     }
   }
@@ -58,11 +64,18 @@ export class BaseStreamAnalyticsCollector implements StreamAnalyticsCollector {
         finishReason: finishReason,
       };
     } catch (error) {
-      logger.warn("Failed to collect metadata from stream result", { error });
-      const finishReason = await result.finishReason.catch(() => "error");
+      if (NoOutputGeneratedError.isInstance(error)) {
+        logger.debug(
+          "No output generated from stream — returning default metadata",
+        );
+      } else {
+        logger.warn("Failed to collect metadata from stream result", {
+          error,
+        });
+      }
       return {
         timestamp: Date.now(),
-        finishReason: finishReason,
+        finishReason: "error" as const,
       };
     }
   }
@@ -84,13 +97,15 @@ export class BaseStreamAnalyticsCollector implements StreamAnalyticsCollector {
         this.collectMetadata(result),
       ]);
 
-      // Get final text content and finish reason
+      // Get final text content and finish reason.
+      // Guard each promise individually: AI SDK v6 rejects all of these with
+      // NoOutputGeneratedError when the stream produced no output.
       const [content, finishReason, toolResults, toolCalls] = await Promise.all(
         [
-          result.text,
-          result.finishReason,
-          result.toolResults || Promise.resolve([]),
-          result.toolCalls || Promise.resolve([]),
+          Promise.resolve(result.text).catch(() => ""),
+          Promise.resolve(result.finishReason).catch(() => "error" as const),
+          Promise.resolve(result.toolResults || []).catch(() => []),
+          Promise.resolve(result.toolCalls || []).catch(() => []),
         ],
       );
 

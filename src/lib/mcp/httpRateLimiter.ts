@@ -5,13 +5,23 @@
  */
 
 import { mcpLogger } from "../utils/logger.js";
-import type { RateLimitConfig, RateLimiterStats } from "../types/mcpTypes.js";
-
+import { parseRetryAfterMs } from "../utils/retryAfter.js";
+import type {
+  TokenBucketRateLimitConfig,
+  RateLimiterStats,
+} from "../types/index.js";
+import {
+  SpanSerializer,
+  SpanType,
+  SpanStatus,
+  getMetricsAggregator,
+} from "../observability/index.js";
+import { getActiveTraceContext } from "../telemetry/traceContext.js";
 /**
  * Default rate limit configuration
  * Provides sensible defaults for most MCP HTTP transport use cases
  */
-export const DEFAULT_RATE_LIMIT_CONFIG: RateLimitConfig = {
+export const DEFAULT_RATE_LIMIT_CONFIG: TokenBucketRateLimitConfig = {
   requestsPerWindow: 60,
   windowMs: 60000,
   useTokenBucket: true,
@@ -32,14 +42,14 @@ export const DEFAULT_RATE_LIMIT_CONFIG: RateLimitConfig = {
 export class HTTPRateLimiter {
   private tokens: number;
   private lastRefill: number;
-  private config: RateLimitConfig;
+  private config: TokenBucketRateLimitConfig;
   private waitQueue: Array<{
     resolve: () => void;
     reject: (error: Error) => void;
   }> = [];
   private processingQueue = false;
 
-  constructor(config: Partial<RateLimitConfig> = {}) {
+  constructor(config: Partial<TokenBucketRateLimitConfig> = {}) {
     this.config = { ...DEFAULT_RATE_LIMIT_CONFIG, ...config };
     this.tokens = this.config.maxBurst;
     this.lastRefill = Date.now();
@@ -87,23 +97,56 @@ export class HTTPRateLimiter {
    * @throws Error if the wait queue is too long
    */
   async acquire(): Promise<void> {
-    // First, try to acquire without waiting
-    if (this.tryAcquire()) {
-      return;
-    }
+    const { traceId, parentSpanId } = getActiveTraceContext();
+    const span = SpanSerializer.createSpan(
+      SpanType.MCP_TRANSPORT,
+      "mcp.rateLimit",
+      {
+        "mcp.transport": "http",
+        "mcp.operation": "rateLimit",
+        "mcp.rateLimit.tokensAvailable": this.tokens,
+        "mcp.rateLimit.maxBurst": this.config.maxBurst,
+      },
+      parentSpanId,
+      traceId,
+    );
+    const startTime = Date.now();
 
-    // Add to wait queue
-    return new Promise<void>((resolve, reject) => {
-      this.waitQueue.push({ resolve, reject });
-      mcpLogger.debug(
-        `[HTTPRateLimiter] Request queued, queue length: ${this.waitQueue.length}`,
-      );
-
-      // Start processing the queue if not already processing
-      if (!this.processingQueue) {
-        this.processQueue();
+    try {
+      // First, try to acquire without waiting
+      if (this.tryAcquire()) {
+        span.durationMs = Date.now() - startTime;
+        span.attributes["mcp.rateLimit.waited"] = false;
+        const endedSpan = SpanSerializer.endSpan(span, SpanStatus.OK);
+        getMetricsAggregator().recordSpan(endedSpan);
+        return;
       }
-    });
+
+      // Add to wait queue
+      await new Promise<void>((resolve, reject) => {
+        this.waitQueue.push({ resolve, reject });
+        mcpLogger.debug(
+          `[HTTPRateLimiter] Request queued, queue length: ${this.waitQueue.length}`,
+        );
+
+        // Start processing the queue if not already processing
+        if (!this.processingQueue) {
+          this.processQueue();
+        }
+      });
+
+      span.durationMs = Date.now() - startTime;
+      span.attributes["mcp.rateLimit.waited"] = true;
+      const endedSpan = SpanSerializer.endSpan(span, SpanStatus.OK);
+      getMetricsAggregator().recordSpan(endedSpan);
+    } catch (error) {
+      span.durationMs = Date.now() - startTime;
+      const endedSpan = SpanSerializer.endSpan(span, SpanStatus.ERROR);
+      endedSpan.statusMessage =
+        error instanceof Error ? error.message : String(error);
+      getMetricsAggregator().recordSpan(endedSpan);
+      throw error;
+    }
   }
 
   /**
@@ -187,61 +230,54 @@ export class HTTPRateLimiter {
    * @returns Wait time in milliseconds, or 0 if no rate limit headers found
    */
   handleRateLimitResponse(headers: Headers): number {
-    // Check for Retry-After header (standard HTTP 429 response)
+    const parsedWaitTimeMs = parseRetryAfterMs(headers);
+
+    // Keep the existing source-specific logs while delegating delay parsing.
     const retryAfter = headers.get("Retry-After");
 
-    if (retryAfter) {
-      // Retry-After can be either a number of seconds or an HTTP-date
+    if (retryAfter && parsedWaitTimeMs !== undefined) {
       const seconds = parseInt(retryAfter, 10);
 
       if (!isNaN(seconds)) {
-        // It's a number of seconds
-        const waitTimeMs = seconds * 1000;
         mcpLogger.info(
           `[HTTPRateLimiter] Server requested retry after ${seconds} seconds`,
         );
-        return waitTimeMs;
+        return parsedWaitTimeMs;
       } else {
-        // Try to parse as HTTP-date
         const retryDate = new Date(retryAfter);
         if (!isNaN(retryDate.getTime())) {
-          const waitTimeMs = Math.max(0, retryDate.getTime() - Date.now());
           mcpLogger.info(
-            `[HTTPRateLimiter] Server requested retry at ${retryDate.toISOString()} (${waitTimeMs}ms)`,
+            `[HTTPRateLimiter] Server requested retry at ${retryDate.toISOString()} (${parsedWaitTimeMs}ms)`,
           );
-          return waitTimeMs;
+          return parsedWaitTimeMs;
         }
       }
     }
 
     // Check for X-RateLimit-Reset header (common non-standard header)
     const rateLimitReset = headers.get("X-RateLimit-Reset");
-    if (rateLimitReset) {
+    if (rateLimitReset && parsedWaitTimeMs !== undefined) {
       const resetTimestamp = parseInt(rateLimitReset, 10);
       if (!isNaN(resetTimestamp)) {
-        // Could be Unix timestamp (seconds) or milliseconds
         const resetTime =
           resetTimestamp > 1e12 ? resetTimestamp : resetTimestamp * 1000;
-        const waitTimeMs = Math.max(0, resetTime - Date.now());
         mcpLogger.info(
-          `[HTTPRateLimiter] Rate limit resets at ${new Date(resetTime).toISOString()} (${waitTimeMs}ms)`,
+          `[HTTPRateLimiter] Rate limit resets at ${new Date(resetTime).toISOString()} (${parsedWaitTimeMs}ms)`,
         );
-        return waitTimeMs;
+        return parsedWaitTimeMs;
       }
     }
 
     // Check for X-RateLimit-Remaining header
     const remaining = headers.get("X-RateLimit-Remaining");
-    if (remaining === "0") {
-      // No remaining requests, use default backoff
-      const defaultBackoffMs = 1000;
+    if (remaining === "0" && parsedWaitTimeMs !== undefined) {
       mcpLogger.info(
-        `[HTTPRateLimiter] Rate limit exhausted, using default backoff: ${defaultBackoffMs}ms`,
+        `[HTTPRateLimiter] Rate limit exhausted, using default backoff: ${parsedWaitTimeMs}ms`,
       );
-      return defaultBackoffMs;
+      return parsedWaitTimeMs;
     }
 
-    return 0;
+    return parsedWaitTimeMs ?? 0;
   }
 
   /**
@@ -293,7 +329,7 @@ export class HTTPRateLimiter {
    * Update configuration dynamically
    * Useful when server provides rate limit information
    */
-  updateConfig(config: Partial<RateLimitConfig>): void {
+  updateConfig(config: Partial<TokenBucketRateLimitConfig>): void {
     Object.assign(this.config, config);
     mcpLogger.info(`[HTTPRateLimiter] Configuration updated:`, config);
   }
@@ -301,7 +337,7 @@ export class HTTPRateLimiter {
   /**
    * Get current configuration
    */
-  getConfig(): Readonly<RateLimitConfig> {
+  getConfig(): Readonly<TokenBucketRateLimitConfig> {
     return { ...this.config };
   }
 }
@@ -323,7 +359,7 @@ export class RateLimiterManager {
    */
   getLimiter(
     serverId: string,
-    config?: Partial<RateLimitConfig>,
+    config?: Partial<TokenBucketRateLimitConfig>,
   ): HTTPRateLimiter {
     let limiter = this.limiters.get(serverId);
 

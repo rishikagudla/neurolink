@@ -1,0 +1,7412 @@
+import {
+  initializeProxyOtelLogs,
+  routeProxyConsoleToOtel,
+  shutdownProxyOtelLogs,
+  isProxyOtelOnly,
+  withProxyOtelLogShutdown,
+} from "../../lib/proxy/otelLogSink.js";
+/**
+ * Proxy CLI Commands for NeuroLink
+ *
+ * Implements commands for managing the Claude multi-account proxy:
+ * - neurolink proxy start  — Start the proxy server
+ * - neurolink proxy status — Show proxy status (accounts, sessions, routing)
+ *
+ * The proxy creates a NeuroLink instance and builds a Hono app that registers
+ * Claude-compatible proxy routes. All requests flow through ctx.neurolink
+ * (generate/stream), with an optional ModelRouter for model remapping.
+ */
+
+import type { CommandModule, Argv } from "yargs";
+import { registerCliShutdownOwner } from "../lifecycle.js";
+import { writeFileAtomic } from "../proxy-clients/snapshot.js";
+import { spawn } from "node:child_process";
+import { Server as HttpServer } from "node:http";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import { stripVTControlCharacters } from "node:util";
+import chalk from "chalk";
+import ora from "ora";
+import type { Context, Hono, Next } from "hono";
+import {
+  buildProxyHealthResponse,
+  createProxyReadinessState,
+  markProxyDrainingForUpdate,
+  markProxyReady,
+  resumeProxyConnections,
+  waitForProxyReadiness,
+} from "../../lib/proxy/proxyHealth.js";
+import {
+  ensureTelemetry,
+  getLangfuseHealthStatus,
+} from "../../lib/services/server/ai/observability/instrumentation.js";
+import { logger } from "../../lib/utils/logger.js";
+import {
+  applyAllClients,
+  applyClientsOnProxyStart,
+  restoreAllClients,
+} from "../proxy-clients/registry.js";
+import { resolveProxyConfigPath } from "../../lib/proxy/proxyConfig.js";
+import { readProxyRequestText } from "../../lib/proxy/requestBodyLimit.js";
+import { RawBodyTooLargeError } from "../../lib/server/utils/rawBody.js";
+import {
+  redactUrlsInText,
+  sanitizeForLog,
+} from "../../lib/utils/logSanitize.js";
+import {
+  raceWithAbort,
+  withTimeout,
+} from "../../lib/utils/async/withTimeout.js";
+import { startProxyHttpTrace } from "../../lib/proxy/proxyTracer.js";
+import {
+  formatUptime,
+  isProcessRunning,
+  StateFileManager,
+} from "../utils/serverUtils.js";
+import type {
+  AccountAllowlist,
+  FallbackInfo,
+  LoadedProxyConfig,
+  ModelRouterInterface,
+  PersistedAccountCooldown,
+  ProxyGuardArgs,
+  ProxyHealthProbe,
+  ProxyLogCleanupScheduler,
+  ProxyNeurolinkRuntime,
+  ProxySpinner,
+  ProxyStartApp,
+  ProxyStartArgs,
+  ProxyStartStrategy,
+  ProxyClosableServer,
+  ProxyState,
+  ProxyRestartSupervisorState as ProxySupervisorState,
+  ProxyStatusArgs,
+  ProxyStatusPrimaryAccount,
+  ProxyTelemetryAction,
+  ProxyTelemetryArgs,
+  ProxyRuntimeActivity,
+  ProxyPackageSelection,
+  ProxyRuntimeConfigSnapshot,
+  ProxyReadinessState,
+  ProxyResponseTrackingObserver,
+  ProxyServingWorkerIdentity,
+  RuntimeRequestMetadata,
+  StatusStats,
+} from "../../lib/types/index.js";
+import type { NeuroLink } from "../../lib/neurolink.js";
+import { configureProxyKeepAliveDispatcher } from "../../lib/proxy/proxyDispatcher.js";
+import {
+  evaluateProxyBindPolicy,
+  isUnauthenticatedBindAllowedByEnv,
+  resolveInboundToken,
+} from "../../lib/proxy/inboundAuth.js";
+import { isGrantRequiredByEnv } from "../../lib/proxy/shareGate.js";
+import { tightenProcessUmask } from "../../lib/auth/secureFiles.js";
+import { ProxyRuntimeConfigStore } from "../../lib/proxy/runtimeConfig.js";
+import { sessionAffinity } from "../../lib/proxy/sessionAffinity.js";
+import { startProxyLogCleanupScheduler } from "../../lib/proxy/logCleanupScheduler.js";
+import {
+  anthropicAccountKeysEqual,
+  createAccountAllowlist,
+  isAccountAllowed,
+  LEGACY_ANTHROPIC_ACCOUNT_KEY,
+  normalizeAnthropicAccountKey,
+  shouldLoadFallbackCredential,
+} from "../../lib/proxy/accountSelection.js";
+import { resolveProxyStatusAccountIdentity } from "../../lib/proxy/codexAccountUsage.js";
+import {
+  beginProxyRequest,
+  consumeInternalProxyRequest,
+  releaseProxyRequestAccounting,
+  withProxyFinalLogOwnership,
+  getProxyActivitySnapshot,
+  observeProxyFinalLog,
+  takeProxyResponseObservers,
+  trackProxyResponse,
+} from "../../lib/proxy/proxyActivity.js";
+import {
+  configureProxyLifecycleLogger,
+  flushProxyLifecycleEvents,
+  persistProxyLifecycleAcceptance,
+  getProxyLifecycleLoggerSnapshot,
+  hashProxyLifecycleSessionId,
+  logProxyLifecycleEvent,
+} from "../../lib/proxy/proxyLifecycle.js";
+import {
+  describeInstallFailure,
+  assertProxyServiceInstallIdle,
+  probeProxyLaunchdPresence,
+  inspectProxyPackage,
+  isProxyServiceEnvironmentKey,
+  parseProxyServiceInstallSettings,
+  installStagedProxyPackage,
+  prepareProxyPackageUpgrade,
+  readProxyPackageSelection,
+  resolveProxyWorkerPackage,
+  selectProxyPackage,
+  writeProxyPackageLauncher,
+  isTransientInstallFailure,
+  resolveGlobalInstaller,
+  validateInstalledVersion,
+} from "../../lib/proxy/globalInstaller.js";
+import { pruneProxyPackages } from "../../lib/proxy/packagePrune.js";
+import { startUpdaterWorkerSupervisor } from "../../lib/proxy/updaterSupervisor.js";
+import { openProxyWorkerLog } from "../../lib/proxy/workerLog.js";
+import { startRollingProxyServer } from "../../lib/proxy/rollingProxyServer.js";
+import {
+  startProxyRestartControl,
+  requestProxySupervisorTelemetry,
+} from "../../lib/proxy/restartControl.js";
+import { getProxyProcessTelemetry } from "../../lib/proxy/processTelemetry.js";
+import { recordFinalError as recordProxyRuntimeFinalError } from "../../lib/proxy/usageStats.js";
+import { logRequest as logProxyRequestFinal } from "../../lib/proxy/requestLogger.js";
+import { bindProxyClientCancellation } from "../../lib/proxy/proxyClientCancellation.js";
+import { isProxyAuxiliaryRequest } from "../../lib/proxy/proxyRequestKind.js";
+import { spawnProxySocketWorker } from "../../lib/proxy/rollingWorkerProcess.js";
+import {
+  PROXY_ROLLING_SUPERVISOR_ENV,
+  PROXY_SOCKET_WORKER_ENV,
+} from "../../lib/proxy/rollingWorkerProtocol.js";
+import { attachSocketWorkerProcess } from "../../lib/proxy/socketWorkerRuntime.js";
+import {
+  isSameProxyServingWorker,
+  parseProxyServingWorkerIdentity,
+  parseProxyRuntimeActivity,
+  isProxyUpdateOwnerCurrent,
+  shouldRefreshStaleSupervisor,
+  waitForProxyUpdateWindow,
+} from "../../lib/proxy/updateCoordinator.js";
+import {
+  abandonPendingUpdate,
+  clearUpdateDeferral,
+  isVersionSuppressed,
+  loadUpdateState,
+  recordCheck,
+  recordCheckFailure,
+  recordSuccessfulUpdate,
+  recordUpdateDeferred,
+  recordUpdateFailure,
+  recordUpdateInstalled,
+  suppressVersion,
+} from "../../lib/proxy/updateState.js";
+import {
+  loadProxyEnvFile,
+  resolveProxyEnvFile,
+} from "../../lib/proxy/proxyEnv.js";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+import packageJson from "../../../package.json" with { type: "json" };
+
+const _require = createRequire(import.meta.url);
+const PROXY_VERSION = packageJson.version;
+const PROXY_INTERNAL_ACCOUNT_LABEL = "proxy/internal";
+const PROXY_INTERNAL_ACCOUNT_TYPE = "internal";
+
+const PROXY_TELEMETRY_SCRIPT_PATH = fileURLToPath(
+  new URL(
+    "../../../scripts/observability/manage-local-openobserve.sh",
+    import.meta.url,
+  ),
+);
+/**
+ * Requests accepted by the gate-only share listener.
+ *
+ * Both listeners serve the same Hono app, so the only thing separating a gated
+ * request from an ungated one is which socket accepted it. Recovering that from
+ * `c.env.incoming.socket.localPort` worked but failed in two directions: an
+ * unreadable port answered "not gated", which is fail-open on the one listener
+ * that must never fail open, and a share port configured equal to the main port
+ * answered "gated" for the operator's own untokened traffic.
+ *
+ * Stamping the Request as the share listener hands it to the app settles both.
+ * The mark is applied by the accepting listener before any handler runs, it
+ * says nothing about ports, and nothing a client sends can add or remove it. A
+ * `WeakSet` keyed on the Request holds it for exactly as long as the request
+ * object lives and not a moment longer.
+ */
+const gatedShareRequests = new WeakSet<Request>();
+
+const PROXY_LIFECYCLE_SHUTDOWN_TIMEOUT_MS = 5_000;
+/** Reverse proxies in front of this server (cloudflared keeps idle origin
+ *  connections for 90s) reuse sockets longer than Node's 5s default. A socket
+ *  the server closes while the tunnel sends a POST on it surfaces as a 502,
+ *  because a POST is never retried, so the server must be the side that waits
+ *  longer. headersTimeout has to exceed it, or Node cuts idle sockets early. */
+const PROXY_SERVER_KEEP_ALIVE_TIMEOUT_MS = 120_000;
+const PROXY_SERVER_HEADERS_TIMEOUT_MS = 125_000;
+
+function extendProxyServerKeepAlive(server: unknown): void {
+  if (server instanceof HttpServer) {
+    server.keepAliveTimeout = PROXY_SERVER_KEEP_ALIVE_TIMEOUT_MS;
+    server.headersTimeout = PROXY_SERVER_HEADERS_TIMEOUT_MS;
+  }
+}
+// Allow the normal 30-second worker drain plus startup settlement, leaving
+// telemetry and scheduling headroom inside launchd's 45-second stop budget.
+const PROXY_SUPERVISOR_DRAIN_TIMEOUT_MS = 35_000;
+/** How long shutdown waits on the share listener before moving on. */
+const SHARE_LISTENER_CLOSE_TIMEOUT_MS = 10_000;
+const PROXY_STATUS_RECONCILE_TIMEOUT_MS = 750;
+const PROXY_STATUS_ACCOUNT_INVENTORY_TIMEOUT_MS = 750;
+// Allowed drift between a pid's OS-reported start time and the persisted
+// ProxySupervisorState.startTime before processLooksLikeProxySupervisor
+// treats it as a confident mismatch (recycled pid). Generous on purpose:
+// `supervisorStartedAt` is captured inside runLaunchdProxySupervisor, which
+// runs after Node has already booted and done setup, so it always lags the
+// OS-level fork/exec by a little — a tight tolerance would produce false
+// mismatches on a slow/cold-started machine.
+const PROXY_SUPERVISOR_START_TIME_TOLERANCE_MS = 10_000;
+const PROXY_UPDATE_CONTROL_TOKEN =
+  process.env.NEUROLINK_PROXY_UPDATE_CONTROL_TOKEN?.trim() ||
+  crypto.randomUUID();
+
+// =============================================================================
+// STATE MANAGEMENT
+// =============================================================================
+
+let proxyStateManager = new StateFileManager<ProxyState>("proxy-state.json");
+let proxySupervisorStateManager = new StateFileManager<ProxySupervisorState>(
+  "proxy-supervisor-state.json",
+);
+
+/**
+ * Reinitialise the state manager with a custom base directory.
+ * Called when --dev redirects writable paths to .neurolink-dev/.
+ */
+function setProxyStateDir(baseDir: string): void {
+  proxyStateManager = new StateFileManager<ProxyState>(
+    "proxy-state.json",
+    baseDir,
+  );
+  proxySupervisorStateManager = new StateFileManager<ProxySupervisorState>(
+    "proxy-supervisor-state.json",
+    baseDir,
+  );
+}
+
+function saveProxyState(state: ProxyState): void {
+  proxyStateManager.save(state);
+}
+
+function loadProxyState(): ProxyState | null {
+  return proxyStateManager.load();
+}
+
+function clearProxyState(): void {
+  proxyStateManager.clear();
+}
+
+function saveProxySupervisorState(state: ProxySupervisorState): void {
+  proxySupervisorStateManager.save(state);
+}
+
+/**
+ * Drop a supervisor `version` that is not a string.
+ *
+ * `StateFileManager.load()` is a bare `JSON.parse(content) as T` — it validates
+ * nothing. A state file written by a different build, or half-written during a
+ * crash, can carry any JSON type here, and every status renderer interpolates
+ * the field straight into `v${...}`. Coercing at the single load boundary keeps
+ * a non-string from reaching the output as "v[object Object]".
+ */
+export function normalizeSupervisorState(
+  state: ProxySupervisorState | null,
+): ProxySupervisorState | null {
+  if (!state) {
+    return null;
+  }
+  return typeof state.version === "string" || state.version === undefined
+    ? state
+    : { ...state, version: undefined };
+}
+
+/**
+ * Whether a rolling handoff can actually occur.
+ *
+ * A live supervisor PID alone is not enough: a supervisor from a build
+ * predating rolling state leaves `rolling` absent, and calling that a handoff
+ * makes both `/status` clients and the CLI wait for an activation that will
+ * never come. Gate on the capability, not on the process.
+ */
+export function isRollingHandoffCapable(
+  state: ProxySupervisorState | null,
+  isRunning: (pid: number) => boolean = isProcessRunning,
+): boolean {
+  if (!state) {
+    return false;
+  }
+  // Structural, not just non-null: the same unvalidated `as T` load that lets
+  // `version` be an object lets `rolling` be a string.
+  const hasRollingState =
+    typeof state.rolling === "object" && state.rolling !== null;
+  return isRunning(state.pid) && hasRollingState;
+}
+
+function loadProxySupervisorState(): ProxySupervisorState | null {
+  return normalizeSupervisorState(proxySupervisorStateManager.load());
+}
+
+function clearProxySupervisorState(): void {
+  proxySupervisorStateManager.clear();
+}
+
+const PLIST_LABEL = "com.neurolink.proxy";
+const PLIST_DIR = join(homedir(), "Library", "LaunchAgents");
+const PLIST_PATH = join(PLIST_DIR, `${PLIST_LABEL}.plist`);
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getProcessStatus(pid: number): "running" | "not_running" | "unknown" {
+  try {
+    process.kill(pid, 0);
+    return "running";
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") {
+      return "not_running";
+    }
+    if (code === "EPERM") {
+      return "unknown";
+    }
+    return "not_running";
+  }
+}
+
+/**
+ * Read a single `ps -o <field>=` field for `pid`, off the event loop (async
+ * `execFile`, not `execFileSync`) and bounded by a short timeout, so a
+ * hung/zombie `ps` invocation can never block the event loop or hang the
+ * (often uninstall-path) async caller. Shared by {@link getProcessStartTime}
+ * and {@link processLooksLikeProxySupervisor}, which both read a single
+ * `ps -o <field>=` column for the same pid.
+ *
+ * Returns null — never throws — on any error, timeout, or empty output, so
+ * callers uniformly treat "couldn't read" as "can't confirm either way"
+ * rather than distinguishing the failure mode.
+ */
+async function readPsField(pid: number, field: string): Promise<string | null> {
+  try {
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const execFileAsync = promisify(execFile);
+    const { stdout } = await withTimeout(
+      execFileAsync("ps", ["-p", String(pid), "-o", `${field}=`], {
+        encoding: "utf-8" as const,
+      }),
+      2000,
+      `ps -o ${field}= timed out for pid ${pid}`,
+    );
+    const trimmed = stdout.trim();
+    return trimmed || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Best-effort, macOS-only (uninstall is macOS-only) read of `pid`'s
+ * OS-reported start time via `ps -o lstart=`, which prints a fixed-width
+ * `Www Mmm dd hh:mm:ss yyyy` timestamp — the same shape `Date`'s parser
+ * already understands (it's the format `Date#toString()` itself produces
+ * modulo the trailing timezone). Returns null (never throws) when `ps`
+ * fails or its output doesn't parse, so callers can tell "confirmed
+ * mismatch" apart from "couldn't confirm either way".
+ */
+async function getProcessStartTime(pid: number): Promise<Date | null> {
+  const out = await readPsField(pid, "lstart");
+  if (!out) {
+    return null;
+  }
+  // `ps -o lstart=` prints the OS start time in the machine's LOCAL timezone
+  // with no offset, e.g. "Sun Jul 19 20:12:41 2026". Parse the components and
+  // build the Date via the local-time constructor rather than relying on the
+  // engine's implementation-defined parsing of non-ISO date strings. The
+  // result is the same absolute instant the supervisor persisted as an
+  // ISO-UTC string, so the drift comparison against it is timezone-safe.
+  const m = out.match(
+    /^\w{3}\s+(\w{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+(\d{4})$/,
+  );
+  if (!m) {
+    return null;
+  }
+  const monthIndex = [
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+  ].indexOf(m[1]);
+  if (monthIndex < 0) {
+    return null;
+  }
+  const parsed = new Date(
+    Number(m[6]),
+    monthIndex,
+    Number(m[2]),
+    Number(m[3]),
+    Number(m[4]),
+    Number(m[5]),
+  );
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+/**
+ * Best-effort check that a pid actually belongs to a neurolink proxy process,
+ * so a stale/recycled supervisor pid is never mistaken for a live supervisor
+ * and signalled. Returns false when the process cannot be confirmed as ours.
+ *
+ * @param expectedStartTimeIso - The `ProxySupervisorState.startTime` (ISO
+ *   string) recorded when the supervisor we expect at `pid` was launched.
+ *   When provided, this is cross-checked against `pid`'s actual OS-reported
+ *   start time (see {@link getProcessStartTime}) — the args match alone
+ *   (the `neurolink proxy start` command is present) is not airtight, since an
+ *   unrelated process (e.g. a shell running this very test suite, or a
+ *   coincidentally-named script) could match it too. A pid recycled by such
+ *   a process would have a start time far from the recorded supervisor
+ *   startTime, which this catches.
+ *
+ *   Deliberately fail-open on anything unparseable: `ps -o lstart=` output
+ *   parsing is inherently a little fragile (locale/format quirks), and the
+ *   cost of a false "can't confirm" is silently regressing to pre-hardening
+ *   behavior, while the cost of a false "confirmed mismatch" is leaving a
+ *   real supervisor running and orphaning its socket during uninstall — the
+ *   former is the safer failure mode. So this only ever returns false for
+ *   the startTime check when BOTH timestamps parsed successfully AND their
+ *   drift exceeds the tolerance; any parse failure is treated as "can't
+ *   confirm a mismatch" and falls through to the args-only result.
+ */
+export async function processLooksLikeProxySupervisor(
+  pid: number,
+  expectedStartTimeIso?: string,
+): Promise<boolean> {
+  const args = await readPsField(pid, "args");
+  if (args === null) {
+    // `ps` unavailable, timed out, or the pid vanished — do not signal an
+    // unverified pid.
+    return false;
+  }
+  // `/neurolink/i` alone is too broad: any process whose args merely
+  // *mention* "neurolink" (e.g. a shell running in a directory named
+  // "neurolink", an editor with a neurolink file open) would match, and a
+  // stale/recycled pid running such a process could then be SIGTERM'd/
+  // SIGKILL'd by `ensureSupervisorStoppedBeforeClear` during uninstall.
+  // Require the actual proxy-supervisor invocation. Commands such as
+  // `neurolink proxy status` must never be mistaken for the listener owner.
+  if (!/\bneurolink(?:-proxy)?\b.*\bproxy\s+start\b/i.test(args)) {
+    return false;
+  }
+  if (!expectedStartTimeIso) {
+    return true;
+  }
+  const expected = new Date(expectedStartTimeIso);
+  if (Number.isNaN(expected.getTime())) {
+    return true; // recorded startTime itself is unparseable — can't confirm a mismatch
+  }
+  const actual = await getProcessStartTime(pid);
+  if (!actual) {
+    return true; // ps -o lstart= unavailable/unparseable — can't confirm a mismatch
+  }
+  const driftMs = Math.abs(actual.getTime() - expected.getTime());
+  return driftMs <= PROXY_SUPERVISOR_START_TIME_TOLERANCE_MS;
+}
+
+/**
+ * Ensure any supervisor recorded in state is actually stopped before its state
+ * record is cleared. A running supervisor still owns the listening socket;
+ * deleting its record would orphan it with no way to find it again. Returns
+ * false when a running supervisor could not be stopped, so callers can abort
+ * the uninstall instead of silently discarding the record.
+ */
+async function ensureSupervisorStoppedBeforeClear(): Promise<boolean> {
+  const supervisorState = loadProxySupervisorState();
+  const pid = supervisorState?.pid;
+  if (!pid || getProcessStatus(pid) === "not_running") {
+    return true;
+  }
+  // Guard against a stale/recycled pid: only signal a process that still looks
+  // like a neurolink proxy supervisor, so uninstall never terminates an
+  // unrelated, same-user process that inherited the recorded pid. Also cross-
+  // checks the pid's actual OS start time against the recorded
+  // supervisorState.startTime (see processLooksLikeProxySupervisor).
+  if (
+    !(await processLooksLikeProxySupervisor(pid, supervisorState?.startTime))
+  ) {
+    return true;
+  }
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+      return true;
+    }
+    return false;
+  }
+  for (let attempt = 0; attempt < 25; attempt += 1) {
+    if (getProcessStatus(pid) === "not_running") {
+      return true;
+    }
+    await sleep(200);
+  }
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    /* already gone or not permitted */
+  }
+  await sleep(200);
+  return getProcessStatus(pid) === "not_running";
+}
+
+/** Resolve the primary-account info shown in /status. Reads the operator's
+ *  configured email from proxy config and cross-checks it against the token
+ *  store; falls back to the first enabled anthropic account when not set or
+ *  when the configured account isn't currently usable. */
+async function resolveStatusPrimaryAccount(
+  proxyConfig: LoadedProxyConfig | null,
+): Promise<ProxyStatusPrimaryAccount> {
+  const configured = proxyConfig?.routing?.primaryAccount?.trim() || null;
+  const accountAllowlist = createAccountAllowlist(
+    proxyConfig?.routing?.accountAllowlist,
+  );
+  let enabledAnthropicKeys: string[] = [];
+  try {
+    const { tokenStore } = await import("../../lib/auth/tokenStore.js");
+    const all = await tokenStore.listByPrefix("anthropic:");
+    const filtered: string[] = [];
+    for (const key of all) {
+      const disabled = await tokenStore.isDisabled(key);
+      if (!disabled && isAccountAllowed(key, accountAllowlist)) {
+        filtered.push(key);
+      }
+    }
+    enabledAnthropicKeys = filtered;
+  } catch (err) {
+    logger.debug(
+      `[proxy] /status: failed to enumerate anthropic accounts: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+
+  if (configured) {
+    const configuredKey = normalizeAnthropicAccountKey(configured);
+    const matchedKey = enabledAnthropicKeys.find((key) =>
+      anthropicAccountKeysEqual(key, configuredKey),
+    );
+    if (matchedKey) {
+      return {
+        configured,
+        key: matchedKey,
+        label: configured,
+        source: "configured",
+      };
+    }
+  }
+
+  const fallbackKey = enabledAnthropicKeys[0] ?? null;
+  const fallbackLabel = fallbackKey
+    ? (fallbackKey.split(":")[1] ?? null)
+    : null;
+  return {
+    configured,
+    key: fallbackKey,
+    label: fallbackLabel,
+    source: "fallback",
+  };
+}
+
+function deriveAccountAllowance(
+  accountKey: string,
+  now: number,
+  allowlist: AccountAllowlist | undefined,
+  expirations: ReadonlyMap<string, number>,
+  cooldowns: Readonly<Record<string, PersistedAccountCooldown>>,
+): { allowed: boolean; expired: boolean; cooling: boolean } {
+  const allowed = isAccountAllowed(accountKey, allowlist);
+  const expiresAt = expirations.get(accountKey);
+  return {
+    allowed,
+    expired: expiresAt !== undefined && expiresAt <= now,
+    cooling: (cooldowns[accountKey]?.coolingUntil ?? 0) > now,
+  };
+}
+
+/**
+ * Check if the launchd service is loaded and actively managing the proxy.
+ * Returns true if launchctl reports the service as running.
+ */
+async function isLaunchdManaging(): Promise<boolean> {
+  if (process.platform !== "darwin") {
+    return false;
+  }
+  try {
+    const { execFileSync } = await import("node:child_process");
+    const uid = process.getuid?.() ?? 501;
+    const output = execFileSync(
+      "launchctl",
+      ["print", `gui/${uid}/${PLIST_LABEL}`],
+      { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] },
+    );
+    return /state\s*=\s*running/.test(output);
+  } catch {
+    return false;
+  }
+}
+
+function isLaunchdManagedProcess(): boolean {
+  return process.platform === "darwin" && process.ppid === 1;
+}
+
+function isProxySocketWorkerProcess(): boolean {
+  return process.env[PROXY_SOCKET_WORKER_ENV] === "1";
+}
+
+function getProxyWorkerGeneration(): number {
+  const generation = Number(process.env.NEUROLINK_PROXY_WORKER_GENERATION);
+  if (!Number.isSafeInteger(generation) || generation <= 0) {
+    throw new Error("proxy socket worker generation is missing or invalid");
+  }
+  return generation;
+}
+
+function isProxyAutoUpdateEnabled(
+  value = process.env.NEUROLINK_PROXY_AUTO_UPDATE,
+): boolean {
+  return !["0", "off", "false"].includes((value ?? "").trim().toLowerCase());
+}
+
+export async function probeProxyHealth(
+  host: string,
+  port: number,
+  timeoutMs: number,
+): Promise<ProxyHealthProbe> {
+  const startedAt = Date.now();
+  try {
+    const response = await fetch(`http://${host}:${port}/health`, {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    return {
+      healthy: response.ok,
+      durationMs: Date.now() - startedAt,
+      failure: response.ok ? null : "http_status",
+      statusCode: response.status,
+      errorCode: null,
+    };
+  } catch (error) {
+    const candidate = error as {
+      cause?: unknown;
+      code?: unknown;
+      name?: unknown;
+    };
+    const cause = candidate?.cause as { code?: unknown } | undefined;
+    const errorCode =
+      typeof candidate?.code === "string"
+        ? candidate.code
+        : typeof cause?.code === "string"
+          ? cause.code
+          : typeof candidate?.name === "string"
+            ? candidate.name
+            : null;
+    const isTimeout =
+      candidate?.name === "TimeoutError" || candidate?.name === "AbortError";
+    return {
+      healthy: false,
+      durationMs: Date.now() - startedAt,
+      failure: isTimeout ? "timeout" : "network",
+      statusCode: null,
+      errorCode,
+    };
+  }
+}
+
+function formatProxyHealthProbe(probe: ProxyHealthProbe): string {
+  const details = [
+    `reason=${probe.failure ?? "none"}`,
+    `durationMs=${probe.durationMs}`,
+    probe.statusCode === null ? null : `status=${probe.statusCode}`,
+    probe.errorCode === null
+      ? null
+      : `errorCode=${sanitizeForLog(probe.errorCode)}`,
+  ].filter((detail): detail is string => detail !== null);
+  return details.join(" ");
+}
+
+async function getProxyRuntimeActivity(
+  host: string,
+  port: number,
+  timeoutMs: number = 3_000,
+): Promise<ProxyRuntimeActivity | null> {
+  try {
+    const response = await fetch(`http://${host}:${port}/status`, {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok) {
+      return null;
+    }
+    return parseProxyRuntimeActivity(await response.json());
+  } catch {
+    return null;
+  }
+}
+
+async function getRollingActivationFailure(
+  host: string,
+  port: number,
+  expectedVersion: string,
+): Promise<string | null> {
+  try {
+    const response = await fetch(`http://${host}:${port}/status`, {
+      signal: AbortSignal.timeout(3_000),
+    });
+    if (!response.ok) {
+      return null;
+    }
+    const payload = (await response.json()) as {
+      autoUpdate?: {
+        rolling?: {
+          lastFailure?: {
+            version?: string;
+            phase?: string;
+            message?: string;
+            workerPid?: number;
+            workerExitCode?: number | null;
+            workerExitSignal?: string | null;
+            supervisorAction?: string;
+          } | null;
+        } | null;
+      };
+    };
+    const failure = payload.autoUpdate?.rolling?.lastFailure;
+    if (
+      failure?.version !== expectedVersion ||
+      typeof failure.phase !== "string" ||
+      typeof failure.message !== "string"
+    ) {
+      return null;
+    }
+    const workerDetail = [
+      typeof failure.workerPid === "number" ? `pid=${failure.workerPid}` : null,
+      typeof failure.workerExitCode === "number" ||
+      failure.workerExitCode === null
+        ? `exitCode=${failure.workerExitCode ?? "none"}`
+        : null,
+      typeof failure.workerExitSignal === "string" ||
+      failure.workerExitSignal === null
+        ? `exitSignal=${failure.workerExitSignal ?? "none"}`
+        : null,
+      typeof failure.supervisorAction === "string"
+        ? `supervisorAction=${failure.supervisorAction}`
+        : null,
+    ]
+      .filter(Boolean)
+      .join(" ");
+    return `${failure.phase}: ${failure.message}${workerDetail ? ` (${workerDetail})` : ""}`;
+  } catch {
+    return null;
+  }
+}
+
+/** Read the version the proxy currently reports healthy, or undefined. */
+async function fetchProxyHealthVersion(
+  host: string,
+  port: number,
+): Promise<string | undefined> {
+  try {
+    const response = await fetch(`http://${host}:${port}/health`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!response.ok) {
+      return undefined;
+    }
+    const data = (await response.json()) as { version?: string };
+    return data.version;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Read both serving generations so an updated worker cannot hide a stale parent. */
+async function fetchProxyRuntimeVersions(
+  host: string,
+  port: number,
+  rollingSupervisor: boolean = false,
+): Promise<{
+  workerVersion?: string;
+  workerIdentity?: ProxyServingWorkerIdentity;
+  supervisorVersion?: string;
+  supervisorPid?: number;
+}> {
+  try {
+    const response = await fetch(`http://${host}:${port}/status`, {
+      headers: { connection: "close" },
+      signal: AbortSignal.timeout(3_000),
+    });
+    if (!response.ok) {
+      return {};
+    }
+    const data = (await response.json()) as {
+      pid?: number;
+      version?: string;
+      autoUpdate?: {
+        supervisorVersion?: string | null;
+        supervisorPid?: number | null;
+        rolling?: {
+          active?: {
+            version?: string;
+            pid?: number;
+            generation?: number;
+          } | null;
+        } | null;
+      };
+    };
+    const workerIdentity = parseProxyServingWorkerIdentity(
+      data,
+      rollingSupervisor,
+    );
+    return {
+      ...(typeof data.version === "string"
+        ? { workerVersion: data.version }
+        : {}),
+      ...(workerIdentity ? { workerIdentity } : {}),
+      ...(typeof data.autoUpdate?.supervisorVersion === "string"
+        ? { supervisorVersion: data.autoUpdate.supervisorVersion }
+        : {}),
+      ...(typeof data.autoUpdate?.supervisorPid === "number"
+        ? { supervisorPid: data.autoUpdate.supervisorPid }
+        : {}),
+    };
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * After a failed rolling update, re-point the live supervisor at the reinstalled
+ * running version (mirroring the forward path: record the pending target, then
+ * signal SIGUSR2) and wait until the supervisor actually serves that version
+ * again. Returns false if it never reports the running version healthy in time.
+ */
+async function activateRollbackVersion(
+  host: string,
+  port: number,
+  parentPid: number,
+  runningVersion: string,
+  timeoutMs: number,
+  isCurrentOwner: () => boolean,
+): Promise<boolean> {
+  if (!isCurrentOwner()) {
+    return false;
+  }
+  recordUpdateInstalled(runningVersion);
+  try {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (!isCurrentOwner()) {
+        return false;
+      }
+      try {
+        process.kill(parentPid, "SIGUSR2");
+      } catch {
+        // Supervisor may be mid-restart; its recovery loop also re-targets
+        // runningVersion once no worker is active.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      if ((await fetchProxyHealthVersion(host, port)) === runningVersion) {
+        return true;
+      }
+      if (getProcessStatus(parentPid) === "not_running") {
+        return false;
+      }
+    }
+    return false;
+  } finally {
+    abandonPendingUpdate(runningVersion);
+  }
+}
+
+async function setProxyUpdateDrain(
+  host: string,
+  port: number,
+  draining: boolean,
+  supervisorRefresh = false,
+): Promise<boolean> {
+  const confirmState = async (): Promise<boolean> => {
+    try {
+      const response = await fetch(`http://${host}:${port}/status`, {
+        signal: AbortSignal.timeout(3_000),
+      });
+      if (!response.ok) {
+        return false;
+      }
+      const payload = (await response.json()) as {
+        health?: { drainingForUpdate?: boolean };
+      };
+      return payload.health?.drainingForUpdate === draining;
+    } catch {
+      return false;
+    }
+  };
+  try {
+    const response = await fetch(
+      `http://${host}:${port}/internal/update-control`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-neurolink-update-token": PROXY_UPDATE_CONTROL_TOKEN,
+        },
+        body: JSON.stringify({
+          action: draining
+            ? supervisorRefresh
+              ? "fence_for_supervisor_refresh"
+              : "drain"
+            : "resume",
+        }),
+        signal: AbortSignal.timeout(5_000),
+      },
+    );
+    if (!response.ok) {
+      return confirmState();
+    }
+    const payload = (await response.json()) as { draining?: boolean };
+    return payload.draining === draining;
+  } catch {
+    return confirmState();
+  }
+}
+
+async function resumeProxyUpdateDrain(
+  host: string,
+  port: number,
+  attempts: number = 3,
+): Promise<boolean> {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    if (await setProxyUpdateDrain(host, port, false)) {
+      return true;
+    }
+    if (attempt < attempts) {
+      await sleep(1_000);
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Stable entrypoint for launchd
+// ---------------------------------------------------------------------------
+
+/**
+ * Path to a small trampoline script that the plist invokes.
+ * The trampoline selects a validated immutable package. The stable launchd
+ * path does not require reinstalling the service to activate another version.
+ */
+const TRAMPOLINE_DIR = join(homedir(), ".neurolink", "bin");
+const TRAMPOLINE_PATH = join(TRAMPOLINE_DIR, "neurolink-proxy");
+const PROXY_PACKAGES_DIR = join(homedir(), ".neurolink", "proxy-packages");
+
+/**
+ * Verify a candidate bin path actually runs by invoking `--version` on it.
+ * Returns the version string on success, or undefined on any failure.
+ */
+function probeBinVersion(binPath: string): string | undefined {
+  try {
+    const { execFileSync } = _require(
+      "node:child_process",
+    ) as typeof import("node:child_process");
+    const out = execFileSync(binPath, ["--version"], {
+      encoding: "utf8",
+      timeout: 5_000,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return out || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Write (or overwrite) the trampoline shell script.
+ *
+ * Selection is explicit: package validation happens before rewriting the
+ * launcher, and launch itself never imports the CLI merely to probe a version.
+ */
+function writeTrampoline(
+  selection?: ProxyPackageSelection,
+  isCurrentOwner?: () => boolean,
+): void {
+  // Reinstall preserves an already validated proxy-owned selection. A manual
+  // global npm upgrade cannot silently retarget existing worker generations.
+  const selected =
+    selection ??
+    readProxyPackageSelection(PROXY_PACKAGES_DIR) ??
+    inspectProxyPackage(process.argv[1] ?? join(__dirname, "..", "index.js"));
+  writeProxyPackageLauncher(TRAMPOLINE_PATH, selected, isCurrentOwner);
+  selectProxyPackage(PROXY_PACKAGES_DIR, selected, isCurrentOwner);
+}
+
+/** Status must remain available when an external installer damages its entrypoint. */
+function readProxyDiskVersion(): string | null {
+  try {
+    return inspectProxyPackage(process.argv[1]).version;
+  } catch {
+    return null;
+  }
+}
+
+function spawnFailOpenGuard(
+  host: string,
+  port: number,
+  parentPid: number,
+): number | undefined {
+  // The guard runs the same version as this process, so process.argv[1]
+  // (the currently-running script) is correct here — no stale-path risk.
+  const entryScript = process.argv[1];
+  if (!entryScript) {
+    return undefined;
+  }
+
+  const args = [
+    entryScript,
+    "proxy",
+    "guard",
+    "--host",
+    host,
+    "--port",
+    String(port),
+    "--parent-pid",
+    String(parentPid),
+    "--quiet",
+  ];
+
+  const workerLog = openProxyWorkerLog("proxy-guard.log");
+  if (workerLog.error) {
+    logger.debug(`[proxy] guard logging disabled: ${workerLog.error}`);
+  }
+
+  try {
+    const child = spawn(process.execPath, args, {
+      detached: true,
+      stdio: ["ignore", workerLog.stdio, workerLog.stdio],
+    });
+    child.unref();
+    return child.pid;
+  } catch (error) {
+    logger.debug(
+      `[proxy] failed to start fail-open guard: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    return undefined;
+  } finally {
+    workerLog.close();
+  }
+}
+
+function spawnProxyUpdater(
+  host: string,
+  port: number,
+  parentPid: number,
+  rollingSupervisor: boolean = false,
+): number | undefined {
+  if (!isProxyAutoUpdateEnabled()) {
+    logger.always("[proxy] automatic updates disabled by environment");
+    return undefined;
+  }
+
+  const entryScript = process.argv[1];
+  if (!entryScript) {
+    logger.always("[proxy] updater disabled: CLI entry script is unavailable");
+    return undefined;
+  }
+
+  const command = rollingSupervisor ? TRAMPOLINE_PATH : process.execPath;
+  const args = [
+    ...(rollingSupervisor ? [] : [entryScript]),
+    "proxy",
+    "guard",
+    "--host",
+    host,
+    "--port",
+    String(port),
+    "--parent-pid",
+    String(parentPid),
+    "--updater-only",
+    "--quiet",
+  ];
+  const workerLog = openProxyWorkerLog("proxy-updater.log");
+  if (workerLog.error) {
+    logger.always(`[proxy] updater logging disabled: ${workerLog.error}`);
+  }
+
+  try {
+    const child = spawn(command, args, {
+      detached: true,
+      stdio: ["ignore", workerLog.stdio, workerLog.stdio],
+      env: {
+        ...process.env,
+        NEUROLINK_PROXY_UPDATE_CONTROL_TOKEN: PROXY_UPDATE_CONTROL_TOKEN,
+        [PROXY_ROLLING_SUPERVISOR_ENV]: rollingSupervisor ? "1" : "0",
+      },
+    });
+    child.once("error", (error) => {
+      logger.always(
+        `[proxy] updater worker error pid=${child.pid ?? "unknown"}: ${error.message}`,
+      );
+    });
+    child.once("exit", (code, signal) => {
+      logger.always(
+        `[proxy] updater worker exited pid=${child.pid ?? "unknown"} code=${code ?? "none"} signal=${signal ?? "none"}`,
+      );
+    });
+    child.unref();
+    return child.pid;
+  } catch (error) {
+    logger.always(
+      `[proxy] updater failed to start: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return undefined;
+  } finally {
+    workerLog.close();
+  }
+}
+
+async function runProxyTelemetryManager(
+  command: string,
+  argv?: ProxyTelemetryArgs,
+): Promise<void> {
+  const { existsSync } = await import("fs");
+  if (!existsSync(PROXY_TELEMETRY_SCRIPT_PATH)) {
+    throw new Error(
+      "Proxy telemetry helper files were not found in this installation. Reinstall NeuroLink with observability assets included.",
+    );
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const queryCommand = command === "doctor" || command === "query";
+    const queryArgs: string[] = [];
+    if (queryCommand && argv) {
+      for (const [key, option] of [
+        ["since", "--since"],
+        ["until", "--until"],
+        ["kind", "--kind"],
+        ["format", "--format"],
+        ["maxRows", "--max-rows"],
+        ["proxyUrl", "--proxy-url"],
+        ["admissionLookbackMinutes", "--admission-lookback-minutes"],
+        ["requestTimeoutMs", "--request-timeout-ms"],
+        ["ingestionGraceMs", "--ingestion-grace-ms"],
+      ] as const) {
+        if (argv[key] !== undefined) {
+          queryArgs.push(option, String(argv[key]));
+        }
+      }
+    }
+    const child = spawn(
+      queryCommand ? process.execPath : "bash",
+      queryCommand
+        ? [
+            join(
+              dirname(PROXY_TELEMETRY_SCRIPT_PATH),
+              command === "doctor"
+                ? "check-proxy-telemetry.mjs"
+                : "query-proxy-history.mjs",
+            ),
+            ...queryArgs,
+          ]
+        : [PROXY_TELEMETRY_SCRIPT_PATH, command],
+      {
+        stdio: "inherit",
+        env: process.env,
+      },
+    );
+
+    child.on("error", (error) => {
+      reject(error);
+    });
+
+    child.on("exit", (code, signal) => {
+      if (signal) {
+        reject(
+          new Error(
+            `proxy telemetry ${command} terminated by signal ${signal}`,
+          ),
+        );
+        return;
+      }
+      if (code !== 0) {
+        reject(
+          new Error(`proxy telemetry ${command} exited with code ${code ?? 1}`),
+        );
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+// =============================================================================
+// STARTUP BANNER
+// =============================================================================
+
+function printProxyBanner(url: string, strategy: string): void {
+  logger.always("");
+  logger.always(chalk.bold.cyan("NeuroLink Claude Proxy"));
+  logger.always(chalk.gray("=".repeat(50)));
+  logger.always("");
+  logger.always(`  ${chalk.bold("URL:")}        ${chalk.cyan(url)}`);
+  logger.always(`  ${chalk.bold("Strategy:")}   ${chalk.cyan(strategy)}`);
+  logger.always(`  ${chalk.bold("PID:")}        ${chalk.cyan(process.pid)}`);
+  logger.always("");
+  logger.always(chalk.bold("Endpoints:"));
+  logger.always(
+    `  ${chalk.blue("POST")} /v1/messages         — Claude proxy (Anthropic format)`,
+  );
+  logger.always(
+    `  ${chalk.blue("POST")} /v1/chat/completions — OpenAI-compatible proxy`,
+  );
+  // The banner listed two of the four inbound doors, so the Codex and Gemini
+  // CLIs looked unsupported to anyone reading start-up output rather than the
+  // docs. Every door the proxy actually answers on belongs here.
+  logger.always(
+    `  ${chalk.blue("POST")} /backend-api/codex/… — Codex proxy (Responses format)`,
+  );
+  logger.always(
+    `  ${chalk.blue("POST")} /v1beta/models/…     — Gemini proxy (generateContent)`,
+  );
+  logger.always(`  ${chalk.green("GET")}  /health              — Health check`);
+  logger.always(
+    `  ${chalk.green("GET")}  /status              — Detailed status`,
+  );
+  logger.always("");
+  logger.always(chalk.bold("Set in Claude Code:"));
+  logger.always(`  ${chalk.cyan(`ANTHROPIC_BASE_URL=${url}`)}`);
+  logger.always("");
+  logger.always(chalk.gray("Press Ctrl+C to stop the proxy"));
+  logger.always("");
+}
+
+export function mapClaudeErrorTypeToStatus(errorType?: string): number {
+  switch (errorType) {
+    case "invalid_request_error":
+      return 400;
+    case "authentication_error":
+      return 401;
+    case "permission_error":
+      return 403;
+    case "not_found_error":
+      return 404;
+    case "request_too_large":
+      return 413;
+    case "rate_limit_error":
+      return 429;
+    case "overloaded_error":
+      return 529;
+    case "api_error":
+    default:
+      return 502;
+  }
+}
+
+function getProxyRuntimeErrorCode(error: unknown): string | undefined {
+  let current = error;
+  for (let depth = 0; depth < 3; depth += 1) {
+    if (!current || typeof current !== "object") {
+      return undefined;
+    }
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === "string") {
+      return code;
+    }
+    current = (current as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+async function ensureProxyStartAllowed(spinner: ProxySpinner): Promise<void> {
+  const ignoreLaunchd =
+    process.env.NEUROLINK_PROXY_IGNORE_LAUNCHD === "1" ||
+    process.env.NEUROLINK_PROXY_IGNORE_LAUNCHD === "true";
+  const existingSupervisor = loadProxySupervisorState();
+  if (existingSupervisor) {
+    if (
+      existingSupervisor.pid !== process.pid &&
+      isProcessRunning(existingSupervisor.pid) &&
+      !ignoreLaunchd
+    ) {
+      if (spinner) {
+        spinner.fail(
+          chalk.red(
+            `Proxy supervisor already running on port ${existingSupervisor.port} (PID: ${existingSupervisor.pid})`,
+          ),
+        );
+      }
+      process.exit(process.ppid === 1 ? 0 : 1);
+    }
+    if (!isProcessRunning(existingSupervisor.pid)) {
+      clearProxySupervisorState();
+    }
+  }
+  const existingState = loadProxyState();
+  if (existingState) {
+    if (isProcessRunning(existingState.pid)) {
+      // A newly relaunched stable supervisor may inherit state from an orphaned
+      // worker that is draining old connections but no longer owns a listener.
+      // launchd must be allowed to restore listener ownership in that case.
+      if (process.ppid === 1) {
+        return;
+      }
+      // Test / dev escape hatch: when NEUROLINK_PROXY_IGNORE_LAUNCHD is set,
+      // allow starting a second proxy on the test's requested port even if
+      // a launchd-managed instance is using a different port (its state
+      // file is what we hit here). The shared port-conflict surface remains
+      // — node will fail to bind if the requested port is actually busy.
+      if (!ignoreLaunchd) {
+        if (spinner) {
+          spinner.fail(
+            chalk.red(
+              `Proxy already running on port ${existingState.port} (PID: ${existingState.pid})`,
+            ),
+          );
+        }
+        logger.always(
+          chalk.yellow(
+            "Stop it first or use 'neurolink proxy status' to inspect",
+          ),
+        );
+        process.exit(process.ppid === 1 ? 0 : 1);
+      }
+    } else {
+      clearProxyState();
+    }
+  }
+
+  if (process.ppid === 1 || !(await isLaunchdManaging())) {
+    return;
+  }
+
+  // Test / dev escape hatch: when starting on an explicit non-default port,
+  // the launchd-managed proxy (typically on its own port) cannot conflict.
+  // Setting `NEUROLINK_PROXY_IGNORE_LAUNCHD=1` lets the test suite start a
+  // standalone proxy alongside the launchd one without removing the daemon.
+  if (
+    process.env.NEUROLINK_PROXY_IGNORE_LAUNCHD === "1" ||
+    process.env.NEUROLINK_PROXY_IGNORE_LAUNCHD === "true"
+  ) {
+    return;
+  }
+
+  if (spinner) {
+    spinner.fail(
+      chalk.red(
+        "Proxy is managed by launchd. Manual start would cause port conflicts.",
+      ),
+    );
+  }
+  logger.always(
+    chalk.yellow(
+      "Use 'neurolink proxy uninstall' to remove the service first, " +
+        "or 'launchctl kickstart gui/$(id -u)/com.neurolink.proxy' to restart.",
+    ),
+  );
+  process.exit(1);
+}
+
+async function loadProxyStartEnv(
+  argv: ProxyStartArgs,
+  spinner: ProxySpinner,
+): Promise<string | undefined> {
+  try {
+    const envResult = await loadProxyEnvFile({
+      explicitEnvFile: argv.envFile,
+    });
+    if (spinner && envResult.path) {
+      spinner.text = `Loaded proxy env from ${envResult.path}`;
+    }
+    return envResult.path;
+  } catch (error) {
+    if (spinner) {
+      spinner.fail(
+        chalk.red(error instanceof Error ? error.message : String(error)),
+      );
+    }
+    process.exit(1);
+  }
+}
+
+async function createProxyNeurolinkRuntime(logsDir?: string) {
+  process.env.NEUROLINK_SKIP_MCP = "true";
+
+  const { NeuroLink } = await import("../../lib/neurolink.js");
+  const neurolink = new NeuroLink();
+  const { initRequestLogger } =
+    await import("../../lib/proxy/requestLogger.js");
+
+  initRequestLogger(true, logsDir);
+
+  return {
+    neurolink,
+    logsDir: logsDir ?? join(homedir(), ".neurolink", "logs"),
+  };
+}
+
+/**
+ * Replace account identity in a `/status` payload with a stable placeholder.
+ *
+ * The shape is preserved — same rows, same counters — so status tooling keeps
+ * working and only the names go away. Callers that legitimately need the names
+ * present the update-control token.
+ */
+function redactStatusAccounts(
+  rows: ReadonlyArray<Record<string, unknown>>,
+  allowed: boolean,
+): Array<Record<string, unknown>> {
+  if (allowed) {
+    return rows as Array<Record<string, unknown>>;
+  }
+  return rows.map((row, index) => ({
+    ...row,
+    label: `account-${index + 1}`,
+    ...(row.key !== undefined ? { key: null } : {}),
+    ...(row.email !== undefined ? { email: null } : {}),
+  }));
+}
+
+/**
+ * The same treatment for the configured/effective primary account block.
+ *
+ * Named fields rather than "every non-empty string": `source` is a discriminant
+ * (`configured` | `fallback`), not an identity, and blanking it both left the
+ * value outside its own union and hid the one thing a caller reads this block
+ * for — whether the configured primary is the account actually in use.
+ */
+function redactStatusPrimaryAccount(
+  primary: ProxyStatusPrimaryAccount,
+): ProxyStatusPrimaryAccount {
+  return {
+    configured: primary.configured === null ? null : "redacted",
+    key: primary.key === null ? null : "redacted",
+    label: primary.label === null ? null : "redacted",
+    source: primary.source,
+  };
+}
+
+/**
+ * Confirm durable admission and reconcile route finals with the actual
+ * response transport lifecycle.
+ */
+function registerProxyRequestTracking(
+  app: Hono,
+  requestMetadata: WeakMap<Request, RuntimeRequestMetadata>,
+  readiness: ProxyReadinessState,
+): void {
+  /** Persist admission before dispatch and observe the response through termination. */
+  const trackingHandler = async (c: Context, next: Next): Promise<void> => {
+    const startedMonotonicMs = performance.now();
+    const contentLengthHeader = c.req.raw.headers.get("content-length");
+    const rawContentLength =
+      contentLengthHeader === null ? Number.NaN : Number(contentLengthHeader);
+    const requestBytes =
+      Number.isFinite(rawContentLength) && rawContentLength >= 0
+        ? rawContentLength
+        : undefined;
+    const sessionId =
+      c.req.raw.headers.get("x-neurolink-session-id") ??
+      c.req.raw.headers.get("x-claude-code-session-id") ??
+      undefined;
+    const sessionHash = hashProxyLifecycleSessionId(sessionId);
+    const internal = consumeInternalProxyRequest(
+      c.req.raw.headers.get("x-neurolink-internal-request"),
+    );
+    const abortController = new AbortController();
+    const metadata: RuntimeRequestMetadata = {
+      requestId: internal?.requestId ?? crypto.randomUUID(),
+      parentRequestId: internal?.parentRequestId,
+      accountingScope: internal ? "internal" : "client",
+      usageOwnerRequestId: internal?.requestId,
+      abortController,
+      method: c.req.method,
+      path: c.req.path,
+      startedAt: Date.now(),
+      model: "-",
+      stream: false,
+      toolCount: 0,
+      // Trusted child work belongs to an already admitted parent request.
+      rejectForUpdate: !internal && readiness.drainingForUpdate,
+    };
+    requestMetadata.set(c.req.raw, metadata);
+    const httpTrace = startProxyHttpTrace(
+      metadata,
+      Object.fromEntries(c.req.raw.headers),
+    );
+    const stopObservingFinalLog = observeProxyFinalLog(
+      metadata.requestId,
+      (entry) => {
+        metadata.terminalResult = entry;
+      },
+      (entry) => {
+        metadata.lastUpstreamAttempt = { ...entry };
+      },
+    );
+    const finishActivity = metadata.rejectForUpdate
+      ? () => undefined
+      : beginProxyRequest();
+    let responseTracking = false;
+    let cancelledBeforeHeaders = false;
+    const deadline = setTimeout(
+      () =>
+        abortController.abort(
+          new DOMException("Proxy request deadline exceeded", "TimeoutError"),
+        ),
+      900_000,
+    );
+    deadline.unref?.();
+    let unbindClient = () => {};
+    const finish = () => {
+      clearTimeout(deadline);
+      unbindClient();
+      abortController.signal.removeEventListener("abort", onPreheaderAbort);
+      releaseProxyRequestAccounting(metadata.requestId);
+      httpTrace.end(
+        metadata.terminalResult?.responseStatus ?? c.res.status,
+        metadata.terminalResult?.terminalOutcome ?? "unknown",
+        metadata.terminalErrorType,
+      );
+      stopObservingFinalLog();
+      finishActivity();
+      // Borrowed traffic holds a concurrency slot for the lifetime of the
+      // response body, so it is released here rather than when the handler
+      // returns. Idempotent — a request can finish more than one way.
+      metadata.shareRelease?.();
+      requestMetadata.delete(c.req.raw);
+    };
+    const onPreheaderAbort = () => {
+      if (responseTracking || cancelledBeforeHeaders) {
+        return;
+      }
+      cancelledBeforeHeaders = true;
+      const timeout = abortController.signal.reason?.name === "TimeoutError";
+      const status = timeout ? 504 : 499;
+      const errorType = timeout ? "request_timeout" : "client_cancelled";
+      if (!metadata.terminalResult && metadata.accountingScope !== "internal") {
+        recordProxyRuntimeFinalError(status, undefined, undefined, {
+          requestId: metadata.requestId,
+          errorType,
+          terminalOutcome: timeout ? "handler_error" : "client_cancelled",
+          message: timeout
+            ? "Request deadline exceeded"
+            : "Client disconnected before response headers",
+        });
+      }
+      void logProxyRequestFinal({
+        timestamp: new Date().toISOString(),
+        requestId: metadata.requestId,
+        method: metadata.method,
+        path: metadata.path,
+        model: metadata.model,
+        stream: metadata.stream,
+        toolCount: metadata.toolCount,
+        account: "",
+        accountType: "proxy-runtime",
+        responseStatus: status,
+        responseTimeMs: Date.now() - metadata.startedAt,
+        errorType,
+        errorMessage: timeout
+          ? "Request deadline exceeded"
+          : "Client disconnected before response headers",
+      });
+      logProxyLifecycleEvent({
+        event: "request_terminal",
+        requestId: metadata.requestId,
+        parentRequestId: metadata.parentRequestId,
+        accountingScope: metadata.accountingScope,
+        method: metadata.method,
+        path: metadata.path,
+        model: metadata.model,
+        stream: metadata.stream,
+        sessionHash,
+        elapsedMs: performance.now() - startedMonotonicMs,
+        terminalOutcome: timeout ? "handler_error" : "client_cancelled",
+        transportOutcome: timeout ? "stream_error" : "client_cancelled",
+        finalStatus: status,
+        errorType,
+        telemetryStatus: "complete",
+        outcomeSource: "transport_error",
+      });
+      finishActivity();
+      metadata.shareRelease?.();
+      clearTimeout(deadline);
+      unbindClient();
+    };
+    abortController.signal.addEventListener("abort", onPreheaderAbort, {
+      once: true,
+    });
+    unbindClient = bindProxyClientCancellation(
+      c.req.raw,
+      c.env,
+      abortController,
+    );
+    // The route adapter populates model/stream/toolCount after parsing. Omit
+    // them at acceptance instead of publishing misleading placeholder values;
+    // subsequent events carry the parsed metadata under the same request ID.
+    try {
+      await httpTrace.run(() =>
+        persistProxyLifecycleAcceptance({
+          requestId: metadata.requestId,
+          parentRequestId: metadata.parentRequestId,
+          accountingScope: metadata.accountingScope,
+          requestTimeoutMs: 900_000,
+          method: metadata.method,
+          path: metadata.path,
+          sessionHash,
+          requestBytes,
+          elapsedMs: 0,
+          monotonicMs: startedMonotonicMs,
+        }),
+      );
+      if (abortController.signal.aborted) {
+        c.res = new Response(null, { status: 499 });
+        finish();
+        return;
+      }
+      await httpTrace.run(() =>
+        withProxyFinalLogOwnership(metadata.requestId, next),
+      );
+      if (cancelledBeforeHeaders) {
+        void c.res.body
+          ?.cancel(abortController.signal.reason)
+          .catch(() => undefined);
+        finish();
+        return;
+      }
+      const responseStatus = c.res.status;
+      logProxyLifecycleEvent({
+        event: "response_headers",
+        requestId: metadata.requestId,
+        method: metadata.method,
+        path: metadata.path,
+        model: metadata.model,
+        stream: metadata.stream,
+        toolCount: metadata.toolCount,
+        sessionHash,
+        requestBytes,
+        responseStatus,
+        elapsedMs: performance.now() - startedMonotonicMs,
+      });
+      const routeResponseObservers = takeProxyResponseObservers(metadata);
+      const notifyRouteFirstChunk = (
+        details: Parameters<
+          NonNullable<ProxyResponseTrackingObserver["onFirstChunk"]>
+        >[0],
+      ): void => {
+        for (const observer of routeResponseObservers) {
+          try {
+            observer.onFirstChunk?.(details);
+          } catch {
+            // Route-level accounting must never interfere with the relay.
+          }
+        }
+      };
+      const notifyRouteTerminal = async (
+        details: Parameters<
+          NonNullable<ProxyResponseTrackingObserver["onTerminal"]>
+        >[0],
+      ): Promise<boolean> => {
+        const results = await withTimeout(
+          Promise.allSettled(
+            routeResponseObservers.map(async (observer) =>
+              observer.onTerminal?.(details),
+            ),
+          ),
+          3_000,
+          "Timed out joining proxy response accounting",
+        );
+        return results.some((result) => result.status === "rejected");
+      };
+      responseTracking = true;
+      c.res = trackProxyResponse(
+        c.res,
+        finish,
+        {
+          onFirstChunk: ({ observedBodyBytes, responseChunks }) => {
+            logProxyLifecycleEvent({
+              event: "response_first_chunk",
+              requestId: metadata.requestId,
+              method: metadata.method,
+              path: metadata.path,
+              model: metadata.model,
+              stream: metadata.stream,
+              toolCount: metadata.toolCount,
+              sessionHash,
+              requestBytes,
+              responseStatus,
+              observedBodyBytes,
+              responseChunks,
+              elapsedMs: performance.now() - startedMonotonicMs,
+            });
+            notifyRouteFirstChunk({
+              observedBodyBytes,
+              responseChunks,
+            });
+          },
+          onTerminal: async ({
+            outcome,
+            error,
+            observedBodyBytes,
+            responseChunks,
+          }) => {
+            const terminalMonotonicMs = performance.now();
+            const terminalTimestampMs = Date.now();
+            // Route accounting may await SSE parsing/cancellation. Join it before
+            // publishing the semantic terminal record; transport EOF alone is not
+            // evidence of a successful model response.
+            let accountingTimedOut = false;
+            let accountingFailed = false;
+            try {
+              accountingFailed = await httpTrace.run(() =>
+                notifyRouteTerminal({
+                  outcome,
+                  error,
+                  observedBodyBytes,
+                  responseChunks,
+                }),
+              );
+            } catch {
+              accountingTimedOut = true;
+            }
+            if (!metadata.terminalResult && responseStatus >= 400) {
+              if (metadata.accountingScope !== "internal") {
+                recordProxyRuntimeFinalError(
+                  responseStatus,
+                  undefined,
+                  undefined,
+                  {
+                    requestId: metadata.requestId,
+                    errorType:
+                      responseStatus === 404
+                        ? "route_not_found"
+                        : "request_rejected",
+                    terminalOutcome: "handler_error",
+                  },
+                );
+              }
+              await logProxyRequestFinal({
+                timestamp: new Date().toISOString(),
+                requestId: metadata.requestId,
+                method: metadata.method,
+                path: metadata.path,
+                model: metadata.model,
+                stream: metadata.stream,
+                toolCount: metadata.toolCount,
+                account: "",
+                accountType: "proxy-runtime",
+                responseStatus,
+                responseTimeMs: Date.now() - metadata.startedAt,
+                errorType:
+                  responseStatus === 404
+                    ? "route_not_found"
+                    : "request_rejected",
+                terminalOutcome: "handler_error",
+              });
+            }
+            const final = metadata.terminalResult;
+            const auxiliary = isProxyAuxiliaryRequest(
+              metadata.method,
+              metadata.path,
+            );
+            const terminalOutcome =
+              final?.terminalOutcome ??
+              (outcome === "stream_error" ||
+              metadata.terminalErrorType === "stream_error"
+                ? "stream_error"
+                : outcome === "client_cancelled"
+                  ? "client_cancelled"
+                  : responseStatus >= 400
+                    ? "handler_error"
+                    : auxiliary
+                      ? outcome
+                      : "unknown");
+            logProxyLifecycleEvent({
+              event: "request_terminal",
+              timestampMs: terminalTimestampMs,
+              monotonicMs: terminalMonotonicMs,
+              requestId: metadata.requestId,
+              method: metadata.method,
+              path: metadata.path,
+              model: metadata.model,
+              stream: metadata.stream,
+              toolCount: metadata.toolCount,
+              sessionHash,
+              requestBytes,
+              responseStatus,
+              observedBodyBytes,
+              responseChunks,
+              elapsedMs: terminalMonotonicMs - startedMonotonicMs,
+              terminalOutcome,
+              finalStatus: final?.responseStatus,
+              transportOutcome: outcome,
+              outcomeSource: final
+                ? "final_request"
+                : responseStatus >= 400 ||
+                    (auxiliary &&
+                      (outcome === "completed" || outcome === "bodyless"))
+                  ? "http_status"
+                  : terminalOutcome === "unknown"
+                    ? "unknown"
+                    : "transport_error",
+              telemetryStatus: accountingTimedOut
+                ? "timeout"
+                : accountingFailed
+                  ? "observer_error"
+                  : final || auxiliary
+                    ? "complete"
+                    : "missing_final",
+              errorType: final?.errorType ?? metadata.terminalErrorType,
+              errorCode: final?.errorCode ?? metadata.terminalErrorCode,
+            });
+            stopObservingFinalLog();
+            httpTrace.end(
+              final?.responseStatus ?? responseStatus,
+              terminalOutcome,
+              final?.errorType ?? metadata.terminalErrorType,
+            );
+          },
+        },
+        abortController.signal,
+      );
+    } catch (error) {
+      clearTimeout(deadline);
+      unbindClient();
+      abortController.signal.removeEventListener("abort", onPreheaderAbort);
+      if (cancelledBeforeHeaders) {
+        finish();
+        return;
+      }
+      stopObservingFinalLog();
+      // Keep metadata available to app.onError, which records the client-facing
+      // failure with the same request ID before deleting the WeakMap entry.
+      finishActivity();
+      // A handler that threw never produced a body for `trackProxyResponse` to
+      // follow, so `finish` will not run and the borrowed-traffic slot (and its
+      // coin hold) would be held until the process restarts. Both releases are
+      // idempotent, so the double call on paths that do reach `finish` is free.
+      metadata.shareRelease?.();
+      logProxyLifecycleEvent({
+        event: "request_terminal",
+        requestId: metadata.requestId,
+        method: metadata.method,
+        path: metadata.path,
+        model: metadata.model,
+        stream: metadata.stream,
+        toolCount: metadata.toolCount,
+        sessionHash,
+        requestBytes,
+        elapsedMs: performance.now() - startedMonotonicMs,
+        terminalOutcome: "handler_error",
+        errorType: error instanceof Error ? error.name : "unknown_error",
+        errorCode: getProxyRuntimeErrorCode(error),
+      });
+      httpTrace.end(
+        getProxyRuntimeErrorCode(error) === "PROXY_TELEMETRY_UNAVAILABLE"
+          ? 503
+          : 502,
+        "handler_error",
+        error instanceof Error ? error.name : "unknown_error",
+      );
+      throw error;
+    }
+  };
+  // Cover every inbound door so drain/reject, lifecycle logging, and
+  // concurrency accounting apply to all of them.
+  //
+  // `/v1beta/*` is listed separately on purpose: Hono matches wildcards a path
+  // segment at a time, so `/v1/*` does NOT cover `/v1beta/models/...` — the
+  // segment is `v1beta`, not `v1`. When the Gemini door landed it inherited
+  // neither tracker, which meant its requests were absent from the request
+  // log, from per-CLI attribution, and from the in-flight count the graceful
+  // drain waits on. An update could therefore cut a live Gemini stream.
+  app.use("/v1/*", trackingHandler);
+  app.use("/v1beta/*", trackingHandler);
+  app.use("/backend-api/*", trackingHandler);
+}
+
+/**
+ * Assemble proxy routes with shared admission, runtime error accounting,
+ * and response tracking.
+ */
+export async function createProxyStartApp(params: {
+  neurolink: ProxyNeurolinkRuntime["neurolink"];
+  modelRouter: ModelRouterInterface | undefined;
+  strategy: ProxyStartStrategy;
+  passthrough: boolean;
+  port: number;
+  host: string;
+  proxyConfig: LoadedProxyConfig | null;
+  primaryAccountKey: string | undefined;
+  accountAllowlist: AccountAllowlist | undefined;
+  runtimeConfigStore?: ProxyRuntimeConfigStore;
+  updateControlToken?: string;
+  /** Port of the gate-only share listener, when one is configured. */
+  sharePort?: number;
+  /** Bearer every inbound caller must present; omitted means none is required. */
+  inboundToken?: string;
+  /** The bind policy already ran and accepted an unauthenticated listener. */
+  inboundAuthAcknowledged?: boolean;
+}) {
+  const { createClaudeProxyRoutes } =
+    await import("../../lib/server/routes/claudeProxyRoutes.js");
+  const { createOpenAIProxyRoutes } =
+    await import("../../lib/server/routes/openaiProxyRoutes.js");
+  const { createCodexProxyRoutes } =
+    await import("../../lib/server/routes/codexProxyRoutes.js");
+  const { createGeminiProxyRoutes } =
+    await import("../../lib/server/routes/geminiProxyRoutes.js");
+  const { logBodyCapture, getRequestLoggerSnapshot } =
+    await import("../../lib/proxy/requestLogger.js");
+  const { recordFinalError } = await import("../../lib/proxy/usageStats.js");
+  const { admitInboundShareRequest, isGrantRequiredByEnv } =
+    await import("../../lib/proxy/shareGate.js");
+  const { runWithShareContext } =
+    await import("../../lib/proxy/shareContext.js");
+  const {
+    authorizeInboundRequest,
+    hasValidInboundToken,
+    isInboundAuthExemptPath,
+    secretsMatch,
+  } = await import("../../lib/proxy/inboundAuth.js");
+  const { Hono } = await import("hono");
+
+  const app = new Hono();
+  const inboundToken = params.inboundToken;
+  const inboundAuth = {
+    ...(inboundToken ? { token: inboundToken } : {}),
+    // The CLI ran the bind policy; a loopback or acknowledged listener must
+    // not re-trigger the route factories' unauthenticated-mount warning.
+    allowUnauthenticated: params.inboundAuthAcknowledged ?? true,
+  };
+
+  /**
+   * Is this request arriving on the gate-only share listener?
+   *
+   * Decided by the **local port the connection was accepted on**, which no
+   * client can influence. A header or an address check could not do this job:
+   * cloudflared and every reverse proxy connect from 127.0.0.1, so tunnelled
+   * traffic is indistinguishable from the operator's own by origin alone.
+   *
+   * The share port refuses untokened requests by construction; the main port
+   * keeps its existing behaviour unless the operator opts in with
+   * `NEUROLINK_PROXY_REQUIRE_GRANT` — which stays the answer for anyone binding
+   * `0.0.0.0` with nothing in front of it.
+   */
+  const isGatedListener = (c: { req: { raw: Request } }): boolean =>
+    isGrantRequiredByEnv() || gatedShareRequests.has(c.req.raw);
+  const readiness = createProxyReadinessState();
+  const requestMetadata = new WeakMap<Request, RuntimeRequestMetadata>();
+
+  const recordRuntimeError = async (
+    metadata: RuntimeRequestMetadata,
+    status: number,
+    errorType: string,
+    errorMessage: string,
+    options?: {
+      clientMessage?: string;
+      clientErrorType?: string;
+      errorCode?: string;
+    },
+  ): Promise<void> => {
+    const clientMessage = options?.clientMessage ?? errorMessage;
+    const clientErrorType = options?.clientErrorType ?? errorType;
+    const attempt = metadata.lastUpstreamAttempt;
+    if (metadata.accountingScope !== "internal" && !metadata.terminalResult) {
+      recordFinalError(
+        status,
+        attempt?.account ?? PROXY_INTERNAL_ACCOUNT_LABEL,
+        attempt?.accountType ?? PROXY_INTERNAL_ACCOUNT_TYPE,
+        {
+          requestId: metadata.requestId,
+          errorType,
+          errorCode: options?.errorCode,
+          terminalOutcome: "handler_error",
+          message: errorMessage,
+        },
+      );
+    }
+    await Promise.all([
+      logProxyRequestFinal({
+        timestamp: new Date().toISOString(),
+        requestId: metadata.requestId,
+        method: metadata.method,
+        path: metadata.path,
+        model: metadata.model,
+        stream: metadata.stream,
+        toolCount: metadata.toolCount,
+        account: attempt?.account ?? "",
+        accountType: attempt?.accountType ?? "proxy-runtime",
+        accountKey: attempt?.accountKey,
+        provider: attempt?.provider,
+        transportScope: attempt?.transportScope,
+        traceId: attempt?.traceId ?? metadata.traceId,
+        spanId: attempt?.spanId ?? metadata.spanId,
+        traceFlags: attempt?.traceFlags ?? metadata.traceFlags,
+        responseStatus: status,
+        responseTimeMs: Date.now() - metadata.startedAt,
+        errorType,
+        errorMessage,
+        ...(options?.errorCode ? { errorCode: options.errorCode } : {}),
+      }),
+      logBodyCapture({
+        timestamp: new Date().toISOString(),
+        requestId: metadata.requestId,
+        traceId: attempt?.traceId ?? metadata.traceId,
+        spanId: attempt?.spanId ?? metadata.spanId,
+        traceFlags: attempt?.traceFlags ?? metadata.traceFlags,
+        model: metadata.model,
+        stream: metadata.stream,
+        phase: "client_response",
+        headers: { "content-type": "application/json" },
+        body: {
+          type: "error",
+          error: { type: clientErrorType, message: clientMessage },
+        },
+        contentType: "application/json",
+        responseStatus: status,
+        durationMs: Date.now() - metadata.startedAt,
+      }),
+    ]);
+  };
+
+  /** 413 in the wire format this proxy answers its other request errors in. */
+  const respondRequestTooLarge = async (
+    c: Context,
+    metadata: RuntimeRequestMetadata | undefined,
+    message: string,
+  ) => {
+    if (metadata) {
+      await recordRuntimeError(metadata, 413, "request_too_large", message);
+    }
+    return c.json(
+      { type: "error", error: { type: "request_too_large", message } },
+      413,
+    );
+  };
+
+  app.onError(async (err, c) => {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logger.always(`[proxy] unhandled error: ${errMsg}`);
+    if (err instanceof Error && err.stack) {
+      logger.always(`[proxy] unhandled stack: ${err.stack}`);
+    }
+    const metadata = requestMetadata.get(c.req.raw) ?? {
+      requestId: crypto.randomUUID(),
+      method: c.req.method,
+      path: c.req.path,
+      startedAt: Date.now(),
+      model: "-",
+      stream: false,
+      toolCount: 0,
+    };
+    metadata.terminalErrorCode = getProxyRuntimeErrorCode(err);
+    const telemetryUnavailable =
+      metadata.terminalErrorCode === "PROXY_TELEMETRY_UNAVAILABLE";
+    const status = telemetryUnavailable ? 503 : 502;
+    metadata.terminalErrorType = telemetryUnavailable
+      ? "telemetry_unavailable"
+      : "unhandled_proxy_error";
+    try {
+      await recordRuntimeError(
+        metadata,
+        status,
+        metadata.terminalErrorType,
+        errMsg,
+        {
+          clientMessage: "Proxy internal error",
+          clientErrorType: "api_error",
+          errorCode: metadata.terminalErrorCode,
+        },
+      );
+    } finally {
+      // Admission/handler failures may never reach the response tracker. Keep
+      // bridge ownership through final publication, then release this request
+      // only; a child failure must retain its parent's result until delivery.
+      releaseProxyRequestAccounting(metadata.requestId);
+      requestMetadata.delete(c.req.raw);
+    }
+    return c.json(
+      {
+        type: "error",
+        error: {
+          type: "api_error",
+          message: "Proxy internal error",
+        },
+      },
+      status,
+    );
+  });
+
+  let supervisorRefreshDrainLease: NodeJS.Timeout | undefined;
+  const scheduleSupervisorRefreshResume = (delayMs: number): void => {
+    clearTimeout(supervisorRefreshDrainLease);
+    const resumeWhenReady = (): void => {
+      if (resumeProxyConnections(readiness)) {
+        supervisorRefreshDrainLease = undefined;
+        return;
+      }
+      // Readiness can be transiently false during worker replacement. Keep a
+      // recovery lease until admission has actually reopened.
+      supervisorRefreshDrainLease = setTimeout(resumeWhenReady, 30_000);
+      supervisorRefreshDrainLease.unref?.();
+    };
+    supervisorRefreshDrainLease = setTimeout(resumeWhenReady, delayMs);
+    supervisorRefreshDrainLease.unref?.();
+  };
+  app.post("/internal/update-control", async (c) => {
+    const suppliedToken = c.req.header("x-neurolink-update-token");
+    const expectedToken =
+      params.updateControlToken ?? PROXY_UPDATE_CONTROL_TOKEN;
+    if (!suppliedToken || !secretsMatch(expectedToken, suppliedToken)) {
+      return c.json({ error: "not_found" }, 404);
+    }
+    const payload = await c.req
+      .json<{ action?: string }>()
+      .catch(() => ({ action: undefined }));
+    if (
+      payload.action === "drain" ||
+      payload.action === "drain_for_supervisor_refresh" ||
+      payload.action === "fence_for_supervisor_refresh"
+    ) {
+      // A rolling worker must keep admitting until the supervisor has a ready
+      // replacement. The legacy global drain can otherwise strand the listener
+      // behind maintenance responses when its caller stalls or disappears.
+      if (
+        isProxySocketWorkerProcess() &&
+        payload.action !== "drain_for_supervisor_refresh" &&
+        payload.action !== "fence_for_supervisor_refresh"
+      ) {
+        return c.json(
+          {
+            error: "rolling_restart_required",
+            message:
+              "Use neurolink proxy restart; global update drain is disabled for rolling workers.",
+          },
+          409,
+        );
+      }
+      // No await between the activity check and fence: an HTTP request cannot
+      // enter this worker between the idle observation and admission closure.
+      // The updater separately verifies all supervisor generations are settled.
+      if (
+        payload.action === "fence_for_supervisor_refresh" &&
+        getProxyActivitySnapshot().activeRequests !== 0
+      ) {
+        return c.json({ error: "proxy_busy", draining: false }, 409);
+      }
+      if (!markProxyDrainingForUpdate(readiness)) {
+        return c.json({ error: "proxy_not_ready" }, 409);
+      }
+      if (
+        payload.action === "drain_for_supervisor_refresh" ||
+        payload.action === "fence_for_supervisor_refresh"
+      ) {
+        // A crashed updater must not strand the current rolling worker in
+        // maintenance mode. A successful launchd refresh replaces this process.
+        scheduleSupervisorRefreshResume(90 * 1000);
+      }
+    } else if (payload.action === "resume") {
+      if (!resumeProxyConnections(readiness)) {
+        return c.json({ error: "proxy_not_ready" }, 409);
+      }
+      clearTimeout(supervisorRefreshDrainLease);
+      supervisorRefreshDrainLease = undefined;
+    } else {
+      return c.json({ error: "invalid_action" }, 400);
+    }
+    return c.json({
+      draining: readiness.drainingForUpdate,
+      acceptingConnections: readiness.acceptingConnections,
+    });
+  });
+
+  registerProxyRequestTracking(app, requestMetadata, readiness);
+
+  // Complete-mode credentials adopted from a lender have to check in, or they
+  // stop when their offline grace runs out. The timer is unref'd so it never
+  // keeps the process alive, and failures are the lender being unreachable —
+  // exactly the case the grace period exists for, not an error.
+  const { heartbeatDueResidentGrants } =
+    await import("../../lib/proxy/residentGrants.js");
+  const residentHeartbeatTimer = setInterval(
+    () => {
+      void heartbeatDueResidentGrants().catch(() => undefined);
+    },
+    5 * 60 * 1000,
+  );
+  residentHeartbeatTimer.unref();
+
+  const runtimeConfigStore = params.runtimeConfigStore;
+  if (runtimeConfigStore) {
+    // Session bindings live in the process-local sessionAffinity store that
+    // the Claude routes created below read and write, so the app that owns
+    // those routes owns the store's reload transitions. Both directions
+    // clear: a request routed while affinity was on can finish after a
+    // disable reload and bind past that clear, and enabling must still start
+    // empty. A rejected reload leaves getSnapshot() unchanged, so it never
+    // looks like a transition.
+    let sessionAffinityWasEnabled =
+      runtimeConfigStore.getSnapshot().sessionAffinity;
+    runtimeConfigStore.subscribeReload(() => {
+      const sessionAffinityEnabled =
+        runtimeConfigStore.getSnapshot().sessionAffinity;
+      if (sessionAffinityWasEnabled !== sessionAffinityEnabled) {
+        sessionAffinity.clear();
+      }
+      sessionAffinityWasEnabled = sessionAffinityEnabled;
+    });
+  }
+  const runtimeConfigProvider = runtimeConfigStore
+    ? () => runtimeConfigStore.getSnapshot()
+    : undefined;
+  const routeGroup = createClaudeProxyRoutes(
+    params.modelRouter,
+    "",
+    params.strategy,
+    params.passthrough,
+    params.primaryAccountKey,
+    {
+      accountAllowlist: params.accountAllowlist,
+      ...(runtimeConfigProvider ? { runtimeConfigProvider } : {}),
+      inboundAuth,
+    },
+  );
+
+  const openaiRouteGroup = createOpenAIProxyRoutes(
+    params.modelRouter,
+    "",
+    params.port,
+    runtimeConfigProvider,
+    // Keep bridge capabilities, accounting and cancellation in this worker
+    // across supervisor generation switches; never re-enter the public listener.
+    (request) => app.fetch(request),
+  );
+  const codexRouteGroup = createCodexProxyRoutes(
+    "",
+    runtimeConfigProvider,
+    params.port,
+    // Same in-process loopback discipline as the OpenAI->Anthropic bridge:
+    // stay in this worker across supervisor generation switches, never
+    // re-enter the public listener.
+    (request) => app.fetch(request),
+    inboundAuth,
+  );
+  const geminiRouteGroup = createGeminiProxyRoutes(
+    params.modelRouter,
+    "",
+    params.port,
+    runtimeConfigProvider,
+  );
+  const allProxyRoutes = [
+    ...routeGroup.routes,
+    ...openaiRouteGroup.routes,
+    ...codexRouteGroup.routes,
+    ...geminiRouteGroup.routes,
+  ];
+
+  for (const route of allProxyRoutes) {
+    const method = route.method.toLowerCase() as "get" | "post";
+    app[method](route.path, async (c) => {
+      const metadata = requestMetadata.get(c.req.raw);
+      if (metadata?.rejectForUpdate) {
+        if (metadata) {
+          metadata.terminalErrorType = "proxy_draining";
+          await recordRuntimeError(
+            metadata,
+            503,
+            "proxy_draining",
+            "Proxy is draining for an automatic update",
+            {
+              clientMessage: "Proxy is restarting; retry shortly",
+              clientErrorType: "overloaded_error",
+            },
+          );
+        }
+        c.header("Retry-After", "2");
+        return c.json(
+          {
+            type: "error",
+            error: {
+              type: "overloaded_error",
+              message: "Proxy is restarting; retry shortly",
+            },
+          },
+          503,
+        );
+      }
+      // Inbound token, before the body is even read. A request carrying a
+      // share token is left to the share gate below; everything else on a
+      // non-exempt path must present the operator's token.
+      if (
+        inboundToken &&
+        metadata?.accountingScope !== "internal" &&
+        !isInboundAuthExemptPath(c.req.path)
+      ) {
+        const verdict = authorizeInboundRequest(
+          Object.fromEntries(c.req.raw.headers.entries()),
+          inboundToken,
+        );
+        if (!verdict.ok) {
+          for (const [key, value] of Object.entries(verdict.response.headers)) {
+            c.header(key, value);
+          }
+          if (metadata) {
+            metadata.terminalErrorType = "inbound_auth_required";
+            await recordRuntimeError(
+              metadata,
+              401,
+              "inbound_auth_required",
+              "Request did not present the inbound token",
+              {
+                clientMessage: verdict.response.body.error.message,
+                clientErrorType: verdict.response.body.error.type,
+              },
+            );
+          }
+          return c.json(verdict.response.body, 401);
+        }
+      }
+      const emptyBody = {};
+      let body: unknown;
+      let rawBody: string | undefined;
+      if (method === "post") {
+        // Bounded before it is parsed, and so before the share gate below
+        // (which needs the model), the way the server adapters bound theirs.
+        const read = await readProxyRequestText(c.req.raw, route.path);
+        if (read instanceof RawBodyTooLargeError) {
+          return respondRequestTooLarge(c, metadata, read.message);
+        }
+        rawBody = read;
+        try {
+          body = rawBody ? JSON.parse(rawBody) : emptyBody;
+        } catch {
+          const metadata = requestMetadata.get(c.req.raw);
+          if (metadata) {
+            await recordRuntimeError(
+              metadata,
+              400,
+              "invalid_request_error",
+              "Request body must be valid JSON",
+            );
+          }
+          return c.json(
+            {
+              type: "error",
+              error: {
+                type: "invalid_request_error",
+                message: "Request body must be valid JSON",
+              },
+            },
+            400,
+          );
+        }
+      }
+
+      const model = (body as Record<string, unknown>)?.model ?? "-";
+      const stream = (body as Record<string, unknown>)?.stream
+        ? "stream"
+        : "non-stream";
+      const bodyRec = body as Record<string, unknown> | undefined;
+      const toolCount = Array.isArray(bodyRec?.tools)
+        ? (bodyRec.tools as unknown[]).length
+        : 0;
+      if (metadata) {
+        metadata.model = String(model);
+        metadata.stream = stream === "stream";
+        metadata.toolCount = toolCount;
+      }
+      const logModel = sanitizeForLog(String(model));
+      logger.always(
+        `[proxy] ${c.req.method} ${c.req.path} → model=${logModel} ${stream} tools=${toolCount}`,
+      );
+
+      // Peer-sharing gate. Runs here rather than as middleware because the
+      // model is only known after the body is parsed, and the model allowlist
+      // is one of the gates. Requests with no share token take the `local`
+      // branch untouched, which is every request on a node that shares nothing.
+      // `Number()` answers 0 for `null`, `""` and `[]` — all finite, all wrong.
+      // A zero reaches `estimateHoldCoins` and clamps up to its 256 floor
+      // rather than the 4096 an absent value defaults to, so the hold opened
+      // for the request comes out sixteen times too small. Only a real positive
+      // number counts here; anything else is treated as absent, which is the
+      // conservative direction because it holds more, not less.
+      const rawMaxTokens = (body as Record<string, unknown>)?.max_tokens;
+      const requestedMaxTokens =
+        typeof rawMaxTokens === "number" &&
+        Number.isFinite(rawMaxTokens) &&
+        rawMaxTokens > 0
+          ? rawMaxTokens
+          : undefined;
+      // The heartbeat surface authenticates itself against the grant's lease
+      // secret. Running it through the request gate as well would spend the
+      // grant's rate allowance and open a coin hold for a call that consumes no
+      // capacity at all.
+      const shareOutcome =
+        metadata?.accountingScope === "internal" ||
+        c.req.path.startsWith("/peer/")
+          ? ({ kind: "local" } as const)
+          : await admitInboundShareRequest({
+              headers: Object.fromEntries(c.req.raw.headers.entries()),
+              model: String(model),
+              ...(requestedMaxTokens !== undefined
+                ? { maxTokens: requestedMaxTokens }
+                : {}),
+              requireGrant: isGatedListener(c),
+            });
+      if (shareOutcome.kind === "refused") {
+        const refusal = shareOutcome.response;
+        for (const [key, value] of Object.entries(refusal.headers)) {
+          c.header(key, value);
+        }
+        if (metadata) {
+          metadata.terminalErrorType = `share_${refusal.body.error.type}`;
+        }
+        // Narrow to the literals the gate can actually produce; Hono's json()
+        // wants a status literal and the alternative is a cast.
+        const refusalStatus =
+          refusal.status === 401 ? 401 : refusal.status === 403 ? 403 : 429;
+        return c.json(refusal.body, refusalStatus);
+      }
+      const shareContext =
+        shareOutcome.kind === "admitted" ? shareOutcome.context : undefined;
+      if (shareOutcome.kind === "admitted") {
+        if (metadata) {
+          metadata.shareRelease = shareOutcome.release;
+        } else {
+          // No tracked metadata means nothing will call the completion hook;
+          // release immediately rather than leaking the concurrency slot.
+          shareOutcome.release();
+        }
+      }
+
+      const requestAbortController =
+        metadata?.abortController ?? new AbortController();
+      const ctx = {
+        requestId: metadata?.requestId ?? crypto.randomUUID(),
+        method: c.req.method,
+        path: c.req.path,
+        headers: Object.fromEntries(c.req.raw.headers.entries()),
+        query: Object.fromEntries(new URL(c.req.url).searchParams.entries()),
+        params: c.req.param() as Record<string, string>,
+        body,
+        rawBody,
+        abortSignal: AbortSignal.any([
+          c.req.raw.signal,
+          requestAbortController.signal,
+        ]),
+        // The proxy runtime exposes only the structural slice of NeuroLink the
+        // routes use; narrow (overlap-checked) to the full class for ServerContext.
+        neurolink: params.neurolink as NeuroLink,
+        toolRegistry: params.neurolink.getToolRegistry(),
+        timestamp: Date.now(),
+        // Keep route terminal observers on the runtime request metadata so the
+        // outer response tracker can notify them without adding a second body
+        // wrapper to streaming routes.
+        metadata: (metadata ?? {}) as Record<string, unknown>,
+        // Route handlers publish limit/quota headers here. Only the streaming
+        // paths build their own Response (and set headers directly); every
+        // JSON and error path returns a plain object, so without this the
+        // headers had nowhere to go. Applied to each c.json() return below.
+        responseHeaders: {} as Record<string, string>,
+      };
+
+      /** Copy handler-published headers onto the outgoing response. */
+      const applyResponseHeaders = (): void => {
+        for (const [key, value] of Object.entries(ctx.responseHeaders)) {
+          c.header(key, value);
+        }
+      };
+
+      const result = await raceWithAbort(
+        Promise.resolve(
+          shareContext
+            ? runWithShareContext(shareContext, () => route.handler(ctx))
+            : route.handler(ctx),
+        ),
+        ctx.abortSignal,
+      );
+      if (result instanceof Response) {
+        // Streaming responses own their headers; merge in anything the
+        // handler published on the context that the Response lacks. A Response
+        // obtained from fetch() carries immutable headers, so this is
+        // best-effort — the body must still reach the client either way.
+        try {
+          for (const [key, value] of Object.entries(ctx.responseHeaders)) {
+            if (!result.headers.has(key)) {
+              result.headers.set(key, value);
+            }
+          }
+        } catch {
+          // Immutable header guard — skip enrichment, keep the response.
+        }
+        return result;
+      }
+
+      if (
+        result &&
+        typeof result === "object" &&
+        Symbol.asyncIterator in Object(result)
+      ) {
+        const iterator = (result as AsyncIterable<string>)[
+          Symbol.asyncIterator
+        ]();
+        let cancelled = false;
+        const encoder = new TextEncoder();
+        const responseStream = new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            if (cancelled) {
+              return;
+            }
+            try {
+              const next = await iterator.next();
+              if (cancelled) {
+                return;
+              }
+              if (next.done) {
+                controller.close();
+              } else {
+                controller.enqueue(encoder.encode(next.value));
+              }
+            } catch (streamErr) {
+              if (cancelled) {
+                return;
+              }
+              if (metadata) {
+                metadata.terminalErrorType = "stream_error";
+              }
+              logger.debug("[proxy] response stream interrupted", {
+                error: streamErr,
+              });
+              controller.enqueue(
+                encoder.encode(
+                  `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: "Stream interrupted" } })}\n\n`,
+                ),
+              );
+              controller.close();
+            }
+          },
+          async cancel(reason) {
+            cancelled = true;
+            requestAbortController.abort(reason);
+            await withTimeout(
+              Promise.resolve(iterator.return?.()),
+              1000,
+              "[proxy] response cancellation timed out",
+            ).catch(() => undefined);
+          },
+        });
+        return new Response(responseStream, {
+          headers: {
+            ...ctx.responseHeaders,
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+          },
+        });
+      }
+
+      if (
+        result &&
+        typeof result === "object" &&
+        "httpStatus" in (result as Record<string, unknown>)
+      ) {
+        const httpResult = result as Record<string, unknown>;
+        const status = (httpResult.httpStatus as number) ?? 200;
+        delete httpResult.httpStatus;
+        applyResponseHeaders();
+        return c.json(result, status as 400);
+      }
+
+      if (
+        result &&
+        typeof result === "object" &&
+        "type" in result &&
+        (result as Record<string, unknown>).type === "error"
+      ) {
+        const errorResult = result as {
+          type: string;
+          error?: { type?: string };
+        };
+        const status = mapClaudeErrorTypeToStatus(errorResult.error?.type);
+        applyResponseHeaders();
+        return c.json(result, status as 400);
+      }
+
+      applyResponseHeaders();
+      return c.json(result ?? {});
+    });
+  }
+
+  app.get("/health", (c) => {
+    const runtimeConfig = params.runtimeConfigStore?.getSnapshot();
+    return c.json(
+      buildProxyHealthResponse(readiness, {
+        strategy: runtimeConfig ? runtimeConfig.strategy : params.strategy,
+        passthrough: runtimeConfig
+          ? runtimeConfig.passthrough
+          : params.passthrough,
+        version: PROXY_VERSION,
+      }),
+    );
+  });
+
+  app.get("/status", async (c) => {
+    // `/status` is an operator surface. With an inbound token configured it
+    // is refused outright to anyone without it, not merely redacted.
+    if (
+      inboundToken &&
+      !hasValidInboundToken(
+        Object.fromEntries(c.req.raw.headers.entries()),
+        inboundToken,
+      )
+    ) {
+      return c.json(
+        {
+          type: "error",
+          error: {
+            type: "authentication_error",
+            message: "This proxy requires an inbound token.",
+          },
+        },
+        401,
+      );
+    }
+    // A gated proxy is, by definition, one that may be exposed. `/status`
+    // enumerates account labels — which for an OAuth account is an email — plus
+    // quota and cooldown state, and it is not behind the request gate, so
+    // without this anyone who reaches the tunnel could read the pool's identity.
+    //
+    // A loopback check would be no defence: cloudflared runs locally and
+    // connects to 127.0.0.1, so tunnelled traffic arrives from loopback too.
+    // Identity is therefore released only to a caller holding the update-control
+    // token, and redacted for everyone else. Counters and health stay visible so
+    // liveness tooling keeps working.
+    const statusIdentityAllowed =
+      !isGatedListener(c) ||
+      secretsMatch(
+        params.updateControlToken ?? PROXY_UPDATE_CONTROL_TOKEN,
+        c.req.header("x-neurolink-update-token") ?? "",
+      );
+    const runtimeConfig = params.runtimeConfigStore?.getSnapshot();
+    const runtimeConfigStatus = params.runtimeConfigStore?.getStatus();
+    const activeStrategy = runtimeConfig
+      ? runtimeConfig.strategy
+      : params.strategy;
+    const activePassthrough = runtimeConfig
+      ? runtimeConfig.passthrough
+      : params.passthrough;
+    const activeProxyConfig = runtimeConfig
+      ? runtimeConfig.proxyConfig
+      : params.proxyConfig;
+    const activeAccountAllowlist = runtimeConfig
+      ? runtimeConfig.accountAllowlist
+      : params.accountAllowlist;
+    const {
+      getReconciledUsageSnapshot,
+      getUsageSnapshot,
+      getUsageStatsPersistenceStatus,
+    } = await import("../../lib/proxy/usageStats.js");
+    const { loadAccountCooldowns } =
+      await import("../../lib/proxy/accountCooldown.js");
+    let usageSnapshot = getUsageSnapshot();
+    let snapshotSource: "reconciled" | "memory" = "memory";
+    try {
+      usageSnapshot = await withTimeout(
+        getReconciledUsageSnapshot(),
+        PROXY_STATUS_RECONCILE_TIMEOUT_MS,
+        "[proxy] /status usage reconciliation timed out",
+      );
+      snapshotSource = "reconciled";
+    } catch (error) {
+      // Status must not become an outage amplifier when a cross-process lock or
+      // a slow filesystem stalls reconciliation. The process-local snapshot is
+      // coherent and its source is explicit to callers.
+      logger.debug(
+        `[proxy] /status using memory stats snapshot: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    const { stats, terminalErrors } = usageSnapshot;
+    const terminalErrorDetailsComparable =
+      usageSnapshot.statsVersion === usageSnapshot.terminalErrorsVersion;
+    const lastTerminalError = terminalErrors.recent.at(-1) ?? null;
+    const terminalErrorDetailsMissing = terminalErrorDetailsComparable
+      ? Math.max(0, stats.totalErrors - terminalErrors.totalErrors)
+      : undefined;
+    const terminalErrorDetailsExcess = terminalErrorDetailsComparable
+      ? Math.max(0, terminalErrors.totalErrors - stats.totalErrors)
+      : undefined;
+    const runtimeState = loadProxyState();
+    const supervisorState = loadProxySupervisorState();
+    const rollingSupervisorRunning = isRollingHandoffCapable(supervisorState);
+    const updateState = loadUpdateState();
+    const cooldowns = await withTimeout(
+      loadAccountCooldowns(),
+      PROXY_STATUS_ACCOUNT_INVENTORY_TIMEOUT_MS,
+      "[proxy] /status cooldown inspection timed out",
+    ).catch((error) => {
+      logger.debug(
+        `[proxy] /status using empty cooldown snapshot: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return {} as Record<string, PersistedAccountCooldown>;
+    });
+    const storedAnthropicAccountKeys = new Set<string>();
+    const storedCodexAccountKeys = new Set<string>();
+    const storedAccountExpirations = new Map<string, number>();
+    const disabledProviderAccountKeys = new Set<string>();
+    let accountInventoryLoaded = false;
+    try {
+      const { tokenStore } = await import("../../lib/auth/tokenStore.js");
+      const inventory = await withTimeout(
+        tokenStore.getProviderSnapshot(),
+        PROXY_STATUS_ACCOUNT_INVENTORY_TIMEOUT_MS,
+        "[proxy] /status account inspection timed out",
+      );
+      for (const [storedKey, entry] of Object.entries(inventory)) {
+        if (
+          !storedKey.startsWith("anthropic:") &&
+          !storedKey.startsWith("codex:")
+        ) {
+          continue;
+        }
+        const key = storedKey.startsWith("anthropic:")
+          ? normalizeAnthropicAccountKey(storedKey)
+          : storedKey;
+        (key.startsWith("anthropic:")
+          ? storedAnthropicAccountKeys
+          : storedCodexAccountKeys
+        ).add(key);
+        storedAccountExpirations.set(key, entry.tokens.expiresAt);
+        if (entry.disabled) {
+          disabledProviderAccountKeys.add(key);
+        }
+      }
+      accountInventoryLoaded = true;
+    } catch (err) {
+      logger.debug(
+        `[proxy] /status: failed to resolve account cooldown labels: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    const now = Date.now();
+    const health = buildProxyHealthResponse(readiness, {
+      strategy: activeStrategy,
+      passthrough: activePassthrough,
+      version: PROXY_VERSION,
+    });
+    const primaryAccount = await withTimeout(
+      resolveStatusPrimaryAccount(activeProxyConfig),
+      PROXY_STATUS_ACCOUNT_INVENTORY_TIMEOUT_MS,
+      "[proxy] /status primary account inspection timed out",
+    ).catch(() => ({
+      configured: activeProxyConfig?.routing?.primaryAccount?.trim() || null,
+      key: null,
+      label: null,
+      source: "fallback" as const,
+    }));
+    const activeUpdaterPid =
+      supervisorState?.updaterPid ?? runtimeState?.updaterPid;
+    const accountRows: NonNullable<StatusStats["accounts"]> = Object.entries(
+      stats.accounts,
+    ).map(([persistedMapKey, account]) => {
+      // Legacy snapshots used their bare map key as an inferred identity. Do
+      // not map those old rows to a provider based on an email: the same email
+      // can be present in both pools. New records carry account.key.
+      const persistedKey = account.key ?? null;
+      const identity = persistedKey
+        ? resolveProxyStatusAccountIdentity(
+            account.label,
+            account.type,
+            persistedKey,
+          )
+        : { provider: "other" as const, key: null };
+      const isLegacyUnattributed =
+        persistedKey === null &&
+        (account.type === "oauth" ||
+          account.type === "api_key" ||
+          account.type === "codex-oauth");
+      const isAnthropicAccount = identity.provider === "anthropic";
+      const isCodexAccount = identity.provider === "codex";
+      const accountKey = identity.key ?? (persistedKey || persistedMapKey);
+      const isStored =
+        (isAnthropicAccount && storedAnthropicAccountKeys.has(accountKey)) ||
+        (isCodexAccount && storedCodexAccountKeys.has(accountKey));
+      const providerState = isAnthropicAccount
+        ? deriveAccountAllowance(
+            accountKey,
+            now,
+            activeAccountAllowlist,
+            storedAccountExpirations,
+            cooldowns,
+          )
+        : isCodexAccount
+          ? {
+              allowed: true,
+              expired:
+                (storedAccountExpirations.get(accountKey) ?? 0) > 0 &&
+                (storedAccountExpirations.get(accountKey) ?? 0) <= now,
+              cooling: (cooldowns[accountKey]?.coolingUntil ?? 0) > now,
+            }
+          : { allowed: true, expired: false, cooling: false };
+      const isDisabled =
+        !isLegacyUnattributed && disabledProviderAccountKeys.has(accountKey);
+      const accountStatus =
+        account.type === "internal"
+          ? "internal"
+          : isLegacyUnattributed
+            ? "unattributed"
+            : isDisabled
+              ? "disabled"
+              : providerState.expired
+                ? "expired"
+                : isAnthropicAccount && !providerState.allowed
+                  ? "excluded"
+                  : accountInventoryLoaded &&
+                      (isAnthropicAccount || isCodexAccount) &&
+                      !isStored
+                    ? "removed"
+                    : providerState.cooling
+                      ? "cooling"
+                      : "active";
+      return {
+        key: isLegacyUnattributed ? null : accountKey,
+        provider: isLegacyUnattributed ? "unknown" : identity.provider,
+        label: account.label,
+        type: account.type,
+        attempts: account.attemptCount,
+        requests: account.successCount + account.errorCount,
+        success: account.successCount,
+        errors: account.errorCount,
+        attemptErrors: account.attemptErrorCount,
+        rateLimits: account.rateLimitCount,
+        transientRateLimits: account.transientRateLimitCount,
+        quotaRateLimits: account.quotaRateLimitCount,
+        cooling: providerState.cooling,
+        status: accountStatus,
+        allowed:
+          account.type === "internal" ? undefined : providerState.allowed,
+        expired:
+          isAnthropicAccount || isCodexAccount
+            ? providerState.expired
+            : undefined,
+      };
+    });
+    const representedAccountKeys = new Set(
+      accountRows.flatMap((account) =>
+        account.key &&
+        (account.provider === "anthropic" || account.provider === "codex")
+          ? [account.key]
+          : [],
+      ),
+    );
+    for (const accountKey of storedAnthropicAccountKeys) {
+      if (representedAccountKeys.has(accountKey)) {
+        continue;
+      }
+      const { allowed, expired, cooling } = deriveAccountAllowance(
+        accountKey,
+        now,
+        activeAccountAllowlist,
+        storedAccountExpirations,
+        cooldowns,
+      );
+      accountRows.push({
+        key: accountKey,
+        provider: "anthropic",
+        label: accountKey.slice("anthropic:".length),
+        type: "oauth",
+        attempts: 0,
+        requests: 0,
+        success: 0,
+        errors: 0,
+        attemptErrors: 0,
+        rateLimits: 0,
+        transientRateLimits: 0,
+        quotaRateLimits: 0,
+        cooling,
+        status: disabledProviderAccountKeys.has(accountKey)
+          ? "disabled"
+          : expired
+            ? "expired"
+            : !allowed
+              ? "excluded"
+              : cooling
+                ? "cooling"
+                : "active",
+        allowed,
+        expired,
+      });
+    }
+    for (const accountKey of storedCodexAccountKeys) {
+      if (representedAccountKeys.has(accountKey)) {
+        continue;
+      }
+      const expiresAt = storedAccountExpirations.get(accountKey);
+      const expired =
+        expiresAt !== undefined && expiresAt > 0 && expiresAt <= now;
+      const cooling = (cooldowns[accountKey]?.coolingUntil ?? 0) > now;
+      accountRows.push({
+        key: accountKey,
+        provider: "codex",
+        label: accountKey.slice("codex:".length),
+        type: "codex-oauth",
+        attempts: 0,
+        requests: 0,
+        success: 0,
+        errors: 0,
+        attemptErrors: 0,
+        rateLimits: 0,
+        transientRateLimits: 0,
+        quotaRateLimits: 0,
+        cooling,
+        status: disabledProviderAccountKeys.has(accountKey)
+          ? "disabled"
+          : expired
+            ? "expired"
+            : cooling
+              ? "cooling"
+              : "active",
+        allowed: true,
+        expired,
+      });
+    }
+    const attributed = accountRows.reduce(
+      (total, account) => ({
+        attempts: total.attempts + (account.attempts ?? 0),
+        requests: total.requests + (account.requests ?? 0),
+        success: total.success + (account.success ?? 0),
+        errors: total.errors + (account.errors ?? 0),
+        attemptErrors: total.attemptErrors + (account.attemptErrors ?? 0),
+        rateLimits: total.rateLimits + (account.rateLimits ?? 0),
+        transientRateLimits:
+          total.transientRateLimits + (account.transientRateLimits ?? 0),
+        quotaRateLimits: total.quotaRateLimits + (account.quotaRateLimits ?? 0),
+      }),
+      {
+        attempts: 0,
+        requests: 0,
+        success: 0,
+        errors: 0,
+        attemptErrors: 0,
+        rateLimits: 0,
+        transientRateLimits: 0,
+        quotaRateLimits: 0,
+      },
+    );
+    const unattributed = {
+      attempts: Math.max(0, stats.totalAttempts - attributed.attempts),
+      requests: Math.max(0, stats.totalRequests - attributed.requests),
+      success: Math.max(0, stats.totalSuccess - attributed.success),
+      errors: Math.max(0, stats.totalErrors - attributed.errors),
+      attemptErrors: Math.max(
+        0,
+        stats.totalAttemptErrors - attributed.attemptErrors,
+      ),
+      rateLimits: Math.max(0, stats.totalRateLimits - attributed.rateLimits),
+      transientRateLimits: Math.max(
+        0,
+        stats.totalTransientRateLimits - attributed.transientRateLimits,
+      ),
+      quotaRateLimits: Math.max(
+        0,
+        stats.totalQuotaRateLimits - attributed.quotaRateLimits,
+      ),
+    };
+    if (Object.values(unattributed).some((count) => count > 0)) {
+      const internalRow = accountRows.find(
+        (account) => account.label === PROXY_INTERNAL_ACCOUNT_LABEL,
+      );
+      if (internalRow) {
+        internalRow.attempts =
+          (internalRow.attempts ?? 0) + unattributed.attempts;
+        internalRow.requests =
+          (internalRow.requests ?? 0) + unattributed.requests;
+        internalRow.success = (internalRow.success ?? 0) + unattributed.success;
+        internalRow.errors = (internalRow.errors ?? 0) + unattributed.errors;
+        internalRow.attemptErrors =
+          (internalRow.attemptErrors ?? 0) + unattributed.attemptErrors;
+        internalRow.rateLimits =
+          (internalRow.rateLimits ?? 0) + unattributed.rateLimits;
+        internalRow.transientRateLimits =
+          (internalRow.transientRateLimits ?? 0) +
+          unattributed.transientRateLimits;
+        internalRow.quotaRateLimits =
+          (internalRow.quotaRateLimits ?? 0) + unattributed.quotaRateLimits;
+      } else {
+        accountRows.push({
+          label: PROXY_INTERNAL_ACCOUNT_LABEL,
+          type: "internal",
+          ...unattributed,
+          cooling: false,
+          status: "internal",
+        });
+      }
+    }
+    // Unlike the fields below there is no `params` fallback: the static start
+    // options never carried these, so without a runtime snapshot the active
+    // policy is simply the defaults.
+    const activePolicy = {
+      ranking: runtimeConfig?.accountRanking ?? "expiry-first",
+      preferPrimary: runtimeConfig?.preferPrimary ?? false,
+      sessionAffinity: runtimeConfig?.sessionAffinity ?? false,
+      sessionAffinityIdleTtlMs:
+        runtimeConfig?.sessionAffinityIdleTtlMs ?? 3_600_000,
+      spillInflight: runtimeConfig?.spillInflight ?? 0,
+    };
+    return c.json({
+      status: "running",
+      ready: health.ready,
+      acceptingConnections: health.acceptingConnections,
+      readyAt: health.readyAt,
+      pid: process.pid,
+      port: params.port,
+      host: params.host,
+      strategy: activeStrategy,
+      policy: activePolicy,
+      boundSessions: sessionAffinity.countActive(
+        Date.now(),
+        activePolicy.sessionAffinityIdleTtlMs,
+      ),
+      uptime: process.uptime(),
+      version: PROXY_VERSION,
+      health,
+      stats: {
+        startedAt: stats.startedAt,
+        totalAttempts: stats.totalAttempts,
+        totalAttemptErrors: stats.totalAttemptErrors,
+        totalRequests: stats.totalRequests,
+        totalSuccess: stats.totalSuccess,
+        totalErrors: stats.totalErrors,
+        totalRateLimits: stats.totalRateLimits,
+        totalTransientRateLimits: stats.totalTransientRateLimits,
+        totalQuotaRateLimits: stats.totalQuotaRateLimits,
+        terminalErrors,
+        lastTerminalError,
+        terminalErrorDetailsComparable,
+        terminalErrorDetailsMissing,
+        terminalErrorDetailsExcess,
+        snapshotSource,
+        accounts: redactStatusAccounts(accountRows, statusIdentityAllowed),
+        primaryAccount: statusIdentityAllowed
+          ? primaryAccount
+          : redactStatusPrimaryAccount(primaryAccount),
+        persistence: getUsageStatsPersistenceStatus(),
+      },
+      activity: (() => {
+        const activity = getProxyActivitySnapshot();
+        return {
+          activeRequests: activity.activeRequests,
+          lastActivityAt: activity.lastActivityAt?.toISOString() ?? null,
+        };
+      })(),
+      observability: {
+        process: getProxyProcessTelemetry(),
+        supervisor: supervisorState?.pid
+          ? await requestProxySupervisorTelemetry(
+              supervisorState.restartControl,
+              supervisorState.pid,
+            )
+          : { status: "not_applicable" },
+        lifecycle: getProxyLifecycleLoggerSnapshot(),
+        requestLogs: getRequestLoggerSnapshot(),
+      },
+      autoUpdate: {
+        enabled: isProxyAutoUpdateEnabled(),
+        supervisorPid: supervisorState?.pid ?? null,
+        supervisorVersion: supervisorState?.version ?? null,
+        rolling: supervisorState?.rolling ?? null,
+        updaterPid: activeUpdaterPid ?? null,
+        updaterRunning: activeUpdaterPid
+          ? isProcessRunning(activeUpdaterPid)
+          : false,
+        liveVersion: PROXY_VERSION,
+        latestVersion: updateState?.lastCheckVersion || null,
+        lastDetectedVersion: updateState?.lastCheckVersion || null,
+        installedVersion:
+          updateState?.installedVersion ??
+          updateState?.lastUpdateVersion ??
+          null,
+        validatedVersion: updateState?.installedVersion ?? null,
+        selectedPackageVersion:
+          readProxyPackageSelection(PROXY_PACKAGES_DIR)?.version ?? null,
+        diskPackageVersion: readProxyDiskVersion(),
+        candidateVersion:
+          supervisorState?.rolling?.candidate?.expectedVersion ?? null,
+        activatedVersion: PROXY_VERSION,
+        pendingActivationVersion: updateState?.pendingRestartVersion ?? null,
+        pendingRestartVersion: updateState?.pendingRestartVersion ?? null,
+        activationMode: rollingSupervisorRunning
+          ? "rolling-handoff"
+          : "restart",
+        deferredUpdate: updateState?.deferredUpdate ?? null,
+        lastCheckAt: updateState?.lastCheckAt ?? null,
+        lastCheckAttemptAt: updateState?.lastCheckAttemptAt ?? null,
+        lastCheckError: updateState?.lastCheckError ?? null,
+        lastUpdateAt: updateState?.lastUpdateAt ?? null,
+        lastUpdateVersion: updateState?.lastUpdateVersion ?? null,
+        lastFailure: updateState?.lastFailure
+          ? {
+              at: updateState.lastFailure.at,
+              version: updateState.lastFailure.version,
+              stage: updateState.lastFailure.stage,
+            }
+          : null,
+      },
+      config: params.runtimeConfigStore
+        ? {
+            hasRouting: !!activeProxyConfig?.routing,
+            accountAllowlist: activeAccountAllowlist
+              ? [...activeAccountAllowlist]
+              : null,
+            generation: runtimeConfig?.generation ?? null,
+            loadedAt: runtimeConfig?.loadedAt ?? null,
+            hash: runtimeConfig?.configHash ?? null,
+            watching: runtimeConfigStatus?.watching ?? false,
+            lastReloadAttemptAt:
+              runtimeConfigStatus?.lastReloadAttemptAt ?? null,
+            lastReloadAt: runtimeConfigStatus?.lastReloadAt ?? null,
+            lastReloadSource: runtimeConfigStatus?.lastReloadSource ?? null,
+            lastReloadError: runtimeConfigStatus?.lastReloadError ?? null,
+            consecutiveFailures: runtimeConfigStatus?.consecutiveFailures ?? 0,
+          }
+        : params.proxyConfig
+          ? {
+              hasRouting: !!params.proxyConfig.routing,
+              accountAllowlist: params.accountAllowlist
+                ? [...params.accountAllowlist]
+                : null,
+            }
+          : null,
+    });
+  });
+
+  return { app, readiness };
+}
+
+async function initializeProxyOpenTelemetry(): Promise<void> {
+  try {
+    const otlpEndpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
+    if (!process.env.OTEL_SERVICE_NAME) {
+      process.env.OTEL_SERVICE_NAME = "neurolink-proxy";
+    }
+
+    process.env.OTEL_RESOURCE_ATTRIBUTES = [
+      "service.name=neurolink-proxy",
+      `service.version=${PROXY_VERSION}`,
+      "deployment.environment=local",
+      process.env.OTEL_RESOURCE_ATTRIBUTES,
+    ]
+      .filter(Boolean)
+      .join(",");
+
+    const hasLangfuseKeys = Boolean(
+      process.env.LANGFUSE_PUBLIC_KEY && process.env.LANGFUSE_SECRET_KEY,
+    );
+    ensureTelemetry({
+      langfuse: hasLangfuseKeys && {
+        environment: process.env.LANGFUSE_TRACING_ENVIRONMENT || "proxy",
+        release: process.env.LANGFUSE_RELEASE || PROXY_VERSION,
+      },
+    });
+    const langfuseEnabled = getLangfuseHealthStatus().hasProcessor;
+
+    if (langfuseEnabled) {
+      logger.always(
+        `[proxy] Langfuse enabled — exporting to ${process.env.LANGFUSE_BASE_URL || "https://cloud.langfuse.com"}`,
+      );
+    }
+    if (otlpEndpoint) {
+      logger.always(
+        `[proxy] OTLP exporter enabled — exporting to ${otlpEndpoint} (service.name=neurolink-proxy)`,
+      );
+    }
+    if (!langfuseEnabled && !otlpEndpoint) {
+      logger.always(
+        "[proxy] OpenTelemetry exporters disabled — set OTEL_EXPORTER_OTLP_ENDPOINT or Langfuse credentials to enable proxy observability",
+      );
+    }
+  } catch (error) {
+    logger.debug(
+      `[proxy] OpenTelemetry init failed (non-fatal): ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+const BACKGROUND_REFRESH_BASE_COOLDOWN_MS = 30_000;
+const BACKGROUND_REFRESH_MAX_COOLDOWN_MS = 5 * 60 * 1000;
+const backgroundRefreshFailures = new Map<
+  string,
+  { consecutiveFailures: number; coolingUntil: number }
+>();
+const backgroundRejectedRefreshTokens = new Map<string, string>();
+let backgroundRefreshInProgress = false;
+
+function canAttemptBackgroundRefresh(
+  key: string,
+  refreshToken?: string,
+): boolean {
+  const rejectedToken = backgroundRejectedRefreshTokens.get(key);
+  if (rejectedToken !== undefined) {
+    if (rejectedToken === refreshToken) {
+      return false;
+    }
+    backgroundRejectedRefreshTokens.delete(key);
+  }
+  const state = backgroundRefreshFailures.get(key);
+  return !state || Date.now() >= state.coolingUntil;
+}
+
+function recordBackgroundRefreshFailure(key: string): void {
+  const consecutiveFailures =
+    (backgroundRefreshFailures.get(key)?.consecutiveFailures ?? 0) + 1;
+  const delayMs = Math.min(
+    BACKGROUND_REFRESH_MAX_COOLDOWN_MS,
+    BACKGROUND_REFRESH_BASE_COOLDOWN_MS *
+      2 ** Math.min(consecutiveFailures - 1, 4),
+  );
+  backgroundRefreshFailures.set(key, {
+    consecutiveFailures,
+    coolingUntil: Date.now() + delayMs,
+  });
+}
+
+async function refreshProxyTokensInBackground(
+  accountAllowlist?: AccountAllowlist,
+): Promise<void> {
+  const {
+    needsBackgroundRefresh,
+    refreshToken,
+    persistTokens,
+    isPermanentRefreshFailure,
+  } = await import("../../lib/proxy/tokenRefresh.js");
+  const { tokenStore } = await import("../../lib/auth/tokenStore.js");
+
+  let storedAnthropicAccountCount: number | undefined;
+  try {
+    const allKeys = await tokenStore.listProviders();
+    const anthropicKeys = allKeys.filter((key) => key.startsWith("anthropic:"));
+    storedAnthropicAccountCount = anthropicKeys.length;
+    for (const key of anthropicKeys) {
+      try {
+        if (
+          !isAccountAllowed(key, accountAllowlist) ||
+          (await tokenStore.isDisabled(key))
+        ) {
+          continue;
+        }
+        const tokens = await tokenStore.loadTokens(key);
+        if (!tokens) {
+          continue;
+        }
+        const account = {
+          label: key,
+          token: tokens.accessToken,
+          refreshToken: tokens.refreshToken,
+          expiresAt: tokens.expiresAt,
+        };
+        if (!needsBackgroundRefresh(account)) {
+          backgroundRefreshFailures.delete(key);
+          continue;
+        }
+        if (!canAttemptBackgroundRefresh(key, tokens.refreshToken)) {
+          continue;
+        }
+        const result = await refreshToken(account);
+        if (result.success) {
+          await persistTokens({ providerKey: key }, account);
+          backgroundRefreshFailures.delete(key);
+          logger.debug(`[proxy] background token refresh succeeded for ${key}`);
+        } else if (isPermanentRefreshFailure(result)) {
+          await tokenStore.markDisabled(key, "refresh_invalid");
+          backgroundRefreshFailures.delete(key);
+          logger.warn(
+            `[proxy] background refresh credential rejected for ${key}; disabled until explicit login`,
+          );
+        } else {
+          recordBackgroundRefreshFailure(key);
+          logger.debug(`[proxy] background token refresh deferred for ${key}`, {
+            status: result.status,
+          });
+        }
+      } catch {
+        // non-fatal per-account
+      }
+    }
+  } catch {
+    // non-fatal
+  }
+
+  try {
+    if (
+      storedAnthropicAccountCount === undefined ||
+      !shouldLoadFallbackCredential(
+        storedAnthropicAccountCount,
+        LEGACY_ANTHROPIC_ACCOUNT_KEY,
+        accountAllowlist,
+      )
+    ) {
+      return;
+    }
+    const credPath = join(
+      homedir(),
+      ".neurolink",
+      "anthropic-credentials.json",
+    );
+    const { readFileSync } = await import("fs");
+    const creds = JSON.parse(readFileSync(credPath, "utf8"));
+    if (!creds.oauth) {
+      return;
+    }
+    const account = {
+      label: "background",
+      token: creds.oauth.accessToken,
+      refreshToken: creds.oauth.refreshToken,
+      expiresAt: creds.oauth.expiresAt,
+    };
+    const legacyKey = LEGACY_ANTHROPIC_ACCOUNT_KEY;
+    if (!needsBackgroundRefresh(account)) {
+      backgroundRefreshFailures.delete(legacyKey);
+      return;
+    }
+    if (canAttemptBackgroundRefresh(legacyKey, account.refreshToken)) {
+      const result = await refreshToken(account);
+      if (result.success) {
+        await persistTokens(credPath, account);
+        backgroundRefreshFailures.delete(legacyKey);
+        backgroundRejectedRefreshTokens.delete(legacyKey);
+        logger.debug("[proxy] background token refresh succeeded");
+      } else if (isPermanentRefreshFailure(result)) {
+        backgroundRefreshFailures.delete(legacyKey);
+        backgroundRejectedRefreshTokens.set(
+          legacyKey,
+          account.refreshToken ?? "",
+        );
+        logger.warn(
+          "[proxy] background legacy refresh credential rejected; waiting for explicit login",
+        );
+      } else {
+        recordBackgroundRefreshFailure(legacyKey);
+        logger.debug("[proxy] background legacy token refresh deferred", {
+          status: result.status,
+        });
+      }
+    }
+  } catch {
+    // non-fatal
+  }
+}
+
+function startProxyBackgroundMaintenance(
+  logsDir: string,
+  getAccountAllowlist: () => AccountAllowlist | undefined,
+): {
+  refreshInterval: NodeJS.Timeout;
+  logCleanupScheduler: ProxyLogCleanupScheduler;
+} {
+  const refreshInterval = setInterval(() => {
+    if (backgroundRefreshInProgress) {
+      return;
+    }
+    backgroundRefreshInProgress = true;
+    void refreshProxyTokensInBackground(getAccountAllowlist())
+      .catch((error) => {
+        logger.debug(
+          `[proxy] background token refresh cycle failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      })
+      .finally(() => {
+        backgroundRefreshInProgress = false;
+      });
+  }, 30_000);
+  const logCleanupScheduler = startProxyLogCleanupScheduler({ logsDir });
+  return { refreshInterval, logCleanupScheduler };
+}
+
+/** Register signal handlers and return the shared, idempotent drain-and-flush operation. */
+function registerProxyShutdownHandlers(params: {
+  server: { close?: (callback?: (error?: Error) => void) => void };
+  host: string;
+  port: number;
+  isDev?: boolean;
+  refreshInterval: NodeJS.Timeout;
+  logCleanupScheduler: ProxyLogCleanupScheduler;
+  updaterSupervisor?: { stop: () => void };
+  stopRuntimeConfig?: () => void;
+  shareListener?: { stop: () => Promise<void> };
+  registerSignals?: boolean;
+}): (signal: string, options?: { skipServerClose?: boolean }) => Promise<void> {
+  let shutdownStarted = false;
+
+  /**
+   * Await one shutdown step, but never for longer than `ms`.
+   *
+   * By the time a signal has arrived every step here is best-effort: the
+   * process is going away either way, and the only thing an unbounded await
+   * buys is the chance that the supervisor's patience runs out first and turns
+   * a clean exit into a SIGKILL.
+   */
+  const withShutdownDeadline = async (
+    step: Promise<unknown> | undefined,
+    ms: number,
+    label: string,
+  ): Promise<void> => {
+    if (!step) {
+      return;
+    }
+    let timer: NodeJS.Timeout | undefined;
+    const timedOut = await Promise.race([
+      step.then(
+        () => false,
+        () => false,
+      ),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(true), ms);
+        timer.unref?.();
+      }),
+    ]);
+    if (timer) {
+      clearTimeout(timer);
+    }
+    if (timedOut) {
+      logger.always(`[proxy] ${label} did not close in time; continuing`);
+    }
+  };
+
+  const closeServer = async (): Promise<void> => {
+    const close = params.server.close?.bind(params.server);
+    if (!close) {
+      return;
+    }
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (error?: Error) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timeout);
+        if (error) {
+          reject(error);
+        } else {
+          resolve();
+        }
+      };
+      const timeout = setTimeout(
+        () => finish(new Error("Timed out draining the proxy server")),
+        30_000,
+      );
+      timeout.unref?.();
+      try {
+        close((error) => finish(error));
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  };
+
+  /** Stop background work, drain connections, and flush pending telemetry before exit. */
+  const shutdown = async (
+    signal: string,
+    options?: { skipServerClose?: boolean },
+  ) => {
+    if (shutdownStarted) {
+      return;
+    }
+    shutdownStarted = true;
+    clearInterval(params.refreshInterval);
+    await params.logCleanupScheduler.stop();
+    params.updaterSupervisor?.stop();
+    params.stopRuntimeConfig?.();
+    // Bounded like the main server's close below. `stop()` awaits the
+    // listener's own close, and a borrower holding a stream open keeps that
+    // pending for as long as it likes — an unbounded await here is a proxy
+    // that appears to ignore SIGTERM until the borrower hangs up.
+    await withShutdownDeadline(
+      params.shareListener?.stop(),
+      SHARE_LISTENER_CLOSE_TIMEOUT_MS,
+      "share listener",
+    );
+    logger.always(`\nShutting down proxy (${signal})...`);
+    let exitCode = signal === "SIGINT" || signal === "ROLLING_DRAIN" ? 0 : 1;
+
+    if (!options?.skipServerClose) {
+      try {
+        await closeServer();
+      } catch (error) {
+        exitCode = 1;
+        logger.error(
+          `[proxy] failed to drain server during shutdown: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+
+    const usageStatsFlush = import("../../lib/proxy/usageStats.js").then(
+      ({ flushUsageStats }) => flushUsageStats(),
+    );
+    const requestLogsFlush = import("../../lib/proxy/requestLogger.js").then(
+      ({ flushRequestLogs }) => flushRequestLogs(),
+    );
+    const snapshotWritesFlush =
+      import("../../lib/proxy/snapshotPersistence.js").then(
+        ({ flushSnapshotWrites }) => flushSnapshotWrites(),
+      );
+    const [
+      usageStatsFlushResult,
+      lifecycleFlushResult,
+      requestLogsFlushResult,
+      snapshotWritesFlushResult,
+    ] = await Promise.allSettled([
+      withTimeout(
+        usageStatsFlush,
+        PROXY_LIFECYCLE_SHUTDOWN_TIMEOUT_MS,
+        "Timed out flushing proxy usage statistics during shutdown",
+      ),
+      withTimeout(
+        flushProxyLifecycleEvents(),
+        PROXY_LIFECYCLE_SHUTDOWN_TIMEOUT_MS,
+        "Timed out flushing proxy lifecycle metadata during shutdown",
+      ),
+      // This flush owns a separate bounded budget covering the body worker
+      // deadline plus index/OTLP publication; do not truncate it to five seconds.
+      requestLogsFlush,
+      withTimeout(
+        snapshotWritesFlush,
+        PROXY_LIFECYCLE_SHUTDOWN_TIMEOUT_MS,
+        "Timed out flushing proxy snapshot writes during shutdown",
+      ),
+    ]);
+    if (usageStatsFlushResult.status === "rejected") {
+      const error = usageStatsFlushResult.reason;
+      logger.warn(
+        `[proxy] usage statistics flush failed during shutdown: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (lifecycleFlushResult.status === "rejected") {
+      const error = lifecycleFlushResult.reason;
+      logger.debug(
+        `[proxy] lifecycle metadata flush failed during shutdown: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (requestLogsFlushResult.status === "rejected") {
+      const error = requestLogsFlushResult.reason;
+      logger.warn(
+        `[proxy] request log flush failed during shutdown: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (snapshotWritesFlushResult.status === "rejected") {
+      const error = snapshotWritesFlushResult.reason;
+      logger.warn(
+        `[proxy] snapshot write flush failed during shutdown: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+
+    try {
+      const { flushOpenTelemetry, shutdownOpenTelemetry } =
+        await import("../../lib/services/server/ai/observability/instrumentation.js");
+      await withShutdownDeadline(
+        (async () => {
+          await shutdownProxyOtelLogs();
+          await flushOpenTelemetry();
+          await shutdownOpenTelemetry();
+        })(),
+        PROXY_LIFECYCLE_SHUTDOWN_TIMEOUT_MS,
+        "telemetry shutdown",
+      );
+    } catch {
+      // non-fatal — proxy shutdown must not block on OTel
+    }
+
+    if (signal === "SIGINT" && !params.isDev) {
+      const shutdownHost =
+        params.host === "0.0.0.0" ? "localhost" : params.host;
+      // restoreAllClients wraps each client, so one failure cannot stop the
+      // others and none can abort shutdown.
+      await restoreAllClients(`http://${shutdownHost}:${params.port}`);
+    }
+
+    try {
+      const state = loadProxyState();
+      if (state?.pid === process.pid) {
+        clearProxyState();
+      }
+    } catch (error) {
+      exitCode = 1;
+      logger.error(
+        `[proxy] failed to clear runtime state during shutdown: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    process.exit(exitCode);
+  };
+
+  const forceExitAfterShutdownFailure = (error: unknown): never => {
+    logger.error(
+      `[proxy] unexpected shutdown failure: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    process.exit(1);
+  };
+
+  if (params.registerSignals ?? true) {
+    registerCliShutdownOwner((signal) =>
+      shutdown(signal).catch(forceExitAfterShutdownFailure),
+    );
+  }
+  return shutdown;
+}
+
+/** Start the HTTP runtime and connect its worker, configuration, and shutdown lifecycles. */
+async function startProxyRuntime(params: {
+  argv: ProxyStartArgs;
+  spinner: ProxySpinner;
+  app: ProxyStartApp["app"];
+  readiness: ProxyStartApp["readiness"];
+  host: string;
+  port: number;
+  sharePort: number;
+  strategy: ProxyStartStrategy;
+  proxyConfig: LoadedProxyConfig | null;
+  accountAllowlist: AccountAllowlist | undefined;
+  loadedEnvFile: string | undefined;
+  passthrough: boolean;
+  logsDir: ProxyNeurolinkRuntime["logsDir"];
+  runtimeConfigStore?: ProxyRuntimeConfigStore;
+  configPath: string;
+}): Promise<void> {
+  const socketWorker = isProxySocketWorkerProcess();
+  const { createAdaptorServer, serve } = await import("@hono/node-server");
+  const server = socketWorker
+    ? createAdaptorServer({
+        fetch: params.app.fetch,
+        hostname: params.host,
+      })
+    : serve({
+        fetch: params.app.fetch,
+        port: params.port,
+        hostname: params.host,
+      });
+  extendProxyServerKeepAlive(server);
+  // The gate-only listener. It exists only while this node lends something, and
+  // it is the port an operator exposes: the main port keeps serving the
+  // operator's own untokened client exactly as before.
+  const { isShareListenerDisabled, superviseShareListener } =
+    await import("../../lib/proxy/shareListener.js");
+  // Runs under socket workers too. During a rolling replacement both
+  // generations are briefly live and the incoming one loses the bind; that is
+  // now a logged retry rather than a crash, and the supervisor picks the port up
+  // on its next poll once the outgoing worker drains. Disabling it here instead
+  // would leave launchd installs — the main production shape — with no share
+  // listener at all, which is the thing this exists to remove.
+  const shareListener = isShareListenerDisabled()
+    ? undefined
+    : superviseShareListener({
+        start: async () => {
+          // Bind before reporting success, and take the bind error as a
+          // rejection rather than an unhandled `error` event — a port
+          // collision on the derived `port + 1` must cost the operator a log
+          // line and a `--share-port`, never the whole proxy.
+          const shareServer = await new Promise<ProxyClosableServer>(
+            (resolve, reject) => {
+              let listening = false;
+              const started = serve(
+                {
+                  // Every request this listener accepts is gated, and this is
+                  // the only place that fact is known for certain — see
+                  // `gatedShareRequests`.
+                  fetch: (request, env) => {
+                    gatedShareRequests.add(request);
+                    return params.app.fetch(request, env);
+                  },
+                  port: params.sharePort,
+                  hostname: params.host,
+                },
+                () => {
+                  listening = true;
+                  resolve(started);
+                },
+              );
+              extendProxyServerKeepAlive(started);
+              started.on("error", (error: Error) => {
+                if (!listening) {
+                  reject(error);
+                  return;
+                }
+                // Past startup a listener error is a runtime event, not a
+                // reason to take the process down with it.
+                logger.always(`[proxy] share listener error: ${error.message}`);
+              });
+            },
+          );
+          return {
+            port: params.sharePort,
+            close: () =>
+              new Promise<void>((resolve) => {
+                const close = shareServer.close?.bind(shareServer);
+                if (!close) {
+                  resolve();
+                  return;
+                }
+                close(() => resolve());
+              }),
+          };
+        },
+      });
+  // Bring it up now if grants already exist, rather than waiting a poll cycle
+  // for a proxy that restarted with shares already issued.
+  await shareListener?.poll();
+
+  const managedByLaunchd = isLaunchdManagedProcess() || socketWorker;
+  // launchd already owns restart supervision. A second detached supervisor can
+  // outlive its parent and terminate a healthy replacement, so the guard is
+  // reserved for foreground mode where it only cleans stale client settings.
+  const guardPid =
+    params.argv.dev || managedByLaunchd
+      ? undefined
+      : spawnFailOpenGuard(params.host, params.port, process.pid);
+  const readinessHost = params.host === "0.0.0.0" ? "127.0.0.1" : params.host;
+  if (!socketWorker) {
+    await waitForProxyReadiness({
+      host: readinessHost,
+      port: params.port,
+    });
+  }
+  markProxyReady(params.readiness);
+  let updateReconciled = false;
+  const reconcileActivatedUpdate = async (): Promise<void> => {
+    if (updateReconciled) {
+      return;
+    }
+    updateReconciled = true;
+    try {
+      const { reconcileRunningUpdate } =
+        await import("../../lib/proxy/updateState.js");
+      if (reconcileRunningUpdate(PROXY_VERSION)) {
+        logger.always(
+          `[proxy] confirmed pending update is now running at v${PROXY_VERSION}`,
+        );
+      }
+    } catch (error) {
+      logger.always(
+        `[proxy] WARNING: failed to reconcile update state: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  };
+  if (!socketWorker) {
+    await reconcileActivatedUpdate();
+  }
+  /** Mirror the supervised worker PID into the proxy state used by status. */
+  const updatePersistedUpdaterPid = (updaterPid: number | undefined): void => {
+    const state = loadProxyState();
+    if (!state || state.pid !== process.pid) {
+      return;
+    }
+    saveProxyState({ ...state, updaterPid });
+  };
+  const updaterSupervisor =
+    managedByLaunchd && !params.argv.dev && !socketWorker
+      ? startUpdaterWorkerSupervisor({
+          spawnWorker: () =>
+            spawnProxyUpdater(readinessHost, params.port, process.pid),
+          isProcessRunning,
+          stopWorker: (pid) => process.kill(pid, "SIGTERM"),
+          onPidChange: updatePersistedUpdaterPid,
+          log: (message) => logger.always(message),
+        })
+      : undefined;
+  const updaterPid = updaterSupervisor?.currentPid();
+  const initialRuntimeConfig = params.runtimeConfigStore?.getSnapshot();
+  const activeStrategy = initialRuntimeConfig
+    ? initialRuntimeConfig.strategy
+    : params.strategy;
+  const activeProxyConfig = initialRuntimeConfig
+    ? initialRuntimeConfig.proxyConfig
+    : params.proxyConfig;
+  const activeAccountAllowlist = initialRuntimeConfig
+    ? initialRuntimeConfig.accountAllowlist
+    : params.accountAllowlist;
+  const activePassthrough = initialRuntimeConfig
+    ? initialRuntimeConfig.passthrough
+    : params.passthrough;
+  const fallbackChain: FallbackInfo[] | undefined =
+    activeProxyConfig?.routing?.fallbackChain?.map((entry) => ({
+      provider: entry.provider as string,
+      model: entry.model as string,
+    }));
+  const initialConfigStatus = params.runtimeConfigStore?.getStatus();
+  const persistInitialProxyState = (): void => {
+    const supervisorState = socketWorker ? loadProxySupervisorState() : null;
+    saveProxyState({
+      pid: process.pid,
+      port: params.port,
+      host: params.host,
+      sharePort: shareListener ? params.sharePort : undefined,
+      strategy: activeStrategy,
+      startTime: new Date().toISOString(),
+      ready: true,
+      readyAt: params.readiness.readyAtMs
+        ? new Date(params.readiness.readyAtMs).toISOString()
+        : undefined,
+      healthPath: "/health",
+      statusPath: "/status",
+      envFile: params.loadedEnvFile,
+      fallbackChain,
+      accountAllowlist: activeAccountAllowlist
+        ? [...activeAccountAllowlist]
+        : undefined,
+      guardPid,
+      updaterPid: socketWorker ? supervisorState?.updaterPid : updaterPid,
+      supervisorPid: socketWorker
+        ? (supervisorState?.pid ?? process.ppid)
+        : undefined,
+      managedBy: managedByLaunchd ? "launchd" : "manual",
+      passthrough: activePassthrough,
+      configGeneration: initialRuntimeConfig?.generation,
+      configLoadedAt: initialRuntimeConfig?.loadedAt,
+      lastConfigReloadError: initialConfigStatus?.lastReloadError,
+      configFile: initialConfigStatus?.configPath,
+    });
+  };
+  if (!socketWorker) {
+    persistInitialProxyState();
+  }
+
+  const persistRuntimeConfig = (snapshot: ProxyRuntimeConfigSnapshot): void => {
+    const state = loadProxyState();
+    if (!state || state.pid !== process.pid) {
+      return;
+    }
+    const status = params.runtimeConfigStore?.getStatus();
+    const currentFallbackChain =
+      snapshot.proxyConfig?.routing?.fallbackChain?.map((entry) => ({
+        provider: entry.provider as string,
+        model: entry.model as string,
+      }));
+    saveProxyState({
+      ...state,
+      strategy: snapshot.strategy,
+      fallbackChain: currentFallbackChain,
+      accountAllowlist: snapshot.accountAllowlist
+        ? [...snapshot.accountAllowlist]
+        : undefined,
+      passthrough: snapshot.passthrough,
+      configGeneration: snapshot.generation,
+      configLoadedAt: snapshot.loadedAt,
+      lastConfigReloadError: status?.lastReloadError,
+    });
+  };
+  let stopRuntimeConfig: (() => void) | undefined;
+  if (params.runtimeConfigStore) {
+    const runtimeConfigStore = params.runtimeConfigStore;
+    const unsubscribeReload = runtimeConfigStore.subscribeReload((result) => {
+      const snapshot = runtimeConfigStore.getSnapshot();
+      persistRuntimeConfig(snapshot);
+      if (
+        socketWorker &&
+        result.applied &&
+        result.changed &&
+        result.environmentChanged &&
+        process.connected &&
+        process.send
+      ) {
+        try {
+          process.send({
+            type: "proxy-worker:replacement-requested",
+            generation: getProxyWorkerGeneration(),
+            pid: process.pid,
+            reason: "environment",
+          });
+        } catch (error) {
+          logger.warn(
+            `[proxy] failed to request environment replacement: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+    });
+    const reloadOnSighup = (): void => {
+      void runtimeConfigStore.reload("sighup");
+    };
+    runtimeConfigStore.startWatching();
+    process.on("SIGHUP", reloadOnSighup);
+    stopRuntimeConfig = () => {
+      process.off("SIGHUP", reloadOnSighup);
+      unsubscribeReload();
+      runtimeConfigStore.stopWatching();
+    };
+    logger.always(
+      `[proxy] watching configuration generation ${initialRuntimeConfig?.generation ?? 1}; send SIGHUP to reload immediately`,
+    );
+  }
+
+  if (params.spinner) {
+    params.spinner.succeed(chalk.green("Claude proxy started successfully"));
+  }
+
+  const isDev = params.argv.dev ?? false;
+  const normalizedHost = params.host === "0.0.0.0" ? "localhost" : params.host;
+  const url = `http://${normalizedHost}:${params.port}`;
+  printProxyBanner(url, activeStrategy);
+
+  if (isDev) {
+    logger.always(
+      `  ${chalk.bold("Mode:")}       ${chalk.magenta("dev (isolated — state in .neurolink-dev/)")}`,
+    );
+  } else {
+    logger.always(
+      `  ${chalk.bold("Mode:")}       ${chalk.cyan(activePassthrough ? "passthrough" : "full")}`,
+    );
+  }
+  if (activePassthrough) {
+    logger.always(
+      chalk.yellow(
+        "  ! Passthrough mode forwards client auth directly to Anthropic",
+      ),
+    );
+    logger.always(
+      chalk.dim(
+        "    Stored proxy OAuth/API credentials are ignored; clients need their own valid Anthropic auth.",
+      ),
+    );
+  }
+  if (params.loadedEnvFile) {
+    logger.always(
+      `  ${chalk.bold("Env File:")}   ${chalk.cyan(params.loadedEnvFile)}`,
+    );
+  }
+
+  if (!isDev) {
+    for (const result of await applyClientsOnProxyStart(
+      url,
+      { configPath: params.configPath },
+      managedByLaunchd,
+    )) {
+      if (result.error) {
+        // Visible, not debug-level. A client whose config could not be written
+        // will keep talking to its own upstream, which looks like the proxy
+        // silently not being used — the failure has to be actionable at the
+        // level the user actually reads. The setup wizard already reported
+        // this failure loudly; these two paths used to disagree.
+        logger.always(
+          chalk.yellow(
+            `  ⚠ Could not auto-configure ${result.displayName}: ${result.error.message}`,
+          ),
+        );
+        continue;
+      }
+      if (result.applied) {
+        logger.always(
+          chalk.green(`  ✓ Auto-configured ${result.displayName} settings`),
+        );
+        if (result.note) {
+          // A written file is not the same as a live configuration. Printing
+          // the check without this reads as "done" for a client that is still
+          // talking to its own upstream.
+          logger.always(chalk.yellow(`    ↳ ${result.note}`));
+        }
+        logger.always(
+          chalk.dim(
+            `    Restart ${result.displayName} to connect through proxy`,
+          ),
+        );
+      }
+    }
+    if (managedByLaunchd) {
+      logger.always(
+        "  Service startup preserves client settings; use 'neurolink proxy setup' to change client routing.",
+      );
+    }
+  } else {
+    logger.always(
+      chalk.dim("  ⊘ Dev mode: skipping client auto-configuration"),
+    );
+  }
+
+  const maintenance = startProxyBackgroundMaintenance(params.logsDir, () =>
+    params.runtimeConfigStore
+      ? params.runtimeConfigStore.getSnapshot().accountAllowlist
+      : params.accountAllowlist,
+  );
+  const shutdown = registerProxyShutdownHandlers({
+    server,
+    host: params.host,
+    port: params.port,
+    isDev,
+    updaterSupervisor,
+    stopRuntimeConfig,
+    shareListener,
+    registerSignals: !socketWorker,
+    ...maintenance,
+  });
+  if (socketWorker) {
+    attachSocketWorkerProcess(server as import("node:http").Server, {
+      generation: getProxyWorkerGeneration(),
+      version: PROXY_VERSION,
+      processInstanceId: getProxyLifecycleLoggerSnapshot().processInstanceId,
+      onActivated: () => {
+        persistInitialProxyState();
+        void reconcileActivatedUpdate();
+      },
+      onDrained: () => {
+        void shutdown("ROLLING_DRAIN", { skipServerClose: true });
+      },
+    });
+  }
+}
+
+/**
+ * Run the stable listener and journal worker incidents independently of
+ * serving-process exits.
+ */
+async function runLaunchdProxySupervisor(
+  argv: ProxyStartArgs,
+  spinner: ProxySpinner,
+): Promise<void> {
+  let stopping = false;
+  let activeWorkerPid: (() => number | undefined) | undefined;
+  let rollingServerTask: ReturnType<typeof startRollingProxyServer> | undefined;
+  let restartControlTask:
+    | ReturnType<typeof startProxyRestartControl>
+    | undefined;
+  let updaterSupervisor:
+    | ReturnType<typeof startUpdaterWorkerSupervisor>
+    | undefined;
+  let activatePendingUpdate: (() => void) | undefined;
+  let otelInitialized = false;
+
+  /** Own startup as well as serving: await resources already being created,
+   * then drain each independently so one cleanup failure cannot skip the rest. */
+  const shutdown = async (signal: string): Promise<void> => {
+    if (stopping) {
+      return;
+    }
+    stopping = true;
+    logger.always(`[proxy-supervisor] shutting down (${signal})`);
+    if (activatePendingUpdate) {
+      process.off("SIGUSR2", activatePendingUpdate);
+    }
+    let exitCode = process.exitCode ?? 0;
+    const reportCleanupFailure = (error: unknown): void => {
+      exitCode = 1;
+      logger.warn(`[proxy-supervisor] cleanup failed: ${String(error)}`);
+    };
+    const cleanup = async (
+      operation: () => unknown,
+      timeoutMs = PROXY_LIFECYCLE_SHUTDOWN_TIMEOUT_MS,
+      timeoutMessage = "supervisor resource shutdown deadline exceeded",
+    ): Promise<void> => {
+      try {
+        await withTimeout(
+          Promise.resolve().then(operation),
+          timeoutMs,
+          timeoutMessage,
+        );
+      } catch (error) {
+        reportCleanupFailure(error);
+      }
+    };
+    // Close independently: a stalled control must not delay the worker drain.
+    // The operations retain their continuations after a deadline, so a resource
+    // returned during telemetry cleanup is still closed without extending exit.
+    await Promise.all([
+      cleanup(async () => {
+        // Setup errors are already reported by the control-plane startup path.
+        const control = await restartControlTask?.catch(() => undefined);
+        await control?.close();
+      }),
+      cleanup(() => updaterSupervisor?.stop()),
+      cleanup(async () => {
+        const server = await rollingServerTask;
+        await server?.close();
+      }, PROXY_SUPERVISOR_DRAIN_TIMEOUT_MS),
+    ]);
+    if (otelInitialized) {
+      await cleanup(
+        async () => {
+          await flushProxyLifecycleEvents().catch(reportCleanupFailure);
+          await shutdownProxyOtelLogs();
+        },
+        PROXY_LIFECYCLE_SHUTDOWN_TIMEOUT_MS,
+        "supervisor telemetry shutdown deadline exceeded",
+      );
+    }
+    await cleanup(() => {
+      const supervisorState = loadProxySupervisorState();
+      if (supervisorState?.pid === process.pid) {
+        clearProxySupervisorState();
+      }
+    });
+    process.exit(exitCode);
+  };
+  registerCliShutdownOwner(shutdown);
+  // Protect every startup await; a worker loads fresh config before readiness.
+  registerProxySupervisorReload(() =>
+    stopping ? undefined : activeWorkerPid?.(),
+  );
+  await loadProxyStartEnv(argv, spinner);
+  if (stopping) {
+    return;
+  }
+  initializeProxyOtelLogs("supervisor");
+  otelInitialized = true;
+  routeProxyConsoleToOtel();
+  await ensureProxyStartAllowed(spinner);
+  if (stopping) {
+    return;
+  }
+  const entryScript = process.argv[1];
+  if (!entryScript) {
+    throw new Error("proxy supervisor cannot resolve the CLI entry script");
+  }
+  const host = argv.host ?? "127.0.0.1";
+  const port = argv.port ?? 55669;
+  enforceProxyBindPolicy(host, argv, spinner);
+  const workerArgs = process.argv.slice(2);
+  const supervisorStartedAt = new Date().toISOString();
+  configureProxyLifecycleLogger({
+    enabled: true,
+    logDir: join(homedir(), ".neurolink", "logs"),
+    filePrefix: "proxy-supervisor",
+  });
+  let currentUpdaterPid: number | undefined;
+  let restartControl:
+    | Awaited<ReturnType<typeof startProxyRestartControl>>
+    | undefined;
+  rollingServerTask = startRollingProxyServer({
+    onEvent: (event) =>
+      logProxyLifecycleEvent({
+        event: "supervisor_event",
+        requestId: "-",
+        method: "-",
+        path: "-",
+        supervisorEvent: event,
+      }),
+    host,
+    port,
+    initialVersion: PROXY_VERSION,
+    spawnWorker: (generation, expectedVersion) => {
+      const selected = resolveProxyWorkerPackage({
+        packagesDir: PROXY_PACKAGES_DIR,
+        entryScript,
+        expectedVersion,
+      });
+      return spawnProxySocketWorker({
+        generation,
+        expectedVersion,
+        command: selected.nodePath,
+        args: [selected.entryScript, ...workerArgs],
+        env: {
+          NEUROLINK_PROXY_UPDATE_CONTROL_TOKEN: PROXY_UPDATE_CONTROL_TOKEN,
+          NEUROLINK_PROXY_TRAMPOLINE_EXEC_ONLY: "1",
+        },
+      });
+    },
+    onStateChange: (snapshot) => {
+      saveProxySupervisorState({
+        pid: process.pid,
+        host,
+        port,
+        startTime: supervisorStartedAt,
+        version: PROXY_VERSION,
+        updaterPid: currentUpdaterPid,
+        rolling: snapshot,
+        restartControl: restartControl?.identity,
+      });
+    },
+    log: (message) => logger.always(message),
+  });
+  // Retain the creation promise before awaiting it so shutdown owns late results.
+  const rollingServer = await rollingServerTask.catch((error) => {
+    if (!stopping) {
+      throw error;
+    }
+    return undefined;
+  });
+  if (stopping || !rollingServer) {
+    return;
+  }
+  activeWorkerPid = () => rollingServer.snapshot().active?.pid;
+
+  let rollingReplacement: Promise<void> | null = null;
+  activatePendingUpdate = (): void => {
+    if (stopping || rollingReplacement) {
+      return;
+    }
+    let pendingVersion: string | undefined;
+    try {
+      pendingVersion = loadUpdateState()?.pendingRestartVersion ?? undefined;
+    } catch (error) {
+      logger.always(
+        `[proxy-supervisor] failed to read pending update state: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return;
+    }
+    if (!pendingVersion || !/^\d+\.\d+\.\d+$/.test(pendingVersion)) {
+      logger.always(
+        "[proxy-supervisor] ignored update activation without a valid pending version",
+      );
+      return;
+    }
+    logger.always(
+      `[proxy-supervisor] preparing rolling activation for v${pendingVersion}`,
+    );
+    rollingReplacement = rollingServer
+      .replace(pendingVersion)
+      .then(() => {
+        logger.always(
+          `[proxy-supervisor] rolling activation complete version=${pendingVersion}`,
+        );
+      })
+      .catch((error) => {
+        logger.always(
+          `[proxy-supervisor] rolling activation failed version=${pendingVersion}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      })
+      .finally(() => {
+        rollingReplacement = null;
+      });
+  };
+  process.on("SIGUSR2", activatePendingUpdate);
+
+  const readinessHost = host === "0.0.0.0" ? "127.0.0.1" : host;
+  try {
+    restartControlTask = startProxyRestartControl({
+      stateDir: join(homedir(), ".neurolink"),
+      server: rollingServer,
+      getTelemetry: getProxyProcessTelemetry,
+      log: (message) => logger.warn(message),
+      isUpdatePending: () =>
+        !!rollingReplacement || !!loadUpdateState()?.pendingRestartVersion,
+      getInstalledVersion: async () => {
+        const { execFile } = await import("node:child_process");
+        const { promisify } = await import("node:util");
+        const { stdout } = await promisify(execFile)(
+          TRAMPOLINE_PATH,
+          ["--version"],
+          { timeout: 5_000, maxBuffer: 65_536 },
+        );
+        return stdout.trim();
+      },
+      getStatus: async () => {
+        const probeHost = readinessHost === "::" ? "::1" : readinessHost;
+        const response = await fetch(
+          `http://${probeHost.includes(":") ? `[${probeHost}]` : probeHost}:${rollingServer.address.port}/status`,
+          {
+            headers: { connection: "close" },
+            signal: AbortSignal.timeout(3_000),
+          },
+        );
+        if (!response.ok) {
+          throw new Error("Serving status is unavailable.");
+        }
+        return response.json();
+      },
+    });
+    restartControl = await restartControlTask;
+  } catch (error) {
+    // A control-plane setup failure must not stop an otherwise serving proxy.
+    logger.warn(
+      `[proxy-supervisor] safe restart control unavailable: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (stopping) {
+    return;
+  }
+  const updatePersistedUpdaterPid = (updaterPid: number | undefined): void => {
+    currentUpdaterPid = updaterPid;
+    const state = loadProxySupervisorState();
+    if (!state || state.pid !== process.pid) {
+      return;
+    }
+    saveProxySupervisorState({
+      ...state,
+      updaterPid,
+      restartControl: restartControl?.identity,
+    });
+  };
+  updaterSupervisor = startUpdaterWorkerSupervisor({
+    spawnWorker: () =>
+      spawnProxyUpdater(
+        readinessHost,
+        rollingServer.address.port,
+        process.pid,
+        true,
+      ),
+    isProcessRunning,
+    stopWorker: (pid) => process.kill(pid, "SIGTERM"),
+    onPidChange: updatePersistedUpdaterPid,
+    log: (message) => logger.always(message),
+  });
+  updatePersistedUpdaterPid(updaterSupervisor.currentPid());
+
+  if (spinner) {
+    spinner.succeed(
+      chalk.green("Claude proxy supervisor started successfully"),
+    );
+  }
+  logger.always(
+    `[proxy-supervisor] listening on ${host}:${rollingServer.address.port} workerPid=${rollingServer.snapshot().active?.pid ?? "unknown"} version=${PROXY_VERSION}`,
+  );
+
+  await new Promise<void>(() => undefined);
+}
+
+/** Reload only the ready serving worker. A candidate still starting must not
+ * receive SIGHUP before it has installed its handlers. It loads fresh config
+ * during startup; draining workers already hold their request snapshots. */
+export function registerProxySupervisorReload(
+  activeWorkerPid: () => number | undefined,
+): () => void {
+  const reload = (): void => {
+    const pid = activeWorkerPid();
+    if (!pid) {
+      return;
+    }
+    try {
+      process.kill(pid, "SIGHUP");
+      logger.always(
+        `[proxy-supervisor] forwarded configuration reload to worker pid=${pid}`,
+      );
+    } catch (error) {
+      logger.warn(
+        `[proxy-supervisor] configuration reload failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  };
+  process.on("SIGHUP", reload);
+  return () => process.off("SIGHUP", reload);
+}
+
+/**
+ * Decide whether this listener may bind where it was asked to, after the env
+ * file has been loaded (the inbound token may live there). Refusal exits the
+ * process: an open proxy on a routable address is not a configuration to
+ * start and warn about.
+ */
+function enforceProxyBindPolicy(
+  host: string,
+  argv: Pick<ProxyStartArgs, "inboundToken" | "allowUnauthenticated">,
+  spinner: ProxySpinner,
+): { inboundToken: string | undefined; acknowledged: boolean } {
+  const inboundToken = resolveInboundToken(argv.inboundToken);
+  const allowUnauthenticated =
+    argv.allowUnauthenticated === true || isUnauthenticatedBindAllowedByEnv();
+  const decision = evaluateProxyBindPolicy({
+    host,
+    inboundToken,
+    requireGrant: isGrantRequiredByEnv(),
+    allowUnauthenticated,
+  });
+  if (!decision.allowed) {
+    if (spinner) {
+      spinner.fail(chalk.red("Refusing to start an unauthenticated proxy"));
+    }
+    logger.error(chalk.red(decision.reason));
+    process.exit(1);
+  }
+  if (decision.warning) {
+    logger.always(chalk.yellow(`[proxy] WARNING: ${decision.warning}`));
+  }
+  return { inboundToken, acknowledged: true };
+}
+
+async function startProxyCommandHandler(argv: ProxyStartArgs): Promise<void> {
+  // Everything this process creates under ~/.neurolink is owner-only.
+  tightenProcessUmask();
+  const spinner = argv.quiet ? null : ora("Starting Claude proxy...").start();
+  const isDev = argv.dev ?? false;
+  const socketWorker = isProxySocketWorkerProcess();
+
+  try {
+    if (!isDev && isLaunchdManagedProcess() && !socketWorker) {
+      await runLaunchdProxySupervisor(argv, spinner);
+      return;
+    }
+    // In dev mode: redirect writable state to .neurolink-dev/ and skip singleton check
+    let devPaths: import("../../lib/types/index.js").ProxyPaths | undefined;
+    const {
+      resolveProxyPaths,
+      resolveProxyUsageStatsPath,
+      resolveProxyGrantsPath,
+      resolveProxyLedgerPath,
+      resolveProxyPeersPath,
+      resolveProxyResidentGrantsPath,
+      resolveProxyNotesPath,
+      resolveProxyProvisioningPath,
+      resolveProxyReceiptsPath,
+      resolveProxyShareAuditPath,
+    } = await import("../../lib/proxy/proxyPaths.js");
+    const proxyPaths = resolveProxyPaths(isDev);
+    if (isDev) {
+      devPaths = proxyPaths;
+      setProxyStateDir(devPaths.stateDir);
+
+      const { initAccountQuota } =
+        await import("../../lib/proxy/accountQuota.js");
+      initAccountQuota(devPaths.quotaFile);
+      const { initAccountCooldown } =
+        await import("../../lib/proxy/accountCooldown.js");
+      initAccountCooldown(devPaths.cooldownFile);
+      const { initShareGrants } =
+        await import("../../lib/proxy/shareGrants.js");
+      initShareGrants(resolveProxyGrantsPath(devPaths));
+      const { initShareLedger } =
+        await import("../../lib/proxy/shareLedger.js");
+      initShareLedger(resolveProxyLedgerPath(devPaths));
+      const { initPeerStore } = await import("../../lib/proxy/peerStore.js");
+      initPeerStore(resolveProxyPeersPath(devPaths));
+      const { initResidentGrants } =
+        await import("../../lib/proxy/residentGrants.js");
+      initResidentGrants(resolveProxyResidentGrantsPath(devPaths));
+      const { initShareAudit } = await import("../../lib/proxy/shareAudit.js");
+      initShareAudit(resolveProxyShareAuditPath(devPaths));
+      const { initShareProvisioning } =
+        await import("../../lib/proxy/shareProvisioning.js");
+      initShareProvisioning(resolveProxyProvisioningPath(devPaths));
+      const { initShareReceipts } =
+        await import("../../lib/proxy/shareReceipts.js");
+      initShareReceipts(resolveProxyReceiptsPath(devPaths));
+      const { initShareNotes } = await import("../../lib/proxy/shareNotes.js");
+      initShareNotes(resolveProxyNotesPath(devPaths));
+
+      // Ensure the dev state directory exists
+      const { mkdirSync, existsSync } = await import("fs");
+      if (!existsSync(devPaths.stateDir)) {
+        mkdirSync(devPaths.stateDir, { recursive: true, mode: 0o700 });
+      }
+    }
+
+    if (!isDev && !socketWorker) {
+      await ensureProxyStartAllowed(spinner);
+    }
+
+    const { initUsageStats, getUsageStatsPersistenceStatus } =
+      await import("../../lib/proxy/usageStats.js");
+    await initUsageStats(resolveProxyUsageStatsPath(proxyPaths));
+    const usageStatsPersistence = getUsageStatsPersistenceStatus();
+    if (usageStatsPersistence.lastError) {
+      logger.warn(
+        `[proxy] usage statistics persistence unavailable: ${usageStatsPersistence.lastError}`,
+      );
+    } else if (usageStatsPersistence.lastRecoveryAt) {
+      logger.warn(
+        `[proxy] recovered corrupt usage statistics state at ${new Date(usageStatsPersistence.lastRecoveryAt).toISOString()}`,
+      );
+    }
+    if (usageStatsPersistence.terminalErrorsLastError) {
+      logger.warn(
+        `[proxy] terminal-error persistence unavailable: ${usageStatsPersistence.terminalErrorsLastError}`,
+      );
+    } else if (usageStatsPersistence.terminalErrorsLastRecoveryAt) {
+      logger.warn(
+        `[proxy] recovered corrupt terminal-error state at ${new Date(usageStatsPersistence.terminalErrorsLastRecoveryAt).toISOString()}`,
+      );
+    }
+
+    const baseEnv = { ...process.env };
+    const envResolution = resolveProxyEnvFile({
+      explicitEnvFile: argv.envFile,
+      env: baseEnv,
+    });
+    const loadedEnvFile = await loadProxyStartEnv(argv, spinner);
+    initializeProxyOtelLogs("worker");
+    routeProxyConsoleToOtel();
+
+    // Reuse upstream TCP connections (longer keep-alive + bounded pool) instead
+    // of opening a new flow per request — cuts outbound flow churn through host
+    // content-filters. Runs once, after env load so it can be tuned via env.
+    configureProxyKeepAliveDispatcher();
+
+    const { neurolink, logsDir } = await createProxyNeurolinkRuntime(
+      devPaths?.logsDir,
+    );
+    const configPath = resolveProxyConfigPath(argv.config);
+    const runtimeConfigStore = await ProxyRuntimeConfigStore.create({
+      configPath,
+      configRequired: Boolean(argv.config),
+      envFilePath: envResolution.path ?? join(homedir(), ".neurolink", ".env"),
+      envFileRequired: envResolution.required,
+      baseEnv,
+      strategyOverride: argv.strategy as ProxyStartStrategy | undefined,
+      passthrough: argv.passthrough ?? false,
+    });
+    const initialConfig = runtimeConfigStore.getSnapshot();
+    const {
+      proxyConfig,
+      strategy,
+      modelRouter,
+      passthrough,
+      primaryAccountKey,
+      accountAllowlist,
+    } = initialConfig;
+    if (spinner && proxyConfig) {
+      spinner.text = `Loaded proxy config from ${configPath}`;
+    }
+
+    if (spinner) {
+      spinner.text = "Configuring server...";
+    }
+
+    const port = argv.port ?? 55669;
+    const { resolveSharePort } =
+      await import("../../lib/proxy/shareListener.js");
+    const sharePort = resolveSharePort({
+      ...(argv.sharePort !== undefined ? { explicit: argv.sharePort } : {}),
+      mainPort: port,
+    });
+    const host = argv.host ?? "127.0.0.1";
+    const bindPolicy = enforceProxyBindPolicy(host, argv, spinner);
+    const { app, readiness } = await createProxyStartApp({
+      neurolink,
+      modelRouter,
+      strategy,
+      passthrough,
+      port,
+      host,
+      proxyConfig,
+      primaryAccountKey,
+      accountAllowlist,
+      runtimeConfigStore,
+      sharePort,
+      inboundToken: bindPolicy.inboundToken,
+      inboundAuthAcknowledged: bindPolicy.acknowledged,
+    });
+
+    await initializeProxyOpenTelemetry();
+
+    if (spinner) {
+      spinner.text = `Starting proxy on ${host}:${port}...`;
+    }
+
+    await startProxyRuntime({
+      argv,
+      spinner,
+      app,
+      readiness,
+      host,
+      port,
+      sharePort,
+      strategy,
+      proxyConfig,
+      accountAllowlist,
+      loadedEnvFile,
+      passthrough,
+      logsDir,
+      runtimeConfigStore,
+      configPath,
+    });
+  } catch (error) {
+    if (spinner) {
+      spinner.fail(chalk.red("Failed to start proxy"));
+    }
+    logger.error(
+      chalk.red(
+        `Error: ${error instanceof Error ? error.message : String(error)}`,
+      ),
+    );
+    if (argv.debug && error instanceof Error && error.stack) {
+      logger.error(chalk.gray(error.stack));
+    }
+    process.exit(1);
+  }
+}
+
+// =============================================================================
+// PROXY START COMMAND
+// =============================================================================
+
+export const proxyStartCommand: CommandModule<object, ProxyStartArgs> = {
+  command: "start",
+  describe: "Start the Claude multi-account proxy server",
+  builder: (yargs: Argv) => {
+    return yargs
+      .option("port", {
+        type: "number",
+        alias: "p",
+        default: 55669,
+        description: "Port to listen on",
+      })
+      .option("share-port", {
+        type: "number",
+        alias: "sharePort",
+        description:
+          "Gate-only listener port for peer sharing (default: port + 1). " +
+          "Runs only while at least one active grant exists; this is the port to expose.",
+      })
+      .option("host", {
+        type: "string",
+        alias: "H",
+        default: "127.0.0.1",
+        description:
+          "Host to bind to. A non-loopback host needs --inbound-token, " +
+          "NEUROLINK_PROXY_REQUIRE_GRANT=1 or --allow-unauthenticated",
+      })
+      .option("inbound-token", {
+        type: "string",
+        alias: "inboundToken",
+        description:
+          "Bearer every caller must present (x-neurolink-inbound-token or " +
+          "Authorization: Bearer). Also NEUROLINK_PROXY_INBOUND_TOKEN",
+      })
+      .option("allow-unauthenticated", {
+        type: "boolean",
+        alias: "allowUnauthenticated",
+        default: false,
+        description:
+          "Bind a non-loopback host with no inbound authentication (an " +
+          "authenticating reverse proxy must sit in front)",
+      })
+      .option("strategy", {
+        type: "string",
+        alias: "s",
+        choices: ["fill-first", "round-robin"],
+        description:
+          "Account selection strategy for routing requests (default: fill-first)",
+      })
+      .option("health-interval", {
+        type: "number",
+        alias: "healthInterval",
+        default: 30,
+        description: "Health check interval in seconds",
+      })
+      .option("quiet", {
+        type: "boolean",
+        alias: "q",
+        default: false,
+        description: "Suppress non-essential output",
+      })
+      .option("debug", {
+        type: "boolean",
+        alias: "d",
+        default: false,
+        description: "Enable debug output",
+      })
+      .option("config", {
+        type: "string",
+        alias: "c",
+        description: "Path to proxy config file (YAML/JSON)",
+        defaultDescription: "~/.neurolink/proxy-config.yaml",
+      })
+      .option("env-file", {
+        type: "string",
+        alias: "envFile",
+        description:
+          "Path to proxy provider env file (overrides cwd .env for the proxy process)",
+      })
+      .option("passthrough", {
+        type: "boolean",
+        default: false,
+        description:
+          "Run in transparent passthrough mode (no retry, no rotation, no polyfill)",
+      })
+      .option("dev", {
+        type: "boolean",
+        default: false,
+        description:
+          "Run in isolated dev mode — state files scoped to .neurolink-dev/ in cwd, no client auto-configuration, no singleton check",
+      })
+      .example(
+        "neurolink proxy start",
+        "Start proxy on default port 55669 with fill-first strategy",
+      )
+      .example(
+        "neurolink proxy start -p 8080 -s fill-first",
+        "Start proxy on port 8080 with fill-first",
+      )
+      .example(
+        "neurolink proxy start --health-interval 60",
+        "Start proxy with 60-second health checks",
+      ) as Argv<ProxyStartArgs>;
+  },
+  handler: async (argv) => {
+    await startProxyCommandHandler(argv);
+  },
+};
+
+// =============================================================================
+// STATUS DISPLAY HELPERS
+// =============================================================================
+
+export function sanitizeProxyStatusTerminalErrorMessage(
+  message: string,
+): string {
+  return stripVTControlCharacters(
+    sanitizeForLog(redactUrlsInText(message), 700),
+  )
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 200);
+}
+
+function printStatusStats(stats: StatusStats): void {
+  console.info(`\n  Stats:`);
+  if (stats.startedAt !== undefined) {
+    console.info(`    Since:       ${new Date(stats.startedAt).toISOString()}`);
+  }
+  if (stats.totalAttempts !== undefined) {
+    console.info(`    Attempts:    ${stats.totalAttempts}`);
+  }
+  console.info(
+    `    Completed:   ${stats.totalRequests} total, ${stats.totalSuccess} success, ${stats.totalErrors} errors`,
+  );
+  if (stats.totalAttemptErrors !== undefined) {
+    console.info(`    Failed attempts: ${stats.totalAttemptErrors}`);
+  }
+  console.info(
+    `    Rate-limited attempts: ${stats.totalRateLimits}` +
+      (stats.totalTransientRateLimits !== undefined &&
+      stats.totalQuotaRateLimits !== undefined
+        ? ` (${stats.totalTransientRateLimits} transient, ${stats.totalQuotaRateLimits} quota)`
+        : ""),
+  );
+  if (stats.terminalErrors) {
+    const causes = Object.entries(stats.terminalErrors.counts)
+      .filter(([, count]) => count > 0)
+      .map(([category, count]) => `${category}=${count}`)
+      .join(", ");
+    console.info(
+      `    Error details: ${stats.terminalErrors.totalErrors}/${stats.totalErrors}` +
+        (causes ? ` (${causes})` : ""),
+    );
+    console.info(
+      `    Detail since: ${new Date(stats.terminalErrors.startedAt).toISOString()}`,
+    );
+    if (
+      (stats.terminalErrorDetailsMissing ?? 0) > 0 ||
+      (stats.terminalErrorDetailsExcess ?? 0) > 0
+    ) {
+      console.info(
+        `    Detail gap:  ${stats.terminalErrorDetailsMissing ?? 0} missing, ${stats.terminalErrorDetailsExcess ?? 0} awaiting counter reconciliation`,
+      );
+    } else if (stats.terminalErrorDetailsComparable === false) {
+      console.info(
+        "    Detail gap:  unavailable during snapshot reconciliation",
+      );
+    }
+    const lastError =
+      stats.lastTerminalError ?? stats.terminalErrors.recent.at(-1);
+    if (lastError) {
+      const cause = lastError.errorType ?? lastError.category;
+      const code = lastError.errorCode ? `/${lastError.errorCode}` : "";
+      const accountIdentity = lastError.accountKey ?? lastError.account;
+      const account = accountIdentity ? ` account=${accountIdentity}` : "";
+      console.info(
+        `    Last error:  ${new Date(lastError.at).toISOString()} ${cause}${code} status=${lastError.status}${account}`,
+      );
+      if (lastError.message) {
+        console.info(
+          `    Last cause:  ${sanitizeProxyStatusTerminalErrorMessage(lastError.message)}`,
+        );
+      }
+    }
+  }
+  const historical = (stats.accounts ?? []).filter(
+    (account) => account.status === "unattributed",
+  );
+  const accounts = (stats.accounts ?? []).filter(
+    (account) => account.status !== "unattributed",
+  );
+  if (historical.length > 0) {
+    const sum = (
+      field: "attempts" | "success" | "errors" | "rateLimits",
+    ): number =>
+      historical.reduce((total, account) => total + (account[field] ?? 0), 0);
+    console.info(
+      `\n  Historical usage (provider unknown; included in totals):`,
+    );
+    console.info(
+      `    ${historical.length} legacy records: ${sum("attempts")} attempts, ${sum("success")} success, ${sum("errors")} errors, ${sum("rateLimits")} rate-limited attempts`,
+    );
+    console.info(
+      "    Per-record history remains available with --format json.",
+    );
+  }
+  if (accounts.length > 0) {
+    console.info(`\n  Accounts:`);
+    const headers = [
+      "ACCOUNT",
+      "AUTH",
+      "ATTEMPTS",
+      "SUCCESS",
+      "ERRORS",
+      "RL",
+      "STATUS",
+    ];
+    const rows = accounts.map((account) => [
+      account.key ?? account.label,
+      account.type,
+      String(account.attempts ?? account.requests ?? 0),
+      String(account.success ?? 0),
+      String(account.errors ?? 0),
+      String(account.rateLimits ?? 0),
+      (() => {
+        const status =
+          account.status ?? (account.cooling ? "cooling" : "active");
+        const states = [status];
+        if (account.expired && status !== "expired") {
+          states.push("expired");
+        }
+        if (account.allowed === false && status !== "excluded") {
+          states.push("excluded");
+        }
+        return states.join(", ");
+      })(),
+    ]);
+    const widths = headers.map((header, index) =>
+      Math.max(header.length, ...rows.map((row) => row[index].length)),
+    );
+    const numericColumns = new Set([2, 3, 4, 5]);
+    /** Align text columns left and numeric account counters right. */
+    const formatRow = (cells: string[]): string =>
+      cells
+        .map((cell, index) =>
+          numericColumns.has(index)
+            ? cell.padStart(widths[index])
+            : cell.padEnd(widths[index]),
+        )
+        .join("  ");
+
+    console.info(`    ${chalk.gray(formatRow(headers))}`);
+    console.info(
+      `    ${chalk.gray(widths.map((width) => "-".repeat(width)).join("  "))}`,
+    );
+    for (const row of rows) {
+      const status = row[6];
+      const formatted = formatRow(row);
+      const statusStart = formatted.length - widths[6];
+      const prefix = formatted.slice(0, statusStart);
+      const paddedStatus = formatted.slice(statusStart);
+      console.info(
+        `    ${chalk.cyan(prefix.slice(0, widths[0]))}${prefix.slice(widths[0])}${status === "active" ? chalk.green(paddedStatus) : status === "cooling" ? chalk.red(paddedStatus) : chalk.yellow(paddedStatus)}`,
+      );
+    }
+  }
+}
+
+// =============================================================================
+// PROXY STATUS COMMAND
+// =============================================================================
+
+export const proxyStatusCommand: CommandModule<object, ProxyStatusArgs> = {
+  command: "status",
+  describe: "Show Claude proxy status",
+  builder: (yargs: Argv) => {
+    return yargs
+      .option("format", {
+        type: "string",
+        choices: ["text", "json"] as const,
+        default: "text" as const,
+        description: "Output format",
+      })
+      .option("quiet", {
+        type: "boolean",
+        alias: "q",
+        default: false,
+        description: "Suppress non-essential output",
+      })
+      .example("neurolink proxy status", "Show proxy status")
+      .example(
+        "neurolink proxy status --format json",
+        "Show proxy status as JSON",
+      ) as Argv<ProxyStatusArgs>;
+  },
+  handler: async (argv) => {
+    try {
+      const state = loadProxyState();
+      const supervisorState = loadProxySupervisorState();
+      const updateState = loadUpdateState();
+
+      const status = {
+        running: false,
+        pid: null as number | null,
+        port: null as number | null,
+        host: null as string | null,
+        mode: null as "full" | "passthrough" | null,
+        strategy: null as string | null,
+        uptime: null as number | null,
+        startTime: null as string | null,
+        url: null as string | null,
+        envFile: null as string | null,
+        fallbackChain: null as FallbackInfo[] | null,
+        accountAllowlist: null as string[] | null,
+        configGeneration: null as number | null,
+        configLoadedAt: null as string | null,
+        lastConfigReloadError: null as string | null,
+        autoUpdateEnabled: isProxyAutoUpdateEnabled(),
+        workerVersion: null as string | null,
+        supervisorPid: null as number | null,
+        supervisorVersion: supervisorState?.version ?? null,
+        supervisorRunning: false,
+        rolling: null as ProxySupervisorState["rolling"] | null,
+        updaterPid: null as number | null,
+        updaterRunning: false,
+        latestVersion: updateState?.lastCheckVersion || null,
+        lastDetectedVersion: updateState?.lastCheckVersion || null,
+        lastCheckAt: updateState?.lastCheckAt ?? null,
+        lastCheckAttemptAt: updateState?.lastCheckAttemptAt ?? null,
+        lastCheckError: updateState?.lastCheckError ?? null,
+        installedVersion:
+          updateState?.installedVersion ??
+          updateState?.lastUpdateVersion ??
+          null,
+        validatedVersion: updateState?.installedVersion ?? null,
+        selectedPackageVersion:
+          readProxyPackageSelection(PROXY_PACKAGES_DIR)?.version ?? null,
+        diskPackageVersion: readProxyDiskVersion(),
+        candidateVersion:
+          supervisorState?.rolling?.candidate?.expectedVersion ?? null,
+        activatedVersion: supervisorState?.rolling?.active?.version ?? null,
+        pendingActivationVersion: updateState?.pendingRestartVersion ?? null,
+        pendingRestartVersion: updateState?.pendingRestartVersion ?? null,
+        deferredUpdate: updateState?.deferredUpdate ?? null,
+        lastUpdateFailure: updateState?.lastFailure ?? null,
+      };
+
+      const workerRunning = state ? isProcessRunning(state.pid) : false;
+      const supervisorPid = supervisorState?.pid ?? state?.supervisorPid;
+      const supervisorRunning = supervisorPid
+        ? isProcessRunning(supervisorPid)
+        : false;
+      const servingWorker =
+        workerRunning &&
+        (supervisorPid
+          ? supervisorRunning &&
+            (!supervisorState?.rolling ||
+              supervisorState.rolling.active?.pid === state?.pid)
+          : true);
+      if ((state || supervisorState) && (servingWorker || supervisorRunning)) {
+        const servingState = servingWorker ? state : null;
+        const activeHost = servingState?.host ?? supervisorState?.host ?? null;
+        const activePort = servingState?.port ?? supervisorState?.port ?? null;
+        status.running = true;
+        status.pid = servingWorker && state ? state.pid : null;
+        status.port = activePort;
+        status.host = activeHost;
+        status.mode = servingState
+          ? servingState.passthrough
+            ? "passthrough"
+            : "full"
+          : null;
+        status.strategy = servingState?.strategy ?? null;
+        status.startTime =
+          (supervisorRunning ? supervisorState?.startTime : null) ??
+          servingState?.startTime ??
+          null;
+        status.uptime = status.startTime
+          ? Date.now() - new Date(status.startTime).getTime()
+          : null;
+        status.url =
+          activeHost && activePort
+            ? `http://${activeHost === "0.0.0.0" ? "localhost" : activeHost}:${activePort}`
+            : null;
+        status.envFile = servingState?.envFile ?? null;
+        status.fallbackChain = servingState?.fallbackChain ?? null;
+        status.accountAllowlist = servingState?.accountAllowlist ?? null;
+        status.configGeneration = servingState?.configGeneration ?? null;
+        status.configLoadedAt = servingState?.configLoadedAt ?? null;
+        status.lastConfigReloadError =
+          servingState?.lastConfigReloadError ?? null;
+        status.supervisorPid = supervisorPid ?? null;
+        status.supervisorRunning = supervisorRunning;
+        status.supervisorVersion = supervisorState?.version ?? null;
+        status.rolling = supervisorState?.rolling ?? null;
+        status.updaterPid =
+          supervisorState?.updaterPid ?? servingState?.updaterPid ?? null;
+        status.updaterRunning = status.updaterPid
+          ? isProcessRunning(status.updaterPid)
+          : false;
+      }
+
+      // Fetch live stats before rendering (JSON or text)
+      let liveStats: StatusStats | null = null;
+      let liveConfig: Record<string, unknown> | null = null;
+      if (status.running && status.url) {
+        try {
+          const statusResp = await fetch(`${status.url}/status`, {
+            signal: AbortSignal.timeout(2_000),
+          });
+          if (statusResp.ok) {
+            const statusData = (await statusResp.json()) as Record<
+              string,
+              unknown
+            >;
+            liveStats = (statusData.stats as StatusStats | null) ?? null;
+            liveConfig = statusData.config as Record<string, unknown> | null;
+            status.workerVersion =
+              typeof statusData.version === "string"
+                ? statusData.version
+                : null;
+            status.activatedVersion = status.workerVersion;
+            if (typeof liveConfig?.generation === "number") {
+              status.configGeneration = liveConfig.generation;
+            }
+            if (typeof liveConfig?.loadedAt === "string") {
+              status.configLoadedAt = liveConfig.loadedAt;
+            }
+            status.lastConfigReloadError =
+              typeof liveConfig?.lastReloadError === "string"
+                ? liveConfig.lastReloadError
+                : null;
+          }
+        } catch {
+          // Non-fatal — live stats unavailable
+        }
+      }
+
+      if (argv.format === "json") {
+        logger.always(
+          JSON.stringify(
+            { ...status, stats: liveStats, config: liveConfig },
+            null,
+            2,
+          ),
+        );
+        return;
+      }
+
+      // Text format
+      logger.always("");
+      logger.always(chalk.bold.cyan("NeuroLink Claude Proxy Status"));
+      logger.always(chalk.gray("=".repeat(50)));
+      logger.always("");
+
+      if (status.running) {
+        const serving = status.pid !== null;
+        logger.always(
+          `  ${chalk.bold("Status:")}     ${serving ? chalk.green("RUNNING") : chalk.yellow("RECOVERING")}`,
+        );
+        logger.always(
+          `  ${chalk.bold("Worker PID:")} ${serving ? chalk.cyan(status.pid) : chalk.yellow("unavailable")}`,
+        );
+        if (status.supervisorPid) {
+          logger.always(
+            `  ${chalk.bold("Supervisor:")} ${status.supervisorRunning ? chalk.cyan(status.supervisorPid) : chalk.red(`${status.supervisorPid} (not running)`)}`,
+          );
+        }
+        if (status.supervisorVersion) {
+          logger.always(
+            `  ${chalk.bold("Supervisor version:")} ${chalk.cyan(`v${status.supervisorVersion}`)}`,
+          );
+        }
+        if (status.workerVersion) {
+          logger.always(
+            `  ${chalk.bold("Version:")}    ${chalk.cyan(`v${status.workerVersion}`)}`,
+          );
+        }
+        logger.always(
+          `  ${chalk.bold("URL:")}        ${chalk.cyan(status.url)}`,
+        );
+        logger.always(
+          `  ${chalk.bold("Strategy:")}   ${chalk.cyan(status.strategy)}`,
+        );
+        logger.always(
+          `  ${chalk.bold("Mode:")}       ${chalk.cyan(status.mode ?? "full")}`,
+        );
+        if (status.configGeneration !== null) {
+          logger.always(
+            `  ${chalk.bold("Config:")}     ${chalk.cyan(`generation ${status.configGeneration}`)}` +
+              (status.configLoadedAt
+                ? chalk.gray(` (${status.configLoadedAt})`)
+                : ""),
+          );
+        }
+        if (status.lastConfigReloadError) {
+          logger.always(
+            `  ${chalk.bold("Config error:")} ${chalk.red(status.lastConfigReloadError)}`,
+          );
+        }
+        logger.always(
+          `  ${chalk.bold("Started:")}    ${chalk.cyan(status.startTime)}`,
+        );
+        logger.always(
+          `  ${chalk.bold("Uptime:")}     ${chalk.cyan(formatUptime(status.uptime ?? 0))}`,
+        );
+        logger.always(
+          `  ${chalk.bold("Auto-update:")} ${status.autoUpdateEnabled ? chalk.green(status.updaterRunning ? `enabled (PID ${status.updaterPid})` : "enabled (worker unavailable)") : chalk.yellow("disabled")}`,
+        );
+        if (status.pendingActivationVersion) {
+          // A live supervisor PID alone does NOT mean rolling handoff is
+          // available: a supervisor from a build predating rolling state leaves
+          // `rolling` absent, and calling that a handoff tells the operator to
+          // wait for an activation that will never come. Gate on the capability,
+          // not on the process.
+          const rollingCapable =
+            status.supervisorRunning && status.rolling !== null;
+          logger.always(
+            `  ${chalk.bold(rollingCapable ? "Pending handoff:" : "Pending restart:")} ${chalk.yellow(`v${status.pendingActivationVersion} installed; ${rollingCapable ? "rolling activation pending" : "restart pending"}`)}`,
+          );
+        }
+        if (status.rolling?.candidate) {
+          logger.always(
+            `  ${chalk.bold("Handoff:")}    ${chalk.yellow(`preparing v${status.rolling.candidate.expectedVersion} (PID ${status.rolling.candidate.pid})`)}`,
+          );
+        } else if (status.rolling?.draining.length) {
+          logger.always(
+            `  ${chalk.bold("Handoff:")}    ${chalk.cyan(`${status.rolling.draining.length} previous worker(s) draining`)}`,
+          );
+        }
+        if (status.rolling) {
+          logger.always(
+            `  ${chalk.bold("Socket handoff:")} ${status.rolling.pendingTransfers ?? "unknown"} pending, ${status.rolling.queuedSockets} queued; ${status.rolling.rejectedSockets} rejected, ${status.rolling.failedTransfers} failed transfers since supervisor start`,
+          );
+        }
+        if (status.deferredUpdate) {
+          const active =
+            status.deferredUpdate.activeRequests === null
+              ? "unknown activity"
+              : `${status.deferredUpdate.activeRequests} active request(s)`;
+          logger.always(
+            `  ${chalk.bold("Deferred:")}   ${chalk.yellow(`v${status.deferredUpdate.version} ${status.deferredUpdate.reason} (${active})`)}`,
+          );
+        }
+        if (status.latestVersion) {
+          logger.always(
+            `  ${chalk.bold("Latest:")}     ${chalk.cyan(`v${status.latestVersion}`)}`,
+          );
+        }
+        if (status.latestVersion && status.lastCheckAt) {
+          logger.always(
+            `  ${chalk.bold("Last update check:")} ${chalk.cyan(status.lastCheckAt)}`,
+          );
+        }
+        if (status.installedVersion) {
+          logger.always(
+            `  ${chalk.bold("Validated:")}  ${chalk.cyan(`v${status.installedVersion}`)}`,
+          );
+        }
+        if (status.activatedVersion) {
+          logger.always(
+            `  ${chalk.bold("Activated:")}  ${chalk.cyan(`v${status.activatedVersion}`)}`,
+          );
+        }
+        if (status.lastUpdateFailure) {
+          logger.always(
+            `  ${chalk.bold("Update error:")} ${chalk.red(`${status.lastUpdateFailure.stage}: ${status.lastUpdateFailure.message}`)}`,
+          );
+        }
+        if (status.envFile) {
+          logger.always(
+            `  ${chalk.bold("Env File:")}   ${chalk.cyan(status.envFile)}`,
+          );
+        }
+        if (status.accountAllowlist) {
+          const scope =
+            status.accountAllowlist.length > 0
+              ? status.accountAllowlist.join(", ")
+              : "none (deny all)";
+          logger.always(`  ${chalk.bold("Accounts:")}   ${chalk.cyan(scope)}`);
+        }
+
+        // Display fallback chain if configured
+        if (status.fallbackChain && status.fallbackChain.length > 0) {
+          logger.always("");
+          logger.always(chalk.bold("  Fallback Chain:"));
+          for (let i = 0; i < status.fallbackChain.length; i++) {
+            const entry = status.fallbackChain[i];
+            const prefix = i === status.fallbackChain.length - 1 ? "└─" : "├─";
+            logger.always(
+              `    ${chalk.gray(prefix)} ${chalk.cyan(entry.provider)}/${chalk.cyan(entry.model)}`,
+            );
+          }
+        }
+
+        // Try to fetch live status from the running proxy
+        try {
+          const response = await fetch(`${status.url}/health`, {
+            signal: AbortSignal.timeout(2_000),
+          });
+          if (response.ok) {
+            const liveStatus = (await response.json()) as {
+              status: string;
+              strategy: string;
+              uptime: number;
+            };
+            logger.always("");
+            logger.always(
+              `  ${chalk.bold("Live:")}       ${chalk.green(liveStatus.status)}`,
+            );
+          }
+        } catch {
+          // Live status fetch failed — show only persisted state
+          logger.always("");
+          logger.always(
+            chalk.gray("  (Could not reach proxy for live status)"),
+          );
+        }
+
+        if (liveStats) {
+          printStatusStats(liveStats);
+        }
+      } else {
+        logger.always(
+          `  ${chalk.bold("Status:")}     ${chalk.yellow("NOT RUNNING")}`,
+        );
+        logger.always("");
+        logger.always(
+          chalk.gray("  Start the proxy with: neurolink proxy start"),
+        );
+      }
+
+      logger.always("");
+    } catch (error) {
+      logger.error(
+        chalk.red(
+          `Error: ${error instanceof Error ? error.message : String(error)}`,
+        ),
+      );
+      process.exit(1);
+    }
+  },
+};
+
+// =============================================================================
+// PROXY TELEMETRY COMMAND
+// =============================================================================
+
+const PROXY_TELEMETRY_ACTIONS = [
+  "doctor",
+  "query",
+  "setup",
+  "start",
+  "stop",
+  "status",
+  "logs",
+  "import-dashboard",
+] as const;
+
+export const proxyTelemetryCommand: CommandModule<object, ProxyTelemetryArgs> =
+  {
+    command: "telemetry <action>",
+    describe:
+      "Query and verify stored OTel telemetry or manage the local observability stack",
+    builder: (yargs: Argv) =>
+      yargs
+        .positional("action", {
+          type: "string",
+          choices: [...PROXY_TELEMETRY_ACTIONS],
+          describe:
+            "Telemetry action: doctor, query, setup, start, stop, status, logs, or import-dashboard",
+        })
+        .option("since", {
+          type: "string",
+          description: "Inclusive ISO timestamp for stored telemetry",
+        })
+        .option("until", {
+          type: "string",
+          description: "Exclusive ISO timestamp for stored telemetry",
+        })
+        .option("kind", {
+          type: "string",
+          description:
+            "Metadata kind for query, such as request_final or telemetry_delivery",
+        })
+        .option("format", {
+          type: "string",
+          choices: ["json", "text"] as const,
+          description: "Doctor report format; query always returns JSON",
+        })
+        .option("max-rows", {
+          type: "number",
+          description: "Explicit bounded history record limit",
+        })
+        .option("proxy-url", {
+          type: "string",
+          description: "Proxy endpoint used by the read-only doctor",
+        })
+        .option("admission-lookback-minutes", {
+          type: "number",
+          description:
+            "Doctor admission history horizon; must exceed request timeout plus ingestion grace",
+        })
+        .option("request-timeout-ms", {
+          type: "number",
+          description:
+            "Default request deadline for doctor admission reconciliation",
+        })
+        .option("ingestion-grace-ms", {
+          type: "number",
+          description:
+            "Time allowed for telemetry ingestion before reconciliation",
+        })
+        .option("quiet", {
+          type: "boolean",
+          alias: "q",
+          default: false,
+          description: "Suppress the local CLI spinner and delegate directly",
+        })
+        .example(
+          "neurolink proxy telemetry doctor --format json",
+          "Verify field coverage, stored captures, trace correlation, and delivery evidence",
+        )
+        .example(
+          "neurolink proxy telemetry query --since 2026-09-15T00:00:00Z --kind request_final",
+          "Read stored OTLP metadata without scanning proxy log files",
+        )
+        .example(
+          "neurolink proxy telemetry setup",
+          "Start OpenObserve, start the OTEL collector, and import the dashboard",
+        )
+        .example(
+          "neurolink proxy telemetry start",
+          "Start the local proxy telemetry stack without re-importing the dashboard",
+        )
+        .example(
+          "neurolink proxy telemetry stop",
+          "Stop the local OpenObserve and OTEL collector containers",
+        ) as Argv<ProxyTelemetryArgs>,
+    handler: async (argv) => {
+      const action = argv.action as ProxyTelemetryAction;
+      const spinner =
+        argv.quiet || action === "doctor" || action === "query"
+          ? null
+          : ora(`Running proxy telemetry ${action}...`).start();
+
+      try {
+        if (spinner) {
+          spinner.stop();
+        }
+        await runProxyTelemetryManager(action, argv);
+        if (spinner) {
+          spinner.succeed(`proxy telemetry ${action} completed`);
+        }
+      } catch (error) {
+        if (spinner) {
+          spinner.fail(`proxy telemetry ${action} failed`);
+        }
+        logger.error(
+          chalk.red(
+            `Error: ${error instanceof Error ? error.message : String(error)}`,
+          ),
+        );
+        process.exit(1);
+      }
+    },
+  };
+
+// =============================================================================
+// PROXY FAIL-OPEN GUARD COMMAND (HIDDEN)
+// =============================================================================
+
+export const proxyGuardCommand: CommandModule<object, ProxyGuardArgs> = {
+  command: "guard",
+  describe: false,
+  builder: (yargs: Argv) => {
+    return yargs
+      .option("host", {
+        type: "string",
+        default: "127.0.0.1",
+      })
+      .option("port", {
+        type: "number",
+        default: 55669,
+      })
+      .option("parent-pid", {
+        type: "number",
+        alias: "parentPid",
+      })
+      .option("max-wait-ms", {
+        type: "number",
+        alias: "maxWaitMs",
+        default: 0,
+      })
+      .option("failure-threshold", {
+        type: "number",
+        alias: "failureThreshold",
+        default: 5,
+      })
+      .option("poll-interval-ms", {
+        type: "number",
+        alias: "pollIntervalMs",
+        default: 1_000,
+      })
+      .option("updater-only", {
+        type: "boolean",
+        alias: "updaterOnly",
+        default: false,
+      })
+      .option("quiet", {
+        type: "boolean",
+        default: true,
+      }) as Argv<ProxyGuardArgs>;
+  },
+  handler: withProxyOtelLogShutdown(async (argv: ProxyGuardArgs) => {
+    initializeProxyOtelLogs("updater");
+    routeProxyConsoleToOtel();
+    const host = argv.host ?? "127.0.0.1";
+    const port = argv.port ?? 55669;
+    const parentPid = Number(argv.parentPid);
+    const maxWaitMsArg = Number(argv.maxWaitMs ?? 0);
+    const maxWaitMs =
+      Number.isFinite(maxWaitMsArg) && maxWaitMsArg > 0
+        ? Math.max(1_000, maxWaitMsArg)
+        : 0;
+    const failureThreshold = Math.max(1, Number(argv.failureThreshold ?? 5));
+    const pollIntervalMs = Math.max(250, Number(argv.pollIntervalMs ?? 1_000));
+    const updaterOnly = argv.updaterOnly === true;
+    const rollingSupervisor = process.env[PROXY_ROLLING_SUPERVISOR_ENV] === "1";
+
+    if (!Number.isFinite(parentPid) || parentPid <= 0) {
+      return;
+    }
+
+    // Package mutation belongs to the dedicated launchd updater worker. The
+    // foreground fail-open guard remains cleanup-only.
+    const UPDATE_CHECK_INTERVAL_MS = 2 * 60 * 60 * 1000; // 2 hours
+    const QUIET_THRESHOLD_MS = 120 * 1000; // 2 minutes of silence
+    const NATURAL_WINDOW_WAIT_MS = 10 * 60 * 1000; // prefer no admission pause
+    const UPDATE_DRAIN_TIMEOUT_MS = 30 * 1000; // defer and reopen admission instead of waiting through long streams
+    const UPDATE_RETRY_DELAY_MS = 5 * 60 * 1000;
+    const UPDATE_RETRY_MAX_DELAY_MS = 30 * 60 * 1000;
+    const UPDATE_RETRY_MAX_ATTEMPTS = 4;
+    const UPDATE_ACTIVITY_POLL_MS = 10 * 1000;
+    const UPDATE_TIMEOUT_MS = 150 * 1000; // include the supervisor candidate readiness deadline
+
+    // Get running version from /health endpoint (with timeout to avoid hanging)
+    let runningVersion = PROXY_VERSION; // fallback
+    try {
+      const healthResp = await fetch(`http://${host}:${port}/health`, {
+        signal: AbortSignal.timeout(5_000),
+      });
+      const healthData = (await healthResp.json()) as { version?: string };
+      runningVersion = healthData.version ?? PROXY_VERSION;
+    } catch {
+      /* use fallback */
+    }
+
+    // Auto-update only works on macOS with launchd. On other platforms,
+    // there's no restart mechanism, so skip the update loop entirely.
+    const canAutoUpdate =
+      updaterOnly &&
+      isProxyAutoUpdateEnabled() &&
+      process.platform === "darwin" &&
+      (await isLaunchdManaging());
+
+    let guardStopping = false;
+    let updateCheckTimeout: NodeJS.Timeout | undefined;
+    let updateCheckInterval: NodeJS.Timeout | undefined;
+    let updateRetryTimeout: NodeJS.Timeout | undefined;
+    let updateRetryAttempts = 0;
+    let updateRetryVersion: string | null = null;
+    const stopUpdateChecks = (): void => {
+      guardStopping = true;
+      if (updateCheckTimeout) {
+        clearTimeout(updateCheckTimeout);
+        updateCheckTimeout = undefined;
+      }
+      if (updateCheckInterval) {
+        clearInterval(updateCheckInterval);
+        updateCheckInterval = undefined;
+      }
+      if (updateRetryTimeout) {
+        clearTimeout(updateRetryTimeout);
+        updateRetryTimeout = undefined;
+      }
+    };
+    /** Keep state-write failures observable without terminating the updater. */
+    const persistUpdaterState = (
+      operation: string,
+      action: () => void,
+    ): void => {
+      try {
+        action();
+      } catch (error) {
+        logger.always(
+          `[updater] WARNING: failed to ${operation}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    };
+    const isCurrentUpdateOwner = (): boolean => {
+      const runtime = rollingSupervisor
+        ? loadProxySupervisorState()
+        : loadProxyState();
+      return isProxyUpdateOwnerCurrent({
+        stopping: guardStopping,
+        parentPid,
+        updaterPid: process.pid,
+        parentStatus: getProcessStatus(parentPid),
+        runtimePid: runtime?.pid,
+        runtimeUpdaterPid: runtime?.updaterPid,
+      });
+    };
+    // Each release installs a full dependency tree into its own directory and
+    // nothing else ever removes one, so the store has to be trimmed here: on
+    // updater start for the backlog, and after each confirmed update.
+    let updateInProgress = false;
+    let updateRestartInProgress = false;
+    let packagePruneInFlight: Promise<void> | undefined;
+    const prunePackageStore = (trigger: string): Promise<void> => {
+      packagePruneInFlight ??= (async () => {
+        // A stale updater must not mutate package state a newer owner relies on.
+        // An update that reuses an existing unselected build would also race the
+        // rename; the post-update pass runs inside the update and is safe.
+        if (
+          !isCurrentUpdateOwner() ||
+          (updateInProgress && trigger !== "after update")
+        ) {
+          return;
+        }
+        try {
+          const outcome = await pruneProxyPackages({
+            packagesDir: PROXY_PACKAGES_DIR,
+            currentEntryScript: process.argv[1],
+            isCurrentOwner: isCurrentUpdateOwner,
+          });
+          if (outcome.skipped) {
+            logger.always(
+              `[updater] package store prune skipped (${trigger}): ${outcome.skipped}`,
+            );
+          } else if (outcome.removed.length > 0) {
+            logger.always(
+              `[updater] package store prune (${trigger}): removed ${outcome.removed.length} old build(s); retained ${outcome.retained
+                .map((build) => `${build.name} [${build.reason}]`)
+                .join(", ")}`,
+            );
+          }
+          for (const failure of outcome.failed) {
+            logger.always(
+              `[updater] WARNING: could not remove old build ${failure.name}: ${failure.message}`,
+            );
+          }
+        } catch (error) {
+          logger.always(
+            `[updater] WARNING: package store prune failed (${trigger}): ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      })().finally(() => {
+        packagePruneInFlight = undefined;
+      });
+      return packagePruneInFlight;
+    };
+    const runUpdateCheck = async () => {
+      if (updateInProgress || !isCurrentUpdateOwner()) {
+        return;
+      }
+      updateInProgress = true;
+      // A pass already under way works from a snapshot of the store and could
+      // rename a build this update is about to reuse.
+      await packagePruneInFlight?.catch(() => undefined);
+      let updateVersion = runningVersion;
+      let drainActive = false;
+      let previousPackage: ProxyPackageSelection | null;
+      let candidatePackage: ProxyPackageSelection | undefined;
+      let servingWorkerIdentity: ProxyServingWorkerIdentity | undefined;
+      let activatedWorkerIdentity: ProxyServingWorkerIdentity | undefined;
+      const readPersistedServingIdentity =
+        (): ProxyServingWorkerIdentity | null => {
+          if (!servingWorkerIdentity) {
+            return null;
+          }
+          if (rollingSupervisor) {
+            const active = loadProxySupervisorState()?.rolling?.active;
+            return active
+              ? {
+                  version: active.version,
+                  pid: active.pid,
+                  generation: active.generation,
+                }
+              : null;
+          }
+          const state = loadProxyState();
+          return state?.pid
+            ? {
+                version: servingWorkerIdentity.version,
+                pid: state.pid,
+                generation: null,
+              }
+            : null;
+        };
+      const isCurrentUpdateAttemptOwner = (): boolean => {
+        if (!isCurrentUpdateOwner() || !servingWorkerIdentity) {
+          return false;
+        }
+        const current = readPersistedServingIdentity();
+        return (
+          isSameProxyServingWorker(servingWorkerIdentity, current) ||
+          (activatedWorkerIdentity !== undefined &&
+            isSameProxyServingWorker(activatedWorkerIdentity, current))
+        );
+      };
+      try {
+        // A rolling worker may have changed since this updater started. Never
+        // use startup identity to choose rollback or downgrade a serving worker.
+        const runtimeVersions = await fetchProxyRuntimeVersions(
+          host,
+          port,
+          rollingSupervisor,
+        );
+        servingWorkerIdentity = runtimeVersions.workerIdentity;
+        const observedVersion = servingWorkerIdentity?.version;
+        if (!observedVersion) {
+          persistUpdaterState("record unavailable runtime identity", () =>
+            recordCheckFailure("Serving worker version could not be verified"),
+          );
+          scheduleUpdateRetry(
+            "runtime version probe incomplete",
+            runningVersion,
+          );
+          return;
+        }
+        runningVersion = observedVersion;
+        updateVersion = runningVersion;
+        previousPackage = readProxyPackageSelection(PROXY_PACKAGES_DIR);
+        if (previousPackage?.version !== runningVersion) {
+          previousPackage = readProxyPackageSelection(PROXY_PACKAGES_DIR, true);
+        }
+
+        // Lazy-load update modules so they're only imported at check time
+        const { checkForUpdate } =
+          await import("../../lib/proxy/updateChecker.js");
+
+        // 1. Check for update
+        let result = await checkForUpdate(runningVersion);
+        if (result.checkSucceeded === false) {
+          persistUpdaterState("record failed update check", () =>
+            recordCheckFailure(result.checkError ?? "Registry check failed"),
+          );
+          scheduleUpdateRetry("registry check failed", runningVersion);
+          return;
+        }
+        updateVersion = result.latestVersion;
+        persistUpdaterState("record update check", () =>
+          recordCheck(result.latestVersion),
+        );
+
+        let supervisorRefreshOnly = false;
+        if (!result.updateAvailable) {
+          const activeVersions: Awaited<
+            ReturnType<typeof fetchProxyRuntimeVersions>
+          > = rollingSupervisor
+            ? await fetchProxyRuntimeVersions(host, port).catch(() => ({}))
+            : {};
+          if (
+            rollingSupervisor &&
+            (!activeVersions.workerVersion || !activeVersions.supervisorVersion)
+          ) {
+            logger.always(
+              `[updater] WARNING: runtime version probe incomplete (worker=${activeVersions.workerVersion ?? "unknown"}, supervisor=${activeVersions.supervisorVersion ?? "unknown"}); stale-supervisor reconciliation deferred`,
+            );
+            scheduleUpdateRetry(
+              "runtime version probe incomplete",
+              result.latestVersion,
+            );
+            return;
+          }
+          supervisorRefreshOnly = shouldRefreshStaleSupervisor({
+            updateAvailable: result.updateAvailable,
+            rollingSupervisor,
+            runningVersion,
+            workerVersion: activeVersions.workerVersion,
+            supervisorVersion: activeVersions.supervisorVersion,
+          });
+          if (!supervisorRefreshOnly) {
+            updateRetryAttempts = 0;
+            updateRetryVersion = null;
+            persistUpdaterState("clear update deferral", () =>
+              clearUpdateDeferral(),
+            );
+            return;
+          }
+          // A stale registry mirror can report a lower version. Reconcile the
+          // supervisor to the observed worker, never to that older registry row.
+          result = { ...result, latestVersion: runningVersion };
+          updateVersion = runningVersion;
+          logger.always(
+            `[updater] worker v${runningVersion} is current; reconciling stale supervisor v${activeVersions.supervisorVersion}`,
+          );
+        }
+        const initiallyPendingRestart =
+          loadUpdateState()?.pendingRestartVersion === result.latestVersion;
+        if (
+          !supervisorRefreshOnly &&
+          isVersionSuppressed(result.latestVersion) &&
+          !initiallyPendingRestart
+        ) {
+          logger.debug(
+            `[guard] version ${result.latestVersion} is suppressed, skipping`,
+          );
+          return;
+        }
+
+        logger.always(
+          `[updater] update available: ${runningVersion} → ${result.latestVersion}`,
+        );
+
+        if (rollingSupervisor && !supervisorRefreshOnly) {
+          logger.always(
+            `[updater] keeping v${runningVersion} serving while staging the candidate`,
+          );
+        }
+
+        // Recheck the target before staging because discovery can be delayed.
+        let pendingRestart = initiallyPendingRestart;
+        if (!supervisorRefreshOnly) {
+          const refreshedRuntime = await fetchProxyRuntimeVersions(
+            host,
+            port,
+            rollingSupervisor,
+          );
+          if (
+            !servingWorkerIdentity ||
+            !isSameProxyServingWorker(
+              servingWorkerIdentity,
+              refreshedRuntime.workerIdentity,
+            )
+          ) {
+            // Another updater/manual rotation won while registry discovery was
+            // pending. Restart discovery using that worker on the next tick.
+            scheduleUpdateRetry(
+              "serving worker changed during discovery",
+              runningVersion,
+            );
+            return;
+          }
+          const refreshedResult = await checkForUpdate(runningVersion);
+          if (refreshedResult.checkSucceeded === false) {
+            persistUpdaterState("record failed refreshed update check", () =>
+              recordCheckFailure(
+                refreshedResult.checkError ?? "Registry check failed",
+              ),
+            );
+            scheduleUpdateRetry(
+              "refreshed registry check failed",
+              runningVersion,
+            );
+            return;
+          }
+          result = refreshedResult;
+          updateVersion = result.latestVersion;
+          persistUpdaterState("record refreshed update check", () =>
+            recordCheck(result.latestVersion),
+          );
+          if (!result.updateAvailable) {
+            persistUpdaterState("clear update deferral", () =>
+              clearUpdateDeferral(),
+            );
+            return;
+          }
+          pendingRestart =
+            loadUpdateState()?.pendingRestartVersion === result.latestVersion;
+          if (isVersionSuppressed(result.latestVersion) && !pendingRestart) {
+            logger.debug(
+              `[guard] refreshed version ${result.latestVersion} is suppressed, skipping`,
+            );
+            return;
+          }
+        }
+        persistUpdaterState("clear update deferral", () =>
+          clearUpdateDeferral(),
+        );
+        logger.always(
+          `[updater] ${supervisorRefreshOnly ? "supervisor reconciliation prepared" : rollingSupervisor ? "rolling activation prepared" : "candidate preparation started"} for v${result.latestVersion}`,
+        );
+
+        // 3. Install update (validate version string before passing to shell)
+        if (!/^\d+\.\d+\.\d+$/.test(result.latestVersion)) {
+          const message = `invalid version format: ${result.latestVersion}`;
+          logger.always(
+            `[guard] WARNING: invalid version format "${result.latestVersion}", skipping`,
+          );
+          persistUpdaterState("record update failure", () =>
+            recordUpdateFailure(result.latestVersion, "check", message),
+          );
+          return;
+        }
+
+        const { execFileSync } = await import("node:child_process");
+        if (!supervisorRefreshOnly && !pendingRestart) {
+          const installerResolution = resolveGlobalInstaller({
+            entryScript: process.argv[1],
+          });
+          logger.always(
+            `[updater] package-manager candidates: ${installerResolution.tried
+              .map(
+                (candidate) =>
+                  `${candidate.kind}:${candidate.bin}(${candidate.installable ? `v${candidate.version}` : (candidate.reason ?? "unusable")})`,
+              )
+              .join(", ")}`,
+          );
+          // Staging never writes a global package root, including when this
+          // updater itself already runs from a private immutable package.
+          const installer =
+            installerResolution.installer ??
+            installerResolution.tried.find((candidate) => candidate.working);
+          if (!installer) {
+            const message =
+              "no working package manager is available for a private staged install";
+            logger.always(`[updater] WARNING: ${message}; skipping this cycle`);
+            persistUpdaterState("record update failure", () =>
+              recordUpdateFailure(result.latestVersion, "install", message),
+            );
+            return;
+          }
+          logger.always(
+            `[updater] installing @juspay/neurolink@${result.latestVersion} via ${installer.kind} ${installer.bin} (v${installer.version})`,
+          );
+          if (!isCurrentUpdateOwner()) {
+            return;
+          }
+          try {
+            // Keep the exact serving tree, including a same-version local
+            // build. Restaging by version would discard its edits and rollback.
+            if (previousPackage?.version !== runningVersion) {
+              try {
+                const original = inspectProxyPackage(process.argv[1]);
+                if (original.version === runningVersion) {
+                  previousPackage = original;
+                }
+              } catch {
+                // A mutable global entry may have disappeared since startup.
+              }
+            }
+            if (previousPackage?.version !== runningVersion) {
+              previousPackage = await installStagedProxyPackage({
+                version: runningVersion,
+                packagesDir: PROXY_PACKAGES_DIR,
+                installer,
+              });
+            }
+            if (!isCurrentUpdateOwner()) {
+              return;
+            }
+            candidatePackage = await prepareProxyPackageUpgrade({
+              version: result.latestVersion,
+              packagesDir: PROXY_PACKAGES_DIR,
+              installer,
+              activePackage: previousPackage,
+              isCurrentOwner: isCurrentUpdateAttemptOwner,
+              onPolyfills: ({ applied, alreadyIncluded }) =>
+                logger.always(
+                  `[updater] local polyfills: ${applied.length} files applied, ${alreadyIncluded.length} already included in release`,
+                ),
+              onProgress: ({ elapsedMs, outputBytes }) =>
+                logger.debug(
+                  `[updater] staged install progress elapsedMs=${elapsedMs} outputBytes=${outputBytes}`,
+                ),
+            });
+          } catch (installErr) {
+            if (!isCurrentUpdateOwner()) {
+              return;
+            }
+            const detail = describeInstallFailure(installErr);
+            logger.always(
+              `[updater] WARNING: staged install failed:\n${detail}`,
+            );
+            persistUpdaterState("record update failure", () =>
+              recordUpdateFailure(result.latestVersion, "install", detail),
+            );
+            if (isTransientInstallFailure(installErr)) {
+              scheduleUpdateRetry(
+                "transient install failure",
+                result.latestVersion,
+              );
+            }
+            return;
+          }
+        } else if (!supervisorRefreshOnly) {
+          logger.always(
+            `[updater] resuming pending restart for already-installed v${result.latestVersion}`,
+          );
+        }
+
+        // Staging can outlive an operator reinstall or owner replacement.
+        // Never publish or roll back another service's package selection.
+        if (!isCurrentUpdateOwner()) {
+          return;
+        }
+
+        const publicationRuntime = await fetchProxyRuntimeVersions(
+          host,
+          port,
+          rollingSupervisor,
+        );
+        if (
+          !servingWorkerIdentity ||
+          !isSameProxyServingWorker(
+            servingWorkerIdentity,
+            publicationRuntime.workerIdentity,
+          )
+        ) {
+          scheduleUpdateRetry(
+            "serving worker changed during staging",
+            result.latestVersion,
+          );
+          return;
+        }
+
+        // 4. Refresh and validate the stable trampoline. The plist already
+        // points at this path, so it must not be unloaded or rewritten here.
+        if (!supervisorRefreshOnly) {
+          try {
+            previousPackage ??= inspectProxyPackage(process.argv[1]);
+            candidatePackage ??=
+              readProxyPackageSelection(PROXY_PACKAGES_DIR) ?? undefined;
+            if (
+              !candidatePackage ||
+              candidatePackage.version !== result.latestVersion
+            ) {
+              // A legacy pending marker may refer to an in-place global install.
+              // Never guess that it is safe or point a launcher at unverified files.
+              throw new Error(
+                "Pending update has no validated staged package; restaging required",
+              );
+            }
+            if (
+              previousPackage?.version === runningVersion &&
+              !pendingRestart
+            ) {
+              selectProxyPackage(
+                PROXY_PACKAGES_DIR,
+                previousPackage,
+                isCurrentUpdateAttemptOwner,
+              );
+            }
+            writeTrampoline(candidatePackage, isCurrentUpdateAttemptOwner);
+
+            const validation = await validateInstalledVersion({
+              binPath: TRAMPOLINE_PATH,
+              expectedVersion: result.latestVersion,
+            });
+            if (!isCurrentUpdateOwner()) {
+              return;
+            }
+            if (validation.version !== result.latestVersion) {
+              const message = `trampoline validation failed after ${validation.attempts} attempts: ${validation.failure ?? "unknown failure"}`;
+              logger.always(`[updater] WARNING: ${message}; restart deferred`);
+              persistUpdaterState("record update failure", () =>
+                recordUpdateFailure(
+                  result.latestVersion,
+                  "validation",
+                  message,
+                ),
+              );
+              persistUpdaterState("abandon invalid pending update", () =>
+                abandonPendingUpdate(result.latestVersion),
+              );
+              if (previousPackage) {
+                writeTrampoline(previousPackage, isCurrentUpdateAttemptOwner);
+              }
+              scheduleUpdateRetry(
+                "transient candidate validation failure",
+                result.latestVersion,
+              );
+              return;
+            }
+
+            persistUpdaterState("record installed update", () =>
+              recordUpdateInstalled(result.latestVersion),
+            );
+            logger.always(
+              `[updater] trampoline validated at v${validation.version} after ${validation.attempts} attempt(s)`,
+            );
+          } catch (trampolineError) {
+            if (!isCurrentUpdateOwner()) {
+              return;
+            }
+            const message =
+              trampolineError instanceof Error
+                ? trampolineError.message
+                : String(trampolineError);
+            logger.always(
+              `[updater] WARNING: failed to refresh trampoline; refusing restart: ${message}`,
+            );
+            persistUpdaterState("record update failure", () =>
+              recordUpdateFailure(result.latestVersion, "validation", message),
+            );
+            persistUpdaterState("abandon invalid pending update", () =>
+              abandonPendingUpdate(result.latestVersion),
+            );
+            if (previousPackage) {
+              writeTrampoline(previousPackage, isCurrentUpdateAttemptOwner);
+            }
+            scheduleUpdateRetry(
+              "candidate validation failed; restaging permitted",
+              result.latestVersion,
+            );
+            return;
+          }
+        }
+
+        if (!rollingSupervisor) {
+          // Staging and validation finish before closing legacy admission.
+          // A busy service gets a bounded drain attempt and resumes on failure.
+          let lastDeferralSignature = "";
+          const waitForWindow = async (quietWaitMs: number) => {
+            const window = await waitForProxyUpdateWindow({
+              quietThresholdMs: QUIET_THRESHOLD_MS,
+              quietWaitMs,
+              drainWaitMs: UPDATE_DRAIN_TIMEOUT_MS,
+              pollIntervalMs: UPDATE_ACTIVITY_POLL_MS,
+              getActivity: () => getProxyRuntimeActivity(host, port),
+              setDraining: async (draining) => {
+                const changed = await setProxyUpdateDrain(host, port, draining);
+                if (changed) {
+                  logger.always(
+                    `[updater] ${draining ? "draining new inference requests" : "inference admission resumed"}`,
+                  );
+                }
+                return changed;
+              },
+              isStopping: () => guardStopping,
+              isParentAlive: () =>
+                getProcessStatus(parentPid) !== "not_running",
+              onPhase: (phase, activity) => {
+                const reason =
+                  phase === "waiting_for_quiet" && !activity
+                    ? "activity_unavailable"
+                    : phase;
+                const signature = `${reason}:${activity?.activeRequests ?? "unknown"}`;
+                if (signature !== lastDeferralSignature) {
+                  lastDeferralSignature = signature;
+                  persistUpdaterState("record update deferral", () =>
+                    recordUpdateDeferred(
+                      result.latestVersion,
+                      reason,
+                      activity?.activeRequests ?? null,
+                    ),
+                  );
+                }
+                logger.debug(
+                  `[updater] ${reason} (${activity?.activeRequests ?? "unknown"} active requests)`,
+                );
+              },
+            });
+            drainActive = drainActive || window.draining;
+            return window;
+          };
+
+          let updateWindow = await waitForWindow(NATURAL_WINDOW_WAIT_MS);
+          if (!updateWindow.ready) {
+            if (updateWindow.reason === "drain_failed") {
+              persistUpdaterState("record unavailable update drain", () =>
+                recordUpdateDeferred(
+                  result.latestVersion,
+                  "drain_unavailable",
+                  null,
+                ),
+              );
+            }
+            scheduleUpdateRetry(
+              "update window unavailable",
+              result.latestVersion,
+            );
+            return;
+          }
+
+          // Hold admission closed through restart after a quiet
+          // observation, closing the race with a newly admitted request.
+          if (!drainActive) {
+            updateWindow = await waitForWindow(0);
+            if (!updateWindow.ready) {
+              scheduleUpdateRetry(
+                "update drain unavailable",
+                result.latestVersion,
+              );
+              return;
+            }
+          }
+        }
+
+        if (!isCurrentUpdateOwner()) {
+          return;
+        }
+
+        const activationRuntime = await fetchProxyRuntimeVersions(
+          host,
+          port,
+          rollingSupervisor,
+        );
+        if (
+          !servingWorkerIdentity ||
+          !isSameProxyServingWorker(
+            servingWorkerIdentity,
+            activationRuntime.workerIdentity,
+          )
+        ) {
+          scheduleUpdateRetry(
+            "serving worker changed before activation",
+            result.latestVersion,
+          );
+          return;
+        }
+
+        updateRestartInProgress = true;
+        if (rollingSupervisor) {
+          const activeVersions = await fetchProxyRuntimeVersions(
+            host,
+            port,
+            true,
+          );
+          if (
+            !servingWorkerIdentity ||
+            !isSameProxyServingWorker(
+              servingWorkerIdentity,
+              activeVersions.workerIdentity,
+            )
+          ) {
+            updateRestartInProgress = false;
+            scheduleUpdateRetry(
+              "serving worker changed at activation boundary",
+              result.latestVersion,
+            );
+            return;
+          }
+          if (activeVersions.workerVersion === result.latestVersion) {
+            logger.always(
+              `[updater] worker v${result.latestVersion} is already active; resuming supervisor refresh without another worker replacement`,
+            );
+          } else {
+            logger.always(
+              `[updater] requesting rolling activation of v${result.latestVersion}`,
+            );
+            try {
+              if (!isCurrentUpdateAttemptOwner()) {
+                updateRestartInProgress = false;
+                return;
+              }
+              process.kill(parentPid, "SIGUSR2");
+            } catch (activationError) {
+              updateRestartInProgress = false;
+              const message =
+                activationError instanceof Error
+                  ? activationError.message
+                  : String(activationError);
+              logger.always(
+                `[updater] WARNING: rolling activation request failed: ${message}`,
+              );
+              persistUpdaterState("record update failure", () =>
+                recordUpdateFailure(result.latestVersion, "restart", message),
+              );
+              return;
+            }
+          }
+        } else {
+          // Compatibility fallback for services installed before rolling
+          // supervision was enabled.
+          logger.always(`[updater] restarting proxy via launchctl kickstart`);
+          const uid = process.getuid?.() ?? 501;
+          try {
+            execFileSync(
+              "launchctl",
+              ["kickstart", "-k", `gui/${uid}/${PLIST_LABEL}`],
+              {
+                timeout: 10_000,
+                stdio: "pipe",
+              },
+            );
+          } catch (restartErr) {
+            updateRestartInProgress = false;
+            const message =
+              restartErr instanceof Error
+                ? restartErr.message
+                : String(restartErr);
+            logger.always(
+              `[updater] WARNING: launchctl kickstart failed: ${message}`,
+            );
+            persistUpdaterState("record update failure", () =>
+              recordUpdateFailure(result.latestVersion, "restart", message),
+            );
+            return;
+          }
+        }
+        drainActive = false;
+
+        // 5. Wait for healthy restart
+        let healthy = false;
+        let rollingFailure: string | null = null;
+        const restartStart = Date.now();
+        while (Date.now() - restartStart < UPDATE_TIMEOUT_MS) {
+          await new Promise((r) => setTimeout(r, 2000));
+          try {
+            const resp = await fetch(`http://${host}:${port}/health`, {
+              signal: AbortSignal.timeout(3000),
+            });
+            if (resp.ok) {
+              const data = (await resp.json()) as { version?: string };
+              if (data.version === result.latestVersion) {
+                if (rollingSupervisor && servingWorkerIdentity) {
+                  const observedRuntime = await fetchProxyRuntimeVersions(
+                    host,
+                    port,
+                    true,
+                  );
+                  if (
+                    observedRuntime.workerIdentity?.version ===
+                      result.latestVersion &&
+                    !isSameProxyServingWorker(
+                      servingWorkerIdentity,
+                      observedRuntime.workerIdentity,
+                    )
+                  ) {
+                    activatedWorkerIdentity ??= observedRuntime.workerIdentity;
+                  }
+                }
+                healthy = true;
+                break;
+              }
+            }
+          } catch {
+            /* retry */
+          }
+          if (rollingSupervisor) {
+            const observedRuntime = await fetchProxyRuntimeVersions(
+              host,
+              port,
+              true,
+            );
+            if (
+              observedRuntime.workerIdentity?.version ===
+                result.latestVersion &&
+              servingWorkerIdentity &&
+              !isSameProxyServingWorker(
+                servingWorkerIdentity,
+                observedRuntime.workerIdentity,
+              )
+            ) {
+              activatedWorkerIdentity ??= observedRuntime.workerIdentity;
+            }
+            rollingFailure = await getRollingActivationFailure(
+              host,
+              port,
+              result.latestVersion,
+            );
+            if (rollingFailure) {
+              break;
+            }
+          }
+        }
+
+        if (healthy && rollingSupervisor) {
+          const beforeRefresh = await fetchProxyRuntimeVersions(host, port);
+          if (beforeRefresh.supervisorVersion !== result.latestVersion) {
+            logger.always(
+              `[updater] worker v${result.latestVersion} is healthy; waiting for a safe supervisor refresh (supervisor v${beforeRefresh.supervisorVersion ?? "unknown"})`,
+            );
+            let lastRefreshDeferral = "";
+            const waitForSupervisorRefresh = async (quietWaitMs: number) => {
+              const window = await waitForProxyUpdateWindow({
+                allowBusyDrain: false,
+                quietThresholdMs: QUIET_THRESHOLD_MS,
+                quietWaitMs,
+                drainWaitMs: UPDATE_DRAIN_TIMEOUT_MS,
+                pollIntervalMs: UPDATE_ACTIVITY_POLL_MS,
+                getActivity: () => getProxyRuntimeActivity(host, port),
+                setDraining: async (draining) => {
+                  const changed = await setProxyUpdateDrain(
+                    host,
+                    port,
+                    draining,
+                    true,
+                  );
+                  if (changed) {
+                    logger.always(
+                      `[updater] ${draining ? "draining new inference requests for supervisor refresh" : "inference admission resumed"}`,
+                    );
+                  }
+                  return changed;
+                },
+                isStopping: () => guardStopping,
+                isParentAlive: () =>
+                  getProcessStatus(parentPid) !== "not_running",
+                onPhase: (phase, activity) => {
+                  const signature = `${phase}:${activity?.activeRequests ?? "unknown"}`;
+                  if (signature !== lastRefreshDeferral) {
+                    lastRefreshDeferral = signature;
+                    persistUpdaterState(
+                      "record supervisor refresh deferral",
+                      () =>
+                        recordUpdateDeferred(
+                          result.latestVersion,
+                          phase,
+                          activity?.activeRequests ?? null,
+                        ),
+                    );
+                  }
+                  logger.debug(
+                    `[updater] supervisor refresh ${phase} (${activity?.activeRequests ?? "unknown"} active requests)`,
+                  );
+                },
+              });
+              drainActive = drainActive || window.draining;
+              return window;
+            };
+
+            let refreshWindow = await waitForSupervisorRefresh(
+              NATURAL_WINDOW_WAIT_MS,
+            );
+            // A naturally quiet result still needs a short admission fence to
+            // close the race between the last activity poll and launchd.
+            if (refreshWindow.ready && !refreshWindow.draining) {
+              refreshWindow = await waitForSupervisorRefresh(0);
+            }
+            if (!refreshWindow.ready) {
+              logger.always(
+                `[updater] supervisor refresh deferred: ${refreshWindow.reason ?? "safe window unavailable"}`,
+              );
+              persistUpdaterState("record supervisor refresh deferral", () =>
+                recordUpdateDeferred(
+                  result.latestVersion,
+                  refreshWindow.reason === "drain_timeout"
+                    ? "drain_timeout"
+                    : refreshWindow.reason === "busy"
+                      ? "waiting_for_quiet"
+                      : "drain_unavailable",
+                  null,
+                ),
+              );
+              updateRestartInProgress = false;
+              scheduleUpdateRetry(
+                "supervisor refresh window unavailable",
+                result.latestVersion,
+              );
+              return;
+            }
+
+            if (!isCurrentUpdateOwner()) {
+              updateRestartInProgress = false;
+              return;
+            }
+            const refreshIdentity = await fetchProxyRuntimeVersions(
+              host,
+              port,
+              true,
+            );
+            const allowedRefreshIdentity =
+              servingWorkerIdentity &&
+              (isSameProxyServingWorker(
+                servingWorkerIdentity,
+                refreshIdentity.workerIdentity,
+              ) ||
+                (activatedWorkerIdentity !== undefined &&
+                  isSameProxyServingWorker(
+                    activatedWorkerIdentity,
+                    refreshIdentity.workerIdentity,
+                  )));
+            if (!allowedRefreshIdentity) {
+              updateRestartInProgress = false;
+              scheduleUpdateRetry(
+                "serving worker changed before supervisor refresh",
+                result.latestVersion,
+              );
+              return;
+            }
+            logger.always(
+              `[updater] refreshing launchd supervisor at v${result.latestVersion}`,
+            );
+            if (!isCurrentUpdateAttemptOwner()) {
+              updateRestartInProgress = false;
+              return;
+            }
+            const uid = process.getuid?.() ?? 501;
+            try {
+              execFileSync(
+                "launchctl",
+                ["kickstart", "-k", `gui/${uid}/${PLIST_LABEL}`],
+                { timeout: 10_000, stdio: "pipe" },
+              );
+              // The drained worker belongs to the replaced service. The new
+              // supervisor starts with admission open.
+              drainActive = false;
+            } catch (refreshError) {
+              const message =
+                refreshError instanceof Error
+                  ? refreshError.message
+                  : String(refreshError);
+              logger.always(
+                `[updater] WARNING: supervisor refresh failed: ${message}`,
+              );
+              persistUpdaterState("record supervisor refresh failure", () =>
+                recordUpdateFailure(
+                  result.latestVersion,
+                  "restart",
+                  `supervisor refresh failed: ${message}`,
+                ),
+              );
+              updateRestartInProgress = false;
+              scheduleUpdateRetry(
+                "supervisor refresh failed",
+                result.latestVersion,
+              );
+              return;
+            }
+
+            const refreshStartedAt = Date.now();
+            const previousSupervisorPid =
+              beforeRefresh.supervisorPid ?? parentPid;
+            healthy = false;
+            while (Date.now() - refreshStartedAt < 120_000) {
+              await sleep(2_000);
+              const versions = await fetchProxyRuntimeVersions(host, port);
+              if (
+                versions.workerVersion === result.latestVersion &&
+                versions.supervisorVersion === result.latestVersion &&
+                versions.supervisorPid !== undefined &&
+                versions.supervisorPid !== previousSupervisorPid
+              ) {
+                healthy = true;
+                break;
+              }
+            }
+            if (!healthy) {
+              const message = `supervisor did not report v${result.latestVersion} with a new process within 120000ms`;
+              logger.always(`[updater] WARNING: ${message}`);
+              persistUpdaterState("record supervisor refresh failure", () =>
+                recordUpdateFailure(result.latestVersion, "health", message),
+              );
+              updateRestartInProgress = false;
+              scheduleUpdateRetry(
+                "supervisor refresh health unavailable",
+                result.latestVersion,
+              );
+              return;
+            }
+          }
+        }
+
+        if (healthy) {
+          logger.always(
+            `[updater] update successful: now running ${result.latestVersion}`,
+          );
+          persistUpdaterState("record successful update", () =>
+            recordSuccessfulUpdate(result.latestVersion),
+          );
+          updateRetryAttempts = 0;
+          updateRetryVersion = null;
+          // The new version is serving and the selection pair is committed, so
+          // the build that just fell out of retention is unreferenced.
+          await prunePackageStore("after update");
+          // The replacement proxy starts a worker running the new version.
+          await shutdownProxyOtelLogs().catch(() => undefined);
+          process.exit(0);
+        } else {
+          logger.always(
+            `[updater] WARNING: proxy unhealthy after ${supervisorRefreshOnly ? "supervisor reconciliation at" : "update to"} ${result.latestVersion}`,
+          );
+          let failureMessage = rollingFailure
+            ? `rolling candidate failed: ${rollingFailure}`
+            : `proxy did not report v${result.latestVersion} healthy within ${UPDATE_TIMEOUT_MS}ms`;
+          if (rollingSupervisor && !supervisorRefreshOnly) {
+            if (!isCurrentUpdateOwner()) {
+              updateRestartInProgress = false;
+              return;
+            }
+            try {
+              const rollbackRuntime = await fetchProxyRuntimeVersions(
+                host,
+                port,
+                true,
+              );
+              const rollbackStillOwned =
+                servingWorkerIdentity &&
+                (isSameProxyServingWorker(
+                  servingWorkerIdentity,
+                  rollbackRuntime.workerIdentity,
+                ) ||
+                  (activatedWorkerIdentity !== undefined &&
+                    isSameProxyServingWorker(
+                      activatedWorkerIdentity,
+                      rollbackRuntime.workerIdentity,
+                    )));
+              if (!rollbackStillOwned) {
+                throw new Error(
+                  "Serving worker identity changed; stale updater refused rollback",
+                );
+              }
+              if (
+                !previousPackage ||
+                previousPackage.version !== runningVersion
+              ) {
+                throw new Error(
+                  "Previous validated package selection is unavailable",
+                );
+              }
+              logger.always(
+                `[updater] restoring immutable package selection v${runningVersion}`,
+              );
+              writeTrampoline(previousPackage, isCurrentUpdateAttemptOwner);
+              const rollbackValidation = await validateInstalledVersion({
+                binPath: TRAMPOLINE_PATH,
+                expectedVersion: runningVersion,
+              });
+              if (rollbackValidation.version !== runningVersion) {
+                throw new Error(
+                  `Rollback selection did not validate as v${runningVersion}`,
+                );
+              }
+              // Restoring the old package selection is not enough: the supervisor was
+              // told to activate result.latestVersion, so its recovery loop
+              // keeps demanding the new version against the now-downgraded
+              // installation and can never serve a worker again. Re-point the
+              // supervisor at runningVersion and report success only once it
+              // actually serves that version again.
+              if (!isCurrentUpdateOwner()) {
+                updateRestartInProgress = false;
+                return;
+              }
+              const rollbackActivated = await activateRollbackVersion(
+                host,
+                port,
+                parentPid,
+                runningVersion,
+                UPDATE_TIMEOUT_MS,
+                isCurrentUpdateAttemptOwner,
+              );
+              if (!rollbackActivated) {
+                throw new Error(
+                  `supervisor did not report v${runningVersion} healthy within ${UPDATE_TIMEOUT_MS}ms after rollback`,
+                );
+              }
+              logger.always(
+                `[updater] package rollback complete; v${runningVersion} active again`,
+              );
+            } catch (rollbackError) {
+              const rollbackMessage =
+                rollbackError instanceof Error
+                  ? rollbackError.message
+                  : String(rollbackError);
+              failureMessage += `; package rollback failed: ${rollbackMessage}`;
+              logger.always(`[updater] WARNING: ${failureMessage}`);
+            }
+          }
+          persistUpdaterState("record update failure", () =>
+            recordUpdateFailure(result.latestVersion, "health", failureMessage),
+          );
+          if (supervisorRefreshOnly) {
+            scheduleUpdateRetry(
+              "stale supervisor reconciliation health unavailable",
+              result.latestVersion,
+            );
+          } else {
+            persistUpdaterState("abandon unhealthy pending update", () =>
+              abandonPendingUpdate(result.latestVersion),
+            );
+            persistUpdaterState("suppress unhealthy update", () =>
+              suppressVersion(result.latestVersion, "unhealthy_after_restart"),
+            );
+          }
+          updateRestartInProgress = false;
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        logger.always(`[updater] update check error: ${message}`);
+        persistUpdaterState("record update failure", () =>
+          recordUpdateFailure(updateVersion, "check", message),
+        );
+      } finally {
+        if (drainActive && !updateRestartInProgress && isCurrentUpdateOwner()) {
+          const resumed = await resumeProxyUpdateDrain(host, port);
+          if (!resumed && getProcessStatus(parentPid) !== "not_running") {
+            logger.always(
+              `[updater] WARNING: failed to resume inference admission after deferred update`,
+            );
+          }
+        }
+        updateInProgress = false;
+      }
+    };
+
+    const scheduleUpdateRetry = (reason: string, version: string): void => {
+      if (guardStopping || updateRetryTimeout) {
+        return;
+      }
+      if (updateRetryVersion !== version) {
+        updateRetryVersion = version;
+        updateRetryAttempts = 0;
+      }
+      if (updateRetryAttempts >= UPDATE_RETRY_MAX_ATTEMPTS) {
+        logger.always(
+          `[updater] retry budget exhausted after ${updateRetryAttempts} attempt(s); waiting for the periodic check`,
+        );
+        return;
+      }
+      updateRetryAttempts += 1;
+      const delay = Math.min(
+        UPDATE_RETRY_MAX_DELAY_MS,
+        UPDATE_RETRY_DELAY_MS * 2 ** (updateRetryAttempts - 1),
+      );
+      logger.always(
+        `[updater] retry scheduled reason=${reason} attempt=${updateRetryAttempts}/${UPDATE_RETRY_MAX_ATTEMPTS} delayMs=${delay}`,
+      );
+      updateRetryTimeout = setTimeout(() => {
+        updateRetryTimeout = undefined;
+        void runUpdateCheck();
+      }, delay);
+      updateRetryTimeout.unref?.();
+    };
+
+    // Not gated on canAutoUpdate: builds left by earlier runs are dead weight
+    // whether or not this process will install another one. The periodic pass
+    // is cheap (one readdir and one process listing) and covers a startup pass
+    // that ran before the supervisor had recorded this updater as the owner.
+    if (updaterOnly) {
+      setTimeout(() => void prunePackageStore("startup"), 60_000).unref();
+      setInterval(
+        () => void prunePackageStore("periodic"),
+        UPDATE_CHECK_INTERVAL_MS,
+      ).unref();
+    }
+
+    // Run first check after a short delay, then on interval
+    if (canAutoUpdate) {
+      updateCheckTimeout = setTimeout(runUpdateCheck, 30_000);
+      updateCheckInterval = setInterval(
+        runUpdateCheck,
+        UPDATE_CHECK_INTERVAL_MS,
+      );
+    }
+
+    const startedAt = Date.now();
+    let parentStatus = getProcessStatus(parentPid);
+    let consecutiveUnhealthy = 0;
+    let lastUnhealthyProbe: ProxyHealthProbe | null = null;
+
+    // Keep monitoring for as long as the parent can affect Claude settings.
+    while (true) {
+      const healthProbe = await probeProxyHealth(host, port, 1_500);
+      const healthy = healthProbe.healthy;
+
+      if (healthy) {
+        if (updaterOnly && consecutiveUnhealthy >= failureThreshold) {
+          logger.always(
+            `[updater] proxy health recovered after ${consecutiveUnhealthy} failed checks; ${formatProxyHealthProbe(lastUnhealthyProbe ?? healthProbe)}`,
+          );
+        }
+        consecutiveUnhealthy = 0;
+        lastUnhealthyProbe = null;
+      } else {
+        consecutiveUnhealthy += 1;
+        lastUnhealthyProbe = healthProbe;
+        if (updaterOnly && consecutiveUnhealthy === failureThreshold) {
+          logger.always(
+            `[updater] proxy health unavailable after ${consecutiveUnhealthy} checks; worker remains active; ${formatProxyHealthProbe(healthProbe)}`,
+          );
+        }
+      }
+
+      if (parentStatus === "not_running" && !updateRestartInProgress) {
+        if (updaterOnly) {
+          logger.always(
+            `[updater] parent pid=${parentPid} exited; updater worker stopping`,
+          );
+        }
+        // Parent is gone (and we're not mid-update-restart).
+        // If endpoint is still healthy, another proxy took over.
+        if (healthy) {
+          stopUpdateChecks();
+          return;
+        }
+        break;
+      }
+
+      if (
+        !updaterOnly &&
+        !updateRestartInProgress &&
+        !healthy &&
+        consecutiveUnhealthy >= failureThreshold
+      ) {
+        // A detached guard cannot safely decide that a live process should be
+        // replaced. Leave recovery to the foreground operator or launchd.
+        if (!argv.quiet) {
+          logger.always(
+            `[proxy] fail-open guard observed an unhealthy live parent; leaving process supervision unchanged`,
+          );
+        }
+        stopUpdateChecks();
+        return;
+      }
+
+      if (maxWaitMs > 0 && Date.now() - startedAt >= maxWaitMs) {
+        stopUpdateChecks();
+        return;
+      }
+
+      await sleep(pollIntervalMs);
+      parentStatus = getProcessStatus(parentPid);
+    }
+
+    stopUpdateChecks();
+
+    if (updaterOnly) {
+      return;
+    }
+
+    const guardHost = host === "0.0.0.0" ? "localhost" : host;
+    const expectedBaseUrl = `http://${guardHost}:${port}`;
+
+    // The parent is confirmed gone and no replacement is healthy. Foreground
+    // guards are cleanup-only; they never restart or signal proxy processes.
+    const restored = await restoreAllClients(expectedBaseUrl);
+    // Downstream logic keys off whether Claude Code specifically was restored.
+    const cleared =
+      restored.find((r) => r.id === "claude-code")?.restored ?? false;
+
+    const state = loadProxyState();
+    if (
+      state &&
+      state.host === host &&
+      state.port === port &&
+      !isProcessRunning(state.pid)
+    ) {
+      clearProxyState();
+    }
+
+    if (cleared && !argv.quiet) {
+      logger.always(
+        `[proxy] fail-open guard removed stale ${expectedBaseUrl} from Claude settings`,
+      );
+    }
+  }),
+};
+
+// =============================================================================
+// PROXY SETUP COMMAND
+// =============================================================================
+
+export const proxySetupCommand: CommandModule = {
+  command: "setup",
+  describe:
+    "One-command setup: login + install proxy as persistent service + configure Claude Code",
+  builder: (yargs: Argv) => {
+    return yargs
+      .option("port", {
+        type: "number",
+        alias: "p",
+        default: 55669,
+        description: "Proxy port",
+      })
+      .option("method", {
+        type: "string",
+        default: "oauth",
+        choices: ["oauth", "api-key"],
+        description: "Auth method",
+      })
+      .option("no-service", {
+        type: "boolean",
+        default: false,
+        description:
+          "Skip service installation and start proxy in foreground instead",
+      })
+      .option("env-file", {
+        type: "string",
+        alias: "envFile",
+        description: "Path to proxy provider env file to persist for the proxy",
+      })
+      .example("neurolink proxy setup", "Full setup with defaults")
+      .example("neurolink proxy setup -p 9000", "Setup on custom port")
+      .example(
+        "neurolink proxy setup --no-service",
+        "Setup without installing as service",
+      ) as Argv;
+  },
+  handler: async (argv) => {
+    console.info("\n" + chalk.bold("NeuroLink Proxy Setup\n"));
+
+    const port = (argv.port as number) ?? 55669;
+    const noService = argv["no-service"] as boolean;
+
+    // Step 1: Check existing accounts
+    console.info(chalk.blue("Step 1:") + " Checking accounts...");
+    const { tokenStore } = await import("../../lib/auth/tokenStore.js");
+    const allKeys = await tokenStore.listProviders();
+    const anthropicKeys = allKeys.filter(
+      (k) => k.startsWith("anthropic:") || k === "anthropic",
+    );
+    const validKeys: string[] = [];
+    for (const key of anthropicKeys) {
+      const tokens = await tokenStore.loadTokens(key);
+      if (tokens && (!tokens.expiresAt || tokens.expiresAt > Date.now())) {
+        validKeys.push(key);
+      }
+    }
+
+    // Also check legacy credentials file
+    try {
+      const fs = await import("fs");
+      const credPath = join(
+        homedir(),
+        ".neurolink",
+        "anthropic-credentials.json",
+      );
+      const creds = JSON.parse(fs.readFileSync(credPath, "utf8"));
+      if (creds.oauth?.accessToken && creds.oauth?.expiresAt > Date.now()) {
+        validKeys.push("legacy-anthropic");
+        console.info(chalk.green("  ✓ Found valid OAuth account"));
+      }
+    } catch {
+      /* no file */
+    }
+
+    if (validKeys.length > 0) {
+      console.info(
+        chalk.green(`  ✓ Found ${validKeys.length} valid account(s)`),
+      );
+    } else {
+      // Step 2: Login
+      console.info(
+        chalk.yellow("  No valid accounts found. Starting login..."),
+      );
+      console.info(chalk.blue("\nStep 2:") + " Authenticating...");
+      const { handleLogin } = await import("./auth.js");
+      await handleLogin({
+        provider: "anthropic",
+        method: argv.method as string,
+      } as Parameters<typeof handleLogin>[0]);
+      console.info(chalk.green("  ✓ Authentication complete"));
+    }
+
+    // Step 3: Install as persistent service (macOS) or start foreground
+    const stepNum = validKeys.length > 0 ? 2 : 3;
+
+    if (!noService && process.platform === "darwin") {
+      console.info(
+        chalk.blue(`\nStep ${stepNum}:`) +
+          " Installing proxy as persistent service...",
+      );
+      await (proxyInstallCommand.handler as Function)({
+        ...argv,
+        port,
+        host: "127.0.0.1",
+      });
+
+      // Step 4: Configure Claude Code settings
+      const nextStep = stepNum + 1;
+      console.info(
+        chalk.blue(`\nStep ${nextStep}:`) + " Configuring Claude Code...",
+      );
+      const url = `http://127.0.0.1:${port}`;
+      for (const result of await applyAllClients(url, {
+        configPath: resolveProxyConfigPath(
+          (argv as { config?: string }).config,
+        ),
+      })) {
+        if (result.error) {
+          console.info(
+            chalk.yellow(
+              `  ⚠ Could not auto-configure ${result.displayName}: ${result.error.message}`,
+            ),
+          );
+          // Claude Code is the one client whose manual fallback is a single
+          // env var, so it is worth spelling out.
+          if (result.id === "claude-code") {
+            console.info(
+              chalk.yellow(`  Set manually: ANTHROPIC_BASE_URL=${url}`),
+            );
+          }
+          continue;
+        }
+        if (result.applied) {
+          console.info(chalk.green(`  ✓ ${result.displayName} configured`));
+          if (result.note) {
+            console.info(chalk.yellow(`    ↳ ${result.note}`));
+          }
+        }
+      }
+
+      // Done!
+      console.info("");
+      console.info(chalk.bold.green("Setup complete!"));
+      console.info(`  Proxy running as daemon on ${chalk.cyan(url)}`);
+      console.info(`  Auto-restarts on crash (5s throttle) and on login`);
+      console.info("");
+      console.info(chalk.gray("  Status:    neurolink proxy status"));
+      console.info(
+        chalk.gray("  Logs:      ~/.neurolink/logs/proxy-launchd-*.log"),
+      );
+      console.info(chalk.gray("  Uninstall: neurolink proxy uninstall"));
+      console.info("");
+    } else {
+      // Foreground mode (--no-service or non-macOS)
+      if (noService) {
+        console.info(
+          chalk.blue(`\nStep ${stepNum}:`) + " Starting proxy in foreground...",
+        );
+      } else {
+        console.info(chalk.blue(`\nStep ${stepNum}:`) + " Starting proxy...");
+        console.info(
+          chalk.yellow(
+            "  Note: No daemon support on this platform. Proxy runs in foreground.",
+          ),
+        );
+      }
+      // Delegate to proxy start handler — blocks until Ctrl+C
+      await (proxyStartCommand.handler as Function)({
+        ...argv,
+        quiet: false,
+      });
+    }
+  },
+};
+
+// =============================================================================
+// PROXY INSTALL / UNINSTALL — launchd service (macOS)
+// =============================================================================
+
+function escapeXml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+/**
+ * Build a PATH for the launchd plist that includes the current Node/pnpm
+ * bin directories so the guard process can find npm/pnpm for update checks.
+ */
+function buildLaunchdPath(): string {
+  const fallback = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin";
+  const nodeDir = dirname(process.execPath);
+  const segments = new Set<string>();
+
+  // Add the directory containing the Node binary that launched this process
+  if (nodeDir && nodeDir !== ".") {
+    segments.add(nodeDir);
+  }
+
+  // Add pnpm home if available (e.g., ~/.local/share/pnpm)
+  const pnpmHome = process.env.PNPM_HOME;
+  if (pnpmHome) {
+    segments.add(pnpmHome);
+  }
+
+  // Add the standard system paths
+  for (const p of fallback.split(":")) {
+    segments.add(p);
+  }
+
+  return [...segments].join(":");
+}
+
+export function buildProxyLaunchdPlist(
+  port: number,
+  host: string,
+  envFile?: string,
+  configFile?: string,
+): string {
+  // The stable launcher selects an already validated package without
+  // rewriting the launchd service or its inherited runtime environment.
+  const trampolinePath = escapeXml(TRAMPOLINE_PATH);
+  const envFileArgs = envFile
+    ? `
+    <string>--env-file</string>
+    <string>${escapeXml(envFile)}</string>`
+    : "";
+  const configArgs = configFile
+    ? `
+    <string>--config</string>
+    <string>${escapeXml(configFile)}</string>`
+    : "";
+
+  const otelEnvironment = Object.keys(process.env)
+    .filter(
+      (name) =>
+        isProxyServiceEnvironmentKey(name) && process.env[name] !== undefined,
+    )
+    .sort()
+    .map(
+      (name) =>
+        `    <key>${escapeXml(name)}</key>\n    <string>${escapeXml(process.env[name]!)}</string>`,
+    )
+    .join("\n");
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${PLIST_LABEL}</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>${trampolinePath}</string>
+    <string>proxy</string>
+    <string>start</string>
+    <string>--port</string>
+    <string>${port}</string>
+    <string>--host</string>
+    <string>${host}</string>
+${envFileArgs}
+${configArgs}
+    <string>--quiet</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+
+  <key>ExitTimeOut</key>
+  <integer>45</integer>
+
+  <key>StandardOutPath</key>
+  <string>${isProxyOtelOnly() ? "/dev/null" : join(homedir(), ".neurolink", "logs", "proxy-launchd-stdout.log")}</string>
+
+  <key>StandardErrorPath</key>
+  <string>${isProxyOtelOnly() ? "/dev/null" : join(homedir(), ".neurolink", "logs", "proxy-launchd-stderr.log")}</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>${buildLaunchdPath()}</string>
+    <key>HOME</key>
+    <string>${homedir()}</string>
+${otelEnvironment}
+  </dict>
+</dict>
+</plist>`;
+}
+
+export const proxyInstallCommand: CommandModule = {
+  command: "install",
+  describe:
+    "Install proxy as a persistent background service (auto-restarts on crash/reboot)",
+  builder: (yargs: Argv) => {
+    return yargs
+      .option("port", {
+        type: "number",
+        alias: "p",
+        description: "Proxy port",
+      })
+      .option("host", {
+        type: "string",
+        description:
+          "Proxy host. A non-loopback host needs --inbound-token, " +
+          "NEUROLINK_PROXY_REQUIRE_GRANT=1 or --allow-unauthenticated",
+      })
+      .option("inbound-token", {
+        type: "string",
+        alias: "inboundToken",
+        description:
+          "Bearer every caller must present; persisted into the service " +
+          "environment as NEUROLINK_PROXY_INBOUND_TOKEN",
+      })
+      .option("allow-unauthenticated", {
+        type: "boolean",
+        alias: "allowUnauthenticated",
+        default: false,
+        description:
+          "Install a non-loopback service with no inbound authentication",
+      })
+      .option("env-file", {
+        type: "string",
+        alias: "envFile",
+        description:
+          "Path to proxy provider env file to persist for the service",
+      })
+      .option("config", {
+        type: "string",
+        description:
+          "Path to proxy routing config file to persist for the service",
+      })
+      .example("neurolink proxy install", "Install with defaults (port 55669)")
+      .example(
+        "neurolink proxy install -p 9000",
+        "Install on custom port",
+      ) as Argv;
+  },
+  handler: async (argv) => {
+    if (process.platform !== "darwin") {
+      console.info(
+        chalk.red("proxy install is currently macOS-only (uses launchd)."),
+      );
+      console.info(
+        chalk.yellow("On Linux, use systemd. On Windows, use Task Scheduler."),
+      );
+      process.exit(1);
+    }
+
+    const existingSupervisor = loadProxySupervisorState();
+    const existingWorker = loadProxyState();
+    assertProxyServiceInstallIdle({
+      pids: [
+        existingSupervisor?.pid,
+        existingWorker?.pid,
+        existingSupervisor?.rolling?.active?.pid,
+        existingSupervisor?.rolling?.candidate?.pid,
+        ...(existingSupervisor?.rolling?.draining?.map(
+          (worker) => worker.pid,
+        ) ?? []),
+      ].filter((pid): pid is number => typeof pid === "number"),
+      getProcessStatus,
+      launchdPresence: probeProxyLaunchdPresence({
+        label: PLIST_LABEL,
+        uid: process.getuid?.() ?? 501,
+      }),
+    });
+
+    const { mkdirSync, existsSync, chmodSync } = await import("fs");
+    let savedSettings = parseProxyServiceInstallSettings(null);
+    if (existsSync(PLIST_PATH)) {
+      // Existing runtime values are defaults, never printed. Refuse to rewrite
+      // an unreadable service rather than silently dropping its OTel settings.
+      const { execFileSync } = await import("node:child_process");
+      try {
+        savedSettings = parseProxyServiceInstallSettings(
+          JSON.parse(
+            execFileSync(
+              "plutil",
+              ["-convert", "json", "-o", "-", PLIST_PATH],
+              {
+                encoding: "utf8",
+                timeout: 5_000,
+                stdio: ["ignore", "pipe", "pipe"],
+              },
+            ),
+          ),
+        );
+      } catch {
+        // Neither captured plutil output nor JSON parse excerpts may expose
+        // stored exporter authorization headers in a reinstall error.
+        throw new Error(
+          "Existing proxy service settings could not be read; refusing reinstall before service changes.",
+        );
+      }
+      for (const [name, value] of Object.entries(savedSettings.environment)) {
+        process.env[name] ??= value;
+      }
+    }
+    const port =
+      (argv.port as number | undefined) ?? savedSettings.port ?? 55669;
+    const host =
+      (argv.host as string | undefined) ?? savedSettings.host ?? "127.0.0.1";
+    const envResolution = resolveProxyEnvFile({
+      explicitEnvFile:
+        (argv as { envFile?: string }).envFile ?? savedSettings.envFile,
+    });
+    const envFile = envResolution.path;
+    const explicitConfig =
+      (argv as { config?: string }).config ?? savedSettings.configFile;
+    const configPath = resolveProxyConfigPath(explicitConfig);
+    if (explicitConfig && !existsSync(configPath)) {
+      console.info(chalk.red(`Proxy config file not found: ${configPath}`));
+      process.exit(1);
+    }
+    const configFile = existsSync(configPath) ? configPath : undefined;
+
+    if (envFile && !existsSync(envFile)) {
+      console.info(chalk.red(`Proxy env file not found: ${envFile}`));
+      process.exit(1);
+    }
+
+    await loadProxyEnvFile({ explicitEnvFile: envFile });
+    tightenProcessUmask();
+    // The service inherits NEUROLINK_PROXY_* from this environment (see
+    // isProxyServiceEnvironmentKey), so a flag given here is persisted into
+    // the 0600 plist rather than echoed on the command line.
+    const installArgs = argv as {
+      inboundToken?: string;
+      allowUnauthenticated?: boolean;
+    };
+    if (installArgs.inboundToken?.trim()) {
+      process.env.NEUROLINK_PROXY_INBOUND_TOKEN =
+        installArgs.inboundToken.trim();
+    }
+    if (installArgs.allowUnauthenticated === true) {
+      process.env.NEUROLINK_PROXY_ALLOW_UNAUTHENTICATED = "1";
+    }
+    enforceProxyBindPolicy(host, installArgs, null);
+    const logsDir = join(homedir(), ".neurolink", "logs");
+    if (!isProxyOtelOnly() && !existsSync(logsDir)) {
+      mkdirSync(logsDir, { recursive: true, mode: 0o700 });
+    }
+
+    if (!existsSync(PLIST_DIR)) {
+      mkdirSync(PLIST_DIR, { recursive: true });
+    }
+
+    writeTrampoline();
+    console.info(chalk.green(`✓ Trampoline written to ${TRAMPOLINE_PATH}`));
+
+    // Validate selected package metadata without initializing the CLI graph.
+    // Worker startup separately proves readiness before accepting traffic.
+    const trampolineVersion = probeBinVersion(TRAMPOLINE_PATH);
+    if (!trampolineVersion) {
+      console.info(
+        chalk.red(
+          `✗ Trampoline validation failed: ${TRAMPOLINE_PATH} --version did not run cleanly.`,
+        ),
+      );
+      console.info(
+        chalk.yellow(
+          `  The launchd service would not be able to start neurolink. Fix your install first.`,
+        ),
+      );
+      console.info(
+        chalk.yellow(
+          `  Inspect the selected package and reinstall the missing version before retrying.`,
+        ),
+      );
+      process.exit(1);
+    }
+    if (trampolineVersion !== PROXY_VERSION) {
+      console.info(
+        chalk.yellow(
+          `Retaining selected proxy package v${trampolineVersion}; this service installer is v${PROXY_VERSION}.`,
+        ),
+      );
+    }
+    console.info(
+      chalk.green(
+        `✓ Trampoline validated (resolves to neurolink v${trampolineVersion})`,
+      ),
+    );
+
+    const plist = buildProxyLaunchdPlist(port, host, envFile, configFile);
+    await writeFileAtomic(PLIST_PATH, plist, 0o600);
+    chmodSync(PLIST_PATH, 0o600);
+    console.info(chalk.green(`✓ Plist written to ${PLIST_PATH}`));
+    if (envFile) {
+      console.info(chalk.green(`✓ Proxy env file: ${envFile}`));
+    }
+
+    try {
+      const { execFileSync } = await import("node:child_process");
+      execFileSync("launchctl", ["unload", PLIST_PATH], {
+        stdio: "ignore",
+      });
+    } catch {
+      /* not loaded yet */
+    }
+
+    try {
+      const { execFileSync } = await import("node:child_process");
+      execFileSync("launchctl", ["load", PLIST_PATH]);
+      console.info(chalk.green(`✓ Service loaded and started`));
+    } catch (e) {
+      console.info(chalk.red(`Failed to load service: ${e}`));
+      process.exit(1);
+    }
+
+    console.info("");
+    console.info(chalk.bold("Proxy is now a persistent service:"));
+    console.info(`  • Auto-starts on login`);
+    console.info(`  • Auto-restarts on crash (5s throttle)`);
+    console.info(`  • Listening on http://${host}:${port}`);
+    console.info(`  • Logs: ~/.neurolink/logs/proxy-launchd-*.log`);
+    console.info("");
+    console.info(chalk.gray(`  Manage: launchctl start/stop ${PLIST_LABEL}`));
+    console.info(chalk.gray(`  Remove: neurolink proxy uninstall`));
+  },
+};
+
+/**
+ * Put every auto-configured CLI back the way it was, using the URL recorded in
+ * the proxy's own state file.
+ *
+ * `proxy uninstall` is the one moment where "the proxy is going away for good"
+ * is unambiguous, and it is the only place this can be done for a
+ * launchd-managed service: the shutdown path restores on SIGINT only, and both
+ * `launchctl unload` and this command stop the supervisor with SIGTERM. Without
+ * this, uninstalling left all five clients pointing at a socket that no longer
+ * answers, with nothing to say why.
+ *
+ * Must run before `clearProxyState()` — the state file is what tells us which
+ * URL the clients were given, and the restore helpers deliberately refuse to
+ * touch a URL they did not write.
+ */
+async function restoreClientsOnUninstall(): Promise<void> {
+  let state: ProxyState | null = null;
+  try {
+    state = loadProxyState();
+  } catch {
+    // An unreadable state file is not a reason to abort an uninstall.
+  }
+  if (!state?.port) {
+    // Nothing recorded, so we cannot prove which URL the configs carry.
+    return;
+  }
+  // 0.0.0.0 is a bind address, never a reachable one; clients were handed
+  // localhost, so that is what restore has to match on.
+  const host =
+    state.host === "0.0.0.0" ? "localhost" : (state.host ?? "localhost");
+  const results = await restoreAllClients(`http://${host}:${state.port}`);
+  for (const result of results) {
+    if (result.restored) {
+      console.info(
+        chalk.green(`\u2713 Restored ${result.displayName} settings`),
+      );
+    } else if (result.error) {
+      logger.debug(
+        `[proxy] ${result.id} restore failed during uninstall: ${result.error.message}`,
+      );
+    }
+  }
+}
+
+export const proxyUninstallCommand: CommandModule = {
+  command: "uninstall",
+  describe: "Remove proxy background service",
+  builder: (yargs: Argv) => yargs,
+  handler: async () => {
+    if (process.platform !== "darwin") {
+      console.info(chalk.red("proxy uninstall is currently macOS-only."));
+      process.exit(1);
+    }
+
+    const { existsSync, unlinkSync } = await import("fs");
+
+    if (!existsSync(PLIST_PATH)) {
+      if (!(await ensureSupervisorStoppedBeforeClear())) {
+        console.info(
+          chalk.red(
+            "A proxy supervisor is still running and could not be stopped; leaving its state intact. Stop it manually and retry.",
+          ),
+        );
+        process.exit(1);
+      }
+      await restoreClientsOnUninstall();
+      clearProxyState();
+      clearProxySupervisorState();
+      console.info(chalk.yellow("No proxy service installed."));
+      return;
+    }
+
+    try {
+      const { execFileSync } = await import("node:child_process");
+      execFileSync("launchctl", ["unload", PLIST_PATH]);
+      console.info(chalk.green(`✓ Service stopped`));
+    } catch {
+      /* may not be loaded */
+    }
+
+    // Do not delete supervisor state while a supervisor still owns the
+    // listener: a swallowed unload failure (or a supervisor started outside
+    // launchd) would otherwise be orphaned.
+    if (!(await ensureSupervisorStoppedBeforeClear())) {
+      console.info(
+        chalk.red(
+          "launchctl could not stop the running supervisor; aborting uninstall so its state is preserved. Stop it manually and retry.",
+        ),
+      );
+      process.exit(1);
+    }
+
+    unlinkSync(PLIST_PATH);
+    await restoreClientsOnUninstall();
+    clearProxyState();
+    clearProxySupervisorState();
+    console.info(chalk.green(`✓ Plist removed from ${PLIST_PATH}`));
+    console.info(chalk.green(`✓ Proxy service uninstalled`));
+  },
+};

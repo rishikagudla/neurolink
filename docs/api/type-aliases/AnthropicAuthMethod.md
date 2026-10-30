@@ -1,0 +1,18 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / AnthropicAuthMethod
+
+# Type Alias: AnthropicAuthMethod
+
+> **AnthropicAuthMethod** = `"api_key"` \| `"oauth"`
+
+Authentication methods supported for Anthropic API access
+
+## Description
+
+Defines the available authentication methods:
+
+- "api_key": Traditional API key authentication for direct API access
+- "oauth": OAuth 2.0 authentication for subscription-based access

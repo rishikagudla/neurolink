@@ -4,13 +4,17 @@
  */
 
 import { z } from "zod";
-import type { Unknown, UnknownRecord } from "../../../types/common.js";
 import type {
-  NeuroLinkMCPTool,
+  AIProvider,
+  DebugResult,
+  DocumentationResult,
   NeuroLinkExecutionContext,
+  NeuroLinkMCPTool,
+  RefactoringResult,
   ToolResult,
-} from "../../../types/mcpTypes.js";
-import type { AIProvider } from "../../../types/index.js";
+  Unknown,
+  UnknownRecord,
+} from "../../../types/index.js";
 import { AIProviderFactory } from "../../../core/factory.js";
 import { getBestProvider } from "../../../utils/providerUtils.js";
 import { DEFAULT_MAX_TOKENS } from "../../../core/constants.js";
@@ -114,43 +118,6 @@ const debugAIOutputSchema = z.object({
 });
 
 // Type definitions for tool results
-interface _TestCase {
-  name: string;
-  type: string;
-  code: string;
-  description: string;
-  assertions: number;
-}
-
-interface RefactoringResult {
-  refactoredCode: string;
-  changes: string[];
-  improvements: string[];
-  metrics: {
-    linesReduced: number;
-    complexityReduction: number;
-    readabilityScore: number;
-  };
-}
-
-interface DocumentationResult {
-  documentation: string;
-  sections: string[];
-  examples: string[];
-  coverage: number;
-}
-
-interface DebugResult {
-  issues: Array<{
-    type: string;
-    severity: "low" | "medium" | "high";
-    description: string;
-    location?: string;
-  }>;
-  suggestions: string[];
-  possibleCauses: string[];
-  fixedOutput?: string;
-}
 
 /**
  * Generate test cases for code functions

@@ -4,7 +4,9 @@ description: Stream text and images together with automatic provider fallbacks a
 keywords: multimodal, images, vision, chat, streaming, text and images, visual AI
 ---
 
-NeuroLink 7.47.0 introduces full multimodal pipelines so you can mix text, URLs, and local images in a single interaction. The CLI, SDK, and loop sessions all use the same message builder, ensuring parity across workflows.
+# Multimodal Chat Experiences
+
+NeuroLink provides full multimodal pipelines so you can mix text, URLs, and local images in a single interaction. The CLI, SDK, and loop sessions all use the same message builder, ensuring parity across workflows.
 
 ## Video Generation {#video-generation}
 
@@ -30,6 +32,35 @@ if (result.video) {
 
 **See:** [Video Generation Guide](video-generation.md) for complete documentation.
 
+## PPT Generation {#ppt-generation}
+
+NeuroLink supports **AI-powered PowerPoint generation** from text prompts. Create professional presentations with 35 slide types, 5 themes, and optional AI-generated images.
+
+```typescript
+const result = await neurolink.generate({
+  input: {
+    text: "Quarterly Business Report: Revenue growth, key metrics, and 2026 outlook",
+  },
+  provider: "vertex",
+  model: "gemini-2.5-pro",
+  output: {
+    mode: "ppt",
+    ppt: {
+      pages: 15,
+      theme: "corporate",
+      audience: "business",
+      generateAIImages: true,
+    },
+  },
+});
+
+if (result.ppt) {
+  console.log(`Presentation saved: ${result.ppt.filePath}`);
+}
+```
+
+**See:** [PPT Generation Guide](ppt-generation.md) for complete documentation.
+
 ## Images {#images}
 
 NeuroLink provides comprehensive image support across all vision-capable providers. Images can be provided as local file paths, HTTPS URLs, or Buffer objects, and are automatically converted to the provider's required encoding format.
@@ -41,13 +72,15 @@ NeuroLink provides comprehensive image support across all vision-capable provide
 - **Provider fallbacks** – orchestration automatically retries compatible multimodal models.
 - **Streaming support** – `neurolink stream` renders partial responses while images upload in the background.
 
-!!! tip "Format Support"
+:::tip[Format Support]
 The image input accepts three formats: **Buffer objects** (from `readFileSync`), **local file paths** (relative or absolute), or **HTTPS URLs**. All formats are automatically converted to the provider's required encoding.
+:::
 
 ## Supported Providers & Models
 
-!!! warning "Provider Compatibility"
+:::warning[Provider Compatibility]
 Not all providers support multimodal inputs. Verify your chosen model has the `vision` capability using `npx @juspay/neurolink models list --capability vision`. Unsupported providers will return an error or ignore image inputs.
+:::
 
 | Provider               | Recommended Models                       | Notes                                                     |
 | ---------------------- | ---------------------------------------- | --------------------------------------------------------- |
@@ -61,7 +94,7 @@ Not all providers support multimodal inputs. Verify your chosen model has the `v
 ## Prerequisites
 
 1. Provider credentials with vision/multimodal permissions.
-2. Latest CLI (`npm`, `pnpm`, or `npx`) or SDK `>=7.47.0`.
+2. Latest CLI (`npm`, `pnpm`, or `npx`) or SDK.
 3. Optional: Redis if you want images stored alongside loop-session history.
 
 ## CLI Quick Start
@@ -182,7 +215,12 @@ const result = await neurolink.generate({
 });
 ```
 
-!!! tip "Alt Text Best Practices" - Keep alt text concise but descriptive (under 125 characters is ideal) - Focus on the key information the image conveys - Alt text is automatically included as context in the prompt, helping AI models better understand the images
+:::tip[Alt Text Best Practices]
+
+- Keep alt text concise but descriptive (under 125 characters is ideal)
+- Focus on the key information the image conveys
+- Alt text is automatically included as context in the prompt, helping AI models better understand the images
+  :::
 
 Use `stream()` with the same structure when you need incremental tokens:
 
@@ -274,7 +312,7 @@ await neurolink.generate({
 - Use JSON format for structured data processing
 - Limit to 1000 rows by default (configurable up to 10K)
 - Combine CSV with visualization images for comprehensive analysis
-- Works with ALL providers (not just vision-capable models)
+- Works across supported providers (not just vision-capable models)
 
 ## PDF File Support
 
@@ -374,6 +412,11 @@ Set appropriate `maxTokens` for PDF analysis (recommended: 2000-8000 tokens).
 | `Streaming ends early`             | Disable tools (`--disableTools`) to avoid tool calls that may not support vision. |
 
 ## Related Features
+
+**Content Generation:**
+
+- [PPT Generation](ppt-generation.md) – AI-powered PowerPoint presentations with 35 slide types
+- [Video Generation](video-generation.md) – Generate videos from images with Veo 3.1
 
 **Document Processing:**
 

@@ -1,0 +1,33 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / wrapError
+
+# Function: wrapError()
+
+> **wrapError**(`error`, `requestId?`, `path?`, `method?`): [`ServerAdapterError`](../classes/ServerAdapterError.md)
+
+Helper to wrap errors as ServerAdapterError
+
+## Parameters
+
+### error
+
+`unknown`
+
+### requestId?
+
+`string`
+
+### path?
+
+`string`
+
+### method?
+
+`string`
+
+## Returns
+
+[`ServerAdapterError`](../classes/ServerAdapterError.md)

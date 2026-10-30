@@ -1,37 +1,58 @@
+import type { NeuroLink } from "../neurolink.js";
 import type { AIProviderName } from "../constants/enums.js";
-import type { UnknownRecord } from "../types/common.js";
-import type { AIProvider } from "../types/index.js";
+import type {
+  AIProvider,
+  NeurolinkCredentials,
+  ProviderConstructor,
+  ProviderDescriptor,
+  ProviderRegistration,
+} from "../types/index.js";
+
 import { logger } from "../utils/logger.js";
+import { suggestClosest } from "../utils/stringDistance.js";
+import {
+  PROVIDER_DESCRIPTORS,
+  PROVIDER_DESCRIPTORS_BY_NAME,
+  PROVIDER_ALIAS_INDEX,
+} from "./providerDescriptors.js";
 
 // Pure factory pattern with no hardcoded imports
 // All providers loaded dynamically via registry to avoid circular dependencies
 
 /**
- * Provider constructor interface - supports both sync constructors and async factory functions
+ * Resolve a registered provider name (or alias) to its NeurolinkCredentials
+ * key. Backed by ProviderFactory.getDescriptor() — PROVIDER_DESCRIPTORS is
+ * the single source of truth for provider identity — instead of a
+ * hand-maintained map, so this can no longer drift out of sync with the
+ * descriptors, and it correctly resolves aliases (e.g. "hf") through
+ * PROVIDER_ALIAS_INDEX, not just canonical names. Falls back to the
+ * lowercased input when no descriptor is found, matching the retired
+ * map's behavior for unknown provider names.
+ *
+ * Referencing ProviderFactory here (defined further down this file) is
+ * safe: this function's body only runs when called, by which point the
+ * module has finished evaluating and ProviderFactory is fully defined —
+ * there is no temporal-dead-zone hazard from the declaration order.
  */
-type ProviderConstructor =
-  | {
-      new (
-        modelName?: string,
-        providerName?: string,
-        sdk?: UnknownRecord,
-        region?: string,
-      ): AIProvider;
-    }
-  | ((
-      modelName?: string,
-      providerName?: string,
-      sdk?: UnknownRecord,
-      region?: string,
-    ) => Promise<AIProvider>);
+export function resolveCredentialKey(providerName: string): string {
+  const normalized = providerName.toLowerCase();
+  return (
+    ProviderFactory.getDescriptor(normalized)?.credentialsKey ?? normalized
+  );
+}
 
 /**
- * Provider registration entry
+ * registerProvider() takes a class as well as a factory (ProviderConstructor),
+ * and calling a class without `new` throws. A prototype test cannot tell them
+ * apart, because every non-arrow function's prototype points back at itself,
+ * so the source text decides. A factory is therefore never constructed and
+ * never retried after it throws.
  */
-interface ProviderRegistration {
-  constructor: ProviderConstructor;
-  defaultModel?: string; // Optional - provider can read from env
-  aliases?: string[];
+function isClassConstructor(candidate: unknown): boolean {
+  return (
+    typeof candidate === "function" &&
+    /^class[\s{]/.test(Function.prototype.toString.call(candidate))
+  );
 }
 
 /**
@@ -51,11 +72,13 @@ export class ProviderFactory {
     constructor: ProviderConstructor,
     defaultModel?: string, // Optional - provider can read from env
     aliases: string[] = [],
+    descriptor?: ProviderDescriptor,
   ): void {
     const registration: ProviderRegistration = {
       constructor,
       defaultModel,
       aliases,
+      descriptor,
     };
 
     // Register main name
@@ -78,8 +101,9 @@ export class ProviderFactory {
   static async createProvider(
     providerName?: AIProviderName | string,
     modelName?: string,
-    sdk?: UnknownRecord,
+    sdk?: NeuroLink,
     region?: string,
+    credentials?: NeurolinkCredentials,
   ): Promise<AIProvider> {
     // Note: Providers are registered explicitly by ProviderRegistry to avoid circular dependencies
 
@@ -95,76 +119,104 @@ export class ProviderFactory {
 
     if (!registration) {
       throw new Error(
-        `Unknown provider: ${resolvedProviderName}. Available providers: ${ProviderFactory.getAvailableProviders().join(", ")}`,
+        ProviderFactory.describeUnresolvableProvider(resolvedProviderName),
       );
     }
 
-    // Respect environment variables before falling back to registry default
-    let model = modelName;
-    if (!model) {
-      // Check for provider-specific environment variables
-      if (resolvedProviderName.toLowerCase().includes("vertex")) {
-        // Use gemini-2.5-flash as default - latest GA model with best price-performance
-        model = process.env.VERTEX_MODEL || "gemini-2.5-flash";
-      } else if (resolvedProviderName.toLowerCase().includes("bedrock")) {
-        model = process.env.BEDROCK_MODEL || process.env.BEDROCK_MODEL_ID;
-      }
-      // Fallback to registry default if no env var
-      model = model || registration.defaultModel;
-    }
-
+    // Everything below this point — model resolution included — is wrapped in
+    // the same try/catch. The dynamic import a few lines down is on this
+    // path too: a load failure there is a provider-construction failure like
+    // any other and must come back as "Failed to create provider ...", not
+    // escape unwrapped.
     try {
+      // Respect environment variables before falling back to registry default
+      let model = modelName;
+      if (model) {
+        // #337: the model registry has always carried aliases ("gpt4o" ->
+        // "gpt-4o"), and capability lookups resolve through them, but the id
+        // actually sent to the provider did not — so `generate({ model:
+        // "gpt4o" })` put the alias on the wire and the provider 404'd.
+        // Imported lazily: the registry is a large module and this is the only
+        // thing on the construction path that needs it.
+        const { resolveProviderModelAlias } =
+          await import("../models/modelRegistry.js");
+        const canonicalProvider =
+          ProviderFactory.getDescriptor(normalizedName)?.name ?? normalizedName;
+        const canonicalModel = resolveProviderModelAlias(
+          canonicalProvider,
+          model,
+        );
+        if (canonicalModel) {
+          logger.debug("[ProviderFactory] Resolved model alias", {
+            provider: canonicalProvider,
+            requested: model,
+            resolved: canonicalModel,
+          });
+          model = canonicalModel;
+        }
+      }
+      if (!model) {
+        // Check for provider-specific environment variables
+        if (resolvedProviderName.toLowerCase().includes("vertex")) {
+          // Use gemini-2.5-flash as default - latest GA model with best price-performance
+          model = process.env.VERTEX_MODEL || "gemini-2.5-flash";
+        } else if (resolvedProviderName.toLowerCase().includes("bedrock")) {
+          model = process.env.BEDROCK_MODEL || process.env.BEDROCK_MODEL_ID;
+        }
+        // Fallback to registry default if no env var
+        model = model || registration.defaultModel;
+      }
+
+      const credKey = resolveCredentialKey(normalizedName);
+
+      // Extract provider-scoped credential slice (e.g. credentials.openai for OpenAI)
+      const scopedCredentials = credentials
+        ? ((credentials as Record<string, unknown>)[credKey] as
+            | Record<string, unknown>
+            | undefined)
+        : undefined;
+
       if (typeof registration.constructor !== "function") {
         throw new Error(
           `Invalid constructor for provider ${providerName}: not a function`,
         );
       }
 
-      let result: AIProvider;
-
-      try {
-        const factoryResult = (
-          registration.constructor as (
+      // A factory keeps being called as a method of the registration, as it
+      // always was; only a class is constructed.
+      const factoryResult = isClassConstructor(registration.constructor)
+        ? new (registration.constructor as new (
             modelName?: string,
             providerName?: string,
-            sdk?: UnknownRecord,
+            sdk?: NeuroLink,
             region?: string,
-          ) => Promise<AIProvider> | AIProvider
-        )(model, resolvedProviderName, sdk, region);
-
-        // Handle both sync and async results
-        result =
-          factoryResult instanceof Promise
-            ? await factoryResult
-            : factoryResult;
-      } catch (factoryError) {
-        if (
-          registration.constructor.prototype &&
-          registration.constructor.prototype.constructor ===
-            registration.constructor
-        ) {
-          try {
-            result = new (registration.constructor as new (
+            credentials?: Record<string, unknown>,
+          ) => AIProvider)(
+            model,
+            resolvedProviderName,
+            sdk,
+            region,
+            scopedCredentials,
+          )
+        : (
+            registration.constructor as (
               modelName?: string,
               providerName?: string,
-              sdk?: UnknownRecord,
+              sdk?: NeuroLink,
               region?: string,
-            ) => AIProvider)(model, resolvedProviderName, sdk, region);
-          } catch (constructorError) {
-            throw new Error(
-              `Both factory function and constructor failed. Factory error: ${factoryError}. Constructor error: ${constructorError}`,
-            );
-          }
-        } else {
-          throw factoryError;
-        }
-      }
+              credentials?: Record<string, unknown>,
+            ) => Promise<AIProvider> | AIProvider
+          )(model, resolvedProviderName, sdk, region, scopedCredentials);
+
+      const result =
+        factoryResult instanceof Promise ? await factoryResult : factoryResult;
 
       return result;
     } catch (error) {
       logger.error(`Failed to create provider ${resolvedProviderName}:`, error);
       throw new Error(
         `Failed to create provider ${resolvedProviderName}: ${error}`,
+        { cause: error },
       );
     }
   }
@@ -178,6 +230,75 @@ export class ProviderFactory {
   /**
    * Get list of available providers
    */
+  /**
+   * Explain why a provider name did not resolve, usefully (#354).
+   *
+   * Three distinct situations used to share one generic message:
+   *
+   * - The registry is empty, because `ProviderRegistry.registerAllProviders()`
+   *   has not run yet. Every name is unresolvable, and listing zero available
+   *   providers tells the reader nothing about why.
+   * - The name IS a known provider but has no registration — recognised,
+   *   unavailable. Distinct from a typo and worth saying so.
+   * - The name is not a provider at all, in which case a near-miss is almost
+   *   always a typo and is worth naming: "opennai" -> "openai".
+   *
+   * Canonical names are offered as suggestions ahead of aliases, so a typo
+   * resolves to the name the docs use.
+   *
+   * @param requested - The provider name as the caller supplied it
+   * @returns A message naming the situation and what to do about it
+   */
+  private static describeUnresolvableProvider(requested: string): string {
+    const registered = ProviderFactory.getAvailableProviders();
+    if (registered.length === 0) {
+      return (
+        `Cannot resolve provider "${requested}": no providers are registered yet. ` +
+        `ProviderRegistry.registerAllProviders() has not completed, so every name ` +
+        `is unresolvable at this point — this is a lifecycle problem, not a bad name.`
+      );
+    }
+
+    // `registered` mixes canonical names and aliases (registerProvider sets
+    // both as separate map keys — see registerProvider above), and a name
+    // registered without a descriptor (a caller-supplied registerProvider()
+    // with no 5th argument) has no entry in PROVIDER_ALIAS_INDEX at all. Only
+    // PROVIDER_DESCRIPTORS would previously stand in for "what's registered",
+    // which listed every built-in provider whether or not this factory
+    // instance had actually registered it, and mislabelled a descriptor-less
+    // custom registration as an "alias" simply for not matching that static
+    // list. Deriving both lists from `registered` itself fixes both: a
+    // registered name canonicalizes to what PROVIDER_ALIAS_INDEX resolves it
+    // to (itself, when it has no descriptor), and only a name that resolves
+    // to a *different*, registered canonical name is a true alias.
+    const canonical = Array.from(
+      new Set(registered.map((name) => PROVIDER_ALIAS_INDEX.get(name) ?? name)),
+    ).sort();
+    const aliases = registered
+      .filter((name) => {
+        const target = PROVIDER_ALIAS_INDEX.get(name);
+        return target !== undefined && target !== name;
+      })
+      .sort();
+
+    const known = PROVIDER_ALIAS_INDEX.get(requested.toLowerCase());
+    if (known) {
+      return (
+        `Provider "${requested}" is a recognised provider (${known}) but is not registered ` +
+        `in this factory, so it cannot be constructed. Registered providers: ${canonical.join(", ")}.`
+      );
+    }
+
+    // Canonical names first so a tie resolves to the documented spelling.
+    const suggestions = suggestClosest(requested, [...canonical, ...aliases]);
+    const didYouMean =
+      suggestions.length > 0 ? ` Did you mean: ${suggestions.join(", ")}?` : "";
+    return (
+      `Unknown provider: "${requested}".${didYouMean} ` +
+      `Valid providers: ${canonical.join(", ")}. Accepted aliases: ${aliases.join(", ")}.`
+    );
+  }
+
   static getAvailableProviders(): string[] {
     return Array.from(ProviderFactory.providers.keys()).filter(
       (name, index, arr) => arr.indexOf(name) === index, // Remove duplicates from aliases
@@ -194,23 +315,48 @@ export class ProviderFactory {
   }
 
   /**
+   * Look up a provider's static descriptor. Checks the built-in
+   * PROVIDER_DESCRIPTORS first (works even before registerAllProviders()
+   * has run, and resolves aliases via PROVIDER_ALIAS_INDEX), then falls
+   * back to whatever descriptor a live custom registration attached via
+   * registerProvider()'s 5th parameter.
+   */
+  static getDescriptor(name: string): ProviderDescriptor | undefined {
+    const normalized = name.toLowerCase();
+    const canonical = PROVIDER_ALIAS_INDEX.get(normalized);
+    if (canonical) {
+      const builtIn = PROVIDER_DESCRIPTORS_BY_NAME.get(canonical);
+      if (builtIn) {
+        return builtIn;
+      }
+    }
+    return ProviderFactory.providers.get(normalized)?.descriptor;
+  }
+
+  /** All built-in provider descriptors (does not include custom-registered providers that lack a descriptor). */
+  static getAllDescriptors(): readonly ProviderDescriptor[] {
+    return PROVIDER_DESCRIPTORS;
+  }
+
+  /**
    * Normalize provider names using aliases (PHASE 1: Factory Pattern)
    */
   static normalizeProviderName(providerName: string): string | null {
     const normalized = providerName.toLowerCase();
-
-    // Check direct registration
     if (ProviderFactory.providers.has(normalized)) {
       return normalized;
     }
-
-    // Check aliases from all registrations
+    const canonical = PROVIDER_ALIAS_INDEX.get(normalized);
+    if (canonical && ProviderFactory.providers.has(canonical)) {
+      return canonical;
+    }
+    // Fallback for providers registered without a built-in descriptor
+    // (e.g. TTS/STT/media handlers registered outside PROVIDER_DESCRIPTORS).
     for (const [name, registration] of ProviderFactory.providers.entries()) {
       if (registration.aliases?.includes(normalized)) {
         return name;
       }
     }
-
     return null;
   }
 
@@ -251,9 +397,16 @@ export class ProviderFactory {
     providerName: AIProviderName | string,
     modelName?: string,
     enableMCP?: boolean,
-    sdk?: UnknownRecord,
+    sdk?: NeuroLink,
+    credentials?: NeurolinkCredentials,
   ): Promise<AIProvider> {
-    return await ProviderFactory.createProvider(providerName, modelName, sdk);
+    return await ProviderFactory.createProvider(
+      providerName,
+      modelName,
+      sdk,
+      undefined,
+      credentials,
+    );
   }
 }
 
@@ -263,6 +416,13 @@ export class ProviderFactory {
 export async function createAIProvider(
   providerName: AIProviderName | string,
   modelName?: string,
+  credentials?: NeurolinkCredentials,
 ): Promise<AIProvider> {
-  return await ProviderFactory.createProvider(providerName, modelName);
+  return await ProviderFactory.createProvider(
+    providerName,
+    modelName,
+    undefined,
+    undefined,
+    credentials,
+  );
 }

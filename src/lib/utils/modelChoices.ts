@@ -10,41 +10,97 @@ import {
   GoogleAIModels,
   BedrockModels,
   VertexModels,
-  MistralModels,
   OllamaModels,
   AzureOpenAIModels,
   LiteLLMModels,
-  HuggingFaceModels,
   SageMakerModels,
   OpenRouterModels,
+  NvidiaNimModels,
+  CohereModels,
+  VoyageModels,
+  JinaModels,
+  StabilityModels,
+  IdeogramModels,
+  RecraftModels,
+  TypeSafeModels,
+  PerplexityDeciderModels,
+  CloudflareClefModels,
+  ReplicateModels,
 } from "../constants/enums.js";
+import {
+  getCatalogJsonEntries,
+  getDecideCatalogEntries,
+} from "../providers/catalog/loader.js";
+import type {
+  CatalogEntry,
+  CatalogProviderName,
+  ModelChoice,
+} from "../types/index.js";
 
 /**
- * Model choice for CLI prompts (inquirer format)
+ * Looks up the JSON catalog entry for a provider, if it is one of the 11
+ * JSON-catalog providers. Used to short-circuit the hand tables below so a
+ * catalog provider's models are always sourced from its catalog JSON, never
+ * from stale hand-written duplicates. A decide provider's entry is searched
+ * after the chat catalog (the two never share an id), so its models need no
+ * hand-written rows either.
  */
-export interface ModelChoice {
-  name: string;
-  value: string;
-  description?: string;
+function catalogEntryFor(provider: AIProviderName): CatalogEntry | undefined {
+  return (
+    getCatalogJsonEntries().find((entry) => entry.id === provider) ??
+    getDecideCatalogEntries().find((entry) => entry.id === provider)
+  );
+}
+
+/**
+ * Derives CLI-prompt entries for a catalog provider. Uses the curated
+ * `models.topModels` ordering when the JSON provides one (mapping each id to
+ * its own `models.catalog[id].description`); falls back to the full
+ * `models.catalog` in file key-order when `topModels` is absent, matching
+ * the loader's documented fallback contract.
+ */
+function catalogTopModels(
+  entry: CatalogEntry,
+): { model: string; description: string }[] {
+  if (entry.models.topModels) {
+    return entry.models.topModels.map((model) => ({
+      model,
+      description: entry.models.catalog[model].description,
+    }));
+  }
+  return Object.entries(entry.models.catalog).map(([model, spec]) => ({
+    model,
+    description: spec.description,
+  }));
 }
 
 /**
  * Top models per provider with descriptions for CLI prompts
  * These are curated lists of the most commonly used/recommended models
+ *
+ * Covers every provider EXCEPT the JSON-catalog providers (see
+ * `CatalogProviderName`) — their entries are derived from
+ * `models.catalog[*].description` by `catalogTopModels()` and merged in at
+ * the accessor-function level below, never hand-duplicated here.
  */
 const TOP_MODELS_CONFIG: Record<
-  AIProviderName,
+  Exclude<AIProviderName, CatalogProviderName>,
   { model: string; description: string }[]
 > = {
   [AIProviderName.OPENAI]: [
     {
+      model: OpenAIModels.GPT_5_4,
+      description: "Recommended - Direct OpenAI GPT-5.4 model",
+    },
+    { model: OpenAIModels.GPT_5_4_MINI, description: "Cost-effective, fast" },
+    {
       model: OpenAIModels.GPT_4O,
-      description: "Recommended - Latest multimodal model",
+      description: "Previous generation multimodal model",
     },
     { model: OpenAIModels.GPT_4O_MINI, description: "Cost-effective, fast" },
     {
       model: OpenAIModels.GPT_5_2,
-      description: "Latest flagship with deep reasoning",
+      description: "Previous flagship with deep reasoning",
     },
     { model: OpenAIModels.O3, description: "Advanced reasoning model" },
     { model: OpenAIModels.GPT_4_TURBO, description: "Previous generation" },
@@ -96,14 +152,6 @@ const TOP_MODELS_CONFIG: Record<
       model: GoogleAIModels.GEMINI_3_PRO_PREVIEW,
       description: "Latest preview",
     },
-    {
-      model: GoogleAIModels.GEMINI_1_5_PRO,
-      description: "Previous generation",
-    },
-    {
-      model: GoogleAIModels.GEMINI_1_5_FLASH,
-      description: "Legacy fast model",
-    },
   ],
   [AIProviderName.VERTEX]: [
     {
@@ -119,7 +167,6 @@ const TOP_MODELS_CONFIG: Record<
       model: VertexModels.GEMINI_2_0_FLASH,
       description: "Stable production model",
     },
-    { model: VertexModels.GEMINI_1_5_PRO, description: "Previous generation" },
     {
       model: VertexModels.CLAUDE_3_5_SONNET,
       description: "Claude 3.5 on Vertex",
@@ -152,26 +199,6 @@ const TOP_MODELS_CONFIG: Record<
       description: "Previous generation",
     },
     { model: AzureOpenAIModels.GPT_3_5_TURBO, description: "Legacy model" },
-  ],
-  [AIProviderName.MISTRAL]: [
-    {
-      model: MistralModels.MISTRAL_LARGE_LATEST,
-      description: "Recommended - Flagship model",
-    },
-    {
-      model: MistralModels.MISTRAL_SMALL_LATEST,
-      description: "Cost-effective",
-    },
-    {
-      model: MistralModels.CODESTRAL_LATEST,
-      description: "Specialized for code",
-    },
-    { model: MistralModels.PIXTRAL_LARGE, description: "Multimodal vision" },
-    {
-      model: MistralModels.MAGISTRAL_MEDIUM_LATEST,
-      description: "Reasoning model",
-    },
-    { model: MistralModels.MISTRAL_NEMO, description: "Efficient base model" },
   ],
   [AIProviderName.OLLAMA]: [
     {
@@ -207,23 +234,6 @@ const TOP_MODELS_CONFIG: Record<
       description: "Vertex via LiteLLM",
     },
   ],
-  [AIProviderName.HUGGINGFACE]: [
-    {
-      model: HuggingFaceModels.LLAMA_3_3_70B_INSTRUCT,
-      description: "Recommended - Latest Llama",
-    },
-    {
-      model: HuggingFaceModels.MISTRAL_LARGE_3_675B,
-      description: "Mistral Large",
-    },
-    { model: HuggingFaceModels.DEEPSEEK_R1, description: "Advanced reasoning" },
-    {
-      model: HuggingFaceModels.QWEN_2_5_72B_INSTRUCT,
-      description: "Qwen flagship",
-    },
-    { model: HuggingFaceModels.PHI_4, description: "Microsoft Phi-4" },
-    { model: HuggingFaceModels.GEMMA_3_27B_IT, description: "Google Gemma 3" },
-  ],
   [AIProviderName.SAGEMAKER]: [
     {
       model: SageMakerModels.LLAMA_4_MAVERICK_17B_128E,
@@ -237,7 +247,7 @@ const TOP_MODELS_CONFIG: Record<
   ],
   [AIProviderName.OPENROUTER]: [
     {
-      model: OpenRouterModels.CLAUDE_3_5_SONNET,
+      model: OpenRouterModels.CLAUDE_SONNET_4_5,
       description: "Anthropic via OpenRouter",
     },
     { model: OpenRouterModels.GPT_4O, description: "OpenAI via OpenRouter" },
@@ -258,45 +268,259 @@ const TOP_MODELS_CONFIG: Record<
     { model: "gpt-4-turbo", description: "Turbo compatible model" },
     { model: "gpt-3.5-turbo", description: "Legacy compatible model" },
   ],
+  [AIProviderName.NVIDIA_NIM]: [
+    {
+      model: NvidiaNimModels.GPT_OSS_20B,
+      description: "Recommended - gpt-oss 20B (default)",
+    },
+    {
+      model: NvidiaNimModels.LLAMA_3_2_11B_VISION,
+      description: "Llama 3.2 11B vision",
+    },
+    {
+      model: NvidiaNimModels.LLAMA_3_2_90B_VISION,
+      description: "Llama 3.2 90B vision",
+    },
+  ],
+  [AIProviderName.LM_STUDIO]: [
+    {
+      model: "",
+      description: "Auto-discover loaded model from /v1/models",
+    },
+  ],
+  [AIProviderName.LLAMACPP]: [
+    {
+      model: "",
+      description: "Use whatever model llama-server has loaded",
+    },
+  ],
+  [AIProviderName.COHERE]: [
+    {
+      model: CohereModels.COMMAND_R_PLUS,
+      description: "Recommended - Flagship RAG-tuned chat",
+    },
+    { model: CohereModels.COMMAND_R, description: "Smaller RAG-tuned chat" },
+    { model: CohereModels.COMMAND_R7B, description: "Most compact" },
+  ],
+  [AIProviderName.REPLICATE]: [
+    {
+      model: "meta/meta-llama-3-70b-instruct",
+      description: "Recommended - Llama 3 70B Instruct (stable)",
+    },
+    {
+      model: "meta/meta-llama-3.1-405b-instruct",
+      description: "Llama 3.1 405B (flagship)",
+    },
+    {
+      model: "mistralai/mixtral-8x7b-instruct-v0.1",
+      description: "Mixtral 8x7B v0.1",
+    },
+    {
+      model: "black-forest-labs/flux-1.1-pro",
+      description: "FLUX 1.1 Pro (image-gen)",
+    },
+    {
+      model: "stability-ai/stable-diffusion-3.5-large",
+      description: "SD 3.5 Large (image-gen)",
+    },
+  ],
+  [AIProviderName.VOYAGE]: [
+    {
+      model: VoyageModels.VOYAGE_3_5,
+      description: "Recommended - General-purpose embeddings",
+    },
+    {
+      model: VoyageModels.VOYAGE_3_LARGE,
+      description: "Flagship — highest accuracy",
+    },
+    {
+      model: VoyageModels.VOYAGE_CODE_3,
+      description: "Code-tuned embeddings",
+    },
+    {
+      model: VoyageModels.VOYAGE_MULTILINGUAL_2,
+      description: "Multilingual embeddings",
+    },
+    {
+      model: VoyageModels.VOYAGE_3_5_LITE,
+      description: "Smaller / cheaper",
+    },
+  ],
+  [AIProviderName.JINA]: [
+    {
+      model: JinaModels.JINA_EMBEDDINGS_V3,
+      description: "Recommended - Multilingual flagship",
+    },
+    {
+      model: JinaModels.JINA_EMBEDDINGS_V2_BASE_EN,
+      description: "v2 base English",
+    },
+    {
+      model: JinaModels.JINA_EMBEDDINGS_V2_BASE_CODE,
+      description: "v2 base code",
+    },
+    {
+      model: JinaModels.JINA_RERANKER_V2_BASE_MULTILINGUAL,
+      description: "Reranker (multilingual)",
+    },
+    {
+      model: JinaModels.JINA_COLBERT_V2,
+      description: "Late-interaction retrieval",
+    },
+  ],
+  [AIProviderName.STABILITY]: [
+    {
+      model: StabilityModels.STABLE_IMAGE_ULTRA,
+      description: "Recommended - Flagship quality",
+    },
+    {
+      model: StabilityModels.STABLE_IMAGE_CORE,
+      description: "Fast tier",
+    },
+    { model: StabilityModels.SD_3_5_LARGE, description: "SD 3.5 Large" },
+    {
+      model: StabilityModels.SD_3_5_LARGE_TURBO,
+      description: "SD 3.5 Large Turbo",
+    },
+    { model: StabilityModels.SD_3_5_MEDIUM, description: "SD 3.5 Medium" },
+  ],
+  [AIProviderName.IDEOGRAM]: [
+    { model: IdeogramModels.IDEOGRAM_V3, description: "Recommended - V3" },
+    { model: IdeogramModels.IDEOGRAM_V2, description: "V2" },
+    { model: IdeogramModels.IDEOGRAM_V2_TURBO, description: "V2 Turbo (fast)" },
+    { model: IdeogramModels.IDEOGRAM_V1, description: "V1" },
+  ],
+  [AIProviderName.RECRAFT]: [
+    {
+      model: RecraftModels.RECRAFT_V3,
+      description: "Recommended - Raster V3",
+    },
+    {
+      model: RecraftModels.RECRAFT_V3_SVG,
+      description: "Vector / SVG output",
+    },
+    { model: RecraftModels.RECRAFT_V2, description: "V2" },
+  ],
+  [AIProviderName.TYPESAFE]: [
+    {
+      model: TypeSafeModels.JEV_LATEST,
+      description: "Recommended - Jev (decisions, not text)",
+    },
+    {
+      model: TypeSafeModels.JEV_PREVIEW,
+      description: "Preview build of Jev",
+    },
+  ],
+  [AIProviderName.PERPLEXITY_DECIDER]: [
+    {
+      model: PerplexityDeciderModels.PPLX_DECIDER_V1_27B,
+      description:
+        "Recommended - Perplexity decision model that also reads images",
+    },
+  ],
+  [AIProviderName.CLOUDFLARE_CLEF]: [
+    {
+      model: CloudflareClefModels.CLEF,
+      description:
+        "Recommended - Cloudflare Clef 27B decision model that also reads images (state limited to ~2,000 tokens)",
+    },
+    {
+      model: CloudflareClefModels.CLEF_FLASH,
+      description:
+        "Clef-flash 9B - the faster, cheaper Cloudflare decision model (same ~2,000-token state limit)",
+    },
+  ],
   [AIProviderName.AUTO]: [],
 };
 
 /**
- * Default models per provider (first choice/recommended)
+ * Default models per provider (first choice/recommended).
+ *
+ * Covers every provider EXCEPT the JSON-catalog providers (see
+ * `CatalogProviderName`) — those default models come from `models.default`
+ * in the catalog JSON, read directly by `getDefaultModel()` below. (cerebras,
+ * sambanova — never had a hand entry here at all; `getDefaultModel()` now
+ * resolves them too.)
+ *
+ * AUTO is also excluded — it never had an entry here either (matches
+ * pre-existing behavior: `getDefaultModel(AUTO)` returns `undefined`).
+ *
+ * This table is not what a call with no model uses. The runtime order is the
+ * explicit model, then the provider's environment variable, then the default in
+ * the dynamic model configuration, then the registry default
+ * (`providerRegistry.ts`); the OpenAI row mirrors that registry default. Only
+ * an `OpenAIProvider` constructed directly with none of those falls back to
+ * `gpt-5.4` (`openAI/client.ts`).
  */
-export const DEFAULT_MODELS: Record<string, string> = {
-  [AIProviderName.OPENAI]: OpenAIModels.GPT_4O,
+export const DEFAULT_MODELS: Record<
+  Exclude<AIProviderName, CatalogProviderName | AIProviderName.AUTO>,
+  string
+> = {
+  [AIProviderName.OPENAI]: OpenAIModels.GPT_4O_MINI,
   [AIProviderName.ANTHROPIC]: AnthropicModels.CLAUDE_SONNET_4_5,
   [AIProviderName.GOOGLE_AI]: GoogleAIModels.GEMINI_2_5_FLASH,
   [AIProviderName.VERTEX]: VertexModels.GEMINI_2_5_FLASH,
   [AIProviderName.BEDROCK]: BedrockModels.CLAUDE_4_5_SONNET,
   [AIProviderName.AZURE]: AzureOpenAIModels.GPT_4O,
-  [AIProviderName.MISTRAL]: MistralModels.MISTRAL_LARGE_LATEST,
   [AIProviderName.OLLAMA]: OllamaModels.LLAMA4_LATEST,
   [AIProviderName.LITELLM]: LiteLLMModels.OPENAI_GPT_4O,
-  [AIProviderName.HUGGINGFACE]: HuggingFaceModels.LLAMA_3_3_70B_INSTRUCT,
   [AIProviderName.SAGEMAKER]: SageMakerModels.LLAMA_4_MAVERICK_17B_128E,
-  [AIProviderName.OPENROUTER]: OpenRouterModels.CLAUDE_3_5_SONNET,
+  [AIProviderName.OPENROUTER]: OpenRouterModels.CLAUDE_SONNET_4_5,
   [AIProviderName.OPENAI_COMPATIBLE]: "gpt-4o",
+  [AIProviderName.NVIDIA_NIM]: NvidiaNimModels.GPT_OSS_20B,
+  // LM Studio + llama.cpp auto-discover their loaded model from /v1/models;
+  // an empty default is the documented signal to use that path.
+  [AIProviderName.LM_STUDIO]: "",
+  [AIProviderName.LLAMACPP]: "",
+  [AIProviderName.COHERE]: CohereModels.COMMAND_R_PLUS,
+  [AIProviderName.REPLICATE]: "meta/meta-llama-3-70b-instruct",
+  [AIProviderName.VOYAGE]: VoyageModels.VOYAGE_3_5,
+  [AIProviderName.JINA]: JinaModels.JINA_EMBEDDINGS_V3,
+  [AIProviderName.STABILITY]: StabilityModels.STABLE_IMAGE_ULTRA,
+  [AIProviderName.IDEOGRAM]: IdeogramModels.IDEOGRAM_V3,
+  [AIProviderName.RECRAFT]: RecraftModels.RECRAFT_V3,
+  [AIProviderName.TYPESAFE]: TypeSafeModels.JEV_LATEST,
+  [AIProviderName.PERPLEXITY_DECIDER]:
+    PerplexityDeciderModels.PPLX_DECIDER_V1_27B,
+  [AIProviderName.CLOUDFLARE_CLEF]: CloudflareClefModels.CLEF,
 };
 
 /**
- * Model enum mappings for getAllModels
+ * Model enum mappings for getAllModels.
+ *
+ * Covers every provider EXCEPT the JSON-catalog providers (see
+ * `CatalogProviderName`) — those model lists come from
+ * `Object.keys(models.catalog)` in the catalog JSON, read directly by
+ * `getAllModels()` below.
  */
-const MODEL_ENUMS: Record<AIProviderName, Record<string, string> | null> = {
+const MODEL_ENUMS: Record<
+  Exclude<AIProviderName, CatalogProviderName>,
+  Record<string, string> | null
+> = {
   [AIProviderName.OPENAI]: OpenAIModels,
   [AIProviderName.ANTHROPIC]: AnthropicModels,
   [AIProviderName.GOOGLE_AI]: GoogleAIModels,
   [AIProviderName.VERTEX]: VertexModels,
   [AIProviderName.BEDROCK]: BedrockModels,
   [AIProviderName.AZURE]: AzureOpenAIModels,
-  [AIProviderName.MISTRAL]: MistralModels,
   [AIProviderName.OLLAMA]: OllamaModels,
   [AIProviderName.LITELLM]: LiteLLMModels,
-  [AIProviderName.HUGGINGFACE]: HuggingFaceModels,
   [AIProviderName.SAGEMAKER]: SageMakerModels,
   [AIProviderName.OPENROUTER]: OpenRouterModels,
   [AIProviderName.OPENAI_COMPATIBLE]: null,
+  [AIProviderName.NVIDIA_NIM]: NvidiaNimModels,
+  [AIProviderName.LM_STUDIO]: null,
+  [AIProviderName.LLAMACPP]: null,
+  [AIProviderName.COHERE]: CohereModels,
+  [AIProviderName.REPLICATE]: ReplicateModels,
+  [AIProviderName.VOYAGE]: VoyageModels,
+  [AIProviderName.JINA]: JinaModels,
+  [AIProviderName.STABILITY]: StabilityModels,
+  [AIProviderName.IDEOGRAM]: IdeogramModels,
+  [AIProviderName.RECRAFT]: RecraftModels,
+  [AIProviderName.TYPESAFE]: TypeSafeModels,
+  [AIProviderName.PERPLEXITY_DECIDER]: PerplexityDeciderModels,
+  [AIProviderName.CLOUDFLARE_CLEF]: CloudflareClefModels,
   [AIProviderName.AUTO]: null,
 };
 
@@ -312,13 +536,26 @@ export function getTopModelChoices(
   provider: AIProviderName,
   limit = 5,
 ): ModelChoice[] {
-  const config = TOP_MODELS_CONFIG[provider];
+  const catalogEntry = catalogEntryFor(provider);
+  const config = catalogEntry
+    ? catalogTopModels(catalogEntry)
+    : TOP_MODELS_CONFIG[
+        provider as Exclude<AIProviderName, CatalogProviderName>
+      ];
   if (!config || config.length === 0) {
     return [];
   }
 
   const choices = config.slice(0, limit).map((item) => ({
-    name: `${item.model} (${item.description})`,
+    // Empty-string entries are auto-discovery sentinels for LM Studio /
+    // llama.cpp. Surface them with a friendly label so the CLI doesn't show a
+    // blank row, but keep `value: ""` so it matches `DEFAULT_MODELS` (which
+    // also uses `""`) and any caller that preselects the active choice via
+    // the default model still resolves to this entry.
+    name:
+      item.model.length > 0
+        ? `${item.model} (${item.description})`
+        : `Auto-discover loaded model (${item.description})`,
     value: item.model,
     description: item.description,
   }));
@@ -337,11 +574,24 @@ export function getTopModelChoices(
  * Get all available models for a provider
  * Returns all values from the provider's model enum
  *
+ * For a JSON-catalog provider, excludes retired ids. The `catalog` map keeps
+ * retired entries as raw table keys (they still resolve for a caller who
+ * pins that id explicitly — see `isValidModel`'s dedicated retired-id
+ * allowance below), but a listing/selection surface should not offer them.
+ * Mirrors the `selectableModels` filter in catalog/schema.ts.
+ *
  * @param provider - The AI provider to get models for
  * @returns Array of model identifier strings
  */
 export function getAllModels(provider: AIProviderName): string[] {
-  const modelEnum = MODEL_ENUMS[provider];
+  const catalogEntry = catalogEntryFor(provider);
+  if (catalogEntry) {
+    return Object.entries(catalogEntry.models.catalog)
+      .filter(([, spec]) => spec.status !== "retired")
+      .map(([model]) => model);
+  }
+  const modelEnum =
+    MODEL_ENUMS[provider as Exclude<AIProviderName, CatalogProviderName>];
   if (!modelEnum) {
     return [];
   }
@@ -370,15 +620,41 @@ export function getAllProviderChoices(): string[] {
 /**
  * Get the default model for a provider
  *
+ * Reads `DEFAULT_MODELS`, which mirrors the registry default rather than the
+ * runtime resolution order (see the note on that table).
+ *
  * @param provider - The AI provider
  * @returns Default model string for the provider
  */
 export function getDefaultModel(provider: AIProviderName): string | undefined {
-  return DEFAULT_MODELS[provider];
+  const catalogEntry = catalogEntryFor(provider);
+  if (catalogEntry) {
+    return catalogEntry.models.default;
+  }
+  return DEFAULT_MODELS[
+    provider as Exclude<
+      AIProviderName,
+      CatalogProviderName | AIProviderName.AUTO
+    >
+  ];
 }
 
 /**
  * Check if a model is valid for a given provider
+ *
+ * `getAllModels` excludes retired catalog ids (it is a listing/selection
+ * surface), but a caller who pins a retired id explicitly must not have
+ * that pin start failing validation just because it dropped out of the
+ * listing — so this falls back to the full catalog (all statuses) before
+ * rejecting a JSON-catalog provider's model.
+ *
+ * The empty-listing case is checked against catalog membership, not
+ * accepted outright: a catalog provider whose every entry happens to be
+ * retired still has a real catalog to validate against, and a fabricated
+ * id must not slip through just because the *selectable* listing is empty.
+ * Only a provider with no catalog entry at all (openai-compatible,
+ * lm-studio, llamacpp — providers without a strict model list) keeps the
+ * permissive "allow any model" behavior.
  *
  * @param provider - The AI provider
  * @param model - The model identifier to check
@@ -386,11 +662,22 @@ export function getDefaultModel(provider: AIProviderName): string | undefined {
  */
 export function isValidModel(provider: AIProviderName, model: string): boolean {
   const models = getAllModels(provider);
-  if (models.length === 0) {
-    // For providers without strict model lists (like openai-compatible), allow any model
+  if (models.includes(model)) {
     return true;
   }
-  return models.includes(model);
+  const catalogEntry = catalogEntryFor(provider);
+  if (catalogEntry) {
+    // Falls back to the FULL catalog (all statuses) so an explicitly pinned
+    // retired id still validates, and — critically — so an all-retired
+    // catalog (getAllModels() === []) is checked against real membership
+    // instead of accepting any string. Object.hasOwn (not `in`) so an
+    // inherited Object.prototype member name (e.g. "toString") is never
+    // mistaken for a real catalog key.
+    return Object.hasOwn(catalogEntry.models.catalog, model);
+  }
+  // No JSON catalog and no strict MODEL_ENUMS entry (openai-compatible,
+  // lm-studio, llamacpp): keep the permissive "allow any model" behavior.
+  return models.length === 0;
 }
 
 /**
@@ -443,17 +730,38 @@ export function getPopularModelsAcrossProviders(): {
     description: string;
   }[] = [];
 
-  for (const [provider, config] of Object.entries(TOP_MODELS_CONFIG)) {
-    if (config && config.length > 0) {
-      // Take top 2 from each provider
-      config.slice(0, 2).forEach((item) => {
+  // Take top 2 from each provider, ignoring blank auto-discovery sentinels.
+  // (Auto-discovery is surfaced separately by `getTopModelChoices` for
+  // LM Studio / llama.cpp; we don't want it to appear in the cross-
+  // provider popular-models list as an empty value.)
+  const pushTop2 = (
+    provider: AIProviderName,
+    config: { model: string; description: string }[],
+  ) => {
+    config
+      .filter((item) => item.model.length > 0)
+      .slice(0, 2)
+      .forEach((item) => {
         popularModels.push({
-          provider: provider as AIProviderName,
+          provider,
           model: item.model,
           description: item.description,
         });
       });
+  };
+
+  for (const [provider, config] of Object.entries(TOP_MODELS_CONFIG)) {
+    if (config && config.length > 0) {
+      pushTop2(provider as AIProviderName, config);
     }
+  }
+  // JSON-catalog providers are excluded from TOP_MODELS_CONFIG above; merge
+  // their models in here, derived the same way getTopModelChoices() does.
+  for (const entry of [
+    ...getCatalogJsonEntries(),
+    ...getDecideCatalogEntries(),
+  ]) {
+    pushTop2(entry.id as AIProviderName, catalogTopModels(entry));
   }
 
   return popularModels;

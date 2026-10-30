@@ -341,22 +341,26 @@ pnpm run project:health
 pnpm run build:analyze
 ```
 
-### **Mock-First Testing Strategy**
-```typescript
-// Standard mock configuration
-vi.mock("ai", () => ({
-  stream: vi.fn(),
-  generate: vi.fn(),
-  Output: { object: vi.fn() },
-}));
+### **End-to-End Testing Strategy**
+Suites are end-to-end and run via `tsx`; there is no vitest runner and no
+module mocking. A suite drives a surface the package actually ships — it
+constructs `NeuroLink` from the built entry and calls `generate()`/`stream()`,
+or drives the built CLI. See CLAUDE.md rule 15 for the full contract,
+including the narrow determinism exception.
 
-// Provider-specific mocks
-vi.mock("@ai-sdk/openai", () => ({ openai: vi.fn() }));
-vi.mock("@ai-sdk/amazon-bedrock", () => ({
-  amazonBedrock: vi.fn(),
-  createAmazonBedrock: vi.fn(),
-}));
+```typescript
+import { NeuroLink } from "../dist/index.js";
+
+const sdk = new NeuroLink();
+const res = await sdk.generate({
+  input: { text: "hello" },
+  provider: "openai",
+});
 ```
+
+Take everything in one suite from the same module graph: `dist/` for a suite
+driving the public surface, `src/` for one under the determinism exception,
+never both — mixing them breaks stubs, spies and `instanceof` silently.
 
 ### **Testing Success Criteria**
 - ✅ **Zero Failures**: All executed tests must pass (26/29 currently passing)
@@ -402,7 +406,7 @@ memory-bank/research/          # Research & analysis
 ### **Documentation Creation Workflow**
 
 #### **For API Documentation (docs/)**
-<!-- TODO: ADD this -->
+<!-- TODO(#1318): ADD this -->
 
 #### **For Internal Knowledge (memory-bank/)**
 ```bash
@@ -456,7 +460,7 @@ memory-bank/research/NEW-FEATURE-ANALYSIS.md
 memory-bank/development/new-workflow-guide.md
 
 # ✅ Demo scripts
-scripts/examples/new-demo.js
+examples/new-demo.ts
 
 # ✅ Test files
 test/continuous-test-suite.ts
@@ -493,7 +497,7 @@ const hasServiceAccountEnvAuth = () => !!(process.env.GOOGLE_AUTH_CLIENT_EMAIL &
 // Always use full inference profile ARN for Anthropic models
 const getBedrockModelId = (): string => {
   return process.env.BEDROCK_MODEL ||
-         'arn:aws:bedrock:us-east-2:225681119357:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0';
+         'arn:aws:bedrock:us-east-2:123456789012:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0';
 };
 ```
 
@@ -1055,7 +1059,7 @@ scripts/
 ### **File Organization Rules**
 - **Provider Files**: `src/lib/providers/{providerName}.ts`
 - **Test Files**: `test/{feature}.test.ts`
-- **Demo Scripts**: `scripts/examples/{demo}.js`
+- **Demo Scripts**: `examples/{demo}.ts`
 - **Research Docs**: `memory-bank/research/{TOPIC}-ANALYSIS.md`
 - **Development Guides**: `memory-bank/development/{guide}.md`
 

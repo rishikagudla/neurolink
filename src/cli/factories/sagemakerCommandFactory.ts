@@ -1,14 +1,23 @@
+import { randomBytes } from "node:crypto";
 import type { Argv, CommandModule } from "yargs";
 import chalk from "chalk";
 import ora from "ora";
 import inquirer from "inquirer";
-import {
-  SageMakerClient,
-  ListEndpointsCommand,
-  type EndpointSummary,
-} from "@aws-sdk/client-sagemaker";
-import type { UnknownRecord } from "../../lib/types/common.js";
+import type { EndpointSummary } from "@aws-sdk/client-sagemaker";
+
+async function loadSageMakerControl() {
+  return tryImport<typeof import("@aws-sdk/client-sagemaker")>(
+    "@aws-sdk/client-sagemaker",
+    "SageMaker setup",
+  );
+}
+import type {
+  UnknownRecord,
+  DoGenerateModel,
+  SecureConfiguration,
+} from "../../lib/types/index.js";
 import { logger } from "../../lib/utils/logger.js";
+import { tryImport } from "../../lib/utils/tryImport.js";
 import {
   checkSageMakerConfiguration,
   getSageMakerConfig,
@@ -20,7 +29,21 @@ import {
   runQuickDiagnostics,
   formatDiagnosticReport,
 } from "../../lib/providers/sagemaker/diagnostics.js";
-import type { SecureConfiguration } from "../../lib/types/cli.js";
+
+/**
+ * Narrow a LanguageModel to a DoGenerateModel if it exposes doGenerate.
+ */
+function asDoGenerateModel(model: unknown): DoGenerateModel {
+  if (
+    model &&
+    typeof model === "object" &&
+    "doGenerate" in model &&
+    typeof (model as Record<string, unknown>).doGenerate === "function"
+  ) {
+    return model as DoGenerateModel;
+  }
+  throw new Error("Model does not support doGenerate method");
+}
 
 /**
  * Factory for creating SageMaker CLI commands using the Factory Pattern
@@ -193,7 +216,7 @@ export class SageMakerCommandFactory {
     timeout: number;
     maxRetries: number;
   }): SecureConfiguration {
-    const sessionId = `sagemaker_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const sessionId = `sagemaker_${Date.now()}_${randomBytes(16).toString("hex")}`;
 
     const secureConfig: SecureConfiguration = {
       ...config,
@@ -205,12 +228,15 @@ export class SageMakerCommandFactory {
     this.secureCredentialStore.set(sessionId, secureConfig);
 
     // Auto-cleanup after 5 minutes for security
-    setTimeout(
+    const expiry = setTimeout(
       () => {
         this.secureCredentialStore.delete(sessionId);
       },
       5 * 60 * 1000,
     );
+    // Setup also deletes the entry itself when it finishes; the timer is only
+    // the backstop and must not hold the CLI open for the rest of its window.
+    expiry.unref();
 
     return secureConfig;
   }
@@ -218,10 +244,11 @@ export class SageMakerCommandFactory {
   /**
    * Validate secure configuration without exposing credentials
    */
-  private static validateSecureConfiguration(
+  private static async validateSecureConfiguration(
     secureConfig: SecureConfiguration,
-  ): void {
+  ): Promise<void> {
     // Create temporary AWS SDK client with secure credentials
+    const { SageMakerClient } = await loadSageMakerControl();
     const tempClient = new SageMakerClient({
       region: secureConfig.region,
       credentials: {
@@ -350,7 +377,8 @@ export class SageMakerCommandFactory {
         // Run a simple generation test
         spinner.start("Testing text generation...");
         try {
-          const result = await languageModel.doGenerate({
+          const generateModel = asDoGenerateModel(languageModel);
+          const result = await generateModel.doGenerate({
             inputFormat: "messages" as const,
             mode: { type: "regular" as const },
             prompt: [
@@ -362,14 +390,14 @@ export class SageMakerCommandFactory {
             maxTokens: 50,
           });
 
-          spinner.succeed("✅ Text generation test successful");
-          logger.always(chalk.blue("\n📝 Test Response:"));
+          spinner.succeed("Text generation test successful");
+          logger.always(chalk.blue("\n Test Response:"));
           logger.always(`   Input: "${prompt}"`);
           logger.always(
             `   Output: "${result.text?.substring(0, 100)}${result.text && result.text.length > 100 ? "..." : ""}"`,
           );
           logger.always(
-            `   Tokens: ${result.usage.promptTokens} → ${result.usage.completionTokens} (${(result.usage as { totalTokens?: number }).totalTokens ?? result.usage.promptTokens + result.usage.completionTokens} total)`,
+            `   Tokens: ${result.usage.promptTokens ?? result.usage.inputTokens ?? 0} -> ${result.usage.completionTokens ?? result.usage.outputTokens ?? 0} (${result.usage.totalTokens ?? (result.usage.promptTokens ?? result.usage.inputTokens ?? 0) + (result.usage.completionTokens ?? result.usage.outputTokens ?? 0)} total)`,
           );
           logger.always(`   Finish Reason: ${result.finishReason}`);
         } catch (genError) {
@@ -406,6 +434,8 @@ export class SageMakerCommandFactory {
       // Use AWS SDK directly for better security and error handling
       try {
         const config = await getSageMakerConfig();
+        const { SageMakerClient, ListEndpointsCommand } =
+          await loadSageMakerControl();
         const sagemakerClient = new SageMakerClient({
           region: config.region,
           credentials: {
@@ -666,7 +696,7 @@ export class SageMakerCommandFactory {
       spinner.start("Setting up SageMaker configuration...");
 
       // Secure credential management without process.env exposure
-      const secureConfig = this.createSecureConfiguration({
+      const secureConfig = SageMakerCommandFactory.createSecureConfiguration({
         accessKeyId: answers.accessKeyId,
         secretAccessKey: answers.secretAccessKey,
         region: answers.region,
@@ -679,7 +709,7 @@ export class SageMakerCommandFactory {
       clearConfigurationCache();
 
       try {
-        this.validateSecureConfiguration(secureConfig); // Validate configuration is loadable
+        await SageMakerCommandFactory.validateSecureConfiguration(secureConfig); // Validate configuration is loadable
         spinner.succeed("✅ Configuration validated successfully");
 
         logger.always(chalk.green("\n🎉 SageMaker setup complete!"));
@@ -717,7 +747,7 @@ export class SageMakerCommandFactory {
         );
 
         // Clear secure credentials from memory after successful setup
-        this.clearSecureCredentials(secureConfig.sessionId);
+        SageMakerCommandFactory.clearSecureCredentials(secureConfig.sessionId);
       } catch (configError) {
         spinner.fail("❌ Configuration validation failed");
         logger.error(
@@ -726,7 +756,7 @@ export class SageMakerCommandFactory {
           ),
         );
         // Clear secure credentials from memory on error
-        this.clearSecureCredentials(secureConfig.sessionId);
+        SageMakerCommandFactory.clearSecureCredentials(secureConfig.sessionId);
         process.exit(1);
       }
     } catch (error) {
@@ -811,6 +841,7 @@ export class SageMakerCommandFactory {
       const provider = new AmazonSageMakerProvider(undefined, endpoint);
 
       const model = await provider.getModel();
+      const generateModel = asDoGenerateModel(model);
 
       spinner.text = "Running connectivity test...";
       const connectivityTest = await provider.testConnectivity();
@@ -842,7 +873,7 @@ export class SageMakerCommandFactory {
           batchPromises.push(
             (async () => {
               try {
-                const result = await model.doGenerate({
+                const result = await generateModel.doGenerate({
                   inputFormat: "messages" as const,
                   mode: { type: "regular" as const },
                   prompt: [
@@ -861,8 +892,13 @@ export class SageMakerCommandFactory {
                 return {
                   duration: Date.now() - requestStart,
                   tokens:
-                    (result.usage as { totalTokens?: number }).totalTokens ??
-                    result.usage.promptTokens + result.usage.completionTokens,
+                    result.usage.totalTokens ??
+                    (result.usage.promptTokens ??
+                      result.usage.inputTokens ??
+                      0) +
+                      (result.usage.completionTokens ??
+                        result.usage.outputTokens ??
+                        0),
                   success: true,
                 };
               } catch (error: unknown) {

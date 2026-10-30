@@ -9,7 +9,7 @@ import { z } from "zod";
 import type {
   SageMakerConfig,
   SageMakerModelConfig,
-} from "../../types/providers.js";
+} from "../../types/index.js";
 import { logger } from "../../utils/logger.js";
 
 /**
@@ -64,38 +64,84 @@ const modelConfigCache: Map<string, SageMakerModelConfig> = new Map();
  * @returns Validated SageMaker configuration
  * @throws {Error} When required configuration is missing or invalid
  */
-export function getSageMakerConfig(region?: string): SageMakerConfig {
-  // Return cached config if available
-  if (configCache) {
+export function getSageMakerConfig(
+  region?: string,
+  /**
+   * Per-request credentials, applied BEFORE validation.
+   *
+   * They have to participate in validation rather than be overlaid onto an
+   * already-validated result: this function throws when accessKeyId or
+   * secretAccessKey is empty, so a caller passing credentials explicitly
+   * still had to have AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY set in the
+   * environment or construction failed before their values were ever looked
+   * at. That made `credentials.sagemaker` unusable on its own, which is the
+   * entire point of per-request credentials.
+   */
+  overrides?: Partial<
+    Pick<
+      SageMakerConfig,
+      "region" | "accessKeyId" | "secretAccessKey" | "sessionToken" | "endpoint"
+    >
+  >,
+): SageMakerConfig {
+  // The cache holds the environment-derived config, so it can only be used
+  // when this call adds nothing of its own. Emptiness is decided by whether
+  // any field is actually set, not by whether an object was passed: the
+  // provider always passes an object literal, which is `{}` — and truthy —
+  // when the caller supplied no credentials. Testing the object itself would
+  // bypass the cache on every ordinary call and discard configuration loaded
+  // from file along with it.
+  // The `region` ARGUMENT counts as request-specific too, not just the
+  // overrides object. The provider passes its constructor region through it,
+  // so treating such a call as environment-derived would let it return a
+  // cached config carrying a different region — or cache its own explicit
+  // region and hand that to every later caller.
+  const hasRequestSpecificInput =
+    region !== undefined ||
+    (overrides !== undefined &&
+      Object.values(overrides).some((value) => value !== undefined));
+  if (configCache && !hasRequestSpecificInput) {
     return configCache;
   }
 
+  const explicitRegion = overrides?.region ?? region;
   const config: SageMakerConfig = {
+    // An explicitly supplied region is preserved even when empty, so the
+    // schema's min(1) rejects it rather than it being silently replaced by
+    // the environment. Only an absent one falls through.
     region:
-      region ||
-      process.env.SAGEMAKER_REGION ||
-      process.env.AWS_REGION ||
-      "us-east-1",
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
-    sessionToken: process.env.AWS_SESSION_TOKEN,
+      explicitRegion !== undefined
+        ? explicitRegion
+        : process.env.SAGEMAKER_REGION || process.env.AWS_REGION || "us-east-1",
+    // `??`, not `||`: an explicitly supplied empty credential must reach
+    // validation and be rejected there. With `||` it reads as absent and the
+    // request silently runs on whatever ambient AWS credentials the machine
+    // happens to have — which is precisely the per-request isolation this
+    // parameter exists to provide.
+    accessKeyId: overrides?.accessKeyId ?? process.env.AWS_ACCESS_KEY_ID ?? "",
+    secretAccessKey:
+      overrides?.secretAccessKey ?? process.env.AWS_SECRET_ACCESS_KEY ?? "",
+    sessionToken: overrides?.sessionToken ?? process.env.AWS_SESSION_TOKEN,
     timeout: parseInt(process.env.SAGEMAKER_TIMEOUT || "30000"),
     maxRetries: parseInt(process.env.SAGEMAKER_MAX_RETRIES || "3"),
-    endpoint: process.env.SAGEMAKER_ENDPOINT,
+    endpoint: overrides?.endpoint ?? process.env.SAGEMAKER_ENDPOINT,
   };
 
   // Validate configuration using Zod schema
   try {
     const validatedConfig = SageMakerConfigSchema.parse(config);
 
-    // Cache the validated configuration
-    configCache = validatedConfig;
+    // Only the environment-derived config is cacheable; a per-request result
+    // must not become the answer for every later caller.
+    if (!hasRequestSpecificInput) {
+      configCache = validatedConfig;
+    }
 
     return validatedConfig;
   } catch (error) {
     if (error instanceof z.ZodError) {
-      const errorMessages = error.errors.map(
-        (err) => `${err.path.join(".")}: ${err.message}`,
+      const errorMessages = error.issues.map(
+        (err) => `${String(err.path.join("."))}: ${err.message}`,
       );
       throw new Error(
         `SageMaker configuration validation failed:\n${errorMessages.join("\n")}\n\n` +
@@ -106,6 +152,7 @@ export function getSageMakerConfig(region?: string): SageMakerConfig {
           `- AWS_SESSION_TOKEN: Session token (optional, for temporary credentials)\n` +
           `- SAGEMAKER_TIMEOUT: Request timeout in ms (optional, default: 30000)\n` +
           `- SAGEMAKER_MAX_RETRIES: Max retry attempts (optional, default: 3)`,
+        { cause: error },
       );
     }
     throw error;
@@ -184,11 +231,12 @@ export function getSageMakerModelConfig(
     return validatedConfig;
   } catch (error) {
     if (error instanceof z.ZodError) {
-      const errorMessages = error.errors.map(
-        (err) => `${err.path.join(".")}: ${err.message}`,
+      const errorMessages = error.issues.map(
+        (err) => `${String(err.path.join("."))}: ${err.message}`,
       );
       throw new Error(
         `SageMaker model configuration validation failed for endpoint '${endpoint}':\n${errorMessages.join("\n")}`,
+        { cause: error },
       );
     }
     throw error;
@@ -369,6 +417,7 @@ export async function loadConfigurationFromFile(
       `Failed to load SageMaker configuration from file '${filePath}': ${
         error instanceof Error ? error.message : "Unknown error"
       }`,
+      { cause: error },
     );
   }
 }

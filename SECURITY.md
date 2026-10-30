@@ -2,13 +2,26 @@
 
 ## Supported Versions
 
-We release security updates for the following versions of NeuroLink:
+NeuroLink releases continuously from the `release` branch with semantic
+versioning; the current major line is where fixes land. Versions as of
+2026-10-26 (`gh api repos/juspay/neurolink/tags`):
 
-| Version | Supported          | Status              |
-| ------- | ------------------ | ------------------- |
-| 8.x     | :white_check_mark: | Active development  |
-| 7.x     | :warning:          | Security fixes only |
-| < 7.0   | :x:                | No longer supported |
+| Version        | Supported          | Status                                                             |
+| -------------- | ------------------ | ------------------------------------------------------------------ |
+| 13.x (13.8.16) | :white_check_mark: | Active development — every fix ships here                          |
+| 12.x (12.59.0) | :warning:          | Security fixes on request, for a bounded period after 13.0 shipped |
+| < 12.0         | :x:                | No longer supported — upgrade                                      |
+
+Upgrade with `npm install @juspay/neurolink@latest` (or an exact version); the
+[migration guide](docs/guides/migration-guide.md) lists breaking changes per
+major.
+
+### Runtime
+
+NeuroLink requires a currently supported Node.js line with the latest security
+patches applied (`engines.node` in `package.json`). Node security releases are
+announced at <https://nodejs.org/en/blog/vulnerability/>; a NeuroLink release
+never backports a Node fix, so keep the runtime current independently.
 
 ## Reporting a Vulnerability
 
@@ -18,7 +31,14 @@ If you discover a security vulnerability in NeuroLink, please report it responsi
 
 ### How to Report
 
-**Email:** security@juspay.in
+**Preferred:** open a private vulnerability report at
+<https://github.com/juspay/neurolink/security/advisories/new>. It reaches the
+maintainers directly, stays private until a fix is published, and gives the
+report a GHSA id and a CVE if one is warranted. No account with write access is
+needed.
+
+**Alternative:** email **security@juspay.in**. Use this if the GitHub form is
+unavailable to you; please do not open a public issue or pull request.
 
 Please include the following information in your report:
 
@@ -72,7 +92,11 @@ When using NeuroLink in production, follow these security best practices:
 NeuroLink includes a production-ready HITL system for high-stakes operations:
 
 ```typescript
-import { NeuroLink } from "@juspay/neurolink";
+import {
+  NeuroLink,
+  type ConfirmationRequestEvent,
+  type ConfirmationResponseEvent,
+} from "@juspay/neurolink";
 
 const neurolink = new NeuroLink({
   hitl: {
@@ -88,15 +112,18 @@ const neurolink = new NeuroLink({
     ],
     timeout: 60000, // 60 seconds for user response
     autoApproveOnTimeout: false, // Reject on timeout for safety
-    allowArgumentModification: true, // Allow users to modify tool arguments
-    auditLogging: true, // Enable audit logs for compliance
+    allowArgumentModification: true, // Hint for the approval UI; not enforced
+    auditLogging: true, // Log each approval request and decision, with the full tool arguments
   },
 });
 
 // Listen for confirmation requests using events
 const emitter = neurolink.getEventEmitter();
 emitter.on("hitl:confirmation-request", async (event) => {
-  const { confirmationId, toolName, arguments: args } = event.payload;
+  const receivedAt = Date.now();
+  // The emitter types listener arguments as unknown, so narrow the event
+  const { payload } = event as ConfirmationRequestEvent;
+  const { confirmationId, toolName, arguments: args } = payload;
 
   // Integrate with your approval system
   const approved = await yourApprovalSystem.requestReview({
@@ -111,11 +138,16 @@ emitter.on("hitl:confirmation-request", async (event) => {
       confirmationId,
       approved,
       reason: approved ? undefined : "Denied by security policy",
-      metadata: { timestamp: new Date().toISOString() },
+      metadata: {
+        timestamp: new Date().toISOString(),
+        responseTime: Date.now() - receivedAt, // ms since the request arrived
+      },
     },
-  });
+  } satisfies ConfirmationResponseEvent);
 });
 ```
+
+> **Audit logs hold tool arguments.** With `auditLogging: true`, each request and decision is written to the NeuroLink logger at info level, and every entry includes the full tool arguments. Redact secrets and personal data at the logger sink, or send the logs to a protected sink that only reviewers can read.
 
 **Use HITL for:**
 
@@ -171,17 +203,20 @@ NeuroLink includes enterprise-grade security features:
 
 ### Audit Trail
 
-Full audit logging for compliance (HIPAA, SOC2, GDPR):
+Request and decision logging for HITL approvals. It is a log, not a compliance control:
 
 ```typescript
 const neurolink = new NeuroLink({
   enableAnalytics: true, // Captures full request/response data
   hitl: {
     enabled: true,
-    auditLogging: true, // Logs all approval decisions
+    dangerousActions: ["delete", "remove", "drop"], // Required when enabled
+    auditLogging: true, // Logs each approval request and decision, with the full tool arguments
   },
 });
 ```
+
+Audit entries include the full tool arguments, so redact sensitive fields at the logger sink or send the logs to a protected sink.
 
 ### Guardrails Middleware
 
@@ -226,21 +261,29 @@ const result = await neurolink.generate({
 });
 ```
 
-## Previous Security Advisories
+## Published Security Advisories
 
-We maintain a list of all security advisories:
+Every advisory for this package is published through GitHub Security Advisories
+and mirrored to the GitHub Advisory Database (so `npm audit` and Dependabot see
+it):
 
-- [GitHub Security Advisories](https://github.com/juspay/neurolink/security/advisories)
+- <https://github.com/juspay/neurolink/security/advisories>
 
-No security advisories have been published as of this document's creation.
+Advisories have been published there (for example GHSA-6jr6-6vw7-f9gx). Each one
+names the first fixed version. The repository's own dependency gate
+(`scripts/security-check.ts`) accepts a third-party advisory only by GHSA id,
+with a declared dependency path, an expiry date and a stated reason; the
+accepted-risk table is printed in every CI run's job summary.
 
 ## Security Updates
 
 Subscribe to security updates:
 
-- Watch the [NeuroLink repository](https://github.com/juspay/neurolink) for security announcements
-- Follow [@juspay](https://twitter.com/juspay) on Twitter
-- Subscribe to release notifications
+- Watch the [NeuroLink repository](https://github.com/juspay/neurolink) with
+  "Custom → Security alerts" enabled; published advisories are delivered there
+- Enable Dependabot alerts on your own repository: advisories for this package
+  reach the GitHub Advisory Database and `npm audit`
+- Subscribe to release notifications for the fixed versions
 
 ## Bug Bounty Program
 

@@ -21,8 +21,20 @@ import type {
   ServerAdapterConfig,
   ServerAdapterEvents,
   ServerContext,
-} from "../types.js";
+} from "../../types/index.js";
+import { resolveClientAddress } from "../utils/clientAddress.js";
+import { shapeRouteError } from "../utils/clientError.js";
+import { pathMatchesAny } from "../utils/pathMatch.js";
 import { isErrorResponse } from "../utils/validation.js";
+import { createBoundedBodyParser } from "../utils/expressBody.js";
+import {
+  isRawBodyContentType,
+  isWebResponse,
+  readWebResponse,
+} from "../utils/rawBody.js";
+
+/** How long `listen()` may take; `config.timeout` is the per-request budget. */
+const STARTUP_TIMEOUT_MS = 30_000;
 
 /**
  * Express-specific server adapter
@@ -32,6 +44,8 @@ export class ExpressServerAdapter extends BaseServerAdapter {
   private server?: import("http").Server;
   private frameworkInitialized = false;
   private sockets: Set<Socket> = new Set();
+  // The rate limiter counts nothing it cannot attribute, and says so once.
+  private warnedNoClientAddress = false;
 
   constructor(neurolink: NeuroLink, config: ServerAdapterConfig = {}) {
     super(neurolink, config);
@@ -54,7 +68,9 @@ export class ExpressServerAdapter extends BaseServerAdapter {
     }
 
     // Dynamic import to avoid loading if not used (ESM-compatible)
-    const expressModule = await import("express");
+    const expressModule = await this.importFrameworkDependency<{
+      default: typeof import("express");
+    }>("express", "Express");
     const express = expressModule.default;
     this.app = express();
 
@@ -64,19 +80,40 @@ export class ExpressServerAdapter extends BaseServerAdapter {
         this.config.bodyParser.maxSize ||
         this.config.bodyParser.jsonLimit ||
         "10mb";
+      const jsonLimit = this.config.bodyParser.jsonLimit || bodyLimit;
+      // body-parser drains a body it refuses, so each is read through a bound.
       this.app.use(
-        express.json({ limit: this.config.bodyParser.jsonLimit || bodyLimit }),
+        createBoundedBodyParser(express.json({ limit: jsonLimit }), jsonLimit),
       );
-      this.app.use(express.urlencoded({ extended: true, limit: bodyLimit }));
+      this.app.use(
+        createBoundedBodyParser(
+          express.urlencoded({ extended: true, limit: bodyLimit }),
+          bodyLimit,
+        ),
+      );
+      // Uploads (multipart, octet-stream, audio/*) reach the route as bytes.
+      this.app.use(
+        express.raw({
+          type: (req) => isRawBodyContentType(req.headers["content-type"]),
+          limit: this.config.bodyParser.rawMaxSize || "64mb",
+        }),
+      );
     }
 
     // CORS
     if (this.config.cors.enabled) {
-      const corsModule = await import("cors");
+      const corsModule = await this.importFrameworkDependency<{
+        default: typeof import("cors");
+      }>("cors", "Express");
       const cors = corsModule.default;
       this.app.use(
         cors({
-          origin: this.config.cors.origins,
+          // A list is matched literally, so the default `["*"]` would match
+          // nothing; the wildcard has to be the string "*" (Koa handles it in
+          // its origin callback).
+          origin: this.config.cors.origins.includes("*")
+            ? "*"
+            : this.config.cors.origins,
           methods: this.config.cors.methods,
           allowedHeaders: this.config.cors.headers,
           credentials: this.config.cors.credentials,
@@ -87,12 +124,21 @@ export class ExpressServerAdapter extends BaseServerAdapter {
 
     // Rate limiting
     if (this.config.rateLimit.enabled) {
-      const rateLimitModule = await import("express-rate-limit");
+      const rateLimitModule = await this.importFrameworkDependency<
+        typeof import("express-rate-limit")
+      >("express-rate-limit", "Express");
       const rateLimit = rateLimitModule.default;
       const windowMs = this.config.rateLimit.windowMs;
       const limiter = rateLimit({
         windowMs,
         max: this.config.rateLimit.maxRequests,
+        // The key is resolved here, from the TCP peer or, behind a declared
+        // proxy, the client it reports; the library's own reading of the
+        // request (and its warnings about it) is not used. A request with no
+        // attributable address passes rather than share a bucket.
+        validate: false,
+        keyGenerator: (req: Request) => this.clientKeyFor(req) ?? "",
+        skip: (req: Request) => this.clientKeyFor(req) === undefined,
         message: {
           error: {
             code: "RATE_LIMIT_EXCEEDED",
@@ -155,12 +201,38 @@ export class ExpressServerAdapter extends BaseServerAdapter {
     this.frameworkInitialized = true;
   }
 
+  /** The address a request is counted against; `undefined` when there is none. */
+  private clientKeyFor(req: Request): string | undefined {
+    const key = resolveClientAddress({
+      remoteAddress: req.socket?.remoteAddress,
+      forwardedFor: req.headers["x-forwarded-for"] as string | undefined,
+      trustProxy: this.config.rateLimit.trustProxy,
+      trustedProxies: this.config.rateLimit.trustedProxies,
+    });
+    if (key === undefined && !this.warnedNoClientAddress) {
+      this.warnedNoClientAddress = true;
+      logger.alwaysStderr(
+        "[ExpressAdapter] A request arrived with no peer address, so the rate limiter cannot count it; configure rateLimit.keyGenerator to limit by another key.",
+      );
+    }
+    return key;
+  }
+
   /**
    * Override initialize to ensure async framework setup
    */
   public async initialize(): Promise<void> {
-    // Initialize Express asynchronously first
-    await this.initializeFrameworkAsync();
+    // Initialize Express asynchronously first. This runs before
+    // super.initialize()'s try/catch even starts, so a failure here (e.g. the
+    // "express" package is not installed) must be caught here too — otherwise
+    // it propagates with lifecycleState left at "uninitialized" instead of
+    // "error".
+    try {
+      await this.initializeFrameworkAsync();
+    } catch (error) {
+      this.lifecycleState = "error";
+      throw error;
+    }
 
     // Then call base class initialize
     await super.initialize();
@@ -180,7 +252,7 @@ export class ExpressServerAdapter extends BaseServerAdapter {
 
     this.app[method](
       route.path,
-      async (req: Request, res: Response, next: NextFunction) => {
+      async (req: Request, res: Response, _next: NextFunction) => {
         const requestId = req.headers["x-request-id"] as string;
         const startTime = Date.now();
 
@@ -193,12 +265,27 @@ export class ExpressServerAdapter extends BaseServerAdapter {
           query: req.query as Record<string, string>,
           params: req.params as Record<string, string>,
           body: req.body,
+          remoteAddress: req.socket?.remoteAddress,
         });
 
         // Copy response headers from middleware (stored in res.locals by middleware)
         if (res.locals.responseHeaders) {
           ctx.responseHeaders = { ...res.locals.responseHeaders };
         }
+        this.restoreCarriedContext(ctx, res.locals.carriedContext);
+
+        // The handler learns of a client that went away, and a request over
+        // `config.timeout` is answered 504 and its work aborted. Express used
+        // to apply that timeout only to its own listen().
+        const abort = this.attachRequestAbort(ctx, {
+          onClientClose: (listener) =>
+            res.on("close", () => {
+              if (!res.writableFinished) {
+                listener();
+              }
+            }),
+          applyTimeout: !route.streaming?.enabled,
+        });
 
         // Emit request event
         this.emit("request", {
@@ -215,8 +302,29 @@ export class ExpressServerAdapter extends BaseServerAdapter {
           }
 
           // Execute handler
-          const result = await route.handler(ctx);
+          const result = abort.deadline
+            ? await Promise.race([route.handler(ctx), abort.deadline])
+            : await route.handler(ctx);
           const duration = Date.now() - startTime;
+
+          // A route that answers in its own wire format returns a web Response.
+          if (isWebResponse(result)) {
+            const raw = await readWebResponse(result);
+            this.emit("response", {
+              requestId,
+              statusCode: raw.status,
+              duration,
+              timestamp: new Date(),
+            } satisfies ServerAdapterEvents["response"]);
+            for (const [key, value] of Object.entries({
+              ...ctx.responseHeaders,
+              ...raw.headers,
+            })) {
+              res.setHeader(key, value);
+            }
+            res.status(raw.status).send(raw.body);
+            return;
+          }
 
           // Check if result is an error response
           if (isErrorResponse(result)) {
@@ -275,7 +383,30 @@ export class ExpressServerAdapter extends BaseServerAdapter {
             },
           });
         } catch (error) {
-          next(error);
+          // The exception's text stays in the log under this request id; the
+          // client gets a fixed message for its category.
+          const shaped = shapeRouteError("ExpressAdapter", requestId, error);
+          this.emitRequestError({
+            requestId,
+            error: error instanceof Error ? error : new Error(String(error)),
+            timestamp: new Date(),
+          });
+          this.emit("response", {
+            requestId,
+            statusCode: shaped.status,
+            duration: Date.now() - startTime,
+            timestamp: new Date(),
+          } satisfies ServerAdapterEvents["response"]);
+          if (res.headersSent) {
+            res.end();
+            return;
+          }
+          res.status(shaped.status).json({
+            error: { code: shaped.code, message: shaped.message },
+            metadata: { requestId, timestamp: new Date().toISOString() },
+          });
+        } finally {
+          abort.release();
         }
       },
     );
@@ -298,25 +429,35 @@ export class ExpressServerAdapter extends BaseServerAdapter {
       (error: Error, req: Request, res: Response, _next: NextFunction) => {
         const requestId = req.headers["x-request-id"] as string;
 
-        logger.error("[ExpressAdapter] Request error", {
-          requestId,
-          error: error.message,
-          stack: error.stack,
-        });
+        this.logRequestError("ExpressAdapter", requestId, error);
 
-        this.emit("error", {
+        this.emitRequestError({
           requestId,
           error,
           timestamp: new Date(),
-        } satisfies ServerAdapterEvents["error"]);
+        });
 
         // Use dynamic status code from ServerAdapterError if available
         const isServerAdapterError = error instanceof ServerAdapterError;
-        const statusCode = isServerAdapterError ? error.getHttpStatus() : 500;
-        const errorCode = isServerAdapterError ? error.code : "INTERNAL_ERROR";
-        const errorMessage = isServerAdapterError
-          ? error.message
-          : "An internal error occurred";
+        // body-parser marks an over-limit body; it is the client's error.
+        const tooLarge =
+          !isServerAdapterError &&
+          "type" in error &&
+          error.type === "entity.too.large";
+        const statusCode = isServerAdapterError
+          ? error.getHttpStatus()
+          : tooLarge
+            ? 413
+            : 500;
+        const errorCode = isServerAdapterError
+          ? error.code
+          : tooLarge
+            ? "PAYLOAD_TOO_LARGE"
+            : "INTERNAL_ERROR";
+        const errorMessage =
+          isServerAdapterError || tooLarge
+            ? error.message
+            : "An internal error occurred";
 
         res.status(statusCode).json({
           error: {
@@ -365,10 +506,14 @@ export class ExpressServerAdapter extends BaseServerAdapter {
       res.write(`data: \n\n`);
       res.end();
     } catch (error) {
+      const shaped = shapeRouteError("ExpressAdapter", ctx.requestId, error);
       res.write(`event: error\n`);
       res.write(
         `data: ${JSON.stringify({
-          error: error instanceof Error ? error.message : "Stream error",
+          error: shaped.message,
+          code: shaped.code,
+          status: shaped.status,
+          requestId: ctx.requestId,
         })}\n\n`,
       );
       res.end();
@@ -388,7 +533,7 @@ export class ExpressServerAdapter extends BaseServerAdapter {
         path,
         async (req: Request, res: Response, next: NextFunction) => {
           // Skip excluded paths
-          if (middleware.excludePaths?.some((p) => req.path.startsWith(p))) {
+          if (pathMatchesAny(req.path, middleware.excludePaths)) {
             return next();
           }
 
@@ -408,14 +553,19 @@ export class ExpressServerAdapter extends BaseServerAdapter {
             query: req.query as Record<string, string>,
             params: req.params as Record<string, string>,
             body: req.body,
+            remoteAddress: req.socket?.remoteAddress,
           });
 
           // Copy existing response headers to context
           ctx.responseHeaders = { ...res.locals.responseHeaders };
+          this.restoreCarriedContext(ctx, res.locals.carriedContext);
 
           // Execute middleware
           try {
             await middleware.handler(ctx, async () => {
+              // What this middleware set (ctx.user included) is for the next
+              // middleware and the route handler, which build their own contexts.
+              res.locals.carriedContext = this.captureCarriedContext(ctx);
               // After middleware execution, merge response headers back to res.locals
               if (ctx.responseHeaders) {
                 Object.assign(res.locals.responseHeaders, ctx.responseHeaders);
@@ -451,7 +601,7 @@ export class ExpressServerAdapter extends BaseServerAdapter {
 
     this.lifecycleState = "starting";
     const { port, host } = this.config;
-    const startupTimeout = this.config.timeout || 30000;
+    const startupTimeout = STARTUP_TIMEOUT_MS;
 
     const startPromise = new Promise<void>((resolve, reject) => {
       try {
@@ -459,6 +609,7 @@ export class ExpressServerAdapter extends BaseServerAdapter {
           this.isRunning = true;
           this.startTime = new Date();
           this.lifecycleState = "running";
+          this.warnIfSensitiveRoutesUnauthenticated();
 
           // Track connections for graceful shutdown
           this.server?.on("connection", (socket: Socket) => {
@@ -605,7 +756,11 @@ export class ExpressServerAdapter extends BaseServerAdapter {
   /**
    * Get the Express app instance
    */
-  public getFrameworkInstance(): Express {
+  public getFrameworkInstance(): unknown {
     return this.app;
+  }
+
+  public override getNativeServer(): unknown {
+    return this.server;
   }
 }

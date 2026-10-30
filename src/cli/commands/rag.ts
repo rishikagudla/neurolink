@@ -26,8 +26,10 @@ import { InMemoryVectorStore } from "../../lib/rag/retrieval/vectorQueryTool.js"
 import type {
   Chunk,
   ChunkingStrategy,
-  RAGCommandArgs,
-} from "../../lib/rag/types.js";
+  RagChunkArgs,
+  RagIndexArgs,
+  RagQueryArgs,
+} from "../../lib/types/index.js";
 import { globalSession } from "../../lib/session/globalSessionState.js";
 import { logger } from "../../lib/utils/logger.js";
 import { getBestProvider } from "../../lib/utils/providerUtils.js";
@@ -207,27 +209,6 @@ async function getEmbeddingModel(
 /**
  * Chunk subcommand arguments
  */
-interface ChunkArgs extends RAGCommandArgs {
-  file: string;
-  output?: string;
-  extract?: boolean;
-}
-
-/**
- * Index subcommand arguments
- */
-interface IndexArgs extends RAGCommandArgs {
-  file: string;
-  indexName?: string;
-}
-
-/**
- * Query subcommand arguments
- */
-interface QueryArgs extends RAGCommandArgs {
-  query: string;
-  indexName?: string;
-}
 
 /**
  * In-memory storage for indexed documents
@@ -316,7 +297,7 @@ function formatChunks(chunks: Chunk[], format: string): string {
 /**
  * Create the chunk subcommand
  */
-function createChunkCommand(): CommandModule<{}, ChunkArgs> {
+function createChunkCommand(): CommandModule<{}, RagChunkArgs> {
   return {
     command: "chunk <file>",
     describe: "Chunk a document into smaller pieces for processing",
@@ -388,8 +369,8 @@ function createChunkCommand(): CommandModule<{}, ChunkArgs> {
           describe: "Enable verbose output",
           type: "boolean",
           default: false,
-        }) as Argv<ChunkArgs>,
-    handler: async (args: Arguments<ChunkArgs>) => {
+        }) as Argv<RagChunkArgs>,
+    handler: async (args: Arguments<RagChunkArgs>) => {
       const spinner = ora("Processing document...").start();
 
       try {
@@ -504,7 +485,7 @@ function createChunkCommand(): CommandModule<{}, ChunkArgs> {
 /**
  * Create the index subcommand
  */
-function createIndexCommand(): CommandModule<{}, IndexArgs> {
+function createIndexCommand(): CommandModule<{}, RagIndexArgs> {
   return {
     command: "index <file>",
     describe: "Index a document for semantic search",
@@ -571,8 +552,8 @@ function createIndexCommand(): CommandModule<{}, IndexArgs> {
           describe: "Enable verbose output",
           type: "boolean",
           default: false,
-        }) as Argv<IndexArgs>,
-    handler: async (args: Arguments<IndexArgs>) => {
+        }) as Argv<RagIndexArgs>,
+    handler: async (args: Arguments<RagIndexArgs>) => {
       const spinner = ora("Indexing document...").start();
 
       try {
@@ -637,10 +618,7 @@ function createIndexCommand(): CommandModule<{}, IndexArgs> {
         );
 
         // Verify the provider has an embed method
-        if (
-          typeof (embeddingProvider as unknown as { embed?: unknown }).embed !==
-          "function"
-        ) {
+        if (typeof embeddingProvider.embed !== "function") {
           spinner.fail(
             chalk.red(
               `Provider ${embeddingProviderName} with model ${embeddingModelName} does not support embeddings. ` +
@@ -653,11 +631,7 @@ function createIndexCommand(): CommandModule<{}, IndexArgs> {
         // Generate embeddings
         const embeddings: number[][] = [];
         for (const chunk of chunks) {
-          const embedding = await (
-            embeddingProvider as unknown as {
-              embed: (s: string) => Promise<number[]>;
-            }
-          ).embed(chunk.text);
+          const embedding = await embeddingProvider.embed(chunk.text);
           embeddings.push(embedding);
           chunk.embedding = embedding;
         }
@@ -737,7 +711,7 @@ function createIndexCommand(): CommandModule<{}, IndexArgs> {
 /**
  * Create the query subcommand
  */
-function createQueryCommand(): CommandModule<{}, QueryArgs> {
+function createQueryCommand(): CommandModule<{}, RagQueryArgs> {
   return {
     command: "query <query>",
     describe: "Query indexed documents",
@@ -793,8 +767,8 @@ function createQueryCommand(): CommandModule<{}, QueryArgs> {
           describe: "Enable verbose output",
           type: "boolean",
           default: false,
-        }) as Argv<QueryArgs>,
-    handler: async (args: Arguments<QueryArgs>) => {
+        }) as Argv<RagQueryArgs>,
+    handler: async (args: Arguments<RagQueryArgs>) => {
       const spinner = ora("Searching...").start();
 
       try {
@@ -840,10 +814,7 @@ function createQueryCommand(): CommandModule<{}, QueryArgs> {
         );
 
         // Verify the provider has an embed method
-        if (
-          typeof (embeddingProvider as unknown as { embed?: unknown }).embed !==
-          "function"
-        ) {
+        if (typeof embeddingProvider.embed !== "function") {
           spinner.fail(
             chalk.red(
               `Provider ${embeddingProviderName} with model ${embeddingModelName} does not support embeddings. ` +
@@ -853,11 +824,7 @@ function createQueryCommand(): CommandModule<{}, QueryArgs> {
           process.exit(1);
         }
 
-        const queryEmbedding = await (
-          embeddingProvider as unknown as {
-            embed: (s: string) => Promise<number[]>;
-          }
-        ).embed(args.query);
+        const queryEmbedding = await embeddingProvider.embed(args.query);
 
         let results: Array<{ id: string; score: number; text: string }>;
 

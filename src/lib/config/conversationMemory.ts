@@ -3,10 +3,12 @@
  * Provides default values for conversation memory feature with environment variable support
  */
 
-import type { ConversationMemoryConfig } from "../types/conversation.js";
+import type { ConversationMemoryConfig } from "../types/index.js";
 
 /**
  * Default maximum number of turns per session
+ * @deprecated Use tokenThreshold-based memory management instead.
+ * This constant is kept for backward compatibility with legacy turn-based memory.
  */
 export const DEFAULT_MAX_TURNS_PER_SESSION = 50;
 
@@ -93,13 +95,8 @@ export function getConversationMemoryDefaults(): ConversationMemoryConfig {
     summarizationModel:
       process.env.NEUROLINK_SUMMARIZATION_MODEL || "gemini-2.5-flash",
 
-    // Deprecated (for backward compatibility)
-    maxTurnsPerSession:
-      Number(process.env.NEUROLINK_MEMORY_MAX_TURNS_PER_SESSION) ||
-      DEFAULT_MAX_TURNS_PER_SESSION,
-    summarizationThresholdTurns:
-      Number(process.env.NEUROLINK_SUMMARIZATION_THRESHOLD_TURNS) || 20,
-    summarizationTargetTurns:
-      Number(process.env.NEUROLINK_SUMMARIZATION_TARGET_TURNS) || 10,
+    // @deprecated — Turn-based fields are superseded by tokenThreshold-based memory.
+    // Kept for backward compatibility; will be removed in a future major version.
+    maxTurnsPerSession: DEFAULT_MAX_TURNS_PER_SESSION,
   };
 }

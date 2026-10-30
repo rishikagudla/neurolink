@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v8.32.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,8 +8,6 @@
 
 > **ExecutionContext**\<`T`\> = `object`
 
-Defined in: [types/tools.ts:55](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L55)
-
 Generic execution context for MCP operations
 Moved from src/lib/mcp/contracts/mcpContract.ts
 
@@ -17,68 +15,64 @@ Moved from src/lib/mcp/contracts/mcpContract.ts
 
 ### T
 
-`T` = `StandardRecord`
+`T` = [`StandardRecord`](StandardRecord.md)
 
 ## Properties
 
 ### sessionId?
 
-> `optional` **sessionId**: `string`
-
-Defined in: [types/tools.ts:57](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L57)
+> `optional` **sessionId?**: `string`
 
 ---
 
 ### userId?
 
-> `optional` **userId**: `string`
-
-Defined in: [types/tools.ts:58](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L58)
+> `optional` **userId?**: `string`
 
 ---
 
 ### config?
 
-> `optional` **config**: `T`
-
-Defined in: [types/tools.ts:61](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L61)
+> `optional` **config?**: `T`
 
 ---
 
 ### metadata?
 
-> `optional` **metadata**: `StandardRecord`
-
-Defined in: [types/tools.ts:62](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L62)
+> `optional` **metadata?**: [`StandardRecord`](StandardRecord.md)
 
 ---
 
 ### cacheOptions?
 
-> `optional` **cacheOptions**: `CacheOptions`
-
-Defined in: [types/tools.ts:65](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L65)
+> `optional` **cacheOptions?**: [`CacheOptions`](CacheOptions.md)
 
 ---
 
 ### fallbackOptions?
 
-> `optional` **fallbackOptions**: `FallbackOptions`
-
-Defined in: [types/tools.ts:66](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L66)
+> `optional` **fallbackOptions?**: [`FallbackOptions`](FallbackOptions.md)
 
 ---
 
 ### timeoutMs?
 
-> `optional` **timeoutMs**: `number`
+> `optional` **timeoutMs?**: `number`
 
-Defined in: [types/tools.ts:67](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L67)
+---
+
+### maxRetries?
+
+> `optional` **maxRetries?**: `number`
 
 ---
 
 ### startTime?
 
-> `optional` **startTime**: `number`
+> `optional` **startTime?**: `number`
 
-Defined in: [types/tools.ts:68](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L68)
+---
+
+### hitlState?
+
+> `optional` **hitlState?**: [`HITLExecutionState`](HITLExecutionState.md)

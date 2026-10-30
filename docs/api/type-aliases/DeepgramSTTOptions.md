@@ -1,0 +1,73 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / DeepgramSTTOptions
+
+# Type Alias: DeepgramSTTOptions
+
+> **DeepgramSTTOptions** = [`STTOptions`](STTOptions.md) & `object`
+
+## Type Declaration
+
+### model?
+
+> `optional` **model?**: [`DeepgramModel`](DeepgramModel.md) \| `"nova-3"`
+
+### smartFormat?
+
+> `optional` **smartFormat?**: `boolean`
+
+### search?
+
+> `optional` **search?**: `string`[]
+
+### replace?
+
+> `optional` **replace?**: `object`[]
+
+### utterances?
+
+> `optional` **utterances?**: `boolean`
+
+### utterSplit?
+
+> `optional` **utterSplit?**: `number`
+
+### uttSplit?
+
+> `optional` **uttSplit?**: `number`
+
+Alias for utterSplit (legacy field name)
+
+### paragraphs?
+
+> `optional` **paragraphs?**: `boolean`
+
+### keywords?
+
+> `optional` **keywords?**: `string`[]
+
+### keywordBoost?
+
+> `optional` **keywordBoost?**: `"legacy"` \| `"medium"` \| `"high"`
+
+### fillerWords?
+
+> `optional` **fillerWords?**: `boolean`
+
+### detectTopics?
+
+> `optional` **detectTopics?**: `boolean`
+
+### detectEntities?
+
+> `optional` **detectEntities?**: `boolean`
+
+### summarize?
+
+> `optional` **summarize?**: `boolean`
+
+### redact?
+
+> `optional` **redact?**: (`"pci"` \| `"numbers"` \| `"ssn"`)[]

@@ -1,0 +1,56 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / ProcessedWord
+
+# Type Alias: ProcessedWord
+
+> **ProcessedWord** = [`ProcessedFileBase`](ProcessedFileBase.md) & `object`
+
+Processed Word document result.
+
+## Type Declaration
+
+### textContent
+
+> **textContent**: `string`
+
+Extracted plain text content from the Word document
+
+### htmlContent
+
+> **htmlContent**: `string`
+
+HTML representation of the Word document
+
+### markdownContent
+
+> **markdownContent**: `string`
+
+Markdown rendering of `htmlContent`, preserving the structure that plain
+text loses: headings, ordered/unordered lists and tables.
+
+### warnings
+
+> **warnings**: `string`[]
+
+Warnings from mammoth extraction (e.g., unsupported elements)
+
+### wordCount
+
+> **wordCount**: `number`
+
+Whitespace-delimited word count of `textContent`.
+
+### paragraphCount
+
+> **paragraphCount**: `number`
+
+Count of non-empty text blocks in `textContent`.
+
+### characterCount
+
+> **characterCount**: `number`
+
+Character count of `textContent`, including whitespace.

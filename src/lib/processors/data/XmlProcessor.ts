@@ -15,6 +15,20 @@
  * 2. **Mitigation**: We reject XML files containing DOCTYPE or ENTITY declarations
  *    and disable entity processing in the parser.
  *
+ * ⚠️ **Reachability**: this guard is not currently wired into the
+ * `generate()`/`stream()` attachment pipeline for a standalone `.xml` file.
+ * `src/lib/processors/config/fileTypeRegistry.ts` has no `"xml"` entry,
+ * `src/lib/utils/mimeTypeHints.ts` maps `application/xml`/`text/xml` to the
+ * generic `"text"` file type, and `messageBuilder.ts`'s `allowedTypes`
+ * whitelist has no `"xml"` entry either — so a `.xml` attachment is always
+ * routed to inert generic-text handling, and `checkXxeVectors()` /
+ * `parseXmlSecurely()` below are never invoked from that path. The
+ * `ProcessorRegistry` subsystem that does own this file has no importer
+ * outside `src/lib/processors/` itself. The guard is correct; it is simply
+ * orphaned. See `test/continuous-test-suite-office-security.ts`'s header for
+ * the test-coverage consequence — no e2e test exercises this file today,
+ * because there is no public surface that reaches it (CLAUDE.md rule 15).
+ *
  * References:
  * - https://owasp.org/www-community/vulnerabilities/XML_External_Entity_(XXE)_Processing
  * - https://cwe.mitre.org/data/definitions/611.html (XXE)
@@ -42,10 +56,11 @@ import { createRequire } from "node:module";
 import { BaseFileProcessor } from "../base/BaseFileProcessor.js";
 import type {
   FileInfo,
-  FileProcessingResult,
-  OperationResult,
+  ProcessorFileProcessingResult,
+  ProcessorOperationResult,
   ProcessOptions,
-} from "../base/types.js";
+  ProcessedXml,
+} from "../../types/index.js";
 import { SIZE_LIMITS_MB } from "../config/index.js";
 import { createFileError, FileErrorCode } from "../errors/index.js";
 
@@ -55,11 +70,7 @@ const require = createRequire(import.meta.url);
 // TYPES
 // =============================================================================
 
-export type { ProcessedXml } from "../base/types.js";
-
 // Re-import for local use within this file
-import type { ProcessedXml } from "../base/types.js";
-
 // =============================================================================
 // CONSTANTS
 // =============================================================================
@@ -180,7 +191,7 @@ export class XmlProcessor extends BaseFileProcessor<ProcessedXml> {
   protected override async validateDownloadedFileWithResult(
     buffer: Buffer,
     fileInfo: FileInfo,
-  ): Promise<OperationResult<void>> {
+  ): Promise<ProcessorOperationResult<void>> {
     try {
       const content = buffer.toString("utf-8");
 
@@ -334,6 +345,6 @@ export function validateXmlSize(sizeBytes: number): boolean {
 export function processXml(
   fileInfo: FileInfo,
   options?: ProcessOptions,
-): Promise<FileProcessingResult<ProcessedXml>> {
+): Promise<ProcessorFileProcessingResult<ProcessedXml>> {
   return xmlProcessor.processFile(fileInfo, options);
 }

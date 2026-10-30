@@ -1,0 +1,1259 @@
+import type { ModelPricingRates, TokenUsage } from "../types/index.js";
+import {
+  getManifestForProvider,
+  resolveManifestEntryExact,
+} from "../models/manifestRegistry.js";
+import { getCatalogJsonEntries } from "../providers/catalog/loader.js";
+
+/**
+ * Per-model pricing for the JSON-catalog providers, derived from
+ * models.catalog[*].pricingPerMTok (dollars-per-million → dollars-per-token,
+ * matching this file's unit convention). `_default` is the rate of the
+ * provider's own models.default model — mirroring what every hand-written
+ * catalog-provider block already did pre-migration (e.g. xai's `_default`
+ * was always grok-3's rate, xai's default model).
+ *
+ * `pricingPerMTok.cachedInput`, where present, maps to this file's
+ * `cacheRead` field — same semantics (price for a cached-read hit), just a
+ * different field name in the two shapes.
+ *
+ * A provider contributes no block here when its catalog carries zero
+ * `pricingPerMTok` data anywhere — fireworks (a fully refreshed model
+ * roster with no sourced pricing yet) and cloudflare (bills per "neuron",
+ * not per token — there's no USD-per-token figure to source). Both stay
+ * entirely hand-written below with their pre-existing symbolic/estimated
+ * rates, since the JSON has nothing to derive. Mistral's catalog likewise
+ * has no pricingPerMTok data, and its hand block below uses coarse model
+ * names ("mistral-large", "codestral", …) that don't match the JSON's real
+ * ids ("mistral-large-latest", "codestral-latest", …) — it stays
+ * hand-written too.
+ */
+const CATALOG_PRICING: Record<
+  string,
+  Record<
+    string,
+    {
+      input: number;
+      output: number;
+      cacheRead?: number;
+      cacheCreation?: number;
+      /**
+       * 1-hour TTL cache-write rate (Anthropic's 2x-of-input multiplier),
+       * distinct from `cacheCreation`'s 5-minute (1.25x) rate. Optional and
+       * populated only where a caller actually writes 1h-TTL breakpoints
+       * today (see `cacheCreation1h` on the hand-written `PRICING` table) —
+       * the catalog-derived entries have no such caller yet, so this field
+       * stays undefined here.
+       */
+      cacheCreation1h?: number;
+    }
+  >
+> = Object.fromEntries(
+  getCatalogJsonEntries().flatMap((entry) => {
+    const priced = Object.fromEntries(
+      Object.entries(entry.models.catalog).flatMap(([modelId, spec]) =>
+        spec.pricingPerMTok
+          ? [
+              [
+                modelId,
+                {
+                  input: spec.pricingPerMTok.input / 1_000_000,
+                  output: spec.pricingPerMTok.output / 1_000_000,
+                  ...(spec.pricingPerMTok.cachedInput !== undefined
+                    ? { cacheRead: spec.pricingPerMTok.cachedInput / 1_000_000 }
+                    : {}),
+                },
+              ] as const,
+            ]
+          : [],
+      ),
+    );
+    if (Object.keys(priced).length === 0) {
+      return [];
+    }
+    const defaultRate =
+      entry.models.catalog[entry.models.default]?.pricingPerMTok;
+    return [
+      [
+        entry.id,
+        {
+          ...(defaultRate
+            ? {
+                _default: {
+                  input: defaultRate.input / 1_000_000,
+                  output: defaultRate.output / 1_000_000,
+                  // Without this, a request falling back to `_default`
+                  // bills cached tokens at the full input rate.
+                  ...(defaultRate.cachedInput !== undefined
+                    ? { cacheRead: defaultRate.cachedInput / 1_000_000 }
+                    : {}),
+                },
+              }
+            : {}),
+          ...priced,
+        },
+      ] as const,
+    ];
+  }),
+);
+
+/**
+ * Per-token pricing data (USD per token). Updated Feb 2026.
+ * Sources:
+ * - Anthropic: https://www.anthropic.com/pricing
+ * - OpenAI: https://openai.com/api/pricing
+ * - Google: https://ai.google.dev/pricing
+ *
+ * Note: Not all supported providers have pricing data. Missing providers
+ * (Bedrock, Azure, Mistral, etc.) will return 0 from calculateCost().
+ */
+const PRICING: Record<string, Record<string, ModelPricingRates>> = {
+  // Anthropic (direct API) — updated March 2026
+  anthropic: {
+    // Claude 5 family. Rates from platform.claude.com/docs/en/about-claude/pricing
+    // (checked 2026-09-23). A 5-minute cache write is 1.25x base input and a
+    // 1-hour one 2x, on every Claude model below. The cache
+    // hit multiplier is 0.1x for most models but 0.05x on Opus 5.5 and 0.025x on
+    // Fable/Mythos 5.1, so those three are listed in full rather than left to the
+    // longest-prefix fallback — which would silently quote the 5.0 family's rates.
+    "claude-fable-5-1": {
+      input: 10.0 / 1_000_000,
+      output: 50.0 / 1_000_000,
+      cacheRead: 0.25 / 1_000_000,
+      cacheCreation: 12.5 / 1_000_000,
+      cacheCreation1h: 20.0 / 1_000_000,
+    },
+    "claude-mythos-5-1": {
+      input: 10.0 / 1_000_000,
+      output: 50.0 / 1_000_000,
+      cacheRead: 0.25 / 1_000_000,
+      cacheCreation: 12.5 / 1_000_000,
+      cacheCreation1h: 20.0 / 1_000_000,
+    },
+    "claude-opus-5-5": {
+      input: 4.0 / 1_000_000,
+      output: 20.0 / 1_000_000,
+      cacheRead: 0.2 / 1_000_000,
+      cacheCreation: 5.0 / 1_000_000,
+      // 1h TTL = 2x base input (platform.claude.com/docs/en/about-claude/pricing, read 2026-09-29).
+      cacheCreation1h: 8.0 / 1_000_000,
+    },
+    // Sonnet 5.5 bills exactly as Sonnet 5 does, cache rates included.
+    "claude-sonnet-5-5": {
+      input: 2.0 / 1_000_000,
+      output: 10.0 / 1_000_000,
+      cacheRead: 0.2 / 1_000_000,
+      cacheCreation: 2.5 / 1_000_000,
+      // 1h TTL = 2x base input (platform.claude.com/docs/en/about-claude/pricing, read 2026-09-29).
+      cacheCreation1h: 4.0 / 1_000_000,
+    },
+    "claude-fable-5": {
+      input: 10.0 / 1_000_000,
+      output: 50.0 / 1_000_000,
+      cacheRead: 1.0 / 1_000_000,
+      cacheCreation: 12.5 / 1_000_000,
+      cacheCreation1h: 20.0 / 1_000_000,
+    },
+    "claude-mythos-5": {
+      input: 10.0 / 1_000_000,
+      output: 50.0 / 1_000_000,
+      cacheRead: 1.0 / 1_000_000,
+      cacheCreation: 12.5 / 1_000_000,
+      cacheCreation1h: 20.0 / 1_000_000,
+    },
+    "claude-opus-5": {
+      input: 5.0 / 1_000_000,
+      output: 25.0 / 1_000_000,
+      cacheRead: 0.5 / 1_000_000,
+      cacheCreation: 6.25 / 1_000_000,
+      cacheCreation1h: 10.0 / 1_000_000,
+    },
+    "claude-opus-4-8": {
+      input: 5.0 / 1_000_000,
+      output: 25.0 / 1_000_000,
+      cacheRead: 0.5 / 1_000_000,
+      cacheCreation: 6.25 / 1_000_000,
+      cacheCreation1h: 10.0 / 1_000_000,
+    },
+    "claude-opus-4-7": {
+      input: 5.0 / 1_000_000,
+      output: 25.0 / 1_000_000,
+      cacheRead: 0.5 / 1_000_000,
+      cacheCreation: 6.25 / 1_000_000,
+      cacheCreation1h: 10.0 / 1_000_000,
+    },
+    // Sonnet 5's $2/$10 launch pricing became the standard price; the
+    // previously scheduled 2026-09-01 rise to $3/$15 was cancelled.
+    "claude-sonnet-5": {
+      input: 2.0 / 1_000_000,
+      output: 10.0 / 1_000_000,
+      cacheRead: 0.2 / 1_000_000,
+      cacheCreation: 2.5 / 1_000_000,
+      // 1h TTL = 2x base input (platform.claude.com/docs/en/about-claude/pricing).
+      cacheCreation1h: 4.0 / 1_000_000,
+    },
+    // Claude 4.6 family
+    "claude-opus-4-6": {
+      input: 5.0 / 1_000_000,
+      output: 25.0 / 1_000_000,
+      cacheRead: 0.5 / 1_000_000,
+      cacheCreation: 6.25 / 1_000_000,
+      cacheCreation1h: 10.0 / 1_000_000,
+    },
+    "claude-sonnet-4-6": {
+      input: 3.0 / 1_000_000,
+      output: 15.0 / 1_000_000,
+      cacheRead: 0.3 / 1_000_000,
+      cacheCreation: 3.75 / 1_000_000,
+      cacheCreation1h: 6.0 / 1_000_000,
+    },
+    // Claude 4.5 family
+    "claude-sonnet-4-5-20250929": {
+      input: 3.0 / 1_000_000,
+      output: 15.0 / 1_000_000,
+      cacheRead: 0.3 / 1_000_000,
+      cacheCreation: 3.75 / 1_000_000,
+      cacheCreation1h: 6.0 / 1_000_000,
+    },
+    // Undated aliases for the same models. Clients report the bare name far
+    // more often than the dated one, and without these the longest-prefix
+    // match lands on the previous generation ("claude-sonnet-4"), which both
+    // reports as an inferred rate and would silently drift if the two
+    // generations ever diverge in price.
+    "claude-sonnet-4-5": {
+      input: 3.0 / 1_000_000,
+      output: 15.0 / 1_000_000,
+      cacheRead: 0.3 / 1_000_000,
+      cacheCreation: 3.75 / 1_000_000,
+      cacheCreation1h: 6.0 / 1_000_000,
+    },
+    "claude-opus-4-5": {
+      input: 5.0 / 1_000_000,
+      output: 25.0 / 1_000_000,
+      cacheRead: 0.5 / 1_000_000,
+      cacheCreation: 6.25 / 1_000_000,
+      cacheCreation1h: 10.0 / 1_000_000,
+    },
+    "claude-haiku-4-5-20251001": {
+      input: 1.0 / 1_000_000,
+      output: 5.0 / 1_000_000,
+      cacheRead: 0.1 / 1_000_000,
+      cacheCreation: 1.25 / 1_000_000,
+      cacheCreation1h: 2.0 / 1_000_000,
+    },
+    "claude-haiku-4-5": {
+      input: 1.0 / 1_000_000,
+      output: 5.0 / 1_000_000,
+      cacheRead: 0.1 / 1_000_000,
+      cacheCreation: 1.25 / 1_000_000,
+      cacheCreation1h: 2.0 / 1_000_000,
+    },
+    // Claude 4.0/4.1 family
+    "claude-opus-4-1": {
+      input: 15.0 / 1_000_000,
+      output: 75.0 / 1_000_000,
+      cacheRead: 1.5 / 1_000_000,
+      cacheCreation: 18.75 / 1_000_000,
+      cacheCreation1h: 30.0 / 1_000_000,
+    },
+    "claude-opus-4": {
+      input: 15.0 / 1_000_000,
+      output: 75.0 / 1_000_000,
+      cacheRead: 1.5 / 1_000_000,
+      cacheCreation: 18.75 / 1_000_000,
+      cacheCreation1h: 30.0 / 1_000_000,
+    },
+    "claude-sonnet-4": {
+      input: 3.0 / 1_000_000,
+      output: 15.0 / 1_000_000,
+      cacheRead: 0.3 / 1_000_000,
+      cacheCreation: 3.75 / 1_000_000,
+      cacheCreation1h: 6.0 / 1_000_000,
+    },
+    // Claude 3.x family
+    "claude-3-7-sonnet": {
+      input: 3.0 / 1_000_000,
+      output: 15.0 / 1_000_000,
+      cacheRead: 0.3 / 1_000_000,
+      cacheCreation: 3.75 / 1_000_000,
+      cacheCreation1h: 6.0 / 1_000_000,
+    },
+    "claude-3-5-sonnet": {
+      input: 3.0 / 1_000_000,
+      output: 15.0 / 1_000_000,
+      cacheRead: 0.3 / 1_000_000,
+      cacheCreation: 3.75 / 1_000_000,
+      cacheCreation1h: 6.0 / 1_000_000,
+    },
+    "claude-3-5-haiku": {
+      input: 0.8 / 1_000_000,
+      output: 4.0 / 1_000_000,
+      cacheRead: 0.08 / 1_000_000,
+      cacheCreation: 1.0 / 1_000_000,
+      cacheCreation1h: 1.6 / 1_000_000,
+    },
+    "claude-3-opus": {
+      input: 15.0 / 1_000_000,
+      output: 75.0 / 1_000_000,
+      cacheRead: 1.5 / 1_000_000,
+      cacheCreation: 18.75 / 1_000_000,
+      cacheCreation1h: 30.0 / 1_000_000,
+    },
+    "claude-3-sonnet": {
+      input: 3.0 / 1_000_000,
+      output: 15.0 / 1_000_000,
+      cacheRead: 0.3 / 1_000_000,
+      cacheCreation: 3.75 / 1_000_000,
+      cacheCreation1h: 6.0 / 1_000_000,
+    },
+    "claude-3-haiku": {
+      input: 0.25 / 1_000_000,
+      output: 1.25 / 1_000_000,
+      cacheRead: 0.025 / 1_000_000,
+      cacheCreation: 0.3125 / 1_000_000,
+      cacheCreation1h: 0.5 / 1_000_000,
+    },
+  },
+  // Google Vertex AI — Claude models on Vertex (same pricing, @ date suffix)
+  vertex: {
+    // Standard Sonnet 4 rates; the lookup also recognizes its @ date suffix.
+    // https://platform.claude.com/docs/en/about-claude/pricing
+    "claude-sonnet-4": {
+      input: 3.0 / 1_000_000,
+      output: 15.0 / 1_000_000,
+      cacheRead: 0.3 / 1_000_000,
+      cacheCreation: 3.75 / 1_000_000,
+      cacheCreation1h: 6.0 / 1_000_000,
+    },
+    // A 1-hour cache write is 2x base input, as on the direct API.
+    // Claude 5 family. Absent here until now, so a Vertex leg serving any of
+    // them resolved to no rate at all and booked the turn at $0 — on the one
+    // provider in the chain that bills in real currency.
+    // `isVertexAnthropicModel` admits every `claude-*` id, so the whole
+    // family needs an entry, not only the ones the chain names today.
+    "claude-fable-5-1": {
+      input: 10.0 / 1_000_000,
+      output: 50.0 / 1_000_000,
+      cacheRead: 0.25 / 1_000_000,
+      cacheCreation: 12.5 / 1_000_000,
+      cacheCreation1h: 20.0 / 1_000_000,
+    },
+    "claude-mythos-5-1": {
+      input: 10.0 / 1_000_000,
+      output: 50.0 / 1_000_000,
+      cacheRead: 0.25 / 1_000_000,
+      cacheCreation: 12.5 / 1_000_000,
+      cacheCreation1h: 20.0 / 1_000_000,
+    },
+    "claude-fable-5": {
+      input: 10.0 / 1_000_000,
+      output: 50.0 / 1_000_000,
+      cacheRead: 1.0 / 1_000_000,
+      cacheCreation: 12.5 / 1_000_000,
+      cacheCreation1h: 20.0 / 1_000_000,
+    },
+    "claude-mythos-5": {
+      input: 10.0 / 1_000_000,
+      output: 50.0 / 1_000_000,
+      cacheRead: 1.0 / 1_000_000,
+      cacheCreation: 12.5 / 1_000_000,
+      cacheCreation1h: 20.0 / 1_000_000,
+    },
+    "claude-opus-5-5": {
+      input: 4.0 / 1_000_000,
+      output: 20.0 / 1_000_000,
+      cacheRead: 0.2 / 1_000_000,
+      cacheCreation: 5.0 / 1_000_000,
+      // 1h TTL = 2x base input (platform.claude.com/docs/en/about-claude/pricing, read 2026-09-29).
+      cacheCreation1h: 8.0 / 1_000_000,
+    },
+    // Sonnet 5.5 bills exactly as Sonnet 5 does, cache rates included.
+    "claude-sonnet-5-5": {
+      input: 2.0 / 1_000_000,
+      output: 10.0 / 1_000_000,
+      cacheRead: 0.2 / 1_000_000,
+      cacheCreation: 2.5 / 1_000_000,
+      // 1h TTL = 2x base input (platform.claude.com/docs/en/about-claude/pricing, read 2026-09-29).
+      cacheCreation1h: 4.0 / 1_000_000,
+    },
+    "claude-opus-5": {
+      input: 5.0 / 1_000_000,
+      output: 25.0 / 1_000_000,
+      cacheRead: 0.5 / 1_000_000,
+      cacheCreation: 6.25 / 1_000_000,
+      cacheCreation1h: 10.0 / 1_000_000,
+    },
+    "claude-sonnet-5": {
+      input: 2.0 / 1_000_000,
+      output: 10.0 / 1_000_000,
+      cacheRead: 0.2 / 1_000_000,
+      cacheCreation: 2.5 / 1_000_000,
+      // 1h TTL = 2x base input (platform.claude.com/docs/en/about-claude/pricing).
+      cacheCreation1h: 4.0 / 1_000_000,
+    },
+    "claude-sonnet-4-6": {
+      input: 3.0 / 1_000_000,
+      output: 15.0 / 1_000_000,
+      cacheRead: 0.3 / 1_000_000,
+      cacheCreation: 3.75 / 1_000_000,
+      cacheCreation1h: 6.0 / 1_000_000,
+    },
+    "claude-opus-4-6": {
+      input: 5.0 / 1_000_000,
+      output: 25.0 / 1_000_000,
+      cacheRead: 0.5 / 1_000_000,
+      cacheCreation: 6.25 / 1_000_000,
+      cacheCreation1h: 10.0 / 1_000_000,
+    },
+    "claude-sonnet-4-5": {
+      input: 3.0 / 1_000_000,
+      output: 15.0 / 1_000_000,
+      cacheRead: 0.3 / 1_000_000,
+      cacheCreation: 3.75 / 1_000_000,
+      cacheCreation1h: 6.0 / 1_000_000,
+    },
+    "claude-opus-4-5": {
+      input: 5.0 / 1_000_000,
+      output: 25.0 / 1_000_000,
+      cacheRead: 0.5 / 1_000_000,
+      cacheCreation: 6.25 / 1_000_000,
+      cacheCreation1h: 10.0 / 1_000_000,
+    },
+    "claude-haiku-4-5": {
+      input: 1.0 / 1_000_000,
+      output: 5.0 / 1_000_000,
+      cacheRead: 0.1 / 1_000_000,
+      cacheCreation: 1.25 / 1_000_000,
+      cacheCreation1h: 2.0 / 1_000_000,
+    },
+    "claude-3-5-haiku": {
+      input: 0.8 / 1_000_000,
+      output: 4.0 / 1_000_000,
+      cacheRead: 0.08 / 1_000_000,
+      cacheCreation: 1.0 / 1_000_000,
+      cacheCreation1h: 1.6 / 1_000_000,
+    },
+    "claude-3-5-sonnet": {
+      input: 3.0 / 1_000_000,
+      output: 15.0 / 1_000_000,
+      cacheRead: 0.3 / 1_000_000,
+      cacheCreation: 3.75 / 1_000_000,
+      cacheCreation1h: 6.0 / 1_000_000,
+    },
+  },
+  // OpenAI — updated March 2026
+  openai: {
+    // GPT-5.6 family (Sol/Terra/Luna). Rates reflect OpenAI's 2026-07-30 cut,
+    // which reduced Luna by 80% and Terra by 20%; Sol was unchanged. Many
+    // third-party tables still carry the pre-cut numbers.
+    // List rates. Note that some resellers advertise sol at 50% off
+    // ($2.50/$15.00/$0.25); those are promotional and expire, so the table
+    // carries list price and cache read stays the documented 0.1x of input.
+    "gpt-5.6-sol": {
+      input: 5.0 / 1_000_000,
+      output: 30.0 / 1_000_000,
+      cacheRead: 0.5 / 1_000_000,
+      cacheCreation: 6.25 / 1_000_000,
+    },
+    "gpt-5.6-terra": {
+      input: 2.0 / 1_000_000,
+      output: 12.0 / 1_000_000,
+      cacheRead: 0.2 / 1_000_000,
+      cacheCreation: 2.5 / 1_000_000,
+    },
+    "gpt-5.6-luna": {
+      input: 0.2 / 1_000_000,
+      output: 1.2 / 1_000_000,
+      cacheRead: 0.02 / 1_000_000,
+      cacheCreation: 0.25 / 1_000_000,
+    },
+    "gpt-5.5": {
+      input: 5.0 / 1_000_000,
+      output: 30.0 / 1_000_000,
+      cacheRead: 0.5 / 1_000_000,
+    },
+    // GPT-5.x family
+    // cacheRead = 0.25x input (cached input tokens; no separate cacheCreation).
+    "gpt-5.4": {
+      input: 2.5 / 1_000_000,
+      output: 15.0 / 1_000_000,
+      cacheRead: 0.625 / 1_000_000,
+    },
+    "gpt-5.2": {
+      input: 1.75 / 1_000_000,
+      output: 14.0 / 1_000_000,
+      cacheRead: 0.4375 / 1_000_000,
+    },
+    "gpt-5.1": {
+      input: 0.625 / 1_000_000,
+      output: 5.0 / 1_000_000,
+      cacheRead: 0.15625 / 1_000_000,
+    },
+    "gpt-5.1-codex": {
+      input: 1.25 / 1_000_000,
+      output: 10.0 / 1_000_000,
+      cacheRead: 0.3125 / 1_000_000,
+    },
+    "gpt-5": {
+      input: 1.25 / 1_000_000,
+      output: 10.0 / 1_000_000,
+      cacheRead: 0.3125 / 1_000_000,
+    },
+    "gpt-5-mini": {
+      input: 0.25 / 1_000_000,
+      output: 2.0 / 1_000_000,
+      cacheRead: 0.0625 / 1_000_000,
+    },
+    "gpt-5-nano": {
+      input: 0.05 / 1_000_000,
+      output: 0.4 / 1_000_000,
+      cacheRead: 0.0125 / 1_000_000,
+    },
+    // GPT-4.1 family
+    "gpt-4.1": {
+      input: 2.0 / 1_000_000,
+      output: 8.0 / 1_000_000,
+      cacheRead: 0.5 / 1_000_000,
+    },
+    "gpt-4.1-mini": {
+      input: 0.4 / 1_000_000,
+      output: 1.6 / 1_000_000,
+      cacheRead: 0.1 / 1_000_000,
+    },
+    "gpt-4.1-nano": {
+      input: 0.1 / 1_000_000,
+      output: 0.4 / 1_000_000,
+      cacheRead: 0.025 / 1_000_000,
+    },
+    // GPT-4o family
+    "gpt-4o": {
+      input: 2.5 / 1_000_000,
+      output: 10.0 / 1_000_000,
+      cacheRead: 0.625 / 1_000_000,
+    },
+    "gpt-4o-mini": {
+      input: 0.15 / 1_000_000,
+      output: 0.6 / 1_000_000,
+      cacheRead: 0.0375 / 1_000_000,
+    },
+    // o-series reasoning
+    o3: {
+      input: 2.0 / 1_000_000,
+      output: 8.0 / 1_000_000,
+      cacheRead: 0.5 / 1_000_000,
+    },
+    "o3-mini": {
+      input: 1.1 / 1_000_000,
+      output: 4.4 / 1_000_000,
+      cacheRead: 0.275 / 1_000_000,
+    },
+    "o4-mini": {
+      input: 1.1 / 1_000_000,
+      output: 4.4 / 1_000_000,
+      cacheRead: 0.275 / 1_000_000,
+    },
+    o1: {
+      input: 15.0 / 1_000_000,
+      output: 60.0 / 1_000_000,
+      cacheRead: 3.75 / 1_000_000,
+    },
+    "o1-mini": {
+      input: 0.55 / 1_000_000,
+      output: 2.2 / 1_000_000,
+      cacheRead: 0.1375 / 1_000_000,
+    },
+    // Legacy
+    "gpt-4-turbo": { input: 10.0 / 1_000_000, output: 30.0 / 1_000_000 },
+    "gpt-4": { input: 30.0 / 1_000_000, output: 60.0 / 1_000_000 },
+    "gpt-3.5-turbo": { input: 0.5 / 1_000_000, output: 1.0 / 1_000_000 },
+  },
+  // Google (Gemini) — updated March 2026
+  google: {
+    // GA text/image/video rates: https://ai.google.dev/gemini-api/docs/pricing
+    "gemini-3.1-flash-lite": {
+      input: 0.25 / 1_000_000,
+      output: 1.5 / 1_000_000,
+      cacheRead: 0.025 / 1_000_000,
+    },
+    // Gemini 3.1 preview family
+    // cacheRead = 0.25x input (cached content tokens; explicit-cache storage is
+    // billed separately by TTL/time, so no per-token cacheCreation rate here).
+    "gemini-3.1-pro-preview": {
+      input: 2.0 / 1_000_000,
+      output: 12.0 / 1_000_000,
+      cacheRead: 0.5 / 1_000_000,
+    },
+    "gemini-3.1-flash-lite-preview": {
+      input: 0.25 / 1_000_000,
+      output: 1.5 / 1_000_000,
+      cacheRead: 0.0625 / 1_000_000,
+    },
+    "gemini-3.1-flash-image-preview": {
+      input: 0.5 / 1_000_000,
+      output: 3.0 / 1_000_000,
+      cacheRead: 0.125 / 1_000_000,
+    },
+    "gemini-3.1-pro-preview-customtools": {
+      input: 2.0 / 1_000_000,
+      output: 12.0 / 1_000_000,
+      cacheRead: 0.5 / 1_000_000,
+    },
+    // Gemini 3 family
+    "gemini-3-flash-preview": {
+      input: 0.5 / 1_000_000,
+      output: 3.0 / 1_000_000,
+      cacheRead: 0.125 / 1_000_000,
+    },
+    "gemini-3-pro-image-preview": {
+      input: 2.0 / 1_000_000,
+      output: 12.0 / 1_000_000,
+      cacheRead: 0.5 / 1_000_000,
+    },
+    /** @deprecated SHUT DOWN March 9, 2026. Migrate to gemini-3.1-pro-preview. */
+    "gemini-3-pro-preview": {
+      input: 2.0 / 1_000_000,
+      output: 12.0 / 1_000_000,
+      cacheRead: 0.5 / 1_000_000,
+    },
+    // Gemini 2.5 family
+    "gemini-2.5-flash": {
+      input: 0.3 / 1_000_000,
+      output: 2.5 / 1_000_000,
+      cacheRead: 0.075 / 1_000_000,
+    },
+    "gemini-2.5-pro": {
+      input: 1.25 / 1_000_000,
+      output: 10.0 / 1_000_000,
+      cacheRead: 0.3125 / 1_000_000,
+    },
+    "gemini-2.5-flash-lite": {
+      input: 0.1 / 1_000_000,
+      output: 0.4 / 1_000_000,
+      cacheRead: 0.025 / 1_000_000,
+    },
+    // Gemini 2.0 family (deprecated June 2026)
+    "gemini-2.0-flash": {
+      input: 0.15 / 1_000_000,
+      output: 0.6 / 1_000_000,
+      cacheRead: 0.0375 / 1_000_000,
+    },
+    "gemini-2.0-flash-lite": {
+      input: 0.075 / 1_000_000,
+      output: 0.3 / 1_000_000,
+      cacheRead: 0.01875 / 1_000_000,
+    },
+    // Gemini 1.5 family
+    "gemini-1.5-pro": {
+      input: 1.25 / 1_000_000,
+      output: 5.0 / 1_000_000,
+      cacheRead: 0.3125 / 1_000_000,
+    },
+    "gemini-1.5-flash": {
+      input: 0.075 / 1_000_000,
+      output: 0.3 / 1_000_000,
+      cacheRead: 0.01875 / 1_000_000,
+    },
+  },
+  // Mistral AI
+  mistral: {
+    "mistral-large": { input: 2.0 / 1_000_000, output: 6.0 / 1_000_000 },
+    "mistral-medium": { input: 2.7 / 1_000_000, output: 8.1 / 1_000_000 },
+    "mistral-small": { input: 0.2 / 1_000_000, output: 0.6 / 1_000_000 },
+    codestral: { input: 0.3 / 1_000_000, output: 0.9 / 1_000_000 },
+    "open-mistral-nemo": {
+      input: 0.15 / 1_000_000,
+      output: 0.15 / 1_000_000,
+    },
+  },
+  deepseek: {
+    "deepseek-chat": {
+      input: 0.27 / 1_000_000,
+      output: 1.1 / 1_000_000,
+      cacheRead: 0.07 / 1_000_000,
+    },
+    "deepseek-reasoner": {
+      input: 0.55 / 1_000_000,
+      output: 2.19 / 1_000_000,
+      cacheRead: 0.14 / 1_000_000,
+    },
+  },
+  "nvidia-nim": {
+    // Source: NVIDIA build.nvidia.com listed rates for openai/gpt-oss-20b,
+    // read 2026-09-06. NIM prices and models both rot — this PR exists
+    // because the default model was decommissioned — so re-check against
+    // https://build.nvidia.com/openai/gpt-oss-20b rather than trusting this.
+    "openai/gpt-oss-20b": {
+      input: 0.05 / 1_000_000,
+      output: 0.2 / 1_000_000,
+    },
+    "meta/llama-3.3-70b-instruct": {
+      input: 0.4 / 1_000_000,
+      output: 0.4 / 1_000_000,
+    },
+    "meta/llama-3.1-405b-instruct": {
+      input: 1.79 / 1_000_000,
+      output: 1.79 / 1_000_000,
+    },
+    "meta/llama-3.1-70b-instruct": {
+      input: 0.4 / 1_000_000,
+      output: 0.4 / 1_000_000,
+    },
+    "meta/llama-3.2-90b-vision-instruct": {
+      input: 0.5 / 1_000_000,
+      output: 0.5 / 1_000_000,
+    },
+    "nvidia/llama-3.3-nemotron-super-49b-v1": {
+      input: 0.3 / 1_000_000,
+      output: 0.3 / 1_000_000,
+    },
+    "deepseek-ai/deepseek-r1": {
+      input: 0.55 / 1_000_000,
+      output: 2.19 / 1_000_000,
+    },
+    "mistralai/mixtral-8x22b-instruct-v0.1": {
+      input: 0.6 / 1_000_000,
+      output: 0.6 / 1_000_000,
+    },
+    "mistralai/mixtral-8x7b-instruct-v0.1": {
+      input: 0.24 / 1_000_000,
+      output: 0.24 / 1_000_000,
+    },
+    "microsoft/phi-4": { input: 0.07 / 1_000_000, output: 0.07 / 1_000_000 },
+    "google/gemma-3-27b-it": {
+      input: 0.07 / 1_000_000,
+      output: 0.07 / 1_000_000,
+    },
+  },
+  "lm-studio": {
+    // Local inference — there is no upstream USD price. Reporting a fabricated
+    // symbolic rate here misstated spend in analytics/spans, so the rate is
+    // explicitly zero. `calculateCost()` returns 0 for zero rates and the CLI
+    // / span renderers already treat 0 as "no billable cost" (no $ shown).
+    _default: { input: 0, output: 0 },
+  },
+  llamacpp: {
+    _default: { input: 0, output: 0 },
+  },
+  // xai, groq, cerebras, sambanova — derived from the JSON catalog, see
+  // CATALOG_PRICING above.
+  ...CATALOG_PRICING,
+  cohere: {
+    _default: { input: 2.5 / 1_000_000, output: 10.0 / 1_000_000 },
+    "command-r-plus": { input: 2.5 / 1_000_000, output: 10.0 / 1_000_000 },
+    "command-r": { input: 0.15 / 1_000_000, output: 0.6 / 1_000_000 },
+    "command-r7b-12-2024": {
+      input: 0.0375 / 1_000_000,
+      output: 0.15 / 1_000_000,
+    },
+  },
+  // together-ai — derived from the JSON catalog, see CATALOG_PRICING above.
+  fireworks: {
+    _default: { input: 0.9 / 1_000_000, output: 0.9 / 1_000_000 },
+    "accounts/fireworks/models/llama-v3p1-70b-instruct": {
+      input: 0.9 / 1_000_000,
+      output: 0.9 / 1_000_000,
+    },
+    "accounts/fireworks/models/llama-v3p1-405b-instruct": {
+      input: 3.0 / 1_000_000,
+      output: 3.0 / 1_000_000,
+    },
+    "accounts/fireworks/models/llama-v3p1-8b-instruct": {
+      input: 0.2 / 1_000_000,
+      output: 0.2 / 1_000_000,
+    },
+    "accounts/fireworks/models/llama-v3p3-70b-instruct": {
+      input: 0.9 / 1_000_000,
+      output: 0.9 / 1_000_000,
+    },
+    "accounts/fireworks/models/mixtral-8x22b-instruct": {
+      input: 1.2 / 1_000_000,
+      output: 1.2 / 1_000_000,
+    },
+    "accounts/fireworks/models/qwen2p5-72b-instruct": {
+      input: 0.9 / 1_000_000,
+      output: 0.9 / 1_000_000,
+    },
+    "accounts/fireworks/models/qwen2p5-coder-32b-instruct": {
+      input: 0.9 / 1_000_000,
+      output: 0.9 / 1_000_000,
+    },
+    "accounts/fireworks/models/deepseek-v3": {
+      input: 0.75 / 1_000_000,
+      output: 3.0 / 1_000_000,
+    },
+  },
+  // perplexity — derived from the JSON catalog, see CATALOG_PRICING above.
+  cloudflare: {
+    // Cloudflare bills per "neuron"; symbolic per-token rate so cost
+    // attribution dashboards have non-zero values.
+    _default: { input: 0.011 / 1_000_000, output: 0.011 / 1_000_000 },
+  },
+  replicate: {
+    // Replicate bills per compute-second, not per-token. Symbolic rate.
+    _default: { input: 0.5 / 1_000_000, output: 1.5 / 1_000_000 },
+  },
+  voyage: {
+    // Voyage bills per million input tokens — output dimension is the
+    // embedding vector, not generated tokens. We charge to input only.
+    _default: { input: 0.18 / 1_000_000, output: 0 },
+    // Voyage 4 family — docs.voyageai.com/docs/embeddings pricing table
+    "voyage-4": { input: 0.06 / 1_000_000, output: 0 },
+    "voyage-4-large": { input: 0.12 / 1_000_000, output: 0 },
+    "voyage-4-lite": { input: 0.02 / 1_000_000, output: 0 },
+    "voyage-code-4": { input: 0.12 / 1_000_000, output: 0 },
+    "voyage-3.5": { input: 0.06 / 1_000_000, output: 0 },
+    "voyage-3.5-lite": { input: 0.02 / 1_000_000, output: 0 },
+    "voyage-3-large": { input: 0.18 / 1_000_000, output: 0 },
+    "voyage-code-3": { input: 0.18 / 1_000_000, output: 0 },
+    "voyage-finance-2": { input: 0.12 / 1_000_000, output: 0 },
+    "voyage-law-2": { input: 0.12 / 1_000_000, output: 0 },
+    "voyage-multilingual-2": { input: 0.12 / 1_000_000, output: 0 },
+  },
+  jina: {
+    _default: { input: 0.02 / 1_000_000, output: 0 },
+    "jina-embeddings-v3": { input: 0.02 / 1_000_000, output: 0 },
+    "jina-reranker-v2-base-multilingual": {
+      input: 0.05 / 1_000_000,
+      output: 0,
+    },
+  },
+  typesafe: {
+    // TypeSafe bills per million INPUT tokens only. Output is REPORTED but
+    // not billed: measured live, a decision returns roughly 17 output tokens
+    // per question (1 question → 21, 20 questions → 354), and the rate on
+    // them is zero. So `output: 0` is a price, not a token count — do not
+    // "correct" it by reading a non-zero `usage.output_tokens` off a
+    // response. A three-question decision costs ~$0.000013 in total.
+    // Rates from typesafe.ai/pricing (checked 2026-09-20).
+    _default: { input: 0.042 / 1_000_000, output: 0 },
+    "jev-latest": { input: 0.042 / 1_000_000, output: 0 },
+  },
+  "perplexity-decider": {
+    // The Decisions API bills $0.04 per million INPUT tokens (image tokens
+    // included) and charges nothing for output or per request. `output: 0` is
+    // a price, not a token count, so do not "correct" it from
+    // `usage.output_tokens`. Rate from the API reference (checked 2026-10-02).
+    _default: { input: 0.04 / 1_000_000, output: 0 },
+    "pplx-decider-v1-27b": { input: 0.04 / 1_000_000, output: 0 },
+  },
+  "openai-decisions": {
+    // $0.10 per million input tokens, input only: `output: 0` is a price, not a
+    // token count, so do not "correct" it from `usage.output_tokens`. Source:
+    // https://developers.openai.com/api/docs/guides/decisions (read 2026-10-07).
+    // Regional and long-context multipliers are not modelled. Only `_default`:
+    // LiteLLM, OpenRouter and openai-compatible search every table by model
+    // name, so a `"gpt-6-luna"` key would price that chat model at this rate.
+    _default: { input: 0.1 / 1_000_000, output: 0 },
+  },
+  scaledown: {
+    // $0.05 per million input tokens, output free: `output: 0` is a price, not
+    // a token count, so do not "correct" it from `usage.output_tokens`. A list
+    // price from ScaleDown's launch post and from `usage.cost` in a response,
+    // both as reported to this project on 2026-10-15; this project has not
+    // priced a call itself. Per ScaleDown's docs each choice option is a
+    // separate internal call, so input tokens grow with options times state
+    // length (not measured here). Only `_default`: LiteLLM, OpenRouter and
+    // openai-compatible search every table by model name, so a `"classify"` key
+    // would price an unrelated model at this rate.
+    _default: { input: 0.05 / 1_000_000, output: 0 },
+  },
+  "cloudflare-clef": {
+    // Workers AI bills Clef per million INPUT tokens ($0.24 for clef, $0.09 for
+    // clef-flash); no output price is listed. `output: 0` is a price, not a token
+    // count, so do not "correct" it from `usage.output_tokens`. The `cf-ai-neurons`
+    // response header was checked against the published neuron rates on
+    // 2026-10-03 and matched them exactly (21,818 and 8,182 neurons per million
+    // input tokens). Rates from Cloudflare's Workers AI pricing page. An unknown
+    // model name is priced as clef, the dearer of the two.
+    _default: { input: 0.24 / 1_000_000, output: 0 },
+    clef: { input: 0.24 / 1_000_000, output: 0 },
+    "clef-flash": { input: 0.09 / 1_000_000, output: 0 },
+  },
+  stability: {
+    // Stability AI bills per image; symbolic per-token rate.
+    _default: { input: 0, output: 0.04 / 1_000 },
+  },
+  ideogram: {
+    _default: { input: 0, output: 0.08 / 1_000 },
+  },
+  recraft: {
+    _default: { input: 0, output: 0.04 / 1_000 },
+  },
+};
+
+/**
+ * Derives the catalog-provider rows of PROVIDER_ALIASES from each entry's
+ * own `id` and `aliases` — the same stripped-lowercase key format the hand
+ * rows below use ("together-ai" -> "togetherai", "workers-ai" -> "workersai").
+ */
+function buildCatalogProviderAliases(): Record<string, string> {
+  return Object.fromEntries(
+    getCatalogJsonEntries().flatMap((entry) => {
+      const stripped = (s: string) => s.toLowerCase().replace(/[^a-z]/g, "");
+      return [
+        [stripped(entry.id), entry.id] as const,
+        ...entry.aliases.map((alias) => [stripped(alias), entry.id] as const),
+      ];
+    }),
+  );
+}
+
+/**
+ * Map of normalized provider aliases to canonical PRICING keys.
+ * After stripping non-alpha characters, e.g. "google-ai" becomes "googleai".
+ */
+const PROVIDER_ALIASES: Record<string, string> = {
+  googleai: "google",
+  googleaistudio: "google",
+  googlevertex: "vertex",
+  anthropic: "anthropic",
+  openai: "openai",
+  vertex: "vertex",
+  google: "google",
+  azure: "openai",
+  azureopenai: "openai",
+  bedrock: "anthropic",
+  amazonbedrock: "anthropic",
+  litellm: "__cross_provider__",
+  openrouter: "__cross_provider__",
+  openaicompatible: "__cross_provider__",
+  deepseek: "deepseek",
+  nvidianim: "nvidia-nim",
+  nim: "nvidia-nim",
+  nvidia: "nvidia-nim",
+  lmstudio: "lm-studio",
+  llamacpp: "llamacpp",
+  cohere: "cohere",
+  replicate: "replicate",
+  voyage: "voyage",
+  voyageai: "voyage",
+  jina: "jina",
+  jinaai: "jina",
+  stability: "stability",
+  stabilityai: "stability",
+  sd: "stability",
+  ideogram: "ideogram",
+  recraft: "recraft",
+  // 9 JSON-catalog providers (cerebras, cloudflare, fireworks, groq,
+  // mistral, perplexity, sambanova, together-ai, xai), derived from each
+  // entry's id/aliases above.
+  ...buildCatalogProviderAliases(),
+  // Not in mistral.json's `aliases` array (only "grok", "together",
+  // "pplx", "workers-ai"/"cf-ai" are real catalog aliases) — a pre-existing
+  // lenient alias kept explicitly since it can't be derived from the catalog.
+  mistralai: "mistral",
+};
+
+/**
+ * Look up per-token rates for a provider/model combination.
+ * Normalises the provider name via aliases, then tries an exact model match
+ * followed by a longest-prefix match so that e.g. "gpt-4o-2024-08-06"
+ * resolves to the "gpt-4o" entry without a false hit on "gpt-4".
+ *
+ * @returns The rate entry, or undefined when the combination is unknown.
+ */
+/**
+ * Whether the tail left over after a longest-prefix match is only a version or
+ * date stamp — e.g. "claude-sonnet-4-5-20250929-v1:0" against the table key
+ * "claude-sonnet-4-5". That is the *same* model carrying a release suffix, so
+ * its rate is quoted, not inferred.
+ *
+ * Deliberately narrow: "gpt-5.6-sol" against "gpt-5" leaves ".6-sol", which is
+ * a different model generation and stays flagged as inferred.
+ */
+const VERSION_SUFFIX_RE =
+  /^[-@](\d{8}|v\d+(:\d+)?|latest)([-@:](\d{8}|v\d+(:\d+)?))*$/;
+
+function isVersionOnlySuffix(model: string, key: string): boolean {
+  if (!model.startsWith(key) || model === key) {
+    return false;
+  }
+  return VERSION_SUFFIX_RE.test(model.slice(key.length));
+}
+
+/**
+ * The manifest's canonical id for `model` when the manifest names it by that
+ * id or by one of its declared aliases — deliberately excludes
+ * resolveManifestEntryExact's longest-prefix fallback. See the call site in
+ * findRates for why the prefix path is unsafe to use for pricing precedence.
+ */
+function manifestCanonicalId(
+  provider: string,
+  model: string,
+): string | undefined {
+  const manifest = getManifestForProvider(provider);
+  if (!manifest) {
+    return undefined;
+  }
+  if (Object.prototype.hasOwnProperty.call(manifest.models, model)) {
+    return model;
+  }
+  return Object.entries(manifest.models).find(([, entry]) =>
+    entry.aliases.includes(model),
+  )?.[0];
+}
+
+/**
+ * A provider table's entry for `modelKey`: the exact key, else the longest
+ * key `modelKey` starts with (never the synthetic "_default"). `exact` is
+ * true for a literal key or a version-only suffix of one.
+ */
+function findTableEntry(
+  providerPricing: Record<string, ModelPricingRates>,
+  modelKey: string,
+): { rates: ModelPricingRates; exact: boolean } | undefined {
+  if (providerPricing[modelKey]) {
+    return { rates: providerPricing[modelKey], exact: true };
+  }
+  const sortedKeys = Object.keys(providerPricing)
+    .filter((k) => k !== "_default")
+    .sort((a, b) => b.length - a.length);
+  const key = sortedKeys.find((k) => modelKey.startsWith(k));
+  return key
+    ? { rates: providerPricing[key], exact: isVersionOnlySuffix(modelKey, key) }
+    : undefined;
+}
+
+function findRates(
+  provider: string,
+  model: string,
+  /**
+   * Set to true when the rates came from a literal table key rather than a
+   * prefix/fallback match. Threaded as an out-param so there is exactly one
+   * lookup implementation — a second hand-written copy drifted from this one
+   * and mislabelled every Bedrock and Vertex-Gemini hit.
+   */
+  matchKind?: { exact: boolean },
+): ModelPricingRates | undefined {
+  const stripped = provider.toLowerCase().replace(/[^a-z]/g, "");
+  const normalizedProvider = PROVIDER_ALIASES[stripped] ?? stripped;
+
+  // Proxy providers (LiteLLM, OpenRouter): search all known providers for a model match
+  if (normalizedProvider === "__cross_provider__") {
+    for (const providerPricing of Object.values(PRICING)) {
+      // Exact match
+      if (providerPricing[model]) {
+        if (matchKind) {
+          matchKind.exact = true;
+        }
+        return providerPricing[model];
+      }
+      const sortedKeys = Object.keys(providerPricing).sort(
+        (a, b) => b.length - a.length,
+      );
+      // model is a prefix of a known key (e.g. "claude-sonnet-4-5" matches "claude-sonnet-4-5-20250929")
+      const reverseKey = sortedKeys.find((k) => k.startsWith(model));
+      if (reverseKey) {
+        return providerPricing[reverseKey];
+      }
+      // Known key is a prefix of model (e.g. "gpt-4o" matches "gpt-4o-2024-08-06")
+      const forwardKey = sortedKeys.find((k) => model.startsWith(k));
+      if (forwardKey) {
+        return providerPricing[forwardKey];
+      }
+    }
+    return undefined;
+  }
+
+  const providerPricing = PRICING[normalizedProvider] || PRICING[provider];
+  if (!providerPricing) {
+    return undefined;
+  }
+
+  // Bedrock model IDs carry region/vendor prefixes ("us.anthropic.claude-…",
+  // "global.anthropic.claude-…", "anthropic.claude-…") or arrive as full
+  // inference-profile ARNs ("arn:aws:bedrock:…:inference-profile/us.anthropic.
+  // claude-…" — the form this repo's own setup guides recommend). None of
+  // those match the bare pricing keys ("claude-…"), so every Bedrock call
+  // priced to $0. Strip everything up to and including the vendor prefix; the
+  // trailing "-v1:0" version suffix is absorbed by the longest-prefix match
+  // below. Non-Anthropic Bedrock models (meta./amazon./mistral.) don't match
+  // and fall through unchanged, exactly as before.
+  const modelKey =
+    stripped === "bedrock" || stripped === "amazonbedrock"
+      ? model.replace(/^.*\banthropic\./, "")
+      : model;
+
+  // Manifest-backed exact/alias match takes precedence over legacy PRICING
+  // (see Task 8 of the model metadata consolidation plan). Deliberately
+  // gated to a NAMED match only (manifest's own id or a declared alias) —
+  // never resolveManifestEntryExact's longest-prefix fallback. The
+  // manifest's model set is coarser-grained than PRICING's for several
+  // live ids today (e.g. openai's manifest names only "gpt-5" while
+  // PRICING.openai carries distinct exact entries for
+  // gpt-5.1/5.4/5.5/5.6-sol/terra/luna); letting the manifest's prefix
+  // match run first would silently steal a more specific PRICING entry's
+  // rate — confirmed: resolveManifestEntryExact("openai", "gpt-5.4")
+  // prefix-matches onto the "gpt-5" entry, $1.25/$10 instead of the
+  // correct $2.5/$15. Everything the manifest doesn't name exactly or
+  // alias — including a named entry with no pricingPerMTok, e.g.
+  // claude-sonnet-5 — falls straight through to PRICING's unchanged
+  // exact+prefix match below, which is exactly "legacy PRICING as the
+  // fallback for entries the manifest lacks."
+  const canonicalId = manifestCanonicalId(normalizedProvider, modelKey);
+  if (canonicalId !== undefined) {
+    const manifestEntry = resolveManifestEntryExact(
+      normalizedProvider,
+      modelKey,
+    );
+    if (manifestEntry?.pricingPerMTok) {
+      if (matchKind) {
+        matchKind.exact = true;
+      }
+      // The manifest carries no 1-hour cache-write rate; the table entry for
+      // the same model does. Without it a 1h write bills at the 5m rate.
+      const cacheCreation1h = (
+        findTableEntry(providerPricing, modelKey) ??
+        findTableEntry(providerPricing, canonicalId)
+      )?.rates.cacheCreation1h;
+      return {
+        input: manifestEntry.pricingPerMTok.input / 1_000_000,
+        output: manifestEntry.pricingPerMTok.output / 1_000_000,
+        cacheRead:
+          manifestEntry.pricingPerMTok.cacheRead !== undefined
+            ? manifestEntry.pricingPerMTok.cacheRead / 1_000_000
+            : undefined,
+        cacheCreation:
+          manifestEntry.pricingPerMTok.cacheWrite !== undefined
+            ? manifestEntry.pricingPerMTok.cacheWrite / 1_000_000
+            : undefined,
+        ...(cacheCreation1h !== undefined ? { cacheCreation1h } : {}),
+      };
+    }
+  }
+
+  // Exact match, else longest-prefix match
+  const tableEntry = findTableEntry(providerPricing, modelKey);
+  if (tableEntry) {
+    if (matchKind && tableEntry.exact) {
+      matchKind.exact = true;
+    }
+    return tableEntry.rates;
+  }
+
+  // Fallback: Vertex hosts both Claude and Gemini models.
+  // If no match found under "vertex", try "google" pricing for Gemini models.
+  // (Run BEFORE the provider-level _default fallback so that Vertex Gemini
+  // requests get the more specific Google rates rather than a generic Vertex
+  // _default if one is ever added.)
+  if (normalizedProvider === "vertex" && model.startsWith("gemini")) {
+    const googlePricing = PRICING["google"];
+    if (googlePricing) {
+      if (googlePricing[model]) {
+        if (matchKind) {
+          matchKind.exact = true;
+        }
+        return googlePricing[model];
+      }
+      const googleKeys = Object.keys(googlePricing).sort(
+        (a, b) => b.length - a.length,
+      );
+      const googleKey = googleKeys.find((k) => model.startsWith(k));
+      if (googleKey) {
+        return googlePricing[googleKey];
+      }
+    }
+  }
+
+  // Provider-level fallback: when a pricing table only has _default (or has
+  // no entry matching the specific model), use _default. This is mainly for
+  // local/symbolic providers (lm-studio, llamacpp) that don't enumerate per-
+  // model pricing.
+  if (providerPricing["_default"]) {
+    return providerPricing["_default"];
+  }
+
+  return undefined;
+}
+
+/**
+ * Calculate the dollar cost of a generate/stream call based on token usage.
+ * Returns 0 if the provider/model combination is not in the pricing table.
+ */
+export function calculateCost(
+  provider: string,
+  model: string,
+  usage: TokenUsage,
+): number {
+  const rates = findRates(provider, model);
+  if (!rates) {
+    return 0;
+  }
+
+  let cost = 0;
+  cost += (usage.input || 0) * rates.input;
+  cost += (usage.output || 0) * rates.output;
+  if (usage.cacheReadTokens) {
+    // Price cache reads at the discounted cacheRead rate when one exists;
+    // otherwise fall back to the full input rate. The overlapping extractor
+    // (tokenUtils) moves cached tokens out of `input` into `cacheReadTokens`
+    // for OpenAI/Gemini-family providers, so without this fallback a provider
+    // that reports cached tokens but has no cacheRead rate would bill those
+    // tokens at $0 (silent undercharge). Falling back to the input rate keeps
+    // total cost identical to pre-split billing for unpriced providers, while
+    // priced providers still get the cheaper cacheRead rate.
+    cost += usage.cacheReadTokens * (rates.cacheRead ?? rates.input);
+  }
+  if (usage.cacheCreationTokens) {
+    // `cacheCreation1hTokens` is a subset of `cacheCreationTokens` (the 1h-TTL
+    // share of the total cache-write count), not additive with it — Anthropic
+    // reports the 1h breakdown inside the same total
+    // (`cache_creation.ephemeral_1h_input_tokens` within
+    // `cache_creation_input_tokens`). Clamp to [0, total] so an inconsistent
+    // or negative count can never bill more tokens than were written, or
+    // subtract cost.
+    const oneHourTokens = Math.max(
+      0,
+      Math.min(usage.cacheCreation1hTokens ?? 0, usage.cacheCreationTokens),
+    );
+    const fiveMinTokens = usage.cacheCreationTokens - oneHourTokens;
+    // Like cache reads, disjoint cache writes must not silently become free
+    // when a model has no separate creation rate. Preserve explicit zero rates.
+    cost += fiveMinTokens * (rates.cacheCreation ?? rates.input);
+    // A model without a `cacheCreation1h` rate keeps today's pricing exactly:
+    // it falls back through the 5-minute rate to the input rate, the same
+    // chain the 5-minute share already uses, rather than going unpriced.
+    cost +=
+      oneHourTokens *
+      (rates.cacheCreation1h ?? rates.cacheCreation ?? rates.input);
+  }
+
+  return Math.round(cost * 1_000_000) / 1_000_000; // Round to 6 decimal places
+}
+
+/**
+ * Check if pricing is available for a provider/model combination.
+ * Checks the rate table directly instead of computing a cost,
+ * so even very cheap models (e.g. gemini-1.5-flash) are detected correctly.
+ *
+ * Zero-rate entries (the local-provider `_default` for lm-studio / llamacpp)
+ * count as "no pricing" — those providers explicitly don't have an upstream
+ * USD price, and any caller gated by `hasPricing()` should treat them as
+ * non-billable rather than zero-cost-billable.
+ */
+/**
+ * Whether a model's rates came from an exact table entry or were inferred.
+ *
+ * `findRates` falls back to a longest-prefix match, so an unlisted model can
+ * silently inherit a listed one's rates — e.g. "gpt-5.6-sol" matches the
+ * "gpt-5" entry and is billed at its price. That is a guess, not a quote, and
+ * a caller reporting spend needs to be able to say which it had.
+ */
+export function isExactPricingMatch(provider: string, model: string): boolean {
+  const matchKind = { exact: false };
+  const rates = findRates(provider, model, matchKind);
+  return rates !== undefined && matchKind.exact;
+}
+
+export function hasPricing(provider: string, model: string): boolean {
+  const rates = findRates(provider, model);
+  if (!rates) {
+    return false;
+  }
+  return (
+    rates.input > 0 ||
+    rates.output > 0 ||
+    (rates.cacheRead ?? 0) > 0 ||
+    (rates.cacheCreation ?? 0) > 0
+  );
+}

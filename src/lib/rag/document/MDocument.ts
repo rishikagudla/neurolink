@@ -26,30 +26,14 @@ import { LLMMetadataExtractor } from "../metadata/metadataExtractor.js";
 import type {
   BaseChunkerConfig,
   Chunk,
-  ChunkingStrategy,
   ChunkParams,
+  ChunkingStrategy,
+  DocumentState,
   DocumentType,
+  EmbedInput,
   ExtractParams,
   MDocumentConfig,
-} from "../types.js";
-
-/**
- * Document processing state
- */
-interface DocumentState {
-  /** Raw document content */
-  content: string;
-  /** Document type */
-  type: DocumentType;
-  /** Document metadata */
-  metadata: Record<string, unknown>;
-  /** Generated chunks (after chunking) */
-  chunks: Chunk[];
-  /** Document embeddings (after embedding) */
-  embeddings: number[][];
-  /** Processing history */
-  history: string[];
-}
+} from "../../types/index.js";
 
 /**
  * MDocument class for comprehensive document processing
@@ -262,11 +246,18 @@ export class MDocument {
    * Generate embeddings for all chunks
    * @param provider - Embedding provider name
    * @param modelName - Embedding model name
+   * @param imageData - Optional array of image data (Buffer or base64) aligned with chunks,
+   *                    enabling multi-modal embeddings for providers that support them
+   * @param mimeType - MIME type of the images (default: "image/png"). Pass an
+   *                    array to declare a per-image MIME type aligned with
+   *                    `imageData`; a plain string applies to every image.
    * @returns This MDocument instance (for chaining)
    */
   async embed(
     provider: string = "openai",
     modelName: string = "text-embedding-3-small",
+    imageData?: Array<Buffer | string>,
+    mimeType: string | string[] = "image/png",
   ): Promise<MDocument> {
     if (this.state.chunks.length === 0) {
       logger.warn("[MDocument] No chunks to embed. Call chunk() first.");
@@ -274,15 +265,15 @@ export class MDocument {
     }
 
     // Lazy import to avoid circular dependencies
-    const { ProviderFactory } = await import(
-      "../../factories/providerFactory.js"
-    );
+    const { ProviderFactory } =
+      await import("../../factories/providerFactory.js");
 
     logger.debug("[MDocument] Generating embeddings", {
       documentId: this.documentId,
       chunkCount: this.state.chunks.length,
       provider,
       model: modelName,
+      hasImages: imageData !== undefined && imageData.length > 0,
     });
 
     const embeddingProvider = await ProviderFactory.createProvider(
@@ -290,21 +281,22 @@ export class MDocument {
       modelName,
     );
 
-    if (
-      typeof (embeddingProvider as unknown as { embed?: unknown }).embed !==
-      "function"
-    ) {
+    if (typeof embeddingProvider.embed !== "function") {
       throw new Error(`Provider ${provider} does not support embeddings`);
     }
 
     this.state.embeddings = [];
 
-    for (const chunk of this.state.chunks) {
-      const embedding = await (
-        embeddingProvider as unknown as {
-          embed: (s: string) => Promise<number[]>;
-        }
-      ).embed(chunk.text);
+    for (let i = 0; i < this.state.chunks.length; i++) {
+      const chunk = this.state.chunks[i];
+      const image = imageData?.[i];
+      const imageMimeType =
+        typeof mimeType === "string" ? mimeType : (mimeType[i] ?? "image/png");
+      const input: string | EmbedInput = image
+        ? { text: chunk.text, image, mimeType: imageMimeType }
+        : chunk.text;
+
+      const embedding = await embeddingProvider.embed(input);
       this.state.embeddings.push(embedding);
       chunk.embedding = embedding;
     }
@@ -318,6 +310,27 @@ export class MDocument {
     });
 
     return this;
+  }
+
+  /**
+   * Generate multi-modal embeddings for all chunks using text + optional image data.
+   * Uses a provider that supports multi-modal embeddings (e.g. Bedrock Titan Image).
+   *
+   * @param provider - Embedding provider name
+   * @param modelName - Embedding model name
+   * @param imageData - Optional array of image data (Buffer or base64) aligned with chunks
+   * @param mimeType - MIME type of the images (default: "image/png"). Pass an
+   *                    array to declare a per-image MIME type aligned with
+   *                    `imageData`; a plain string applies to every image.
+   * @returns This MDocument instance (for chaining)
+   */
+  async embedMultiModal(
+    provider: string = "bedrock",
+    modelName: string = "amazon.titan-embed-image-v1",
+    imageData?: Array<Buffer | string>,
+    mimeType: string | string[] = "image/png",
+  ): Promise<MDocument> {
+    return this.embed(provider, modelName, imageData, mimeType);
   }
 
   // ============================================================================

@@ -1,5 +1,11 @@
 # ✨ PHASE 3: ADVANCED FEATURES & POLISH
 
+> **⚠️ HISTORICAL DOCUMENT (August 2025)**
+>
+> This audit was conducted when NeuroLink shipped 9 providers. At audit time, v9.62.0 (May 2026) shipped 24 providers including DeepSeek, NVIDIA NIM, LM Studio, llama.cpp, plus voice (TTS/STT/realtime). References to "9 providers" or "8/9 working" in this file reflect the state at time of analysis.
+>
+> For current capabilities see [README on GitHub](https://github.com/juspay/neurolink/blob/main/README.md) and [Provider Capabilities Audit](https://github.com/juspay/neurolink/blob/main/docs/reference/provider-capabilities-audit.md).
+
 **Phase**: 3 of 4  
 **Status**: ✅ **COMPLETE**  
 **Priority**: MEDIUM  
@@ -354,11 +360,11 @@ try {
 **Promise-Based Analytics**: Updated StreamResult interface to support analytics and evaluation promises:
 
 ```typescript
-export interface StreamResult {
+export type StreamResult = {
   stream: AsyncIterable<{ content: string }>;
   analytics?: AnalyticsData | Promise<AnalyticsData>; // Resolves after stream completion
   evaluation?: EvaluationData | Promise<EvaluationData>;
-}
+};
 ```
 
 **Rich Analytics Data**: Real streaming now provides comprehensive analytics:

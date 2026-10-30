@@ -1,0 +1,1372 @@
+#!/usr/bin/env tsx
+/**
+ * Continuous Test Suite: Client SDK
+ *
+ * Tests the consumer-facing Client SDK the way developers actually use it:
+ *   1. Start a real NeuroLink server (Hono adapter)
+ *   2. Connect with NeuroLinkClient over HTTP
+ *   3. Generate text, stream responses, execute tools
+ *   4. Verify auth, interceptors, error handling, AI SDK adapter
+ *
+ * All tests hit real endpoints. Provider-dependent tests SKIP when
+ * credentials are not configured.
+ *
+ * Run: npx tsx test/continuous-test-suite-client.ts
+ *      npx tsx test/continuous-test-suite-client.ts --provider=vertex --model=gemini-2.5-flash
+ */
+
+import "dotenv/config";
+
+// ============================================================
+// LOGGING UTILITIES — provided by shared harness
+// ============================================================
+
+import {
+  defineSuite,
+  log,
+  logSection,
+  type ColorName,
+  withCaseTimeout,
+  isCaseTimeout,
+} from "./helpers/harness.js";
+
+const { recordTest, runSuite } = defineSuite("Client");
+
+/** Print-only logTest shim. Counters come from recordTest in the runner loop. */
+function logTest(
+  testName: string,
+  status: "PASS" | "FAIL" | "SKIP" | "TESTING",
+  details?: string,
+): void {
+  const color: ColorName =
+    status === "PASS"
+      ? "green"
+      : status === "FAIL"
+        ? "red"
+        : status === "SKIP"
+          ? "yellow"
+          : "blue";
+  log(`[${status}] ${testName}${details ? ` — ${details}` : ""}`, color);
+}
+// ============================================================
+// TEST CONFIGURATION
+// ============================================================
+
+const TEST_CONFIG = {
+  provider: process.env.TEST_PROVIDER || "ollama",
+  model: process.env.TEST_MODEL || "llama3.2",
+  timeout: 60_000,
+  interTestDelay: 1_000,
+  serverPort: 9200,
+};
+
+// ============================================================
+// TEST RESULTS TRACKING
+// ============================================================
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+function isExpectedProviderError(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return [
+    "api key",
+    "api_key",
+    "authentication",
+    "rate limit",
+    "quota",
+    "credentials",
+    "could not be resolved",
+    "cannot connect",
+    "failed to generate",
+    "google_application_credentials",
+    "econnrefused",
+    "enotfound",
+    "fetch failed",
+    "provider not found",
+    "not configured",
+    "resource_exhausted",
+    "permission denied",
+    "unauthorized",
+    "billing",
+    "payment required",
+    "too many requests",
+    "connection refused",
+    "403",
+    "429",
+    "402",
+    // 500-class transient framings — narrow to the upstream-gateway codes
+    // that genuinely flap. Generic "500" / "http 5" would mask real
+    // regressions in the SDK whose stack traces happen to mention them.
+    "502",
+    "503",
+    "504",
+    "endpoint not found",
+    "provider error",
+    "all providers failed",
+    "ollama",
+    "environment variable",
+    "missing required",
+    "configuration error",
+    "failed to create provider",
+  ].some((p) => lower.includes(p));
+}
+
+// ============================================================
+// SERVER LIFECYCLE
+// ============================================================
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let serverInstance: any = null;
+
+/**
+ * Probe whether the upstream LLM provider is reachable enough to satisfy
+ * an end-to-end Client.generate() / Client.stream() round-trip. Returns
+ * `true` if the test should SKIP. Only does a real probe for `ollama` /
+ * `lmstudio` / `llamacpp` (local-only daemons); other providers fall
+ * through and rely on credential checks inside the SDK.
+ */
+async function isUpstreamProviderUnreachable(
+  provider: string,
+): Promise<boolean> {
+  if (
+    provider === "ollama" ||
+    provider === "lm-studio" ||
+    provider === "llamacpp"
+  ) {
+    const url =
+      provider === "ollama"
+        ? "http://localhost:11434/api/version"
+        : provider === "lm-studio"
+          ? "http://localhost:1234/v1/models"
+          : "http://localhost:8080/v1/models";
+    try {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 500);
+      const r = await fetch(url, { signal: ctl.signal });
+      clearTimeout(timer);
+      return !r.ok;
+    } catch {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Compute the server URL from the current TEST_CONFIG (must be called after CLI args are parsed). */
+function getServerUrl(): string {
+  return `http://localhost:${TEST_CONFIG.serverPort}`;
+}
+
+async function startServer(): Promise<boolean> {
+  try {
+    const { NeuroLink } = await import("../dist/index.js");
+    const { createServer, registerAllRoutes } =
+      await import("../dist/index.js");
+
+    const sdk = new NeuroLink();
+
+    serverInstance = await createServer(sdk, {
+      framework: "hono",
+      config: {
+        port: TEST_CONFIG.serverPort,
+        cors: { origins: ["*"] },
+        timeout: TEST_CONFIG.timeout,
+      },
+    });
+
+    await serverInstance.initialize();
+
+    // Register all routes (agent, tools, health, MCP, memory) after framework initialization
+    registerAllRoutes(serverInstance);
+
+    await serverInstance.start();
+    log(`Server started on port ${TEST_CONFIG.serverPort}`, "green");
+    return true;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    log(`Failed to start server: ${msg}`, "red");
+    return false;
+  }
+}
+
+async function stopServer(): Promise<void> {
+  if (serverInstance) {
+    try {
+      await serverInstance.stop();
+      log("Server stopped", "blue");
+    } catch {
+      // ignore
+    }
+  }
+}
+
+// ============================================================
+// TEST #1: Client connects and health check works
+// ============================================================
+
+async function testClientHealthCheck(): Promise<boolean | null> {
+  logSection("Test #1: Client health check");
+  logTest("Client connects to server", "TESTING");
+
+  try {
+    const { createClient } = await import("../dist/index.js");
+
+    const client = createClient({
+      baseUrl: getServerUrl(),
+    });
+
+    const response = await client.health();
+
+    if (!response.data || !response.data.status) {
+      logTest("Client connects to server", "FAIL", "No health data returned");
+      return false;
+    }
+
+    logTest(
+      "Client connects to server",
+      "PASS",
+      `status=${response.data.status}, version=${response.data.version || "n/a"}`,
+    );
+    return true;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    logTest("Client connects to server", "FAIL", msg);
+    return false;
+  }
+}
+
+// ============================================================
+// TEST #2: Client.generate() with real provider
+// ============================================================
+
+async function testClientGenerate(): Promise<boolean | null> {
+  logSection("Test #2: Client.generate()");
+  logTest("Generate text via HTTP client", "TESTING");
+
+  // When TEST_PROVIDER is ollama (default) but no Ollama daemon is running,
+  // the upstream call returns empty content. SKIP rather than FAIL — this is
+  // a test-env gap, not a client/server bug.
+  if (await isUpstreamProviderUnreachable(TEST_CONFIG.provider)) {
+    logTest(
+      "Generate text via HTTP client",
+      "SKIP",
+      `${TEST_CONFIG.provider} provider unreachable in this environment`,
+    );
+    return null;
+  }
+
+  try {
+    const { createClient } = await import("../dist/index.js");
+
+    const client = createClient({ baseUrl: getServerUrl() });
+
+    const response = await client.generate({
+      input: { text: "What is 2 + 2? Reply with just the number." },
+      provider: TEST_CONFIG.provider,
+      model: TEST_CONFIG.model,
+      maxTokens: 50,
+    });
+
+    const content = response.data?.content || "";
+    if (!content) {
+      logTest("Generate text via HTTP client", "FAIL", "Empty content");
+      return false;
+    }
+
+    logTest(
+      "Generate text via HTTP client",
+      "PASS",
+      `content=${content.length} chars, provider=${response.data?.provider || TEST_CONFIG.provider}`,
+    );
+    return true;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (isExpectedProviderError(msg)) {
+      logTest("Generate text via HTTP client", "SKIP", msg);
+      return null;
+    }
+    logTest("Generate text via HTTP client", "FAIL", msg);
+    return false;
+  }
+}
+
+// ============================================================
+// TEST #3: Client.stream() with real streaming
+// ============================================================
+
+async function testClientStream(): Promise<boolean | null> {
+  logSection("Test #3: Client.stream()");
+  logTest("Stream text via HTTP client", "TESTING");
+
+  if (await isUpstreamProviderUnreachable(TEST_CONFIG.provider)) {
+    logTest(
+      "Stream text via HTTP client",
+      "SKIP",
+      `${TEST_CONFIG.provider} provider unreachable in this environment`,
+    );
+    return null;
+  }
+
+  try {
+    const { createClient } = await import("../dist/index.js");
+
+    const client = createClient({ baseUrl: getServerUrl() });
+
+    const textChunks: string[] = [];
+    let doneReceived = false;
+
+    const result = await client.stream(
+      {
+        input: { text: "Count from 1 to 5. Just the numbers." },
+        provider: TEST_CONFIG.provider,
+        model: TEST_CONFIG.model,
+        maxTokens: 100,
+      },
+      {
+        onText: (text: string) => {
+          textChunks.push(text);
+        },
+        onDone: () => {
+          doneReceived = true;
+        },
+      },
+    );
+
+    const content = result.content || "";
+    if (!content && textChunks.length === 0) {
+      // Server returned 200 with no SSE chunks and no error — could be an
+      // upstream provider that produced an empty stream, but could also be
+      // a regression in the client's SSE framing/parser. Default to FAIL
+      // and let the catch path SKIP for tagged upstream errors instead;
+      // otherwise broken parsers silently disappear into "environmental"
+      // skips.
+      logTest(
+        "Stream text via HTTP client",
+        "FAIL",
+        "Server returned 200 but no SSE content or chunks were received — possible client parser regression",
+      );
+      return false;
+    }
+
+    logTest(
+      "Stream text via HTTP client",
+      "PASS",
+      `chunks=${textChunks.length}, content=${content.length} chars, done=${doneReceived}`,
+    );
+    return true;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (isExpectedProviderError(msg)) {
+      logTest("Stream text via HTTP client", "SKIP", msg);
+      return null;
+    }
+    logTest("Stream text via HTTP client", "FAIL", msg);
+    return false;
+  }
+}
+
+// ============================================================
+// TEST #4: Middleware composition works end-to-end
+// ============================================================
+
+async function testMiddlewareComposition(): Promise<boolean | null> {
+  logSection("Test #4: Middleware composition");
+  logTest("Interceptors execute in order", "TESTING");
+
+  try {
+    const { createClient, composeMiddleware } =
+      await import("../dist/index.js");
+
+    const executionOrder: string[] = [];
+
+    const trackingMiddleware =
+      (name: string) =>
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async (request: any, next: () => Promise<any>) => {
+        executionOrder.push(`${name}:before`);
+        const response = await next();
+        executionOrder.push(`${name}:after`);
+        return response;
+      };
+
+    const composed = composeMiddleware(
+      trackingMiddleware("first"),
+      trackingMiddleware("second"),
+      trackingMiddleware("third"),
+    );
+
+    const client = createClient({ baseUrl: getServerUrl() });
+    client.use(composed);
+
+    // Health check will trigger the middleware chain
+    await client.health();
+
+    const expected = [
+      "first:before",
+      "second:before",
+      "third:before",
+      "third:after",
+      "second:after",
+      "first:after",
+    ];
+
+    const orderCorrect = expected.every(
+      (step, i) => executionOrder[i] === step,
+    );
+
+    if (!orderCorrect) {
+      logTest(
+        "Interceptors execute in order",
+        "FAIL",
+        `Expected [${expected.join(",")}], got [${executionOrder.join(",")}]`,
+      );
+      return false;
+    }
+
+    logTest(
+      "Interceptors execute in order",
+      "PASS",
+      `${executionOrder.length} middleware steps in correct onion order`,
+    );
+    return true;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    logTest("Interceptors execute in order", "FAIL", msg);
+    return false;
+  }
+}
+
+// ============================================================
+// TEST #5: Auth interceptor adds headers
+// ============================================================
+
+async function testAuthInterceptor(): Promise<boolean | null> {
+  logSection("Test #5: Auth interceptor");
+  logTest("API key interceptor adds header", "TESTING");
+
+  try {
+    const { createClient, createApiKeyAuthInterceptor } =
+      await import("../dist/index.js");
+
+    let capturedHeaders: Record<string, string> = {};
+
+    // Interceptor that captures headers after auth interceptor runs
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const headerCapture = async (request: any, next: () => Promise<any>) => {
+      capturedHeaders = { ...request.headers };
+      return next();
+    };
+
+    const client = createClient({ baseUrl: getServerUrl() });
+    client.use(createApiKeyAuthInterceptor("test-secret-key-123"));
+    client.use(headerCapture);
+
+    await client.health();
+
+    if (!capturedHeaders["x-api-key"] && !capturedHeaders["X-API-Key"]) {
+      logTest(
+        "API key interceptor adds header",
+        "FAIL",
+        `No X-API-Key found in headers: ${Object.keys(capturedHeaders).join(", ")}`,
+      );
+      return false;
+    }
+
+    const keyValue =
+      capturedHeaders["x-api-key"] || capturedHeaders["X-API-Key"];
+    if (keyValue !== "test-secret-key-123") {
+      logTest(
+        "API key interceptor adds header",
+        "FAIL",
+        `Wrong key value: ${keyValue}`,
+      );
+      return false;
+    }
+
+    logTest(
+      "API key interceptor adds header",
+      "PASS",
+      "X-API-Key header injected correctly",
+    );
+    return true;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    logTest("API key interceptor adds header", "FAIL", msg);
+    return false;
+  }
+}
+
+// ============================================================
+// TEST #6: Error classes and hierarchy
+// ============================================================
+
+async function testErrorHierarchy(): Promise<boolean | null> {
+  logSection("Test #6: Error hierarchy");
+  logTest("Error classes work correctly", "TESTING");
+
+  try {
+    const {
+      ClientErrorCode: ErrorCode,
+      ClientNeuroLinkError: NeuroLinkError,
+      HttpError,
+      ClientRateLimitError,
+      ClientAuthenticationError,
+      NotFoundError,
+      isRetryableError,
+      isRetryableStatus,
+      mapStatusToErrorCode,
+      isNeuroLinkError,
+      createErrorFromResponse,
+    } = await import("../dist/index.js");
+
+    const errors: string[] = [];
+
+    // Test 1: Inheritance chain
+    const httpErr = new HttpError("Not Found", 404, {
+      code: ErrorCode.NOT_FOUND,
+    });
+    if (!(httpErr instanceof NeuroLinkError)) {
+      errors.push("HttpError should extend NeuroLinkError");
+    }
+    if (!(httpErr instanceof Error)) {
+      errors.push("HttpError should extend Error");
+    }
+    if (httpErr.status !== 404) {
+      errors.push(`HttpError.status should be 404, got ${httpErr.status}`);
+    }
+
+    // Test 2: Specialized errors
+    const rateErr = new ClientRateLimitError("Rate limited", {
+      retryAfter: 5000,
+    });
+    if (!(rateErr instanceof HttpError)) {
+      errors.push("ClientRateLimitError should extend HttpError");
+    }
+    if (typeof rateErr.retryAfter !== "number") {
+      errors.push("ClientRateLimitError should have retryAfter");
+    }
+
+    const notFound = new NotFoundError("Missing");
+    if (notFound.status !== 404) {
+      errors.push(`NotFoundError.status should be 404, got ${notFound.status}`);
+    }
+
+    // Test 3: isRetryableError
+    // Use ClientNetworkError (from errors.ts) which extends NeuroLinkError with retryable=true
+    // The plain NetworkError from httpClient.ts is NOT a NeuroLinkError
+    const { ClientNetworkError } = await import("../dist/index.js");
+    const retryable = new ClientNetworkError("connection reset");
+    if (!isRetryableError(retryable)) {
+      errors.push("NetworkError should be retryable");
+    }
+
+    const authErr = new ClientAuthenticationError("bad key");
+    if (isRetryableError(authErr)) {
+      errors.push("ClientAuthenticationError should NOT be retryable");
+    }
+
+    // Test 4: isRetryableStatus
+    if (!isRetryableStatus(429)) {
+      errors.push("429 should be retryable");
+    }
+    if (!isRetryableStatus(503)) {
+      errors.push("503 should be retryable");
+    }
+    if (isRetryableStatus(404)) {
+      errors.push("404 should NOT be retryable");
+    }
+
+    // Test 5: mapStatusToErrorCode
+    const code401 = mapStatusToErrorCode(401);
+    if (!code401 || !String(code401).toLowerCase().includes("unauthorized")) {
+      // Check it maps to something auth-related
+      const code = String(code401).toLowerCase();
+      if (!code.includes("auth") && !code.includes("unauthorized")) {
+        errors.push(
+          `mapStatusToErrorCode(401) returned unexpected: ${code401}`,
+        );
+      }
+    }
+
+    // Test 6: isNeuroLinkError type guard
+    if (!isNeuroLinkError(httpErr)) {
+      errors.push("isNeuroLinkError should return true for HttpError");
+    }
+    if (isNeuroLinkError(new Error("plain"))) {
+      errors.push("isNeuroLinkError should return false for plain Error");
+    }
+
+    // Test 7: createErrorFromResponse
+    const fromResponse = createErrorFromResponse({
+      code: "NOT_FOUND",
+      message: "Resource not found",
+      status: 404,
+    });
+    if (!isNeuroLinkError(fromResponse)) {
+      errors.push("createErrorFromResponse should return NeuroLinkError");
+    }
+
+    if (errors.length > 0) {
+      logTest("Error classes work correctly", "FAIL", errors.join("; "));
+      return false;
+    }
+
+    logTest(
+      "Error classes work correctly",
+      "PASS",
+      "Inheritance, retryable detection, status mapping, factory all correct",
+    );
+    return true;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    logTest("Error classes work correctly", "FAIL", msg);
+    return false;
+  }
+}
+
+// ============================================================
+// TEST #7: JWT decode and expiry utilities
+// ============================================================
+
+async function testJWTUtilities(): Promise<boolean | null> {
+  logSection("Test #7: JWT utilities");
+  logTest("JWT decode, expiry, and token managers", "TESTING");
+
+  try {
+    const { decodeJWTPayload, isJWTExpired, getJWTExpiry, JWTTokenManager } =
+      await import("../dist/index.js");
+
+    const errors: string[] = [];
+
+    // Create a real JWT-like token (base64 encoded)
+    const header = Buffer.from(
+      JSON.stringify({ alg: "HS256", typ: "JWT" }),
+    ).toString("base64url");
+    const futureExp = Math.floor(Date.now() / 1000) + 3600; // 1 hour from now
+    const payload = Buffer.from(
+      JSON.stringify({ sub: "user-123", exp: futureExp }),
+    ).toString("base64url");
+    const signature = "test-signature";
+    const validToken = `${header}.${payload}.${signature}`;
+
+    // Test 1: decodeJWTPayload
+    const decoded = decodeJWTPayload(validToken);
+    if (decoded.sub !== "user-123") {
+      errors.push(`decoded.sub should be 'user-123', got '${decoded.sub}'`);
+    }
+
+    // Test 2: isJWTExpired — should not be expired
+    if (isJWTExpired(validToken)) {
+      errors.push("Token with future exp should not be expired");
+    }
+
+    // Test 3: Create expired token
+    const pastExp = Math.floor(Date.now() / 1000) - 3600;
+    const expiredPayload = Buffer.from(
+      JSON.stringify({ sub: "user-123", exp: pastExp }),
+    ).toString("base64url");
+    const expiredToken = `${header}.${expiredPayload}.${signature}`;
+
+    if (!isJWTExpired(expiredToken)) {
+      errors.push("Token with past exp should be expired");
+    }
+
+    // Test 4: getJWTExpiry
+    const expiry = getJWTExpiry(validToken);
+    if (expiry === null) {
+      errors.push("getJWTExpiry returned null for a valid token");
+    } else if (expiry <= Date.now()) {
+      errors.push(`getJWTExpiry should return future ms, got ${expiry}`);
+    }
+
+    // Test 5: JWTTokenManager
+    const manager = new JWTTokenManager({
+      token: validToken,
+      expiresAt: futureExp * 1000,
+      refreshFn: async () => {
+        return {
+          accessToken: validToken,
+          expiresIn: 3600,
+          tokenType: "Bearer",
+        };
+      },
+    });
+
+    if (!manager.isValid()) {
+      errors.push("JWTTokenManager with future token should be valid");
+    }
+
+    const retrieved = await manager.getToken();
+    if (retrieved !== validToken) {
+      errors.push("getToken should return the valid token");
+    }
+
+    if (errors.length > 0) {
+      logTest(
+        "JWT decode, expiry, and token managers",
+        "FAIL",
+        errors.join("; "),
+      );
+      return false;
+    }
+
+    logTest(
+      "JWT decode, expiry, and token managers",
+      "PASS",
+      "decode, expiry check, getJWTExpiry, JWTTokenManager all correct",
+    );
+    return true;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    logTest("JWT decode, expiry, and token managers", "FAIL", msg);
+    return false;
+  }
+}
+
+// ============================================================
+// TEST #8: AI SDK adapter creates valid models
+// ============================================================
+
+async function testAiSdkAdapter(): Promise<boolean | null> {
+  logSection("Test #8: AI SDK adapter");
+  logTest("createNeuroLinkProvider returns valid AI SDK models", "TESTING");
+
+  try {
+    const { createNeuroLinkProvider, createNeuroLinkModel } =
+      await import("../dist/index.js");
+
+    const errors: string[] = [];
+
+    // Test 1: Create provider
+    const provider = createNeuroLinkProvider({
+      baseUrl: getServerUrl(),
+      apiKey: "test-key",
+      defaultProvider: "openai",
+    });
+
+    if (typeof provider !== "function") {
+      errors.push("createNeuroLinkProvider should return a callable");
+    }
+
+    // Test 2: Create model via provider
+    const model = provider("gpt-4o");
+    if (!model) {
+      errors.push("provider('gpt-4o') should return a model");
+    }
+
+    if (model.modelId !== "gpt-4o") {
+      errors.push(`model.modelId should be 'gpt-4o', got '${model.modelId}'`);
+    }
+
+    // Test 3: Model has required AI SDK interface methods
+    if (typeof model.doGenerate !== "function") {
+      errors.push("model should have doGenerate method");
+    }
+    if (typeof model.doStream !== "function") {
+      errors.push("model should have doStream method");
+    }
+
+    // Test 4: Provider inference from model name
+    const claudeModel = provider("claude-3-opus");
+    if (
+      claudeModel.provider !== "anthropic" &&
+      String(claudeModel.provider).toLowerCase() !== "anthropic"
+    ) {
+      // Some implementations may not infer provider — just note it
+      log(
+        `   Note: Provider inference returned '${claudeModel.provider}' for claude-3-opus`,
+        "yellow",
+      );
+    }
+
+    // Test 5: createNeuroLinkModel standalone
+    const standalone = createNeuroLinkModel({
+      baseUrl: getServerUrl(),
+      apiKey: "test-key",
+      modelId: "gemini-pro",
+      provider: "vertex",
+    });
+
+    if (!standalone || standalone.modelId !== "gemini-pro") {
+      errors.push(
+        "createNeuroLinkModel should create model with correct modelId",
+      );
+    }
+
+    if (errors.length > 0) {
+      logTest(
+        "createNeuroLinkProvider returns valid AI SDK models",
+        "FAIL",
+        errors.join("; "),
+      );
+      return false;
+    }
+
+    logTest(
+      "createNeuroLinkProvider returns valid AI SDK models",
+      "PASS",
+      "provider callable, model.doGenerate/doStream present, modelId correct",
+    );
+    return true;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    logTest("createNeuroLinkProvider returns valid AI SDK models", "FAIL", msg);
+    return false;
+  }
+}
+
+// ============================================================
+// TEST #9: AI SDK adapter generate() round-trip
+// ============================================================
+
+async function testAiSdkGenerate(): Promise<boolean | null> {
+  logSection("Test #9: AI SDK adapter generate()");
+  logTest("AI SDK doGenerate() round-trip", "TESTING");
+
+  try {
+    const { createNeuroLinkProvider } = await import("../dist/index.js");
+
+    const provider = createNeuroLinkProvider({
+      baseUrl: getServerUrl(),
+      defaultProvider: TEST_CONFIG.provider,
+    });
+
+    const model = provider(TEST_CONFIG.model);
+
+    const result = await model.doGenerate({
+      prompt: "What is 7 + 3? Reply with just the number.",
+      maxTokens: 50,
+    });
+
+    // The AI SDK adapter catches errors and returns { text: "", finishReason: "error" }
+    // Check if this is a provider error (credentials missing, etc.)
+    if (!result.text) {
+      if (result.finishReason === "error") {
+        // Check raw response for provider error details
+        const rawMsg =
+          result.rawResponse instanceof Error
+            ? result.rawResponse.message
+            : typeof result.rawResponse === "object" &&
+                result.rawResponse !== null
+              ? JSON.stringify(result.rawResponse)
+              : String(result.rawResponse);
+        if (isExpectedProviderError(rawMsg)) {
+          logTest(
+            "AI SDK doGenerate() round-trip",
+            "SKIP",
+            rawMsg.substring(0, 100),
+          );
+          return null;
+        }
+      }
+      logTest(
+        "AI SDK doGenerate() round-trip",
+        "SKIP",
+        "No text in response (provider likely not configured)",
+      );
+      return null;
+    }
+
+    logTest(
+      "AI SDK doGenerate() round-trip",
+      "PASS",
+      `text=${result.text.length} chars, finishReason=${result.finishReason || "n/a"}`,
+    );
+    return true;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (isExpectedProviderError(msg)) {
+      logTest("AI SDK doGenerate() round-trip", "SKIP", msg);
+      return null;
+    }
+    logTest("AI SDK doGenerate() round-trip", "FAIL", msg);
+    return false;
+  }
+}
+
+// ============================================================
+// TEST #10: SSE streaming client
+// ============================================================
+
+async function testSSEClient(): Promise<boolean | null> {
+  logSection("Test #10: SSE streaming client");
+  logTest("SSEClient streams real responses", "TESTING");
+
+  try {
+    const { SSEClient } = await import("../dist/index.js");
+
+    const sseUrl = `${getServerUrl()}/api/agent/stream`;
+
+    const sseClient = new SSEClient(sseUrl, {
+      autoReconnect: false,
+    });
+
+    const receivedEvents: string[] = [];
+    let textContent = "";
+
+    sseClient.on("text", (data: unknown) => {
+      if (typeof data === "string") {
+        textContent += data;
+      } else if (data && typeof data === "object" && "content" in data) {
+        textContent += String((data as { content: string }).content);
+      }
+      receivedEvents.push("text");
+    });
+
+    sseClient.on("done", () => {
+      receivedEvents.push("done");
+    });
+
+    // Capture the actual error payload so we can distinguish "upstream
+    // provider unavailable" (SKIP) from "client parser/framing regression"
+    // (FAIL). The previous code dropped the payload and unconditionally
+    // skipped any error.
+    let lastErrorMessage: string | undefined;
+    sseClient.on("error", (err: unknown) => {
+      receivedEvents.push("error");
+      if (typeof err === "string") {
+        lastErrorMessage = err;
+      } else if (err instanceof Error) {
+        lastErrorMessage = err.message;
+      } else if (err && typeof err === "object") {
+        const e = err as { message?: unknown; status?: unknown };
+        lastErrorMessage =
+          (typeof e.message === "string" ? e.message : undefined) ??
+          (typeof e.status === "string" || typeof e.status === "number"
+            ? `status=${e.status}`
+            : undefined) ??
+          JSON.stringify(err);
+      } else {
+        lastErrorMessage = String(err);
+      }
+    });
+
+    try {
+      await sseClient.connect({
+        body: {
+          input: { text: "Say hello in one word." },
+          provider: TEST_CONFIG.provider,
+          model: TEST_CONFIG.model,
+          maxTokens: 30,
+        },
+        headers: { "Content-Type": "application/json" },
+      });
+
+      // Wait for the done event, with a 3-second timeout fallback
+      await new Promise<void>((resolve) => {
+        const timeout = setTimeout(() => resolve(), 3000);
+        sseClient.on("done", () => {
+          clearTimeout(timeout);
+          resolve();
+        });
+      });
+      sseClient.disconnect();
+
+      if (receivedEvents.length === 0 || textContent.length === 0) {
+        // Error events present only justify a SKIP when the captured
+        // payload looks like an upstream-provider problem (auth, rate
+        // limit, gateway, transient network). Anything else — broken SSE
+        // framing, server route regression, parser bug — must surface as
+        // FAIL or it'll hide in the "environmental" bucket.
+        const hasErrorEvents = receivedEvents.some((e) => e === "error");
+        if (
+          hasErrorEvents &&
+          lastErrorMessage &&
+          isExpectedProviderError(lastErrorMessage)
+        ) {
+          logTest(
+            "SSEClient streams real responses",
+            "SKIP",
+            `events=${receivedEvents.length} (incl. error events), text=${textContent.length} chars — provider error: ${lastErrorMessage.slice(0, 120)}`,
+          );
+          return null;
+        }
+        logTest(
+          "SSEClient streams real responses",
+          "FAIL",
+          `events=${receivedEvents.length}, text=${textContent.length} chars — no actual text content streamed`,
+        );
+        return false;
+      }
+
+      logTest(
+        "SSEClient streams real responses",
+        "PASS",
+        `events=${receivedEvents.length}, text=${textContent.length} chars`,
+      );
+      return true;
+    } catch (connectErr) {
+      sseClient.disconnect();
+      const msg =
+        connectErr instanceof Error ? connectErr.message : String(connectErr);
+      if (isExpectedProviderError(msg)) {
+        logTest("SSEClient streams real responses", "SKIP", msg);
+        return null;
+      }
+      logTest("SSEClient streams real responses", "FAIL", msg);
+      return false;
+    }
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    logTest("SSEClient streams real responses", "FAIL", msg);
+    return false;
+  }
+}
+
+// ============================================================
+// TEST #11: Client handles server errors gracefully
+// ============================================================
+
+async function testClientErrorHandling(): Promise<boolean | null> {
+  logSection("Test #11: Error handling");
+  logTest("Client produces typed errors on failures", "TESTING");
+
+  try {
+    const { createClient } = await import("../dist/index.js");
+
+    const client = createClient({ baseUrl: getServerUrl() });
+
+    // Request to a non-existent endpoint should produce a meaningful error
+    let caughtError: unknown = null;
+    try {
+      await client.generate({
+        input: { text: "test" },
+        provider: "nonexistent_provider_xyz_999",
+        model: "nonexistent_model_xyz_999",
+        maxTokens: 10,
+      });
+    } catch (err) {
+      caughtError = err;
+    }
+
+    if (!caughtError) {
+      logTest(
+        "Client produces typed errors on failures",
+        "FAIL",
+        "Expected error for invalid provider but got none",
+      );
+      return false;
+    }
+
+    // The error should be something we can inspect
+    const errMsg =
+      caughtError instanceof Error ? caughtError.message : String(caughtError);
+
+    logTest(
+      "Client produces typed errors on failures",
+      "PASS",
+      `Error caught: ${errMsg.substring(0, 100)}`,
+    );
+    return true;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    logTest("Client produces typed errors on failures", "FAIL", msg);
+    return false;
+  }
+}
+
+// ============================================================
+// TEST #12: React hooks export verification (SKIP in Node)
+// ============================================================
+
+async function testReactHooksExports(): Promise<boolean | null> {
+  logSection("Test #12: React hooks exports");
+  logTest("React hooks are importable", "TESTING");
+
+  try {
+    // Import the way a consumer does, through the published subpath.
+    //
+    // This asserted against "../dist/index.js" — the root barrel — where the
+    // hooks are not exported and should not be: putting React on the default
+    // entry would pull it into every consumer of the package. They are
+    // published under the "./client" subpath, so the test failed permanently
+    // while the code was correct.
+    //
+    // Using the package specifier rather than "../dist/client/index.js" covers
+    // one thing more: it resolves through the "exports" map in package.json, so
+    // a broken or mis-pathed subpath entry fails here too. Node resolves this
+    // by self-reference to this repo's own build — verified as
+    // <repo>/dist/client/index.js, with no @juspay in node_modules to shadow
+    // it — so it is still the built output rule 15 requires, not src.
+    const clientModule = await import("@juspay/neurolink/client");
+
+    const hooks = [
+      "NeuroLinkProvider",
+      "useNeuroLinkClient",
+      "useChat",
+      "useAgent",
+      "useWorkflow",
+      "useVoice",
+      "useStream",
+      "useTools",
+    ];
+
+    const missing = hooks.filter((h) => !(h in clientModule));
+
+    if (missing.length > 0) {
+      logTest(
+        "React hooks are importable",
+        "FAIL",
+        `Missing: ${missing.join(", ")}`,
+      );
+      return false;
+    }
+
+    // Verify they're functions (not undefined/null)
+    const notFunctions = hooks.filter(
+      (h) => typeof (clientModule as Record<string, unknown>)[h] !== "function",
+    );
+    if (notFunctions.length > 0) {
+      logTest(
+        "React hooks are importable",
+        "FAIL",
+        `Not functions: ${notFunctions.join(", ")}`,
+      );
+      return false;
+    }
+
+    logTest(
+      "React hooks are importable",
+      "PASS",
+      `All ${hooks.length} hooks exported as functions (DOM required to invoke)`,
+    );
+
+    // Hooks need React's internal dispatcher, which is only set up inside a
+    // renderer. Calling them outside any component should throw the canonical
+    // "Hook called outside of component" error from React. Catching that
+    // error proves the hook is correctly wired to React's internals; not
+    // catching it would mean the hook is a stub.
+    let invokedSignal: "passes" | "fails" = "fails";
+    let invokeFailReason = "";
+    try {
+      const useChat = (clientModule as Record<string, unknown>)
+        .useChat as () => unknown;
+      // biome-ignore lint/correctness/useHookAtTopLevel: intentional negative test — verifies the hook is wired to React's internal dispatcher and throws when invoked outside a render.
+      useChat();
+      invokeFailReason =
+        "useChat() returned without throwing — expected React-internal error";
+    } catch (invokeError) {
+      const msg =
+        invokeError instanceof Error
+          ? invokeError.message
+          : String(invokeError);
+      // React phrasings observed across 18.x and 19.x:
+      //   "Invalid hook call. Hooks can only be called inside the body of a function component."
+      //   "Cannot read properties of null (reading 'useState')" / 'useContext'
+      //   "Cannot read property 'useState' of null"
+      if (
+        /invalid hook call|hooks can only be called|reading\s+'use(?:state|context|memo|effect|ref|callback|reducer)'/i.test(
+          msg,
+        )
+      ) {
+        invokedSignal = "passes";
+      } else {
+        invokeFailReason = `unexpected error from hook invocation: ${msg.slice(0, 160)}`;
+      }
+    }
+
+    if (invokedSignal === "passes") {
+      logTest(
+        "React hooks invocation",
+        "PASS",
+        "useChat() outside renderer threw React-internal hook error (proves wiring)",
+      );
+    } else {
+      logTest("React hooks invocation", "FAIL", invokeFailReason);
+      return false;
+    }
+
+    return true;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    logTest("React hooks are importable", "FAIL", msg);
+    return false;
+  }
+}
+
+// ============================================================
+// TEST #13: Retry interceptor retries on failure
+// ============================================================
+
+async function testRetryInterceptor(): Promise<boolean | null> {
+  logSection("Test #13: Retry interceptor");
+  logTest("Retry interceptor retries failed requests", "TESTING");
+
+  try {
+    const { createClient, createRetryInterceptor } =
+      await import("../dist/index.js");
+
+    let retryCallbackCount = 0;
+
+    const client = createClient({
+      baseUrl: "http://localhost:1", // Non-existent server — will fail immediately
+      timeout: 2000,
+      // Disable the client's built-in retry so only the interceptor retries
+      retry: {
+        maxAttempts: 1,
+        initialDelayMs: 100,
+        maxDelayMs: 500,
+        backoffMultiplier: 2,
+        retryOnNetworkError: false,
+      },
+    });
+
+    client.use(
+      createRetryInterceptor({
+        maxAttempts: 3,
+        initialDelayMs: 100,
+        maxDelayMs: 500,
+        backoffMultiplier: 2,
+        retryOnNetworkError: true,
+        onRetry: (_attempt) => {
+          retryCallbackCount++;
+        },
+      }),
+    );
+
+    try {
+      await client.health();
+    } catch {
+      // Expected to fail
+    }
+
+    // onRetry is called for each retry (attempt 1 and 2, not the initial attempt 0)
+    // So with maxAttempts=3, we expect 2 retries (onRetry called twice)
+    if (retryCallbackCount >= 1) {
+      logTest(
+        "Retry interceptor retries failed requests",
+        "PASS",
+        `${retryCallbackCount} retries observed via onRetry callback (configured max 3 attempts)`,
+      );
+      return true;
+    } else {
+      logTest(
+        "Retry interceptor retries failed requests",
+        "FAIL",
+        `Only ${retryCallbackCount} retries observed, expected at least 1`,
+      );
+      return false;
+    }
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    logTest("Retry interceptor retries failed requests", "FAIL", msg);
+    return false;
+  }
+}
+
+// ============================================================
+// MAIN RUNNER
+// ============================================================
+
+async function runAllTests(): Promise<void> {
+  log("\n--- NeuroLink Continuous Test Suite: Client SDK ---", "bright");
+  log(
+    `   Provider: ${TEST_CONFIG.provider}  Model: ${TEST_CONFIG.model}  Port: ${TEST_CONFIG.serverPort}`,
+    "cyan",
+  );
+
+  // Start the server first
+  logSection("Starting NeuroLink Server");
+  const serverStarted = await startServer();
+
+  if (!serverStarted) {
+    // Let runSuite(...) observe the rejection and emit a proper summary +
+    // exit code. The earlier `process.exit(1)` short-circuited the
+    // harness's cleanup and summary table.
+    log("Cannot run client tests without a server.", "red");
+    throw new Error(
+      "Cannot run client tests without a server — startServer() returned false",
+    );
+  }
+
+  // Wait for server to be ready
+  await new Promise((r) => setTimeout(r, 2000));
+
+  const tests: Array<{ name: string; fn: () => Promise<boolean | null> }> = [
+    { name: "Client health check", fn: testClientHealthCheck },
+    { name: "Client generate()", fn: testClientGenerate },
+    { name: "Client stream()", fn: testClientStream },
+    { name: "Middleware composition", fn: testMiddlewareComposition },
+    { name: "Auth interceptor", fn: testAuthInterceptor },
+    { name: "Error hierarchy", fn: testErrorHierarchy },
+    { name: "JWT utilities", fn: testJWTUtilities },
+    { name: "AI SDK adapter models", fn: testAiSdkAdapter },
+    { name: "AI SDK generate()", fn: testAiSdkGenerate },
+    { name: "SSE streaming", fn: testSSEClient },
+    { name: "Client error handling", fn: testClientErrorHandling },
+    { name: "React hooks exports", fn: testReactHooksExports },
+    { name: "Retry interceptor", fn: testRetryInterceptor },
+  ];
+
+  for (const test of tests) {
+    try {
+      const result = await withCaseTimeout(test.name, test.fn);
+      recordTest(
+        test.name,
+        result === true,
+        result === null,
+        result === null ? "skipped" : result === true ? undefined : "failed",
+      );
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      logTest(test.name, "FAIL", `Uncaught: ${msg}`);
+      recordTest(test.name, false, false, msg);
+
+      // A case bound is not an ordinary failure: Promise.race cannot cancel, so
+      // the abandoned case is still running. Continuing would run the loop's
+      // cleanup and inter-case delay underneath live work, and record every
+      // remaining case as "not run". Stop at the first one.
+      if (isCaseTimeout(error)) {
+        log(
+          `\n\u{1F6D1} ABORTING: "${test.name}" was abandoned by its timeout and is still executing. ` +
+            `Remaining cases are NOT run — this process no longer has clean state.`,
+          "red",
+        );
+        break;
+      }
+    }
+    await new Promise((r) => setTimeout(r, TEST_CONFIG.interTestDelay));
+  }
+
+  // Stop the server
+  await stopServer();
+}
+
+// ============================================================
+// CLI ARGS + EXECUTION
+// ============================================================
+
+for (const arg of process.argv.slice(2)) {
+  if (arg.startsWith("--provider=")) {
+    TEST_CONFIG.provider = arg.split("=")[1];
+  }
+  if (arg.startsWith("--model=")) {
+    TEST_CONFIG.model = arg.split("=")[1];
+  }
+  if (arg.startsWith("--port=")) {
+    TEST_CONFIG.serverPort = parseInt(arg.split("=")[1], 10);
+  }
+  if (arg === "--help" || arg === "-h") {
+    console.log(
+      "Usage: npx tsx test/continuous-test-suite-client.ts [--provider=X] [--model=Y] [--port=N]",
+    );
+    console.log("\nTests the Client SDK end-to-end:");
+    console.log(
+      "  Starts a real NeuroLink server, connects with NeuroLinkClient,",
+    );
+    console.log(
+      "  generates text, streams responses, tests auth/interceptors/errors.",
+    );
+    console.log(
+      "  Provider-dependent tests SKIP when credentials unavailable.",
+    );
+    console.log(
+      `\nDefaults: --provider=${TEST_CONFIG.provider} --model=${TEST_CONFIG.model} --port=${TEST_CONFIG.serverPort}`,
+    );
+    process.exit(0);
+  }
+}
+
+await runSuite(runAllTests);

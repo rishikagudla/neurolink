@@ -24,88 +24,35 @@
  * ```
  */
 
-import { readFile } from "fs/promises";
 import { existsSync } from "fs";
-import { extname, basename } from "path";
-import { MDocument } from "./MDocument.js";
-import type { DocumentType } from "../types.js";
+import { readFile } from "fs/promises";
+import { basename, extname } from "path";
 import { logger } from "../../utils/logger.js";
-
-/**
- * Document loader options
- */
-export interface LoaderOptions {
-  /** Custom metadata to add to document */
-  metadata?: Record<string, unknown>;
-  /** Encoding for text files */
-  encoding?: BufferEncoding;
-  /** Document type override */
-  type?: DocumentType;
-}
-
-/**
- * Web loader options
- */
-export interface WebLoaderOptions extends LoaderOptions {
-  /** Request timeout in milliseconds */
-  timeout?: number;
-  /** Custom headers for request */
-  headers?: Record<string, string>;
-  /** Extract only main content (remove navigation, ads, etc.) */
-  extractMainContent?: boolean;
-  /** Selector for main content (CSS selector) */
-  contentSelector?: string;
-  /** User agent string */
-  userAgent?: string;
-}
-
-/**
- * PDF loader options
- */
-export interface PDFLoaderOptions extends LoaderOptions {
-  /** Page range to extract (e.g., "1-5" or "1,3,5") */
-  pageRange?: string;
-  /** Extract images as base64 */
-  extractImages?: boolean;
-  /** OCR for scanned documents */
-  enableOCR?: boolean;
-  /** Preserve layout formatting */
-  preserveLayout?: boolean;
-}
-
-/**
- * CSV loader options
- */
-export interface CSVLoaderOptions extends LoaderOptions {
-  /** Delimiter character */
-  delimiter?: string;
-  /** Whether first row is header */
-  hasHeader?: boolean;
-  /** Column names (if no header) */
-  columns?: string[];
-  /** Output format */
-  outputFormat?: "text" | "json" | "markdown";
-}
-
-/**
- * Abstract document loader interface
- */
-export interface DocumentLoader {
-  /**
-   * Load document from source
-   * @param source - File path, URL, or content
-   * @param options - Loader options
-   * @returns Promise resolving to MDocument
-   */
-  load(source: string, options?: LoaderOptions): Promise<MDocument>;
-
-  /**
-   * Check if loader can handle the source
-   * @param source - File path, URL, or content
-   * @returns True if loader can handle the source
-   */
-  canHandle(source: string): boolean;
-}
+import { downloadAttachment } from "../../utils/attachmentPolicy.js";
+import { redactUrlForError } from "../../utils/logSanitize.js";
+import { decodeHtmlTextEntitiesOnce } from "../../utils/htmlEntities.js";
+import { removeHtmlMarkup } from "../../utils/htmlText.js";
+import {
+  CSVProcessor,
+  stripBom,
+  stripMetadataLine,
+  splitCsvLines,
+  dedupeColumnNames,
+  sanitizeColumnName,
+} from "../../utils/csvProcessor.js";
+import { splitCSVFields } from "../../utils/csvUtils.js";
+import type {
+  DocumentType,
+  LoaderOptions,
+  WebLoaderOptions,
+  PDFLoaderOptions,
+  CSVLoaderOptions,
+  DocumentLoader,
+} from "../../types/index.js";
+import { MDocument } from "./MDocument.js";
+// pdf-parse is an optional dependency; only its types are imported here
+// (erased at compile time), the runtime module is loaded dynamically below.
+import type { PDFParse as PDFParseCtor } from "pdf-parse";
 
 /**
  * Text file loader
@@ -189,6 +136,7 @@ export class JSONLoader extends TextLoader {
     } catch (error) {
       throw new Error(
         `Invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
       );
     }
 
@@ -211,28 +159,71 @@ export class CSVLoader extends TextLoader {
   async load(source: string, options?: CSVLoaderOptions): Promise<MDocument> {
     const content = await this.loadContent(source, options?.encoding);
     const {
-      delimiter = ",",
+      delimiter,
       hasHeader = true,
       columns,
       outputFormat = "text",
+      sanitizeColumnNames = false,
+      columnNameCase = "snake_case",
     } = options || {};
 
-    const lines = content.split("\n").filter((line) => line.trim());
-    const headers = hasHeader
-      ? this.parseCSVLine(lines[0], delimiter)
-      : columns || lines[0]?.split(delimiter).map((_, i) => `col${i + 1}`);
+    // #361: an explicit delimiter always wins; otherwise detect it from the
+    // content + extension so a .tsv fed through RAG isn't collapsed into one
+    // comma-column (CSVLoader.canHandle already accepts .tsv).
+    const effectiveDelimiter =
+      delimiter ?? CSVProcessor.detectDelimiter(content, extname(source));
+
+    // Route header/row parsing through the same shared, quote-aware path
+    // detectDelimiter() above already uses internally: a quote-aware logical
+    // row split (splitCsvLines — a newline inside a quoted field stays part
+    // of that field instead of breaking the row) with a leading Excel `sep=`
+    // preamble line stripped (stripMetadataLine), so it can't be parsed as
+    // the header. Field-level splitting also goes through the shared
+    // RFC-4180-aware splitCSVFields() instead of the loader's own naive
+    // backslash-escape parser, which didn't handle doubled-quote (`""`)
+    // escaping or quoted delimiters in the headerless-columns branch.
+    const { dataLines: strippedLines } = stripMetadataLine(
+      splitCsvLines(stripBom(content)),
+    );
+    const lines = strippedLines.filter((line) => line.trim());
+
+    const rawHeaders = hasHeader
+      ? splitCSVFields(lines[0] ?? "", effectiveDelimiter).map((h) => h.trim())
+      : columns ||
+        splitCSVFields(lines[0] ?? "", effectiveDelimiter).map(
+          (_, i) => `col${i + 1}`,
+        );
+    // #378: apply the same opt-in header sanitization CSVProcessor offers, so
+    // the RAG ingestion path doesn't corrupt "Price ($)"-style headers as keys.
+    const headers = sanitizeColumnNames
+      ? dedupeColumnNames(
+          rawHeaders.map((h, i) => sanitizeColumnName(h, columnNameCase, i)),
+        )
+      : rawHeaders;
 
     const dataLines = hasHeader ? lines.slice(1) : lines;
-    const rows = dataLines.map((line) => this.parseCSVLine(line, delimiter));
+    const rows = dataLines.map((line) =>
+      splitCSVFields(line, effectiveDelimiter).map((field) => field.trim()),
+    );
 
     let formattedContent: string;
 
     switch (outputFormat) {
       case "json":
         formattedContent = JSON.stringify(
-          rows.map((row) =>
-            Object.fromEntries(headers.map((h, i) => [h, row[i]])),
-          ),
+          rows.map((row) => {
+            // Defense-in-depth against a caller-controlled header literally
+            // named "__proto__"/"constructor"/"prototype" (#1199);
+            // Object.fromEntries can't actually pollute Object.prototype here
+            // (spec semantics), but a null-prototype target avoids relying on
+            // that for future readers.
+            const record: Record<string, string | undefined> =
+              Object.create(null);
+            headers.forEach((h, i) => {
+              record[h] = row[i];
+            });
+            return record;
+          }),
           null,
           2,
         );
@@ -260,38 +251,24 @@ export class CSVLoader extends TextLoader {
     return ext === ".csv" || ext === ".tsv";
   }
 
-  private parseCSVLine(line: string, delimiter: string): string[] {
-    const result: string[] = [];
-    let current = "";
-    let inQuotes = false;
-
-    for (let i = 0; i < line.length; i++) {
-      const char = line[i];
-
-      if (char === '"' && (i === 0 || line[i - 1] !== "\\")) {
-        inQuotes = !inQuotes;
-      } else if (char === delimiter && !inQuotes) {
-        result.push(current.trim());
-        current = "";
-      } else {
-        current += char;
-      }
-    }
-
-    result.push(current.trim());
-    return result;
-  }
-
   private toMarkdownTable(headers: string[], rows: string[][]): string {
-    const headerRow = `| ${headers.join(" | ")} |`;
-    const separator = `| ${headers.map(() => "---").join(" | ")} |`;
-    const dataRows = rows.map((row) => `| ${row.join(" | ")} |`);
+    const safeHeaders = headers.map((h) => this.collapseEmbeddedNewlines(h));
+    const headerRow = `| ${safeHeaders.join(" | ")} |`;
+    const separator = `| ${safeHeaders.map(() => "---").join(" | ")} |`;
+    const dataRows = rows.map(
+      (row) =>
+        `| ${row.map((cell) => this.collapseEmbeddedNewlines(cell)).join(" | ")} |`,
+    );
     return [headerRow, separator, ...dataRows].join("\n");
   }
 
   private toTextTable(headers: string[], rows: string[][]): string {
-    const allRows = [headers, ...rows];
-    const colWidths = headers.map((_, i) =>
+    const safeHeaders = headers.map((h) => this.collapseEmbeddedNewlines(h));
+    const safeRows = rows.map((row) =>
+      row.map((cell) => this.collapseEmbeddedNewlines(cell)),
+    );
+    const allRows = [safeHeaders, ...safeRows];
+    const colWidths = safeHeaders.map((_, i) =>
       Math.max(...allRows.map((row) => (row[i] || "").length)),
     );
 
@@ -299,10 +276,25 @@ export class CSVLoader extends TextLoader {
       row.map((cell, i) => (cell || "").padEnd(colWidths[i])).join(" | ");
 
     return [
-      formatRow(headers),
+      formatRow(safeHeaders),
       colWidths.map((w) => "-".repeat(w)).join("-+-"),
-      ...rows.map(formatRow),
+      ...safeRows.map(formatRow),
     ].join("\n");
+  }
+
+  /**
+   * Collapse embedded newlines to a single space so one logical CSV row
+   * renders as exactly one line in the text/markdown table output.
+   *
+   * The shared quote-aware parser (`splitCsvLines` + `splitCSVFields`)
+   * preserves newlines embedded inside a quoted field verbatim — correct
+   * for the `json` output format (where `JSON.stringify` escapes them), but
+   * left as-is here it would split a single record across multiple
+   * physical table rows. Mirrors the same normalization `CSVProcessor`
+   * already applies in its own markdown formatter.
+   */
+  private collapseEmbeddedNewlines(cell: string): string {
+    return cell.replace(/\r\n|\n|\r/g, " ");
   }
 }
 
@@ -323,39 +315,12 @@ export class PDFLoader implements DocumentLoader {
       pageRange: options?.pageRange,
     });
 
+    let PDFParse: typeof PDFParseCtor;
     try {
-      // Try to use pdf-parse if available
-      const pdfParse = await this.loadPdfParser();
-      const buffer = await readFile(source);
-      const data = await pdfParse(buffer);
-
-      const text = data.text;
-
-      // Handle page range if specified
-      if (options?.pageRange) {
-        const _pages = this.parsePageRange(options.pageRange, data.numpages);
-        // Note: pdf-parse doesn't support page selection directly
-        // This is a placeholder for more sophisticated page handling
-        logger.debug(
-          "[PDFLoader] Page range requested but not fully supported",
-          {
-            pageRange: options.pageRange,
-            totalPages: data.numpages,
-          },
-        );
-      }
-
-      return new MDocument(text, {
-        type: "pdf",
-        metadata: {
-          source: basename(source),
-          pageCount: data.numpages,
-          info: data.info,
-          ...options?.metadata,
-        },
-      });
+      PDFParse = await this.loadPdfParser();
     } catch (error) {
-      // Fallback: Return placeholder document
+      // pdf-parse genuinely isn't installed / doesn't expose a usable
+      // export — degrade gracefully rather than throwing.
       logger.warn("[PDFLoader] pdf-parse not available, using fallback", {
         error: error instanceof Error ? error.message : String(error),
       });
@@ -372,6 +337,62 @@ export class PDFLoader implements DocumentLoader {
         },
       );
     }
+
+    const buffer = await readFile(source);
+    const parser = new PDFParse({ data: buffer });
+    try {
+      const data = await parser.getText();
+      const text = data.text;
+
+      // Handle page range if specified
+      if (options?.pageRange) {
+        const _pages = this.parsePageRange(options.pageRange, data.total);
+        // Note: pdf-parse doesn't support page selection directly
+        // This is a placeholder for more sophisticated page handling
+        logger.debug(
+          "[PDFLoader] Page range requested but not fully supported",
+          {
+            pageRange: options.pageRange,
+            totalPages: data.total,
+          },
+        );
+      }
+
+      return new MDocument(text, {
+        type: "pdf",
+        metadata: {
+          source: basename(source),
+          pageCount: data.total,
+          ...options?.metadata,
+        },
+      });
+    } catch (error) {
+      // pdf-parse IS installed and loaded fine, but failed on this
+      // specific file (corrupt PDF, password-protected, unsupported
+      // structure, etc.). Keep this distinct from the "not installed"
+      // fallback above — both surface as a placeholder document, but the
+      // message, parseError value, and log level differ so a genuine
+      // parse failure is never mistaken for a missing dependency.
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error("[PDFLoader] pdf-parse failed to parse PDF", {
+        source,
+        error: message,
+      });
+
+      return new MDocument(
+        `[PDF Document: ${basename(source)}]\n\nNote: PDF parsing failed for this file: ${message}`,
+        {
+          type: "pdf",
+          metadata: {
+            source: basename(source),
+            parseError: `pdf-parse failed: ${message}`,
+            ...options?.metadata,
+          },
+        },
+      );
+    } finally {
+      await parser.destroy();
+    }
   }
 
   canHandle(source: string): boolean {
@@ -379,20 +400,29 @@ export class PDFLoader implements DocumentLoader {
     return ext === ".pdf";
   }
 
-  private async loadPdfParser(): Promise<
-    (buffer: Buffer) => Promise<{
-      text: string;
-      numpages: number;
-      info: Record<string, unknown>;
-    }>
-  > {
+  private async loadPdfParser(): Promise<typeof PDFParseCtor> {
+    // pdf-parse v2 exports a `PDFParse` class (`new PDFParse({ data }).getText()`)
+    // instead of v1's bare callable — resolve it dynamically and validate at
+    // runtime that the export shape is actually present instead of blindly
+    // asserting.
+    let pdfParseModule: unknown;
     try {
-      // @ts-expect-error pdf-parse is an optional dependency
-      const pdfParse = await import("pdf-parse");
-      return pdfParse.default || pdfParse;
+      pdfParseModule = await import("pdf-parse");
     } catch {
       throw new Error("pdf-parse module not available");
     }
+    const candidate: unknown =
+      typeof pdfParseModule === "object" &&
+      pdfParseModule !== null &&
+      "PDFParse" in pdfParseModule
+        ? (pdfParseModule as { PDFParse: unknown }).PDFParse
+        : undefined;
+    if (typeof candidate !== "function") {
+      // Outside the try/catch so this message isn't swallowed by the
+      // module-not-available rethrow.
+      throw new Error("pdf-parse module does not export a PDFParse class");
+    }
+    return candidate as typeof PDFParseCtor;
   }
 
   private parsePageRange(range: string, totalPages: number): number[] {
@@ -423,6 +453,9 @@ export class PDFLoader implements DocumentLoader {
  * Fetches and extracts content from web pages.
  * Supports basic HTML parsing without external dependencies.
  */
+/** 25 MiB — the default cap on a fetched page. */
+const WEB_LOADER_MAX_BYTES = 25 * 1024 * 1024;
+
 export class WebLoader implements DocumentLoader {
   private defaultUserAgent =
     "Mozilla/5.0 (compatible; NeuroLink/1.0; +https://github.com/juspay/neurolink)";
@@ -433,14 +466,19 @@ export class WebLoader implements DocumentLoader {
     }
 
     logger.debug("[WebLoader] Fetching URL", {
-      url: source,
+      url: redactUrlForError(source),
       timeout: options?.timeout,
     });
 
-    const response = await fetch(source, {
-      signal: options?.timeout
-        ? AbortSignal.timeout(options.timeout)
-        : undefined,
+    // Through the attachment policy: HTTPS to a public host unless the policy
+    // says otherwise, DNS-pinned, redirects re-validated per hop with the
+    // caller's headers dropped, and the body bounded while it streams rather
+    // than read whole with `text()`.
+    const downloaded = await downloadAttachment(source, {
+      policy: options?.attachmentPolicy,
+      maxBytes: options?.maxBytes ?? WEB_LOADER_MAX_BYTES,
+      label: "web page",
+      timeoutMs: options?.timeout,
       headers: {
         "User-Agent": options?.userAgent || this.defaultUserAgent,
         Accept:
@@ -449,11 +487,7 @@ export class WebLoader implements DocumentLoader {
       },
     });
 
-    if (!response.ok) {
-      throw new Error(`HTTP error ${response.status}: ${response.statusText}`);
-    }
-
-    const html = await response.text();
+    const html = downloaded.buffer.toString("utf-8");
     let content = html;
 
     // Extract main content if requested
@@ -470,7 +504,7 @@ export class WebLoader implements DocumentLoader {
         source,
         url: source,
         fetchedAt: new Date().toISOString(),
-        contentType: response.headers.get("content-type") || "text/html",
+        contentType: downloaded.contentType || "text/html",
         ...options?.metadata,
       },
     });
@@ -517,33 +551,40 @@ export class WebLoader implements DocumentLoader {
    * Convert HTML to plain text
    */
   private htmlToText(html: string): string {
-    return (
-      html
-        // Remove script and style elements
-        .replace(/<script[\s\S]*?<\/script>/gi, "")
-        .replace(/<style[\s\S]*?<\/style>/gi, "")
-        // Remove HTML comments
-        .replace(/<!--[\s\S]*?-->/g, "")
-        // Replace common block elements with newlines
-        .replace(/<\/(p|div|h[1-6]|br|li|tr|blockquote)>/gi, "\n")
-        .replace(/<(br|hr)\s*\/?>/gi, "\n")
-        // Remove remaining tags
-        .replace(/<[^>]+>/g, "")
-        // Decode common HTML entities
-        .replace(/&nbsp;/gi, " ")
-        .replace(/&amp;/gi, "&")
-        .replace(/&lt;/gi, "<")
-        .replace(/&gt;/gi, ">")
-        .replace(/&quot;/gi, '"')
-        .replace(/&#039;/gi, "'")
-        .replace(/&apos;/gi, "'")
-        // Decode numeric entities
-        .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
-        // Normalize whitespace
-        .replace(/\n\s*\n/g, "\n\n")
-        .replace(/[ \t]+/g, " ")
-        .trim()
-    );
+    return decodeHtmlTextEntitiesOnce(
+      removeHtmlMarkup(html, {
+        tagReplacement: "",
+        commentReplacement: "",
+        lineBreakEndTags: [
+          "p",
+          "div",
+          "h1",
+          "h2",
+          "h3",
+          "h4",
+          "h5",
+          "h6",
+          "br",
+          "li",
+          "tr",
+          "blockquote",
+        ],
+        lineBreakVoidTags: ["br", "hr"],
+      }),
+      {
+        nbsp: " ",
+        amp: "&",
+        lt: "<",
+        gt: ">",
+        quot: '"',
+        "#039": "'",
+        apos: "'",
+      },
+      true,
+    )
+      .replace(/\n\s*\n/g, "\n\n")
+      .replace(/[ \t]+/g, " ")
+      .trim();
   }
 }
 

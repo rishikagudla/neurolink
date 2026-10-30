@@ -1,35 +1,844 @@
-/**
- * Direct Tool Definitions for NeuroLink CLI Agent
- * Simple, reliable tools that work immediately with Vercel AI SDK
- */
-
-import { tool } from "ai";
 import { z } from "zod";
 import * as fs from "fs";
 import * as path from "path";
+import { execFile } from "child_process";
 import { logger } from "../utils/logger.js";
-import { VertexAI } from "@google-cloud/vertexai";
 import { CSVProcessor } from "../utils/csvProcessor.js";
+import { shouldEnableBashTool } from "../utils/toolUtils.js";
+import {
+  ARITHMETIC_CONSTANT_NAMES,
+  ARITHMETIC_FUNCTION_NAMES,
+  evaluateArithmetic,
+} from "./arithmeticEvaluator.js";
+import type {
+  AllToolsMap,
+  AnalyzeCsvToolArgs,
+  FileToolRootPolicy,
+  PathSandboxResult,
+  BasicToolsMap,
+  FilesystemToolsMap,
+  Tool,
+  UtilityToolsMap,
+} from "../types/index.js";
+import { tool } from "../utils/tool.js";
+import { withTimeout } from "../utils/async/withTimeout.js";
+import {
+  resolvePathWithinRoot,
+  resolveWithinRoot,
+} from "../utils/pathSandbox.js";
+import { TIMEOUTS } from "../constants/timeouts.js";
 
-// Runtime Google Search tool creation - bypasses TypeScript strict typing
-function createGoogleSearchTools() {
-  const searchTool = {};
-  // Dynamically assign google_search property at runtime
-  Object.defineProperty(searchTool, "google_search", {
-    value: {},
-    enumerable: true,
-    configurable: true,
-  });
-  return [searchTool];
+const MAX_OUTPUT_BYTES = 102400; // 100KB
+
+function truncateOutput(output: string): string {
+  if (output.length > MAX_OUTPUT_BYTES) {
+    return (
+      output.slice(0, MAX_OUTPUT_BYTES) + "\n... [output truncated at 100KB]"
+    );
+  }
+  return output;
 }
+
+/** The historical default: the process working directory, read at call time. */
+const WORKING_DIRECTORY_POLICY: FileToolRootPolicy = Object.freeze({
+  roots: null,
+});
+
+function rootsOf(policy: FileToolRootPolicy): readonly string[] {
+  return policy.roots ?? [process.cwd()];
+}
+
+function withRoots(description: string, policy: FileToolRootPolicy): string {
+  if (policy.roots === null) {
+    return description;
+  }
+  const allowed = policy.roots.length
+    ? policy.roots.join(", ")
+    : "none (file access is disabled for this request)";
+  return `${description}. Allowed roots: ${allowed}`;
+}
+
 /**
- * Direct tool definitions that work immediately with Gemini/AI SDK
- * These bypass MCP complexity and provide reliable agent functionality
+ * Contain a built-in file tool to its roots.
+ *
+ * Symlinks are resolved on both sides and the prefix test is separator-bounded
+ * (`resolvePathWithinRoot`), so neither `<root>/link → /etc` nor
+ * `/home/app-evil` against `/home/app` gets through. A path that does not
+ * exist yet is checked on its nearest existing ancestor, which is what a
+ * write needs. Relative paths resolve against the first root.
+ *
+ * The result is a REAL path, and every consumer opens it with O_NOFOLLOW (or
+ * O_EXCL), so a link swapped in at the final component after this check is
+ * refused by the kernel — on Windows, which has no O_NOFOLLOW, only the
+ * O_EXCL create path keeps that guarantee. A directory component swapped for
+ * a link in that same window is not caught anywhere: Node exposes no
+ * openat/O_PATH walk, so that race is accepted here exactly as
+ * `FileDetector.loadFromPath` accepts it.
  */
-export const directAgentTools = {
+function resolveWithinFileToolRoots(
+  target: string,
+  policy: FileToolRootPolicy,
+): PathSandboxResult {
+  const roots = rootsOf(policy);
+  if (roots.length === 0) {
+    return {
+      error:
+        "Access denied: file tools are disabled for this request (no tool roots are configured)",
+    };
+  }
+  const requested = path.isAbsolute(target)
+    ? target
+    : path.resolve(roots[0], target);
+  for (const root of roots) {
+    const contained = resolvePathWithinRoot(requested, root);
+    if (contained.path !== undefined) {
+      return contained;
+    }
+  }
+  return {
+    error:
+      policy.roots === null
+        ? `Access denied: "${target}" resolves outside the working directory`
+        : `Access denied: "${target}" resolves outside the permitted roots (${roots.join(", ")})`,
+  };
+}
+
+/** Unavailable on Windows, where it is 0 and has no effect. */
+const O_NOFOLLOW = fs.constants.O_NOFOLLOW ?? 0;
+
+const SENSITIVE_SYSTEM_PATH_PREFIXES = [
+  "/etc/",
+  "/sys/",
+  "/proc/",
+  "/dev/",
+  "/root/",
+  "/.ssh/",
+  "/private/etc/",
+  "/private/var/",
+  "c:/windows/",
+  "c:/program files/",
+  "c:/programdata/",
+];
+
+/**
+ * Denylist of system directories analyzeCSV refuses even inside a permitted
+ * root. Expects an already-resolved real path, so what is judged is where the
+ * file actually lives rather than the name it was asked for by.
+ */
+function isSensitiveSystemPath(realPath: string): boolean {
+  const normalized = realPath.toLowerCase().replace(/\\/g, "/");
+  return SENSITIVE_SYSTEM_PATH_PREFIXES.some((prefix) =>
+    normalized.startsWith(prefix),
+  );
+}
+
+/**
+ * Write without following a symlink at the final path component. The root
+ * check ran on the resolved path, so a link that appears there afterwards, or
+ * a dangling one, is refused by the kernel instead of redirecting the write:
+ * `create` uses O_EXCL (which also fails on an existing link), the other
+ * modes O_NOFOLLOW.
+ */
+function writeWithoutFollowingLinks(
+  resolvedPath: string,
+  content: string,
+  mode: "create" | "overwrite" | "append",
+): void {
+  const { O_WRONLY, O_CREAT, O_EXCL, O_TRUNC, O_APPEND } = fs.constants;
+  const flags =
+    mode === "create"
+      ? O_WRONLY | O_CREAT | O_EXCL
+      : O_WRONLY |
+        O_CREAT |
+        O_NOFOLLOW |
+        (mode === "append" ? O_APPEND : O_TRUNC);
+  const fd = fs.openSync(resolvedPath, flags, 0o666);
+  try {
+    fs.writeFileSync(fd, content, "utf-8");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/** Read without following a symlink at the final path component. */
+function readWithoutFollowingLinks(resolvedPath: string): Buffer {
+  const fd = fs.openSync(resolvedPath, fs.constants.O_RDONLY | O_NOFOLLOW);
+  try {
+    return fs.readFileSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+const ZIP_SIGNATURE = Buffer.from([0x50, 0x4b, 0x03, 0x04]);
+const OLE2_SIGNATURE = Buffer.from([
+  0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1,
+]);
+
+/**
+ * Office documents are archives or compound files, so decoding them as UTF-8
+ * hands the model mojibake it then tries to reason about. Detected by content
+ * because extensions are often missing or wrong.
+ */
+function detectBinaryDocumentFormat(bytes: Buffer): string | undefined {
+  if (bytes.subarray(0, ZIP_SIGNATURE.length).equals(ZIP_SIGNATURE)) {
+    return "ZIP-packaged (such as .docx, .xlsx, .pptx, .odt)";
+  }
+  if (bytes.subarray(0, OLE2_SIGNATURE.length).equals(OLE2_SIGNATURE)) {
+    return "OLE2 compound (such as legacy .doc, .xls, .ppt)";
+  }
+  return undefined;
+}
+
+/**
+ * Vertex location for the websearchGrounding tool:
+ * NEUROLINK_WEBSEARCH_LOCATION, else `global`.
+ *
+ * Deliberately does NOT inherit GOOGLE_VERTEX_LOCATION. The search models are
+ * served only from the `global`, `us` and `eu` endpoints — never from a single
+ * region — so inheriting a regional value produces a 404 for the model rather
+ * than a working search. That is not hypothetical: a deployment pinned to
+ * us-east5 for Claude-on-Vertex sent web search to us-east5 too and every
+ * query failed with NOT_FOUND.
+ *
+ * Set NEUROLINK_WEBSEARCH_LOCATION to `us` or `eu` where the multi-region
+ * endpoints are required, e.g. for data residency.
+ */
+export function resolveWebsearchLocation(): string {
+  return process.env.NEUROLINK_WEBSEARCH_LOCATION?.trim() || "global";
+}
+
+/** Model for websearchGrounding — NEUROLINK_WEBSEARCH_MODEL, else the default. */
+export function resolveWebsearchModel(): string {
+  return (
+    process.env.NEUROLINK_WEBSEARCH_MODEL?.trim() || "gemini-3.1-flash-lite"
+  );
+}
+
+/**
+ * The generateContent request for a web search. Google Search grounding is
+ * requested natively through `config.tools`.
+ */
+export function buildWebsearchRequest(
+  model: string,
+  query: string,
+  maxWords: number,
+) {
+  return {
+    model,
+    contents: [
+      {
+        role: "user",
+        parts: [
+          {
+            text: `Search for: "${query}". Provide a concise summary in no more than ${maxWords} words.`,
+          },
+        ],
+      },
+    ],
+    config: { tools: [{ googleSearch: {} }] },
+  };
+}
+
+/**
+ * Display domain for one grounding chunk.
+ *
+ * Blank `domain` values count as absent, and the uri fallback is guarded by
+ * `URL.canParse` — an unparseable provider uri would otherwise throw and take
+ * the entire search down with it.
+ */
+export function resolveGroundingDomain(web: {
+  uri?: string;
+  domain?: string;
+}): string {
+  return (
+    web.domain?.trim() ||
+    (web.uri && URL.canParse(web.uri) ? new URL(web.uri).hostname : "unknown")
+  );
+}
+
+/**
+ * Map grounding chunks onto search results, capped at `limitedResults`.
+ * Returns an empty array when there is no usable grounding metadata, which the
+ * caller replaces with a single synthesised result.
+ */
+export function buildWebsearchResults(
+  groundingMetadata:
+    | {
+        groundingChunks?: {
+          web?: { uri?: string; title?: string; domain?: string };
+        }[];
+      }
+    | undefined,
+  searchContent: string,
+  limitedResults: number,
+) {
+  const searchResults = [];
+  for (const chunk of groundingMetadata?.groundingChunks?.slice(
+    0,
+    limitedResults,
+  ) ?? []) {
+    if (chunk.web) {
+      searchResults.push({
+        title: chunk.web.title || "No title",
+        url: chunk.web.uri || "",
+        // Full content — maxWords already bounds the length.
+        snippet: searchContent,
+        domain: resolveGroundingDomain(chunk.web),
+      });
+    }
+  }
+  return searchResults;
+}
+
+/**
+ * The file tools, bound to one root policy. Built per request when roots are
+ * configured, so concurrent requests never share a boundary.
+ */
+function createReadFileTool(policy: FileToolRootPolicy): Tool {
+  return tool({
+    description: withRoots(
+      "Read the contents of a file from the filesystem",
+      policy,
+    ),
+    inputSchema: z.object({
+      path: z.string().describe("File path to read (relative or absolute)"),
+    }),
+    execute: async ({ path: filePath }) => {
+      try {
+        // Sandbox: contain reads to the tool roots (symlink-aware).
+        const guard = resolveWithinFileToolRoots(filePath, policy);
+        if (guard.error !== undefined) {
+          return { success: false, error: guard.error };
+        }
+        const resolvedPath = guard.path;
+
+        const bytes = readWithoutFollowingLinks(resolvedPath);
+        const binaryFormat = detectBinaryDocumentFormat(bytes);
+        if (binaryFormat) {
+          return {
+            success: false,
+            error: `${filePath} is a binary ${binaryFormat} document, so its bytes are not readable as text. Read it with a parser or converter for that format (for example from a shell command) instead of readFile.`,
+            binaryDocument: true,
+            format: binaryFormat,
+            size: bytes.length,
+            path: resolvedPath,
+          };
+        }
+        const content = bytes.toString("utf-8");
+        const stats = fs.statSync(resolvedPath);
+
+        return {
+          success: true,
+          content,
+          size: stats.size,
+          path: resolvedPath,
+          lastModified: stats.mtime.toISOString(),
+        };
+      } catch (error) {
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+          path: filePath,
+        };
+      }
+    },
+  });
+}
+
+/** List one directory inside the roots; entries are lstat'd, never followed. */
+function createListDirectoryTool(policy: FileToolRootPolicy): Tool {
+  return tool({
+    description: withRoots(
+      "List files and directories in a specified directory",
+      policy,
+    ),
+    inputSchema: z.object({
+      path: z
+        .string()
+        .describe("Directory path to list (relative or absolute)"),
+      includeHidden: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Include hidden files (starting with .)"),
+    }),
+    execute: async ({ path: dirPath, includeHidden }) => {
+      try {
+        // Sandbox: contain directory listing to the tool roots.
+        const guard = resolveWithinFileToolRoots(dirPath, policy);
+        if (guard.error !== undefined) {
+          return { success: false, error: guard.error };
+        }
+        const resolvedPath = guard.path;
+        const items = fs.readdirSync(resolvedPath);
+
+        const filteredItems = includeHidden
+          ? items
+          : items.filter((item) => !item.startsWith("."));
+
+        // lstat, not stat: an entry that is a symlink is reported as one, with
+        // its own metadata. Following it would leak the size and mtime of a
+        // target outside the roots, and a dangling link would fail the whole
+        // listing with ENOENT.
+        const itemDetails = filteredItems.map((item) => {
+          const itemPath = path.join(resolvedPath, item);
+          const stats = fs.lstatSync(itemPath);
+
+          return {
+            name: item,
+            type: stats.isSymbolicLink()
+              ? "symlink"
+              : stats.isDirectory()
+                ? "directory"
+                : "file",
+            size: stats.isFile() ? stats.size : undefined,
+            lastModified: stats.mtime.toISOString(),
+          };
+        });
+
+        return {
+          success: true,
+          path: resolvedPath,
+          items: itemDetails,
+          count: itemDetails.length,
+        };
+      } catch (error) {
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+          path: dirPath,
+        };
+      }
+    },
+  });
+}
+
+function createWriteFileTool(policy: FileToolRootPolicy): Tool {
+  return tool({
+    description: withRoots(
+      "Write content to a file (use with caution)",
+      policy,
+    ),
+    inputSchema: z.object({
+      path: z.string().describe("File path to write to"),
+      content: z.string().describe("Content to write to the file"),
+      mode: z
+        .enum(["create", "overwrite", "append"])
+        .default("create")
+        .describe("Write mode"),
+    }),
+    execute: async ({ path: filePath, content, mode }) => {
+      try {
+        // Sandbox: contain writes to the tool roots (symlink-aware).
+        const guard = resolveWithinFileToolRoots(filePath, policy);
+        if (guard.error !== undefined) {
+          return { success: false, error: guard.error };
+        }
+        const resolvedPath = guard.path;
+
+        // Check if file exists for create mode
+        if (mode === "create" && fs.existsSync(resolvedPath)) {
+          return {
+            success: false,
+            error: `File already exists. Use 'overwrite' or 'append' mode to modify existing files.`,
+          };
+        }
+
+        writeWithoutFollowingLinks(resolvedPath, content, mode);
+        const stats = fs.statSync(resolvedPath);
+
+        return {
+          success: true,
+          path: resolvedPath,
+          mode,
+          size: stats.size,
+          written: content.length,
+        };
+      } catch (error) {
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+          path: filePath,
+        };
+      }
+    },
+  });
+}
+
+/**
+ * Execute one analyzeCSV call: contain the path, parse the file without
+ * following a final-component link, then run the requested aggregation.
+ */
+async function runAnalyzeCSV(
+  { filePath, operation, column, maxRows = 1000 }: AnalyzeCsvToolArgs,
+  policy: FileToolRootPolicy,
+) {
+  const startTime = Date.now();
+  logger.info(
+    `[analyzeCSV] 🚀 START: file=${filePath}, operation=${operation}, column=${column}, maxRows=${maxRows}`,
+  );
+
+  try {
+    // Resolve file path
+    logger.debug(`[analyzeCSV] Resolving file: ${filePath}`);
+
+    // Sandbox: contain CSV reads to the tool roots.
+    const guard = resolveWithinFileToolRoots(filePath, policy);
+    if (guard.error !== undefined) {
+      return { success: false, error: guard.error };
+    }
+    const resolvedPath = guard.path;
+
+    logger.debug(`[analyzeCSV] Resolved path: ${resolvedPath}`);
+
+    // Parse CSV using streaming from disk (memory efficient)
+    logger.info(`[analyzeCSV] Starting CSV parsing (max ${maxRows} rows)...`);
+    // #384: parseCSVFile now returns validated Record<string, string |
+    // undefined>[] rows, so the previous unchecked cast is unnecessary.
+    // The root check ran on the real path; O_NOFOLLOW refuses a link swapped
+    // in at the final component afterwards, as readFile does.
+    const rows = await CSVProcessor.parseCSVFile(
+      resolvedPath,
+      maxRows,
+      undefined,
+      { followSymlinks: false },
+    );
+    logger.info(`[analyzeCSV] ✅ CSV parsing complete: ${rows.length} rows`);
+
+    if (rows.length === 0) {
+      logger.warn(`[analyzeCSV] No data rows found`);
+      return {
+        success: false,
+        error: "No data rows found in CSV",
+      };
+    }
+
+    // Log column names
+    const columnNames = rows.length > 0 ? Object.keys(rows[0]) : [];
+    logger.info(
+      `[analyzeCSV] Found ${rows.length} rows with columns:`,
+      columnNames,
+    );
+    logger.info(`[analyzeCSV] Executing operation: ${operation}`);
+    let result: unknown;
+
+    switch (operation) {
+      case "count_by_column": {
+        logger.info(`[analyzeCSV] count_by_column: column=${column}`);
+        if (!column) {
+          return {
+            success: false,
+            error: "Column name required for count_by_column operation",
+          };
+        }
+
+        // Count occurrences of each value in the column
+        const counts: Record<string, number> = {};
+        logger.debug(`[analyzeCSV] Counting rows...`);
+        for (const row of rows) {
+          const value = row[column];
+          if (value !== undefined) {
+            counts[value] = (counts[value] || 0) + 1;
+          }
+        }
+        logger.debug(
+          `[analyzeCSV] Found ${Object.keys(counts).length} unique values`,
+        );
+
+        // Sort by count descending
+        logger.debug(`[analyzeCSV] Sorting results...`);
+        result = Object.fromEntries(
+          Object.entries(counts).sort(([, a], [, b]) => b - a),
+        );
+        logger.info(
+          `[analyzeCSV] ✅ count_by_column complete. Result:`,
+          result,
+        );
+        break;
+      }
+
+      case "sum_by_column": {
+        logger.info(`[analyzeCSV] sum_by_column: column=${column}`);
+        if (!column) {
+          return {
+            success: false,
+            error: "Column name required for sum_by_column operation",
+          };
+        }
+
+        // Sum numeric values from the target column itself for each group
+        const groups: Record<string, number> = {};
+        logger.debug(
+          `[analyzeCSV] Grouping and summing ${rows.length} rows...`,
+        );
+        let processedRows = 0;
+        let totalNumericValuesFound = 0;
+
+        for (const row of rows) {
+          const key = row[column];
+          if (!key) {
+            continue;
+          }
+
+          // Parse numeric value from the target column
+          const value = row[column];
+          if (value === undefined || value === null || value === "") {
+            continue;
+          }
+
+          const num = parseFloat(value);
+          if (isNaN(num)) {
+            continue;
+          }
+
+          if (!groups[key]) {
+            groups[key] = 0;
+          }
+          groups[key] += num;
+          totalNumericValuesFound++;
+
+          processedRows++;
+          if (processedRows % 10 === 0) {
+            logger.debug(
+              `[analyzeCSV] Processed ${processedRows}/${rows.length} rows`,
+            );
+          }
+        }
+
+        // Fail fast if no numeric data found in the requested column
+        if (totalNumericValuesFound === 0) {
+          return {
+            success: false,
+            error: `No numeric data found in column "${column}" for sum_by_column operation`,
+          };
+        }
+
+        logger.debug(
+          `[analyzeCSV] Calculated sums for ${Object.keys(groups).length} groups (${totalNumericValuesFound} numeric values)`,
+        );
+
+        result = groups;
+        logger.info(`[analyzeCSV] ✅ sum_by_column complete`);
+        break;
+      }
+
+      case "average_by_column": {
+        logger.info(`[analyzeCSV] average_by_column: column=${column}`);
+        if (!column) {
+          return {
+            success: false,
+            error: "Column name required for average_by_column operation",
+          };
+        }
+
+        // Average numeric values from the target column itself for each group
+        const groups: Record<string, { sum: number; count: number }> = {};
+        logger.debug(
+          `[analyzeCSV] Grouping and averaging ${rows.length} rows...`,
+        );
+        let processedRows = 0;
+        let totalNumericValuesFound = 0;
+
+        for (const row of rows) {
+          const key = row[column];
+          if (!key) {
+            continue;
+          }
+
+          // Parse numeric value from the target column
+          const value = row[column];
+          if (value === undefined || value === null || value === "") {
+            continue;
+          }
+
+          const num = parseFloat(value);
+          if (isNaN(num)) {
+            continue;
+          }
+
+          if (!groups[key]) {
+            groups[key] = { sum: 0, count: 0 };
+          }
+          groups[key].sum += num;
+          groups[key].count++;
+          totalNumericValuesFound++;
+
+          processedRows++;
+          if (processedRows % 10 === 0) {
+            logger.debug(
+              `[analyzeCSV] Processed ${processedRows}/${rows.length} rows`,
+            );
+          }
+        }
+
+        // Fail fast if no numeric data found in the requested column
+        if (totalNumericValuesFound === 0) {
+          return {
+            success: false,
+            error: `No numeric data found in column "${column}" for average_by_column operation`,
+          };
+        }
+
+        logger.debug(
+          `[analyzeCSV] Calculated averages for ${Object.keys(groups).length} groups (${totalNumericValuesFound} numeric values)`,
+        );
+
+        result = Object.fromEntries(
+          Object.entries(groups).map(([k, v]) => [
+            k,
+            v.count > 0 ? v.sum / v.count : 0,
+          ]),
+        );
+        logger.info(`[analyzeCSV] ✅ average_by_column complete`);
+        break;
+      }
+
+      case "min_max_by_column": {
+        if (!column) {
+          return {
+            success: false,
+            error: "Column name required for min_max_by_column operation",
+          };
+        }
+
+        const values = rows
+          .map((row) => row[column])
+          .filter((v): v is string => v !== undefined && v !== "");
+
+        const numericValues = values
+          .map((v) => parseFloat(v))
+          .filter((n) => !isNaN(n));
+
+        if (numericValues.length === 0) {
+          return {
+            success: false,
+            error: `No numeric data found in column "${column}" for min_max_by_column operation`,
+          };
+        }
+
+        result = {
+          min: Math.min(...numericValues),
+          max: Math.max(...numericValues),
+          numericCount: numericValues.length,
+          totalCount: values.length,
+        };
+        break;
+      }
+
+      case "describe": {
+        const columnNames = rows.length > 0 ? Object.keys(rows[0]) : [];
+        result = {
+          total_rows: rows.length,
+          columns: columnNames,
+          column_count: columnNames.length,
+        };
+        break;
+      }
+
+      default:
+        return {
+          success: false,
+          error: `Unknown operation: ${operation}`,
+        };
+    }
+
+    const duration = Date.now() - startTime;
+    logger.info(`[analyzeCSV] 🏁 COMPLETE: ${operation} took ${duration}ms`);
+
+    const response = {
+      success: true,
+      operation,
+      column,
+      result: JSON.stringify(result, null, 2),
+      rowCount: rows.length,
+    };
+
+    logger.debug(
+      `[analyzeCSV] 📤 RETURNING TO LLM:`,
+      JSON.stringify(response, null, 2),
+    );
+    return response;
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+      operation,
+      column,
+    };
+  }
+}
+
+/** The analyzeCSV tool bound to `policy`; its schema refuses paths the roots would. */
+function createAnalyzeCsvTool(policy: FileToolRootPolicy): Tool {
+  return tool({
+    description: withRoots(
+      "Analyze CSV file for accurate counting, aggregation, and statistical analysis. Use this for precise data operations like counting rows by column, calculating sums/averages, finding min/max values, etc. The tool reads the file directly - do NOT pass CSV content.",
+      policy,
+    ),
+    inputSchema: z.object({
+      filePath: z
+        .string()
+        .refine(
+          (inputPath) => {
+            // Contain first, then apply the system-directory denylist to the
+            // REAL path the guard resolved: a relative path is thereby judged
+            // against the tool root rather than process.cwd(), and a symlink
+            // into /etc under a wide root is seen for where it points.
+            const contained = resolveWithinFileToolRoots(inputPath, policy);
+            return (
+              contained.path !== undefined &&
+              !isSensitiveSystemPath(contained.path)
+            );
+          },
+          {
+            message:
+              "Invalid file path: access to system directories or paths outside the tool roots is not allowed",
+          },
+        )
+        .describe(
+          "Path to the CSV file to analyze (e.g., 'test/data.csv' or '/absolute/path/file.csv')",
+        ),
+      operation: z
+        .enum([
+          "count_by_column",
+          "sum_by_column",
+          "average_by_column",
+          "min_max_by_column",
+          "describe",
+        ])
+        .describe("Type of analysis to perform"),
+      column: z
+        .string()
+        .optional()
+        .default("")
+        .describe(
+          "Column name for the operation (required for most operations)",
+        ),
+      maxRows: z
+        .number()
+        .optional()
+        .default(1000)
+        .describe("Maximum rows to process (default: 1000)"),
+    }),
+    execute: async (args) => runAnalyzeCSV(args, policy),
+  });
+}
+
+function createFileTools(policy: FileToolRootPolicy) {
+  return {
+    readFile: createReadFileTool(policy),
+    listDirectory: createListDirectoryTool(policy),
+    writeFile: createWriteFileTool(policy),
+    analyzeCSV: createAnalyzeCsvTool(policy),
+  };
+}
+
+/** Tools that never touch the filesystem, shared by every root policy. */
+const policyFreeTools = {
   getCurrentTime: tool({
     description: "Get the current date and time",
-    parameters: z.object({
+    inputSchema: z.object({
       timezone: z
         .string()
         .optional()
@@ -63,100 +872,14 @@ export const directAgentTools = {
     },
   }),
 
-  readFile: tool({
-    description: "Read the contents of a file from the filesystem",
-    parameters: z.object({
-      path: z.string().describe("File path to read (relative or absolute)"),
-    }),
-    execute: async ({ path: filePath }) => {
-      try {
-        // Security check - prevent reading outside current directory for relative paths
-        const resolvedPath = path.resolve(filePath);
-        const cwd = process.cwd();
-
-        if (!resolvedPath.startsWith(cwd) && !path.isAbsolute(filePath)) {
-          return {
-            success: false,
-            error: `Access denied: Cannot read files outside current directory`,
-          };
-        }
-
-        const content = fs.readFileSync(resolvedPath, "utf-8");
-        const stats = fs.statSync(resolvedPath);
-
-        return {
-          success: true,
-          content,
-          size: stats.size,
-          path: resolvedPath,
-          lastModified: stats.mtime.toISOString(),
-        };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-          path: filePath,
-        };
-      }
-    },
-  }),
-
-  listDirectory: tool({
-    description: "List files and directories in a specified directory",
-    parameters: z.object({
-      path: z
-        .string()
-        .describe("Directory path to list (relative or absolute)"),
-      includeHidden: z
-        .boolean()
-        .optional()
-        .default(false)
-        .describe("Include hidden files (starting with .)"),
-    }),
-    execute: async ({ path: dirPath, includeHidden }) => {
-      try {
-        const resolvedPath = path.resolve(dirPath);
-        const items = fs.readdirSync(resolvedPath);
-
-        const filteredItems = includeHidden
-          ? items
-          : items.filter((item) => !item.startsWith("."));
-
-        const itemDetails = filteredItems.map((item) => {
-          const itemPath = path.join(resolvedPath, item);
-          const stats = fs.statSync(itemPath);
-
-          return {
-            name: item,
-            type: stats.isDirectory() ? "directory" : "file",
-            size: stats.isFile() ? stats.size : undefined,
-            lastModified: stats.mtime.toISOString(),
-          };
-        });
-
-        return {
-          success: true,
-          path: resolvedPath,
-          items: itemDetails,
-          count: itemDetails.length,
-        };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-          path: dirPath,
-        };
-      }
-    },
-  }),
-
   calculateMath: tool({
-    description: "Perform mathematical calculations safely",
-    parameters: z.object({
+    description:
+      "Evaluate an arithmetic expression: numbers, + - * / % **, parentheses and Math functions such as sqrt, pow, sin, log, min, max (with or without the Math. prefix). Not a JavaScript evaluator.",
+    inputSchema: z.object({
       expression: z
         .string()
         .describe(
-          'Mathematical expression to evaluate (e.g., "2 + 2", "Math.sqrt(16)")',
+          'Arithmetic expression to evaluate (e.g., "2 + 2", "Math.sqrt(16)", "pow(2, 10) % 7")',
         ),
       precision: z
         .number()
@@ -165,504 +888,40 @@ export const directAgentTools = {
         .default(2),
     }),
     execute: async ({ expression, precision }) => {
-      try {
-        // Simple safe evaluation - only allow basic math operations
-        const sanitizedExpression = expression.replace(/[^0-9+\-*/().\s]/g, "");
-
-        if (sanitizedExpression !== expression) {
-          // Try Math functions for more complex operations
-          const allowedMathFunctions = [
-            "Math.abs",
-            "Math.ceil",
-            "Math.floor",
-            "Math.round",
-            "Math.sqrt",
-            "Math.pow",
-            "Math.sin",
-            "Math.cos",
-            "Math.tan",
-            "Math.log",
-            "Math.exp",
-            "Math.PI",
-            "Math.E",
-          ];
-
-          let safeExpression = expression;
-          for (const func of allowedMathFunctions) {
-            safeExpression = safeExpression.replace(
-              new RegExp(func, "g"),
-              func,
-            );
-          }
-
-          // Remove remaining non-safe characters except Math functions
-          const mathSafe =
-            /^[0-9+\-*/().\s]|Math\.(abs|ceil|floor|round|sqrt|pow|sin|cos|tan|log|exp|PI|E)/g;
-          if (
-            !safeExpression
-              .split("")
-              .every(
-                (char) =>
-                  mathSafe.test(char) ||
-                  char === "(" ||
-                  char === ")" ||
-                  char === "," ||
-                  char === " ",
-              )
-          ) {
-            return {
-              success: false,
-              error: `Unsafe expression: Only basic math operations and Math functions are allowed`,
-            };
-          }
-        }
-
-        // Use Function constructor for safe evaluation
-        const result = new Function(`'use strict'; return (${expression})`)();
-        const roundedResult =
-          typeof result === "number"
-            ? Number(result.toFixed(precision))
-            : result;
-
-        return {
-          success: true,
-          expression,
-          result: roundedResult,
-          type: typeof result,
-        };
-      } catch (error) {
+      // The expression is model output. It is parsed and evaluated by
+      // `evaluateArithmetic` — a recursive-descent parser over numbers and a
+      // fixed list of Math functions — never run as JavaScript.
+      const evaluation = evaluateArithmetic(expression);
+      if (!evaluation.ok) {
         return {
           success: false,
-          error: error instanceof Error ? error.message : String(error),
+          error: `${evaluation.error}. Only numbers, + - * / % ** parentheses and the Math functions ${ARITHMETIC_FUNCTION_NAMES.join(", ")} (constants ${ARITHMETIC_CONSTANT_NAMES.join(", ")}) are supported.`,
           expression,
         };
       }
-    },
-  }),
-
-  writeFile: tool({
-    description: "Write content to a file (use with caution)",
-    parameters: z.object({
-      path: z.string().describe("File path to write to"),
-      content: z.string().describe("Content to write to the file"),
-      mode: z
-        .enum(["create", "overwrite", "append"])
-        .default("create")
-        .describe("Write mode"),
-    }),
-    execute: async ({ path: filePath, content, mode }) => {
-      try {
-        const resolvedPath = path.resolve(filePath);
-        const cwd = process.cwd();
-
-        // Security check
-        if (!resolvedPath.startsWith(cwd) && !path.isAbsolute(filePath)) {
-          return {
-            success: false,
-            error: `Access denied: Cannot write files outside current directory`,
-          };
-        }
-
-        // Check if file exists for create mode
-        if (mode === "create" && fs.existsSync(resolvedPath)) {
-          return {
-            success: false,
-            error: `File already exists. Use 'overwrite' or 'append' mode to modify existing files.`,
-          };
-        }
-
-        let finalContent = content;
-        if (mode === "append" && fs.existsSync(resolvedPath)) {
-          const existingContent = fs.readFileSync(resolvedPath, "utf-8");
-          finalContent = existingContent + content;
-        }
-
-        fs.writeFileSync(resolvedPath, finalContent, "utf-8");
-        const stats = fs.statSync(resolvedPath);
-
-        return {
-          success: true,
-          path: resolvedPath,
-          mode,
-          size: stats.size,
-          written: content.length,
-        };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-          path: filePath,
-        };
-      }
-    },
-  }),
-
-  // NOTE: searchFiles was removed to avoid naming conflict with external MCP 'search_files' tool
-  // from @modelcontextprotocol/server-filesystem which provides the same functionality
-  // with parameters {path, pattern, excludePatterns}
-
-  analyzeCSV: tool({
-    description:
-      "Analyze CSV file for accurate counting, aggregation, and statistical analysis. Use this for precise data operations like counting rows by column, calculating sums/averages, finding min/max values, etc. The tool reads the file directly - do NOT pass CSV content.",
-    parameters: z.object({
-      filePath: z
-        .string()
-        .refine(
-          (inputPath) => {
-            const resolvedPath = path.resolve(inputPath);
-            const normalizedPath = resolvedPath
-              .toLowerCase()
-              .replace(/\\/g, "/");
-
-            const sensitivePatterns = [
-              "/etc/",
-              "/sys/",
-              "/proc/",
-              "/dev/",
-              "/root/",
-              "/.ssh/",
-              "/private/etc/",
-              "/private/var/",
-              "c:/windows/",
-              "c:/program files/",
-              "c:/programdata/",
-            ];
-
-            return !sensitivePatterns.some((pattern) =>
-              normalizedPath.startsWith(pattern),
-            );
-          },
-          {
-            message:
-              "Invalid file path: access to system directories is not allowed",
-          },
-        )
-        .describe(
-          "Path to the CSV file to analyze (e.g., 'test/data.csv' or '/absolute/path/file.csv')",
-        ),
-      operation: z
-        .enum([
-          "count_by_column",
-          "sum_by_column",
-          "average_by_column",
-          "min_max_by_column",
-          "describe",
-        ])
-        .describe("Type of analysis to perform"),
-      column: z
-        .string()
-        .optional()
-        .default("")
-        .describe(
-          "Column name for the operation (required for most operations)",
-        ),
-      maxRows: z
-        .number()
-        .optional()
-        .default(1000)
-        .describe("Maximum rows to process (default: 1000)"),
-    }),
-    execute: async ({ filePath, operation, column, maxRows = 1000 }) => {
-      const startTime = Date.now();
-      logger.info(
-        `[analyzeCSV] 🚀 START: file=${filePath}, operation=${operation}, column=${column}, maxRows=${maxRows}`,
-      );
-
-      try {
-        // Resolve file path
-        logger.debug(`[analyzeCSV] Resolving file: ${filePath}`);
-        const path = await import("path");
-
-        // Resolve path (support both relative and absolute)
-        const resolvedPath = path.isAbsolute(filePath)
-          ? filePath
-          : path.resolve(process.cwd(), filePath);
-
-        logger.debug(`[analyzeCSV] Resolved path: ${resolvedPath}`);
-
-        // Parse CSV using streaming from disk (memory efficient)
-        logger.info(
-          `[analyzeCSV] Starting CSV parsing (max ${maxRows} rows)...`,
-        );
-        const rows = (await CSVProcessor.parseCSVFile(
-          resolvedPath,
-          maxRows,
-        )) as Array<Record<string, string>>;
-        logger.info(
-          `[analyzeCSV] ✅ CSV parsing complete: ${rows.length} rows`,
-        );
-
-        if (rows.length === 0) {
-          logger.warn(`[analyzeCSV] No data rows found`);
-          return {
-            success: false,
-            error: "No data rows found in CSV",
-          };
-        }
-
-        // Log column names
-        const columnNames = rows.length > 0 ? Object.keys(rows[0]) : [];
-        logger.info(
-          `[analyzeCSV] Found ${rows.length} rows with columns:`,
-          columnNames,
-        );
-        logger.info(`[analyzeCSV] Executing operation: ${operation}`);
-        let result: unknown;
-
-        switch (operation) {
-          case "count_by_column": {
-            logger.info(`[analyzeCSV] count_by_column: column=${column}`);
-            if (!column) {
-              return {
-                success: false,
-                error: "Column name required for count_by_column operation",
-              };
-            }
-
-            // Count occurrences of each value in the column
-            const counts: Record<string, number> = {};
-            logger.debug(`[analyzeCSV] Counting rows...`);
-            for (const row of rows) {
-              const value = row[column];
-              if (value !== undefined) {
-                counts[value] = (counts[value] || 0) + 1;
-              }
-            }
-            logger.debug(
-              `[analyzeCSV] Found ${Object.keys(counts).length} unique values`,
-            );
-
-            // Sort by count descending
-            logger.debug(`[analyzeCSV] Sorting results...`);
-            result = Object.fromEntries(
-              Object.entries(counts).sort(([, a], [, b]) => b - a),
-            );
-            logger.info(
-              `[analyzeCSV] ✅ count_by_column complete. Result:`,
-              result,
-            );
-            break;
-          }
-
-          case "sum_by_column": {
-            logger.info(`[analyzeCSV] sum_by_column: column=${column}`);
-            if (!column) {
-              return {
-                success: false,
-                error: "Column name required for sum_by_column operation",
-              };
-            }
-
-            // Sum numeric values from the target column itself for each group
-            const groups: Record<string, number> = {};
-            logger.debug(
-              `[analyzeCSV] Grouping and summing ${rows.length} rows...`,
-            );
-            let processedRows = 0;
-            let totalNumericValuesFound = 0;
-
-            for (const row of rows) {
-              const key = row[column];
-              if (!key) {
-                continue;
-              }
-
-              // Parse numeric value from the target column
-              const value = row[column];
-              if (value === undefined || value === null || value === "") {
-                continue;
-              }
-
-              const num = parseFloat(value);
-              if (isNaN(num)) {
-                continue;
-              }
-
-              if (!groups[key]) {
-                groups[key] = 0;
-              }
-              groups[key] += num;
-              totalNumericValuesFound++;
-
-              processedRows++;
-              if (processedRows % 10 === 0) {
-                logger.debug(
-                  `[analyzeCSV] Processed ${processedRows}/${rows.length} rows`,
-                );
-              }
-            }
-
-            // Fail fast if no numeric data found in the requested column
-            if (totalNumericValuesFound === 0) {
-              return {
-                success: false,
-                error: `No numeric data found in column "${column}" for sum_by_column operation`,
-              };
-            }
-
-            logger.debug(
-              `[analyzeCSV] Calculated sums for ${Object.keys(groups).length} groups (${totalNumericValuesFound} numeric values)`,
-            );
-
-            result = groups;
-            logger.info(`[analyzeCSV] ✅ sum_by_column complete`);
-            break;
-          }
-
-          case "average_by_column": {
-            logger.info(`[analyzeCSV] average_by_column: column=${column}`);
-            if (!column) {
-              return {
-                success: false,
-                error: "Column name required for average_by_column operation",
-              };
-            }
-
-            // Average numeric values from the target column itself for each group
-            const groups: Record<string, { sum: number; count: number }> = {};
-            logger.debug(
-              `[analyzeCSV] Grouping and averaging ${rows.length} rows...`,
-            );
-            let processedRows = 0;
-            let totalNumericValuesFound = 0;
-
-            for (const row of rows) {
-              const key = row[column];
-              if (!key) {
-                continue;
-              }
-
-              // Parse numeric value from the target column
-              const value = row[column];
-              if (value === undefined || value === null || value === "") {
-                continue;
-              }
-
-              const num = parseFloat(value);
-              if (isNaN(num)) {
-                continue;
-              }
-
-              if (!groups[key]) {
-                groups[key] = { sum: 0, count: 0 };
-              }
-              groups[key].sum += num;
-              groups[key].count++;
-              totalNumericValuesFound++;
-
-              processedRows++;
-              if (processedRows % 10 === 0) {
-                logger.debug(
-                  `[analyzeCSV] Processed ${processedRows}/${rows.length} rows`,
-                );
-              }
-            }
-
-            // Fail fast if no numeric data found in the requested column
-            if (totalNumericValuesFound === 0) {
-              return {
-                success: false,
-                error: `No numeric data found in column "${column}" for average_by_column operation`,
-              };
-            }
-
-            logger.debug(
-              `[analyzeCSV] Calculated averages for ${Object.keys(groups).length} groups (${totalNumericValuesFound} numeric values)`,
-            );
-
-            result = Object.fromEntries(
-              Object.entries(groups).map(([k, v]) => [
-                k,
-                v.count > 0 ? v.sum / v.count : 0,
-              ]),
-            );
-            logger.info(`[analyzeCSV] ✅ average_by_column complete`);
-            break;
-          }
-
-          case "min_max_by_column": {
-            if (!column) {
-              return {
-                success: false,
-                error: "Column name required for min_max_by_column operation",
-              };
-            }
-
-            const values = rows
-              .map((row) => row[column])
-              .filter((v) => v !== undefined && v !== "");
-
-            const numericValues = values
-              .map((v) => parseFloat(v))
-              .filter((n) => !isNaN(n));
-
-            if (numericValues.length === 0) {
-              return {
-                success: false,
-                error: `No numeric data found in column "${column}" for min_max_by_column operation`,
-              };
-            }
-
-            result = {
-              min: Math.min(...numericValues),
-              max: Math.max(...numericValues),
-              numericCount: numericValues.length,
-              totalCount: values.length,
-            };
-            break;
-          }
-
-          case "describe": {
-            const columnNames = rows.length > 0 ? Object.keys(rows[0]) : [];
-            result = {
-              total_rows: rows.length,
-              columns: columnNames,
-              column_count: columnNames.length,
-            };
-            break;
-          }
-
-          default:
-            return {
-              success: false,
-              error: `Unknown operation: ${operation}`,
-            };
-        }
-
-        const duration = Date.now() - startTime;
-        logger.info(
-          `[analyzeCSV] 🏁 COMPLETE: ${operation} took ${duration}ms`,
-        );
-
-        const response = {
-          success: true,
-          operation,
-          column,
-          result: JSON.stringify(result, null, 2),
-          rowCount: rows.length,
-        };
-
-        logger.debug(
-          `[analyzeCSV] 📤 RETURNING TO LLM:`,
-          JSON.stringify(response, null, 2),
-        );
-        return response;
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-          operation,
-          column,
-        };
-      }
+      const digits = Math.min(Math.max(Math.trunc(precision ?? 2), 0), 100);
+      return {
+        success: true,
+        expression,
+        result: Number(evaluation.value.toFixed(digits)),
+        type: "number",
+      };
     },
   }),
 
   websearchGrounding: tool({
     description:
-      "Search the web for current information using Google Search grounding. Returns raw search data for AI processing.",
-    parameters: z.object({
-      query: z.string().describe("Search query to find information about"),
+      "Performs a Google Search and returns a summarized answer with source citations. Always check the current date before constructing the query. Use whenever the answer depends on time-sensitive facts or requires verification against real-world sources.",
+    inputSchema: z.object({
+      query: z
+        .string()
+        .trim()
+        .min(1, { message: "must be a non-empty search string" })
+        .refine((v) => v.toLowerCase() !== "undefined", {
+          message:
+            'must not be the literal string "undefined" — pass a real search query',
+        })
+        .describe("The search query string to look up on the web."),
       maxResults: z
         .number()
         .optional()
@@ -678,8 +937,7 @@ export const directAgentTools = {
       try {
         const hasCredentials = process.env.GOOGLE_APPLICATION_CREDENTIALS;
         const hasProjectId = process.env.GOOGLE_VERTEX_PROJECT;
-        const projectLocation =
-          process.env.GOOGLE_VERTEX_LOCATION || "us-central1";
+        const projectLocation = resolveWebsearchLocation();
 
         if (!hasCredentials || !hasProjectId) {
           return {
@@ -694,35 +952,32 @@ export const directAgentTools = {
         }
 
         const limitedResults = Math.min(Math.max(maxResults, 1), 5);
-        const vertex_ai = new VertexAI({
+        const { GoogleGenAI } = await import("@google/genai");
+        const { googleSdkProxyHttpOptions } =
+          await import("../proxy/proxyFetch.js");
+        const vertex_ai = new GoogleGenAI({
+          vertexai: true,
           project: hasProjectId,
           location: projectLocation,
+          httpOptions: googleSdkProxyHttpOptions(),
         });
 
-        const websearchModel = "gemini-2.5-flash-lite";
-
-        const model = vertex_ai.getGenerativeModel({
-          model: websearchModel,
-          tools: createGoogleSearchTools(),
-        });
-
-        // Search query with word limit constraint
-        const searchPrompt = `Search for: "${query}". Provide a concise summary in no more than ${maxWords} words.`;
+        const websearchModel = resolveWebsearchModel();
 
         const startTime = Date.now();
-        const response = await model.generateContent({
-          contents: [
-            {
-              role: "user",
-              parts: [{ text: searchPrompt }],
-            },
-          ],
-        });
+        // A stalled Vertex call would otherwise leave the tool pending
+        // indefinitely; the outer catch turns a timeout into the failure shape.
+        const result = await withTimeout(
+          vertex_ai.models.generateContent(
+            buildWebsearchRequest(websearchModel, query, maxWords),
+          ),
+          TIMEOUTS.TOOL.EXECUTION_DEFAULT_MS,
+          "[websearchGrounding] Vertex AI web search request timed out",
+        );
 
         const responseTime = Date.now() - startTime;
 
         // Extract grounding metadata and search results
-        const result = response.response;
         const candidates = result.candidates;
 
         if (!candidates || candidates.length === 0) {
@@ -733,8 +988,10 @@ export const directAgentTools = {
           };
         }
 
-        const content = candidates[0].content;
-        if (!content || !content.parts || content.parts.length === 0) {
+        // Extract raw search content. The aggregated `text` getter joins every
+        // text part, so it survives responses that lead with a non-text part.
+        const searchContent = result.text?.trim() || "";
+        if (!searchContent) {
           return {
             success: false,
             error: "No search content found",
@@ -742,30 +999,12 @@ export const directAgentTools = {
           };
         }
 
-        // Extract raw search content
-        const searchContent = content.parts[0].text || "";
-
         // Extract grounding sources if available
-        const groundingMetadata = candidates[0]?.groundingMetadata;
-        const searchResults = [];
-
-        if (groundingMetadata?.groundingChunks) {
-          for (const chunk of groundingMetadata.groundingChunks.slice(
-            0,
-            limitedResults,
-          )) {
-            if (chunk.web) {
-              searchResults.push({
-                title: chunk.web.title || "No title",
-                url: chunk.web.uri || "",
-                snippet: searchContent, // Use full content since maxWords already limits length
-                domain: chunk.web.uri
-                  ? new URL(chunk.web.uri).hostname
-                  : "unknown",
-              });
-            }
-          }
-        }
+        const searchResults = buildWebsearchResults(
+          candidates[0]?.groundingMetadata,
+          searchContent,
+          limitedResults,
+        );
 
         // If no grounding metadata, create basic result structure
         if (searchResults.length === 0) {
@@ -803,26 +1042,171 @@ export const directAgentTools = {
 };
 
 /**
- * Type aliases for specific tool categories
+ * Direct tool definitions that work immediately with Gemini/AI SDK.
+ * These bypass MCP complexity and provide reliable agent functionality.
+ *
+ * `createDirectAgentTools` builds a fresh set bound to `policy`; the shared
+ * `directAgentTools` below keeps the working-directory default.
  */
-export type BasicToolsMap = {
-  getCurrentTime: typeof directAgentTools.getCurrentTime;
-  calculateMath: typeof directAgentTools.calculateMath;
-};
+export function createDirectAgentTools(policy: FileToolRootPolicy) {
+  const fileTools = createFileTools(policy);
+  const tools = {
+    getCurrentTime: policyFreeTools.getCurrentTime,
+    readFile: fileTools.readFile,
+    listDirectory: fileTools.listDirectory,
+    calculateMath: policyFreeTools.calculateMath,
+    writeFile: fileTools.writeFile,
+    analyzeCSV: fileTools.analyzeCSV,
+    websearchGrounding: policyFreeTools.websearchGrounding,
+  };
+  // executeBashCommand is opt-in: only included when NEUROLINK_ENABLE_BASH_TOOL=true
+  // or toolConfig.enableBashTool is set. See shouldEnableBashTool() in toolUtils.ts.
+  if (shouldEnableBashTool()) {
+    (tools as Record<string, unknown>).executeBashCommand =
+      createBashTool(policy);
+  }
+  return tools;
+}
 
-export type FilesystemToolsMap = {
-  readFile: typeof directAgentTools.readFile;
-  listDirectory: typeof directAgentTools.listDirectory;
-  writeFile: typeof directAgentTools.writeFile;
-};
+/**
+ * Bash command execution tool - exported separately for opt-in use.
+ *
+ * SECURITY: This tool is NOT included in directAgentTools by default.
+ * It must be explicitly enabled via:
+ *   - Environment variable: NEUROLINK_ENABLE_BASH_TOOL=true
+ *   - Config: toolConfig.enableBashTool = true
+ *
+ * Import this directly when you need bash execution capabilities:
+ *   import { bashTool } from '../agent/directTools.js';
+ */
+export function createBashTool(policy: FileToolRootPolicy): Tool {
+  return tool({
+    description:
+      "Execute a bash/shell command and return stdout, stderr, and exit code. Supports full shell syntax including pipes, redirects, and variable expansion. When HITL is enabled on the NeuroLink instance, every call waits for a human to approve it before it runs. The command runs with the full privileges of the process: tool roots constrain only its starting directory (cwd), not where the command itself can reach.",
+    inputSchema: z.object({
+      command: z
+        .string()
+        .describe(
+          "The shell command to execute (supports pipes, redirects, etc.)",
+        ),
+      timeout: z
+        .number()
+        .optional()
+        .default(30000)
+        .describe("Timeout in milliseconds (default: 30000, max: 120000)"),
+      cwd: z
+        .string()
+        .optional()
+        .describe(
+          policy.roots === null
+            ? "Working directory (defaults to process.cwd())"
+            : `Working directory; must be inside one of: ${policy.roots.join(", ")}`,
+        ),
+    }),
+    execute: async ({ command, timeout = 30000, cwd }) => {
+      try {
+        const effectiveTimeout = Math.min(Math.max(timeout, 100), 120000);
+        const roots = rootsOf(policy);
+        if (roots.length === 0) {
+          return {
+            success: false,
+            code: -1,
+            stdout: "",
+            stderr: "",
+            error:
+              "Access denied: no tool roots are configured, so there is no permitted working directory",
+          };
+        }
+        const requestedCwd = cwd ? path.resolve(roots[0], cwd) : roots[0];
 
-export type UtilityToolsMap = {
-  getCurrentTime: typeof directAgentTools.getCurrentTime;
-  calculateMath: typeof directAgentTools.calculateMath;
-  listDirectory: typeof directAgentTools.listDirectory;
-};
+        // Verify cwd exists before resolving symlinks
+        if (
+          !fs.existsSync(requestedCwd) ||
+          !fs.statSync(requestedCwd).isDirectory()
+        ) {
+          return {
+            success: false,
+            code: -1,
+            stdout: "",
+            stderr: "",
+            error: `Directory does not exist: ${requestedCwd}`,
+          };
+        }
 
-export type AllToolsMap = typeof directAgentTools;
+        // Security: resolve symlinks on both sides and require a separator-bounded
+        // prefix, so neither a symlink nor a sibling like <root>-evil escapes.
+        let resolvedCwd: string | undefined;
+        for (const root of roots) {
+          const contained = resolveWithinRoot(requestedCwd, root);
+          if (contained.path !== undefined) {
+            resolvedCwd = contained.path;
+            break;
+          }
+        }
+        if (resolvedCwd === undefined) {
+          return {
+            success: false,
+            code: -1,
+            stdout: "",
+            stderr: "",
+            error:
+              policy.roots === null
+                ? "Access denied: Cannot execute commands outside current directory"
+                : `Access denied: Cannot execute commands outside the permitted roots (${roots.join(", ")})`,
+          };
+        }
+
+        // Use /bin/bash -c to support full shell syntax (pipes, redirects, etc.)
+        return await new Promise((resolve) => {
+          execFile(
+            "/bin/bash",
+            ["-c", command],
+            {
+              timeout: effectiveTimeout,
+              cwd: resolvedCwd,
+              maxBuffer: MAX_OUTPUT_BYTES,
+            },
+            (error, stdout, stderr) => {
+              if (error) {
+                const exitCode =
+                  typeof error.code === "number" ? error.code : 1;
+                resolve({
+                  success: false,
+                  code: exitCode,
+                  stdout: truncateOutput(stdout || ""),
+                  stderr: truncateOutput(stderr || error.message),
+                  error: error.killed ? "Command timed out" : error.message,
+                });
+              } else {
+                resolve({
+                  success: true,
+                  code: 0,
+                  stdout: truncateOutput(stdout),
+                  stderr: truncateOutput(stderr),
+                });
+              }
+            },
+          );
+        });
+      } catch (error) {
+        return {
+          success: false,
+          code: -1,
+          stdout: "",
+          stderr: "",
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    },
+  });
+}
+
+/** The opt-in bash tool with the working-directory default. */
+export const bashTool: Tool = createBashTool(WORKING_DIRECTORY_POLICY);
+
+export const directAgentTools = createDirectAgentTools(
+  WORKING_DIRECTORY_POLICY,
+);
 
 /**
  * Get a subset of tools for specific use cases with improved type safety
@@ -880,8 +1264,9 @@ export function validateToolStructure(): boolean {
         logger.error(`❌ Tool ${name} missing description`);
         return false;
       }
-      if (!tool.parameters) {
-        logger.error(`❌ Tool ${name} missing parameters`);
+      const toolRecord = tool as Record<string, unknown>;
+      if (!toolRecord.parameters && !toolRecord.inputSchema) {
+        logger.error(`Tool ${name} missing parameters/inputSchema`);
         return false;
       }
       if (!tool.execute || typeof tool.execute !== "function") {

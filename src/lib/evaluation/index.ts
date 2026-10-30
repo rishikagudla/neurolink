@@ -1,19 +1,50 @@
-/**
- * @file This file exports the main Evaluator class, which serves as the central entry point for the evaluation system.
- */
+// Imported on its own, this entry starts tracing at its first span, as the
+// main entry does. The import sits here rather than in the shared tracers so
+// that the client entry stays free of the OpenTelemetry Node SDK.
+import "../services/server/ai/observability/instrumentation.js";
 
-import type { GenerateResult } from "../types/generateTypes.js";
 import type {
-  EvaluationResult,
-  EvaluationConfig,
+  EvaluationData,
+  GenerateResult,
+  AutoEvaluationConfig,
   EnhancedEvaluationContext,
-} from "../types/evaluationTypes.js";
+  EvaluationConfig,
+  EvaluationResult,
+} from "../types/index.js";
 import { ContextBuilder } from "./contextBuilder.js";
 import { RAGASEvaluator } from "./ragasEvaluator.js";
-import type { LanguageModelV1CallOptions } from "ai";
 import { mapToEvaluationData } from "./scoring.js";
-import type { AutoEvaluationConfig } from "../types/middlewareTypes.js";
-import type { EvaluationData } from "../types/evaluation.js";
+import type { LanguageModelV3CallOptions } from "../types/index.js";
+
+// Re-export errors
+export * from "./errors/index.js";
+
+// Re-export hooks
+export * from "./hooks/index.js";
+
+// Re-export pipeline
+export * from "./pipeline/index.js";
+// Re-export reporting
+export * from "./reporting/index.js";
+// Re-export scorers
+export * from "./scorers/index.js";
+
+// Re-export Factory and Registry
+export { BatchEvaluator } from "./BatchEvaluator.js";
+
+export { EvaluationAggregator } from "./EvaluationAggregator.js";
+
+export { EvaluatorFactory, getEvaluatorFactory } from "./EvaluatorFactory.js";
+
+export {
+  EvaluatorRegistry,
+  getEvaluatorRegistry,
+} from "./EvaluatorRegistry.js";
+
+// Re-export internal RAGAS classes so callers (and the evaluation test
+// suite) can instantiate them directly from the public surface.
+export { RAGASEvaluator } from "./ragasEvaluator.js";
+export { RetryManager } from "./retryManager.js";
 
 /**
  * A centralized class for performing response evaluations. It supports different
@@ -45,7 +76,7 @@ export class Evaluator {
    * @returns A promise that resolves to the `EvaluationResult`.
    */
   public async evaluate(
-    options: LanguageModelV1CallOptions,
+    options: LanguageModelV3CallOptions,
     result: GenerateResult,
     threshold: number,
     config: AutoEvaluationConfig,
@@ -100,7 +131,7 @@ export class Evaluator {
    * @returns A promise that resolves to the `EvaluationResult`.
    */
   private async evaluateWithRAGAS(
-    options: LanguageModelV1CallOptions,
+    options: LanguageModelV3CallOptions,
     result: GenerateResult,
   ): Promise<{
     evaluationResult: EvaluationResult;

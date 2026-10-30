@@ -1,0 +1,3494 @@
+#!/usr/bin/env tsx
+
+/**
+ * Continuous Test Suite — Local Usage (Claude Code reader)
+ *
+ * Every case drives the shipped SDK surface: `readAllLocalUsage`,
+ * `getLocalUsageDescriptors` and `createLocalUsageReader` are imported from
+ * `../dist/index.js`, the same entry an SDK consumer gets from
+ * `@juspay/neurolink`. Nothing is imported out of `src/lib/`, and nothing is
+ * stubbed.
+ *
+ * Two kinds of case here, deliberately:
+ *
+ *   1. Fixture cases point HOME at a temp directory holding a hand-written
+ *      transcript. That is still the public surface — the reader is reached
+ *      through `readAllLocalUsage()` — but the input is controlled, which is
+ *      the only way to assert the dedup rule exactly. Real transcripts cannot
+ *      be made to contain a specific duplicate on demand.
+ *
+ *   2. Machine cases run against this machine's real `~/.claude/projects` and
+ *      SKIP when it is absent, so the suite still proves the reader survives
+ *      genuine data at genuine scale (17k+ files, ~10 GB) rather than only the
+ *      shapes a fixture author thought of.
+ */
+
+import { spawnSync } from "child_process";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
+import { defineSuite, log } from "./helpers/harness.js";
+import type { LocalUsageScanResult } from "../src/lib/types/index.js";
+
+const { test, runSuite } = defineSuite("Local Usage", {
+  offline: true,
+});
+
+const sdk = await import("../dist/index.js");
+const { readAllLocalUsage, getLocalUsageDescriptors, createLocalUsageReader } =
+  sdk as unknown as {
+    readAllLocalUsage: (o?: {
+      sinceDays?: number;
+    }) => Promise<LocalReportShape>;
+    getLocalUsageDescriptors: () => Array<{
+      id: string;
+      displayName: string;
+      verified: boolean;
+      dedupStrategy: string;
+      costConfidence: string;
+      requiresSqlite: boolean;
+    }>;
+    createLocalUsageReader: (id: string) => Promise<{
+      detect: () => Promise<boolean>;
+      scan: (o?: { sinceDays?: number }) => Promise<LocalUsageScanResult>;
+    }>;
+  };
+
+type LocalTotalsShape = {
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  costUsd: number;
+  costConfidence: string;
+  unpricedRequests: number;
+  unpricedModels: string[];
+};
+
+type LocalReportShape = {
+  generatedAt: string;
+  totals: Record<string, LocalTotalsShape | undefined>;
+  failures: Array<{ cliId: string; message: string }>;
+  notInstalled: string[];
+};
+
+function assert(condition: boolean, message: string): void {
+  if (!condition) {
+    // No payload interpolation here on purpose: `defineSuite` downgrades a
+    // thrown error to SKIP when its text looks like a provider error, so an
+    // assertion message quoting real content can turn a genuine failure green.
+    throw new Error(message);
+  }
+}
+
+/**
+ * Build a temp HOME containing one Claude Code transcript.
+ *
+ * The layout matches the real one: `~/.claude/projects/<sanitized-cwd>/`, with
+ * a nested `subagents/` directory, because subagent transcripts are the large
+ * majority of files on a real machine and a reader that skipped them would
+ * miss most of the spend.
+ */
+/**
+ * How far back fixture transcripts are stamped, in seconds.
+ *
+ * A transcript written right now sits exactly on the boundary of a zero-length
+ * window: `sinceDays: 0` resolves its cutoff to `Date.now()`, and the file's
+ * mtime is also `Date.now()`, so whether the file counts as inside or outside
+ * the window comes down to which millisecond each landed in. That raced —
+ * observed as one failure in five runs ("sinceDays 0 read transcripts — got 1
+ * turns instead of 0") followed by seven clean runs, which is exactly the
+ * profile of a bug that survives review because it usually passes.
+ *
+ * Backdating puts every fixture unambiguously in the past, so an empty window
+ * is empty for a structural reason rather than a lucky one. A minute is far
+ * larger than any plausible scheduling delay and far smaller than the one-day
+ * granularity every real window uses, so no bounded-window case changes
+ * meaning: `sinceDays: 1` still includes these files with a day to spare.
+ */
+const FIXTURE_AGE_SECONDS = 60;
+
+/** Stamp a fixture file into the past — see FIXTURE_AGE_SECONDS. */
+function backdate(file: string): void {
+  const when = new Date(Date.now() - FIXTURE_AGE_SECONDS * 1000);
+  fs.utimesSync(file, when, when);
+}
+
+function writeFixtureHome(lines: string[], subagentLines?: string[]): string {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "nl-localusage-"));
+  const project = path.join(home, ".claude", "projects", "-tmp-fixture");
+  fs.mkdirSync(project, { recursive: true });
+  const sessionFile = path.join(project, "session-a.jsonl");
+  fs.writeFileSync(sessionFile, lines.join("\n") + "\n");
+  backdate(sessionFile);
+  if (subagentLines) {
+    const nested = path.join(project, "session-a", "subagents");
+    fs.mkdirSync(nested, { recursive: true });
+    const agentFile = path.join(nested, "agent-one.jsonl");
+    fs.writeFileSync(agentFile, subagentLines.join("\n") + "\n");
+    backdate(agentFile);
+  }
+  return home;
+}
+
+function assistantLine(
+  id: string,
+  model: string,
+  usage: Record<string, number>,
+): string {
+  return JSON.stringify({
+    type: "assistant",
+    message: { id, model, role: "assistant", usage },
+  });
+}
+
+/**
+ * Variables that move a reader's store out from under HOME. `GROK_HOME` and
+ * `HERMES_HOME` are read ahead of `~/.grok` and `~/.hermes`, so a developer
+ * with either exported would have these fixture scans read their real store.
+ * Cleared for the call rather than repointed: a fixture HOME already holds
+ * the default location, and an unset variable is the case the default serves.
+ */
+const STORE_OVERRIDE_VARS = ["GROK_HOME", "HERMES_HOME"] as const;
+
+async function withHome<T>(home: string, fn: () => Promise<T>): Promise<T> {
+  const prev = process.env.HOME;
+  const prevProfile = process.env.USERPROFILE;
+  const prevOverrides = STORE_OVERRIDE_VARS.map(
+    (name) => [name, process.env[name]] as const,
+  );
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  for (const name of STORE_OVERRIDE_VARS) {
+    delete process.env[name];
+  }
+  try {
+    return await fn();
+  } finally {
+    if (prev === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = prev;
+    }
+    if (prevProfile === undefined) {
+      delete process.env.USERPROFILE;
+    } else {
+      process.env.USERPROFILE = prevProfile;
+    }
+    for (const [name, value] of prevOverrides) {
+      if (value === undefined) {
+        delete process.env[name];
+      } else {
+        process.env[name] = value;
+      }
+    }
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Build a temp HOME containing one Codex rollout.
+ *
+ * Layout matches the real one: `~/.codex/sessions/<yyyy>/<mm>/<dd>/rollout-*.jsonl`,
+ * nested by date, so the reader's directory walk is exercised rather than
+ * assumed.
+ */
+function writeCodexFixtureHome(lines: string[]): string {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "nl-codexusage-"));
+  const dir = path.join(home, ".codex", "sessions", "2026", "05", "22");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "rollout-2026-05-22T21-39-27-fixture.jsonl"),
+    lines.join("\n") + "\n",
+  );
+  return home;
+}
+
+/** One `token_count` event, carrying both counters the real format carries. */
+function codexTokenCount(
+  cumulative: { input: number; output: number; cached: number },
+  perTurn: { input: number; output: number; cached: number },
+): string {
+  const shape = (t: { input: number; output: number; cached: number }) => ({
+    input_tokens: t.input,
+    cached_input_tokens: t.cached,
+    output_tokens: t.output,
+    reasoning_output_tokens: 0,
+    total_tokens: t.input + t.output,
+  });
+  return JSON.stringify({
+    timestamp: "2026-05-22T16:11:27.095Z",
+    type: "event_msg",
+    payload: {
+      type: "token_count",
+      info: {
+        total_token_usage: shape(cumulative),
+        last_token_usage: shape(perTurn),
+        model_context_window: 258400,
+      },
+      rate_limits: { limit_id: "codex", plan_type: "prolite" },
+    },
+  });
+}
+
+function codexTurnContext(model: string): string {
+  return JSON.stringify({
+    timestamp: "2026-05-22T16:11:12.517Z",
+    type: "turn_context",
+    payload: { turn_id: "t1", model, cwd: "/tmp/fixture" },
+  });
+}
+
+/**
+ * Build a temp HOME containing an OpenCode SQLite store.
+ *
+ * Written with the same `node:sqlite` the reader uses, so the fixture cannot
+ * drift from the shape the reader expects by using a different writer.
+ */
+async function writeOpenCodeFixtureHome(
+  messages: Array<Record<string, unknown>>,
+): Promise<string> {
+  const { DatabaseSync } = await import("node:sqlite");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "nl-ocusage-"));
+  const dir = path.join(home, ".local", "share", "opencode");
+  fs.mkdirSync(dir, { recursive: true });
+  const db = new DatabaseSync(path.join(dir, "opencode.db"));
+  db.exec(
+    "CREATE TABLE message (id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)",
+  );
+  const insert = db.prepare(
+    "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
+  );
+  messages.forEach((m, index) => {
+    insert.run(
+      `msg_${index}`,
+      "ses_fixture",
+      Date.now(),
+      Date.now(),
+      JSON.stringify(m),
+    );
+  });
+  db.close();
+  return home;
+}
+
+function openCodeMessage(tokens: {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}): Record<string, unknown> {
+  return {
+    role: "assistant",
+    modelID: "claude-opus-4.6",
+    providerID: "github-copilot",
+    cost: 0,
+    tokens: {
+      input: tokens.input,
+      output: tokens.output,
+      reasoning: 0,
+      total:
+        tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite,
+      cache: { read: tokens.cacheRead, write: tokens.cacheWrite },
+    },
+  };
+}
+
+/**
+ * Build a temp HOME containing one Qwen Code transcript, and optionally a
+ * second one nested under the first — matching the recursive `chats/` walk
+ * the reader does for the same reason `claudeCodeReader.ts` recurses under
+ * `subagents/`.
+ */
+function writeQwenFixtureHome(lines: string[], nestedLines?: string[]): string {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "nl-qwenusage-"));
+  const chats = path.join(home, ".qwen", "projects", "-tmp-fixture", "chats");
+  fs.mkdirSync(chats, { recursive: true });
+  const sessionFile = path.join(chats, "session-a.jsonl");
+  fs.writeFileSync(sessionFile, lines.join("\n") + "\n");
+  backdate(sessionFile);
+  if (nestedLines) {
+    const nested = path.join(chats, "session-a");
+    fs.mkdirSync(nested, { recursive: true });
+    const subFile = path.join(nested, "sub-session.jsonl");
+    fs.writeFileSync(subFile, nestedLines.join("\n") + "\n");
+    backdate(subFile);
+  }
+  return home;
+}
+
+function qwenAssistantLine(
+  uuid: string,
+  model: string,
+  usage: Record<string, number>,
+): string {
+  return JSON.stringify({
+    type: "assistant",
+    uuid,
+    model,
+    usageMetadata: usage,
+  });
+}
+
+/**
+ * Build a temp HOME containing one Gemini CLI transcript, and optionally a
+ * second nested under it — matching `chats/<parentSessionId>/<subId>.jsonl`
+ * subagent nesting.
+ */
+function writeGeminiFixtureHome(
+  bodyLines: string[],
+  nestedBodyLines?: string[],
+): string {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "nl-geminiusage-"));
+  const chats = path.join(home, ".gemini", "tmp", "fixture-project", "chats");
+  fs.mkdirSync(chats, { recursive: true });
+  const header = JSON.stringify({
+    sessionId: "session-a",
+    projectHash: "abc123",
+    startTime: "2026-05-01T00:00:00.000Z",
+    lastUpdated: "2026-05-01T00:00:00.000Z",
+    kind: "interactive",
+  });
+  const sessionFile = path.join(chats, "session-a.jsonl");
+  fs.writeFileSync(sessionFile, [header, ...bodyLines].join("\n") + "\n");
+  backdate(sessionFile);
+  if (nestedBodyLines) {
+    const nested = path.join(chats, "session-a");
+    fs.mkdirSync(nested, { recursive: true });
+    const subFile = path.join(nested, "sub-agent.jsonl");
+    fs.writeFileSync(subFile, [header, ...nestedBodyLines].join("\n") + "\n");
+    backdate(subFile);
+  }
+  return home;
+}
+
+function geminiMessage(
+  id: string,
+  model: string,
+  tokens?: Record<string, number>,
+): Record<string, unknown> {
+  return { id, type: "gemini", model, tokens };
+}
+
+function geminiBareLine(msg: Record<string, unknown>): string {
+  return JSON.stringify(msg);
+}
+
+function geminiSetMessagesLine(msgs: Array<Record<string, unknown>>): string {
+  return JSON.stringify({ $set: { messages: msgs } });
+}
+
+/**
+ * Build a temp HOME containing a Copilot CLI SQLite store, written with the
+ * same `node:sqlite` the reader uses so the fixture cannot drift from the
+ * shape the reader expects by using a different writer — same discipline as
+ * `writeOpenCodeFixtureHome`.
+ */
+async function writeCopilotFixtureHome(
+  rows: Array<{
+    model: string;
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    reasoning: number;
+    createdAt: string;
+  }>,
+): Promise<string> {
+  const { DatabaseSync } = await import("node:sqlite");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "nl-copilotusage-"));
+  const dir = path.join(home, ".copilot");
+  fs.mkdirSync(dir, { recursive: true });
+  const db = new DatabaseSync(path.join(dir, "session-store.db"));
+  db.exec(
+    "CREATE TABLE assistant_usage_events (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, turn_index INTEGER, model TEXT, input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER, reasoning_tokens INTEGER, created_at TEXT)",
+  );
+  const insert = db.prepare(
+    "INSERT INTO assistant_usage_events (session_id, turn_index, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  );
+  rows.forEach((r, index) => {
+    insert.run(
+      "ses_fixture",
+      index,
+      r.model,
+      r.input,
+      r.output,
+      r.cacheRead,
+      r.cacheWrite,
+      r.reasoning,
+      r.createdAt,
+    );
+  });
+  db.close();
+  return home;
+}
+
+/**
+ * Run the built CLI as a subprocess.
+ *
+ * SIGKILL rather than the default SIGTERM: spawnSync's `timeout` sends
+ * killSignal and then keeps waiting, so a child that ignores SIGTERM hangs it
+ * forever — and because spawnSync blocks the event loop, no Promise.race bound
+ * can fire to rescue it.
+ */
+function runCli(
+  args: string[],
+  env?: Record<string, string>,
+): { status: number | null; stdout: string; stderr: string } {
+  const result = spawnSync(
+    process.execPath,
+    ["--no-warnings", path.resolve("dist/cli/index.js"), ...args],
+    {
+      encoding: "utf8",
+      timeout: 180_000,
+      killSignal: "SIGKILL",
+      env: { ...process.env, ...(env ?? {}) },
+    },
+  );
+  return {
+    status: result.status,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+  };
+}
+
+async function runAllTests(): Promise<void> {
+  await test("the SDK exports the local-usage surface", async () => {
+    assert(
+      typeof readAllLocalUsage === "function",
+      "readAllLocalUsage is not a runtime export of dist/index.js",
+    );
+    assert(
+      typeof getLocalUsageDescriptors === "function",
+      "getLocalUsageDescriptors is not a runtime export of dist/index.js",
+    );
+    const descriptors = getLocalUsageDescriptors();
+    const claude = descriptors.find((d) => d.id === "claude-code");
+    assert(claude !== undefined, "no claude-code reader is registered");
+    assert(
+      claude?.dedupStrategy === "message-id-keep-max",
+      "the claude-code descriptor does not declare the keep-max dedup strategy",
+    );
+
+    const qwen = descriptors.find((d) => d.id === "qwen-code");
+    assert(qwen !== undefined, "no qwen-code reader is registered");
+    assert(
+      qwen?.dedupStrategy === "message-id-keep-max",
+      "the qwen-code descriptor does not declare the keep-max dedup strategy",
+    );
+    assert(
+      qwen?.costConfidence === "unavailable",
+      "the qwen-code descriptor does not declare cost confidence unavailable",
+    );
+
+    const gemini = descriptors.find((d) => d.id === "gemini-cli");
+    assert(gemini !== undefined, "no gemini-cli reader is registered");
+    assert(
+      gemini?.dedupStrategy === "message-id-keep-max",
+      "the gemini-cli descriptor does not declare the keep-max dedup strategy",
+    );
+    assert(
+      gemini?.costConfidence === "unavailable",
+      "the gemini-cli descriptor does not declare cost confidence unavailable",
+    );
+
+    const copilot = descriptors.find((d) => d.id === "copilot");
+    assert(copilot !== undefined, "no copilot reader is registered");
+    assert(
+      copilot?.dedupStrategy === "rowid-high-water-mark",
+      "the copilot descriptor does not declare the rowid-high-water-mark dedup strategy",
+    );
+    assert(
+      copilot?.requiresSqlite === true,
+      "the copilot descriptor does not declare requiresSqlite",
+    );
+
+    log(`registered readers: ${descriptors.map((d) => d.id).join(", ")}`);
+  });
+
+  await test("a re-logged turn counts once, at its largest output count", async () => {
+    // A resumed session re-writes turns it already logged, and the second
+    // copy can carry a HIGHER output count than the first. Summing both
+    // double-counts; taking the first under-counts; taking the last is only
+    // right by luck. The rule is max-per-id, and this is the case that
+    // distinguishes all four.
+    // BOTH orderings are present on purpose. With the duplicate pair only
+    // ever ascending, keep-max and plain last-write-wins produce identical
+    // totals and the case passes against either — it was written that way
+    // first and did exactly that. msg_B descends, so last-write-wins scores
+    // 30 where keep-max scores 90, and first-write-wins fails on msg_A.
+    const home = writeFixtureHome([
+      assistantLine("msg_A", "claude-sonnet-4-5", {
+        input_tokens: 10,
+        output_tokens: 100,
+        cache_read_input_tokens: 5,
+        cache_creation_input_tokens: 7,
+      }),
+      // Same id, resumed, LARGER output — defeats first-write-wins.
+      assistantLine("msg_A", "claude-sonnet-4-5", {
+        input_tokens: 10,
+        output_tokens: 250,
+        cache_read_input_tokens: 5,
+        cache_creation_input_tokens: 7,
+      }),
+      assistantLine("msg_B", "claude-sonnet-4-5", {
+        input_tokens: 3,
+        output_tokens: 90,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      }),
+      // Same id, re-logged SMALLER — defeats last-write-wins.
+      assistantLine("msg_B", "claude-sonnet-4-5", {
+        input_tokens: 3,
+        output_tokens: 30,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      }),
+    ]);
+
+    const report = await withHome(home, () =>
+      readAllLocalUsage({ sinceDays: Infinity }),
+    );
+    const totals = report.totals["claude-code"];
+    assert(totals !== undefined, "the claude-code reader produced no totals");
+
+    assert(
+      totals!.requests === 2,
+      `re-logged turn was not deduplicated — expected 2 requests, got ${totals!.requests}`,
+    );
+    assert(
+      totals!.outputTokens === 340,
+      `dedup did not keep the largest output count — expected 340, got ${totals!.outputTokens}`,
+    );
+    log("a resumed turn is counted once, at its largest output count");
+  });
+
+  await test("subagent transcripts are counted, not skipped", async () => {
+    // On a real machine these outnumber top-level session files roughly 170:1.
+    // A reader globbing only <project>/*.jsonl would report a fraction of the
+    // real spend while looking perfectly healthy.
+    const home = writeFixtureHome(
+      [
+        assistantLine("msg_TOP", "claude-sonnet-4-5", {
+          input_tokens: 1,
+          output_tokens: 10,
+        }),
+      ],
+      [
+        assistantLine("msg_SUB", "claude-sonnet-4-5", {
+          input_tokens: 1,
+          output_tokens: 40,
+        }),
+      ],
+    );
+
+    const report = await withHome(home, () =>
+      readAllLocalUsage({ sinceDays: Infinity }),
+    );
+    const totals = report.totals["claude-code"];
+    assert(totals !== undefined, "the claude-code reader produced no totals");
+    assert(
+      totals!.requests === 2,
+      `nested subagent transcript was not read — expected 2 requests, got ${totals!.requests}`,
+    );
+    assert(
+      totals!.outputTokens === 50,
+      `subagent output tokens were not counted — expected 50, got ${totals!.outputTokens}`,
+    );
+    log("subagent transcripts under <session>/subagents/ are included");
+  });
+
+  await test("non-message record types are skipped, not failed", async () => {
+    // A real transcript carries at least eleven `type` values, several with no
+    // `message` key at all. Treating those as malformed would turn every
+    // ordinary file into an error.
+    const home = writeFixtureHome([
+      JSON.stringify({ type: "last-prompt", value: "hi" }),
+      JSON.stringify({ type: "mode", mode: "default" }),
+      JSON.stringify({ type: "permission-mode", mode: "acceptEdits" }),
+      JSON.stringify({ type: "file-history-snapshot", files: [] }),
+      JSON.stringify({ type: "user", message: { role: "user" } }),
+      assistantLine("msg_ONLY", "claude-sonnet-4-5", {
+        input_tokens: 2,
+        output_tokens: 20,
+      }),
+      "", // blank line
+      "not json at all", // a torn trailing write
+    ]);
+
+    const report = await withHome(home, () =>
+      readAllLocalUsage({ sinceDays: Infinity }),
+    );
+    const totals = report.totals["claude-code"];
+    assert(totals !== undefined, "the claude-code reader produced no totals");
+    assert(
+      report.failures.length === 0,
+      "metadata records or a torn line were reported as a reader failure",
+    );
+    assert(
+      totals!.requests === 1,
+      `non-assistant records were miscounted — expected 1 request, got ${totals!.requests}`,
+    );
+    log("metadata rows, blank lines and a torn trailing line are tolerated");
+  });
+
+  await test("an unpriced model is reported, not silently zeroed", async () => {
+    // Claude Code logs an internal "<synthetic>" model that has no rate entry.
+    // Its turns are real and must be counted; its cost is unknown and must be
+    // declared rather than folded in as $0.
+    const home = writeFixtureHome([
+      assistantLine("msg_S", "<synthetic>", {
+        input_tokens: 5,
+        output_tokens: 15,
+      }),
+    ]);
+
+    const report = await withHome(home, () =>
+      readAllLocalUsage({ sinceDays: Infinity }),
+    );
+    const totals = report.totals["claude-code"];
+    assert(totals !== undefined, "the claude-code reader produced no totals");
+    assert(
+      totals!.requests === 1,
+      "a turn on an unpriced model was dropped from the request count",
+    );
+    assert(
+      totals!.unpricedRequests === 1,
+      "an unpriced turn was not reported as unpriced",
+    );
+    assert(
+      totals!.unpricedModels.includes("<synthetic>"),
+      "the unpriced model was not named in unpricedModels",
+    );
+    log("unpriced turns are counted and named rather than billed at zero");
+  });
+
+  await test("a CLI with no local store is absent, not failed", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "nl-localusage-empty-"));
+    const report = await withHome(home, () => readAllLocalUsage());
+    assert(
+      report.failures.length === 0,
+      "an uninstalled CLI was reported as a reader failure",
+    );
+    assert(
+      report.notInstalled.includes("claude-code"),
+      "an uninstalled CLI was not reported under notInstalled",
+    );
+    assert(
+      report.totals["claude-code"] === undefined,
+      "an uninstalled CLI produced totals",
+    );
+    log("an absent store reports as notInstalled rather than as an error");
+  });
+
+  await test("widening the window never reads less, across the whole range", async () => {
+    // A fixture, not this machine's store. The absurd rungs are full sweeps,
+    // and on a real 17k-file store nine of them take longer than the whole
+    // rest of this suite — the first version of this case timed out at ten
+    // minutes. Controlled mtimes also make the ladder actually vary, which a
+    // single-age store never would.
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "nl-monotonic-"));
+    const project = path.join(home, ".claude", "projects", "-tmp-ladder");
+    fs.mkdirSync(project, { recursive: true });
+    const ages = [2, 60, 900]; // days old
+    ages.forEach((ageDays, i) => {
+      const f = path.join(project, `session-${i}.jsonl`);
+      fs.writeFileSync(
+        f,
+        assistantLine(`msg_L${i}`, "claude-sonnet-4-5", {
+          input_tokens: 3,
+          output_tokens: 4,
+        }) + "\n",
+      );
+      const when = new Date(Date.now() - ageDays * 86_400_000);
+      fs.utimesSync(f, when, when);
+    });
+
+    // Rungs chosen to cross each fixture age and then run off the end of any
+    // possible history: 1e15 and 1e300 stay finite, MAX_VALUE overflows its
+    // span. All three mean all-history, and the cliff this guards against
+    // appeared precisely between two neighbouring absurd values.
+    const ladder = [1, 30, 100, 365, 36_500, 1e15, 1e300, Number.MAX_VALUE];
+    // The per-reader surface, not readAllLocalUsage: the aggregate reports
+    // totals keyed by CLI and carries no filesScanned of its own, so the
+    // file-count half of monotonicity is only observable here.
+    const { scans, all } = await withHome(home, async () => {
+      const reader = await createLocalUsageReader("claude-code");
+      const out: Array<{ days: number; files: number; requests: number }> = [];
+      for (const days of ladder) {
+        const r = await reader.scan({ sinceDays: days });
+        out.push({
+          days,
+          files: r.filesScanned,
+          requests: r.totals.requests,
+        });
+      }
+      return {
+        scans: out,
+        all: await reader.scan({ sinceDays: Infinity }),
+      };
+    });
+
+    // Precondition: the ladder must actually climb, or every comparison
+    // below is 0 >= 0 and this proves nothing.
+    assert(
+      all.filesScanned === ages.length,
+      "the fixture store did not scan as authored",
+    );
+    assert(
+      scans[0].files < all.filesScanned,
+      "the narrowest rung already read the whole fixture; the ladder cannot climb",
+    );
+
+    for (let i = 1; i < scans.length; i++) {
+      assert(
+        scans[i].files >= scans[i - 1].files,
+        `widening the window scanned fewer files at rung ${i}`,
+      );
+      assert(
+        scans[i].requests >= scans[i - 1].requests,
+        `widening the window counted fewer requests at rung ${i}`,
+      );
+    }
+    // Monotonicity alone still permits a ladder that plateaus below
+    // all-history. The top rung must reach it.
+    assert(
+      scans[scans.length - 1].files === all.filesScanned,
+      "the widest finite window disagreed with Infinity",
+    );
+
+    fs.rmSync(home, { recursive: true, force: true });
+    log(
+      `monotonic across ${ladder.length} rungs, ${scans[0].files} to ${all.filesScanned} files, top rung agrees with Infinity`,
+    );
+  });
+
+  await test("this machine's real transcripts scan coherently", async () => {
+    const realProjects = path.join(os.homedir(), ".claude", "projects");
+    if (!fs.existsSync(realProjects)) {
+      throw new Error("SKIP: no ~/.claude/projects on this machine");
+    }
+
+    const reader = await createLocalUsageReader("claude-code");
+    assert(await reader.detect(), "detect() denied a store that exists");
+
+    const day = await reader.scan({ sinceDays: 1 });
+    const week = await reader.scan({ sinceDays: 7 });
+
+    if (day.totals.requests === 0) {
+      throw new Error("SKIP: no Claude Code activity in the last day");
+    }
+
+    // Widening the window can only add files, never remove them. A broken
+    // mtime filter shows up here as a smaller total for the wider window.
+    assert(
+      week.filesScanned >= day.filesScanned,
+      "a wider time window scanned fewer files than a narrower one",
+    );
+    assert(
+      week.totals.requests >= day.totals.requests,
+      "a wider time window produced fewer requests than a narrower one",
+    );
+
+    // Internal coherence, on data nobody authored for this test.
+    assert(
+      day.totals.unpricedRequests <= day.totals.requests,
+      "more turns were reported unpriced than were counted at all",
+    );
+    assert(
+      day.totals.unpricedModels.length > 0 === day.totals.unpricedRequests > 0,
+      "unpricedModels and unpricedRequests disagree about whether anything was unpriced",
+    );
+    assert(
+      day.totals.costUsd > 0,
+      "a day of real priced traffic produced no cost at all",
+    );
+    assert(
+      day.totals.outputTokens > 0 && day.totals.inputTokens >= 0,
+      "real traffic produced no output tokens",
+    );
+
+    log(
+      `real scan: ${day.totals.requests} turns over ${day.filesScanned} files in 1d, ` +
+        `${week.totals.requests} over ${week.filesScanned} in 7d`,
+    );
+  });
+
+  await test("an unreadable project directory is skipped, not fatal", async () => {
+    // collectTranscripts swallows readdir failures and returns. That is the
+    // right behaviour — one project directory the user cannot read must not
+    // cost them the totals from the other eleven thousand files — but it is
+    // silent by construction, so nothing would notice if it stopped being
+    // true. A scan that aborted here would look identical to a machine with
+    // less usage on it.
+    const home = writeFixtureHome([
+      assistantLine("msg_READABLE", "claude-sonnet-4-5", {
+        input_tokens: 7,
+        output_tokens: 70,
+      }),
+    ]);
+
+    const locked = path.join(
+      home,
+      ".claude",
+      "projects",
+      "-tmp-locked-project",
+    );
+    fs.mkdirSync(locked, { recursive: true });
+    fs.writeFileSync(
+      path.join(locked, "unreachable.jsonl"),
+      assistantLine("msg_HIDDEN", "claude-sonnet-4-5", {
+        input_tokens: 999,
+        output_tokens: 999,
+      }) + "\n",
+    );
+    fs.chmodSync(locked, 0o000);
+
+    // Running as root defeats the permission bit entirely, and a test that
+    // silently proves nothing is worse than one that says so.
+    let readdirDenied = false;
+    try {
+      fs.readdirSync(locked);
+    } catch {
+      readdirDenied = true;
+    }
+    if (!readdirDenied) {
+      fs.chmodSync(locked, 0o755);
+      fs.rmSync(home, { recursive: true, force: true });
+      throw new Error(
+        "SKIP: this process can read a 0o000 directory (running as root?)",
+      );
+    }
+
+    try {
+      // The chmod is restored INSIDE the callback, before withHome's own
+      // cleanup runs: a 0o000 directory defeats rmSync too, so leaving it
+      // locked turns this case's teardown into an ENOTEMPTY that reads as a
+      // failure of the thing under test rather than of the fixture.
+      const report = await withHome(home, async () => {
+        const scanned = await readAllLocalUsage({ sinceDays: Infinity });
+        fs.chmodSync(locked, 0o755);
+        return scanned;
+      });
+      const totals = report.totals["claude-code"];
+      assert(
+        totals !== undefined,
+        "an unreadable directory aborted the whole scan",
+      );
+      assert(
+        report.failures.length === 0,
+        "an unreadable directory was reported as a reader failure",
+      );
+      assert(
+        totals!.requests === 1 && totals!.outputTokens === 70,
+        "the readable transcript was lost when a sibling directory could not be read",
+      );
+      log(
+        "an unreadable project directory is skipped; the rest of the scan survives",
+        "green",
+      );
+    } finally {
+      // Restore before cleanup, or rmSync cannot descend either.
+      try {
+        fs.chmodSync(locked, 0o755);
+      } catch {
+        // already gone
+      }
+    }
+  });
+
+  await test("Codex: the cumulative counter is used, not a sum of per-turn values", async () => {
+    // This is the whole design decision, and the naive implementation is the
+    // wrong one. Every token_count event carries a cumulative
+    // total_token_usage AND a per-turn last_token_usage; the per-turn value
+    // repeats across events within a turn, so summing it double-counts.
+    // Measured over 108 real sessions, summing gave 9,191,613,238 tokens
+    // against a true 5,653,217,442 — 62.6% over, and 195% on the worst file.
+    //
+    // The fixture below is built so the two strategies cannot agree:
+    //   sum of per-turn : 100 + 200 + 200 + 300 = 800 output
+    //   cumulative final: 600 output
+    // A reader that sums reports 800. A correct one reports 600.
+    const home = writeCodexFixtureHome([
+      codexTurnContext("gpt-5.5"),
+      codexTokenCount(
+        { input: 1000, output: 100, cached: 400 },
+        { input: 1000, output: 100, cached: 400 },
+      ),
+      codexTokenCount(
+        { input: 3000, output: 300, cached: 1200 },
+        { input: 2000, output: 200, cached: 800 },
+      ),
+      // Repeated event for the same turn — the cumulative total does not
+      // advance, which is exactly what makes summing wrong.
+      codexTokenCount(
+        { input: 3000, output: 300, cached: 1200 },
+        { input: 2000, output: 200, cached: 800 },
+      ),
+      codexTokenCount(
+        { input: 6000, output: 600, cached: 2400 },
+        { input: 3000, output: 300, cached: 1200 },
+      ),
+    ]);
+
+    const report = await withHome(home, () =>
+      readAllLocalUsage({ sinceDays: Infinity }),
+    );
+    const totals = report.totals["codex"];
+    assert(totals !== undefined, "the codex reader produced no totals");
+
+    assert(
+      totals!.outputTokens === 600,
+      `per-turn values were summed instead of using the cumulative counter — expected 600 output, got ${totals!.outputTokens}`,
+    );
+    // input is reported net of the cached subset: 6000 - 2400.
+    assert(
+      totals!.inputTokens === 3600 && totals!.cacheReadTokens === 2400,
+      `cached tokens were not separated from input — expected 3600/2400, got ${totals!.inputTokens}/${totals!.cacheReadTokens}`,
+    );
+    // Three of the four events advanced the counter; the repeat did not.
+    assert(
+      totals!.requests === 3,
+      `a repeated token_count event was counted as a billable turn — expected 3, got ${totals!.requests}`,
+    );
+    log(
+      "Codex usage comes from the cumulative counter, with cached split out of input",
+      "green",
+    );
+  });
+
+  await test("Codex: subscription usage reports no invented cost", async () => {
+    // Codex is a ChatGPT subscription — the rollouts carry rate_limits.plan_type.
+    // A per-token dollar figure would be an invention, so the tokens are real
+    // and the cost is declared unavailable rather than quietly zero.
+    const home = writeCodexFixtureHome([
+      codexTurnContext("gpt-5.5"),
+      codexTokenCount(
+        { input: 500, output: 50, cached: 100 },
+        { input: 500, output: 50, cached: 100 },
+      ),
+    ]);
+
+    const report = await withHome(home, () =>
+      readAllLocalUsage({ sinceDays: Infinity }),
+    );
+    const totals = report.totals["codex"];
+    assert(totals !== undefined, "the codex reader produced no totals");
+    assert(
+      totals!.costConfidence === "unavailable",
+      "a subscription CLI reported a cost confidence other than unavailable",
+    );
+    assert(totals!.costUsd === 0, "a subscription CLI invented a dollar cost");
+    assert(
+      totals!.unpricedRequests === totals!.requests,
+      "a subscription CLI did not report all of its turns as unpriced",
+    );
+    assert(
+      totals!.unpricedModels.includes("gpt-5.5"),
+      "the model behind unpriced subscription turns was not named",
+    );
+    log(
+      "Codex reports real tokens and an explicitly unavailable cost",
+      "green",
+    );
+  });
+
+  await test("Codex: this machine's real rollouts scan coherently", async () => {
+    const realSessions = path.join(os.homedir(), ".codex", "sessions");
+    if (!fs.existsSync(realSessions)) {
+      throw new Error("SKIP: no ~/.codex/sessions on this machine");
+    }
+    const reader = await createLocalUsageReader("codex");
+    assert(await reader.detect(), "detect() denied a store that exists");
+
+    const week = await reader.scan({ sinceDays: 7 });
+    const month = await reader.scan({ sinceDays: 30 });
+
+    if (week.totals.requests === 0 && month.totals.requests === 0) {
+      throw new Error("SKIP: no Codex activity in the last 30 days");
+    }
+
+    assert(
+      month.filesScanned >= week.filesScanned,
+      "a wider time window scanned fewer rollouts than a narrower one",
+    );
+    assert(
+      month.totals.requests >= week.totals.requests,
+      "a wider time window produced fewer turns than a narrower one",
+    );
+    assert(
+      month.totals.costUsd === 0 &&
+        month.totals.costConfidence === "unavailable",
+      "real Codex rollouts produced an invented cost",
+    );
+    log(
+      `real Codex scan: ${month.totals.requests} turns over ${month.filesScanned} rollouts in 30d`,
+      "green",
+    );
+  });
+
+  await test("OpenCode: cache tokens are disjoint from input, not subtracted", async () => {
+    // The convention differs per CLI and cannot be inferred from a sibling
+    // reader. Verified across all 4,674 usage-bearing messages on a real
+    // store: `total` equals input + output + cache.read + cache.write, so
+    // cache is DISJOINT from input here. Codex is the opposite — its
+    // `cached_input_tokens` is a SUBSET of `input_tokens` and the reader
+    // subtracts it back out.
+    //
+    // This fixture is built so applying Codex's rule here is visible:
+    // subtracting cache from input would report 700 input instead of 1000.
+    const home = await writeOpenCodeFixtureHome([
+      openCodeMessage({
+        input: 1000,
+        output: 200,
+        cacheRead: 300,
+        cacheWrite: 50,
+      }),
+    ]);
+
+    const report = await withHome(home, () =>
+      readAllLocalUsage({ sinceDays: Infinity }),
+    );
+    const totals = report.totals["opencode"];
+    assert(totals !== undefined, "the opencode reader produced no totals");
+    assert(
+      totals!.inputTokens === 1000,
+      `cache was subtracted from input as if this were Codex — expected 1000, got ${totals!.inputTokens}`,
+    );
+    assert(
+      totals!.cacheReadTokens === 300 && totals!.cacheCreationTokens === 50,
+      `cache read/write were not carried through — expected 300/50, got ${totals!.cacheReadTokens}/${totals!.cacheCreationTokens}`,
+    );
+    assert(
+      totals!.outputTokens === 200,
+      `output tokens were altered — expected 200, got ${totals!.outputTokens}`,
+    );
+    log(
+      "OpenCode cache tokens are added alongside input, not subtracted from it",
+      "green",
+    );
+  });
+
+  await test("OpenCode: assistant rows with no tokens are not counted as turns", async () => {
+    // 56 of 4,674 rows on a real store are assistant messages whose token
+    // fields are all zero. Counting them inflates the turn count while
+    // adding nothing, which makes an average-tokens-per-turn figure wrong
+    // without making any total wrong — the kind of error that survives a
+    // glance at the headline number.
+    const home = await writeOpenCodeFixtureHome([
+      openCodeMessage({ input: 10, output: 5, cacheRead: 0, cacheWrite: 0 }),
+      openCodeMessage({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }),
+      { role: "user", modelID: "claude-opus-4.6", tokens: { input: 999 } },
+    ]);
+
+    const report = await withHome(home, () =>
+      readAllLocalUsage({ sinceDays: Infinity }),
+    );
+    const totals = report.totals["opencode"];
+    assert(totals !== undefined, "the opencode reader produced no totals");
+    assert(
+      totals!.requests === 1,
+      `empty or non-assistant rows were counted as turns — expected 1, got ${totals!.requests}`,
+    );
+    assert(
+      totals!.inputTokens === 10,
+      `a non-assistant row's tokens were counted — expected 10, got ${totals!.inputTokens}`,
+    );
+    log("empty and non-assistant OpenCode rows are skipped", "green");
+  });
+
+  await test("OpenCode: this machine's real store scans coherently", async () => {
+    const realDb = path.join(
+      os.homedir(),
+      ".local",
+      "share",
+      "opencode",
+      "opencode.db",
+    );
+    if (!fs.existsSync(realDb)) {
+      throw new Error("SKIP: no OpenCode store on this machine");
+    }
+    const reader = await createLocalUsageReader("opencode");
+    assert(await reader.detect(), "detect() denied a store that exists");
+
+    const all = await reader.scan({ sinceDays: Infinity });
+    if (all.totals.requests === 0) {
+      throw new Error("SKIP: OpenCode store has no usage-bearing messages");
+    }
+
+    assert(
+      all.errors.length === 0,
+      "reading the real OpenCode store reported an error",
+    );
+    assert(
+      all.totals.costConfidence === "unavailable" && all.totals.costUsd === 0,
+      "OpenCode invented a cost despite reporting none of its own",
+    );
+    assert(
+      all.totals.unpricedRequests === all.totals.requests,
+      "not every OpenCode turn was reported as unpriced",
+    );
+    assert(
+      all.totals.unpricedModels.length > 0,
+      "no models were named behind the unpriced turns",
+    );
+    log(
+      `real OpenCode scan: ${all.totals.requests} turns, models ${all.totals.unpricedModels.slice(0, 3).join(", ")}`,
+      "green",
+    );
+  });
+
+  await test("CLI: `usage local --json` reports the same shape as the SDK", async () => {
+    // The CLI is the surface most people will actually use, and it is a
+    // separate process from the SDK path every other case here drives — a
+    // registry that failed to load, or an export that did not survive the
+    // build, would show up here and nowhere else.
+    //
+    // Driven against a FIXTURE home, not this machine's. A clean CI worker has
+    // no CLI stores at all, and the first version of this case asserted that
+    // at least one CLI reported usage — which passes on a developer laptop and
+    // fails on the runner. Verified by pointing it at an empty HOME: totals is
+    // {} and every reader lands in notInstalled.
+    const home = writeFixtureHome([
+      assistantLine("msg_CLI", "claude-sonnet-4-5", {
+        input_tokens: 12,
+        output_tokens: 34,
+      }),
+    ]);
+    try {
+      const run = runCli(["usage", "local", "--since", "0", "--json"], {
+        HOME: home,
+        USERPROFILE: home,
+      });
+      assert(run.status === 0, "usage local --json did not exit 0");
+      let parsed: {
+        totals?: Record<string, { requests?: number; outputTokens?: number }>;
+        notInstalled?: string[];
+      };
+      try {
+        parsed = JSON.parse(run.stdout);
+      } catch {
+        throw new Error("usage local --json did not emit parseable JSON");
+      }
+      assert(
+        parsed.totals !== undefined,
+        "the CLI's JSON report carried no totals",
+      );
+      const claude = parsed.totals?.["claude-code"];
+      assert(
+        claude !== undefined,
+        "the CLI did not report the fixture store it was pointed at",
+      );
+      assert(
+        claude?.outputTokens === 34,
+        // No recovered value interpolated: the harness classifies a thrown
+        // message with isExpectedProviderError(), so a payload that happens to
+        // read like a provider error turns a real failure into a SKIP. These
+        // particular strings do not match today — measured — but the next
+        // value to land here might, and the check is on the message text, not
+        // on what produced it.
+        "the CLI reported different output totals than the fixture holds",
+      );
+      log(
+        `CLI reported the fixture store: ${Object.keys(parsed.totals ?? {}).join(", ")}`,
+      );
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  await test("CLI: an empty --cli is rejected, not treated as absent", async () => {
+    // `--cli ""` is a mistake, and a truthiness check reads it as "flag not
+    // given" — so the command scanned every reader and reported all usage for
+    // a request that named nothing.
+    const home = writeFixtureHome([
+      assistantLine("msg_E", "claude-sonnet-4-5", {
+        input_tokens: 1,
+        output_tokens: 2,
+      }),
+    ]);
+    try {
+      const run = runCli(["usage", "local", "--cli", "", "--since", "0"], {
+        HOME: home,
+        USERPROFILE: home,
+      });
+      assert(
+        run.status === 1,
+        `an empty --cli exited ${run.status} instead of 1`,
+      );
+      assert(
+        (run.stdout + run.stderr).includes("Unknown CLI"),
+        "an empty --cli was accepted instead of being rejected",
+      );
+      log("an empty --cli value is rejected", "green");
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  await test("CLI: an unknown --cli fails fast without scanning", async () => {
+    // Validation happens before any store is opened. Getting this wrong is not
+    // a correctness bug but it is a real one: the same typo used to cost a
+    // full 28s sweep of every store before printing the error.
+    const started = Date.now();
+    const run = runCli(["usage", "local", "--cli", "definitely-not-a-cli"]);
+    const elapsedMs = Date.now() - started;
+
+    assert(run.status === 1, `expected exit 1, got ${run.status}`);
+    assert(
+      (run.stderr + run.stdout).includes("Unknown CLI"),
+      "the error did not name the unknown CLI",
+    );
+    // Generous bound: this only has to prove no store was read. A full scan of
+    // this machine's stores takes tens of seconds.
+    assert(
+      elapsedMs < 15_000,
+      "an unknown CLI took long enough that stores were scanned before validating",
+    );
+    log(`unknown --cli rejected in ${elapsedMs}ms without scanning`, "green");
+  });
+
+  await test("CLI: --cli scans only the requested reader", async () => {
+    // `only` must filter which readers are CONSTRUCTED, not which results are
+    // printed. Filtering after the fact gives the same output while reading
+    // every other store — which is what it did first, at 28s for a query that
+    // needs 3.
+    const one = runCli([
+      "usage",
+      "local",
+      "--cli",
+      "codex",
+      "--since",
+      "0",
+      "--json",
+    ]);
+    assert(one.status === 0, "--cli codex did not exit 0");
+    const parsed = JSON.parse(one.stdout) as {
+      totals: Record<string, unknown>;
+      notInstalled?: string[];
+    };
+    const reported = Object.keys(parsed.totals);
+    assert(
+      reported.length <= 1,
+      "--cli codex reported more than one CLI; other readers were still run",
+    );
+    if (reported.length === 1) {
+      assert(
+        reported[0] === "codex",
+        "--cli codex reported a different CLI instead",
+      );
+    }
+    log(
+      "--cli restricts which readers run, not just which rows print",
+      "green",
+    );
+  });
+
+  await test("a non-positive sinceDays is an empty window, not a full sweep", async () => {
+    // The guard used to be `sinceDays > 0`, which left the cutoff undefined
+    // for 0 and for negatives and read every transcript on the machine.
+    // Measured on release before the fix: sinceDays 0 scanned 17,534 files in
+    // 35.9s — the widest possible scan in answer to the narrowest possible
+    // request, and on a 9.7 GB store that is not a harmless surprise.
+    //
+    // Infinity is the only full-sweep signal now. The CLI's `--since 0`
+    // still means all history, because the command translates it to Infinity
+    // before it reaches a reader — that is a CLI convention, not a reader
+    // one, and the two no longer have to agree by accident.
+    const home = writeFixtureHome([
+      assistantLine("msg_W", "claude-sonnet-4-5", {
+        input_tokens: 5,
+        output_tokens: 9,
+      }),
+    ]);
+    try {
+      const [
+        zero,
+        negative,
+        notANumber,
+        negInfinite,
+        overflowMax,
+        overflowHuge,
+        infinite,
+        belowCliff,
+        aboveCliff,
+      ] = await withHome(home, async () => [
+        await readAllLocalUsage({ sinceDays: 0 }),
+        await readAllLocalUsage({ sinceDays: -5 }),
+        // NaN is the case the first version of this fix missed:
+        // Math.max(0, NaN) is NaN and every comparison against NaN is false,
+        // so the filter passed every file — 17,537 of them, measured. The
+        // guard it replaced caught this with Number.isFinite.
+        await readAllLocalUsage({ sinceDays: NaN }),
+        await readAllLocalUsage({ sinceDays: -Infinity }),
+        // A FINITE sinceDays whose window arithmetic overflows. These mean
+        // ALL HISTORY, exactly like Infinity: a window of 1e308 days is longer
+        // than any transcript store, so "everything" is the right answer and
+        // "nothing" is a wrong one. An earlier version of this suite asserted
+        // the opposite and pinned a non-monotonic cliff — 2.07e300 read
+        // everything, 2.09e300 read nothing, Infinity read everything again.
+        // Caught by running the CLI, not this suite: `usage local --since
+        // 999999999999` reported 518,576 turns and `--since 1e308` reported 39.
+        await readAllLocalUsage({ sinceDays: Number.MAX_VALUE }),
+        await readAllLocalUsage({ sinceDays: 1e308 }),
+        await readAllLocalUsage({ sinceDays: Infinity }),
+        // The two sides of the overflow boundary (~2.08e300 = Number.MAX_VALUE
+        // / 86_400_000), read INSIDE the fixture home. They used to sit after
+        // this block returned — after HOME was restored to the real one — so
+        // a case named "an empty window" ended by sweeping every transcript
+        // on the machine twice, concurrently, with an unbounded window.
+        // Measured: 650,530 turns in 211 s for one reader alone, against
+        // 12 ms in here. Under load that passed the suite's 240 s bound and
+        // reported as a hang in the code under test; three earlier runs had
+        // stalled at exactly this case before a watchdog caught the process
+        // reading other projects' subagent transcripts.
+        ...(await Promise.all([
+          readAllLocalUsage({ sinceDays: 2.07e300 }),
+          readAllLocalUsage({ sinceDays: 2.09e300 }),
+        ])),
+      ]);
+
+      assert(
+        (zero.totals["claude-code"]?.requests ?? 0) === 0,
+        `sinceDays 0 read transcripts — got ${zero.totals["claude-code"]?.requests} turns instead of 0`,
+      );
+      assert(
+        (negative.totals["claude-code"]?.requests ?? 0) === 0,
+        `a negative sinceDays read transcripts — got ${negative.totals["claude-code"]?.requests} turns instead of 0`,
+      );
+      assert(
+        (notANumber.totals["claude-code"]?.requests ?? 0) === 0,
+        "a NaN sinceDays read transcripts instead of nothing",
+      );
+      assert(
+        (negInfinite.totals["claude-code"]?.requests ?? 0) === 0,
+        "a -Infinity sinceDays read transcripts instead of nothing",
+      );
+      assert(
+        (overflowMax.totals["claude-code"]?.requests ?? 0) === 1,
+        `a Number.MAX_VALUE sinceDays is a window longer than any history and must read everything — expected 1 turn, got ${overflowMax.totals["claude-code"]?.requests}`,
+      );
+      assert(
+        (overflowHuge.totals["claude-code"]?.requests ?? 0) === 1,
+        `a 1e308 sinceDays must read everything, like Infinity — expected 1 turn, got ${overflowHuge.totals["claude-code"]?.requests}`,
+      );
+      // Monotonicity across the overflow boundary: a caller cannot see where
+      // the multiply stops being finite, so the answer must not change across
+      // it. Asserted against the fixture's one turn rather than as bare
+      // equality: two full sweeps of a real machine also agree with each
+      // other, and that is precisely the case this must not pass on.
+      assert(
+        (belowCliff.totals["claude-code"]?.requests ?? 0) === 1 &&
+          (aboveCliff.totals["claude-code"]?.requests ?? 0) === 1,
+        `the overflow boundary changed the answer, or the scan left the fixture home`,
+      );
+      // The control: without this, a reader that simply returned nothing for
+      // every window would pass every assertion above.
+      assert(
+        (infinite.totals["claude-code"]?.requests ?? 0) === 1,
+        `Infinity stopped being a full sweep — expected 1 turn, got ${infinite.totals["claude-code"]?.requests}`,
+      );
+      log(
+        "a non-positive window reads nothing; Infinity still reads everything",
+        "green",
+      );
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  await test("repeated scans of the same data agree", async () => {
+    // The reader keeps a per-file dedup map. If any of it leaked across calls,
+    // a second scan of identical input would drift.
+    const home = writeFixtureHome([
+      assistantLine("msg_1", "claude-sonnet-4-5", {
+        input_tokens: 4,
+        output_tokens: 40,
+      }),
+      assistantLine("msg_2", "claude-sonnet-4-5", {
+        input_tokens: 6,
+        output_tokens: 60,
+      }),
+    ]);
+
+    const [first, second] = await withHome(home, async () => [
+      await readAllLocalUsage({ sinceDays: Infinity }),
+      await readAllLocalUsage({ sinceDays: Infinity }),
+    ]);
+
+    assert(
+      JSON.stringify(first.totals) === JSON.stringify(second.totals),
+      "two scans of identical input produced different totals",
+    );
+    log("scanning is idempotent across calls");
+  });
+
+  await test("Qwen Code: a re-logged turn counts once, at its largest total", async () => {
+    // Same rationale as the Claude Code case above: a resumed session can
+    // re-log the same uuid with a higher output count than the first write.
+    // Picking maxima on t1 and t2 from different ends defeats first-write-wins
+    // AND last-write-wins simultaneously.
+    const home = writeQwenFixtureHome([
+      qwenAssistantLine("t1", "claude-sonnet-4-5", {
+        promptTokenCount: 10,
+        candidatesTokenCount: 50,
+        cachedContentTokenCount: 0,
+      }),
+      qwenAssistantLine("t1", "claude-sonnet-4-5", {
+        promptTokenCount: 10,
+        candidatesTokenCount: 120,
+        cachedContentTokenCount: 0,
+      }),
+      qwenAssistantLine("t2", "claude-sonnet-4-5", {
+        promptTokenCount: 5,
+        candidatesTokenCount: 90,
+        cachedContentTokenCount: 0,
+      }),
+      qwenAssistantLine("t2", "claude-sonnet-4-5", {
+        promptTokenCount: 5,
+        candidatesTokenCount: 30,
+        cachedContentTokenCount: 0,
+      }),
+    ]);
+
+    const report = await withHome(home, () =>
+      readAllLocalUsage({ sinceDays: Infinity }),
+    );
+    const totals = report.totals["qwen-code"];
+    assert(totals !== undefined, "the qwen-code reader produced no totals");
+    assert(
+      totals?.requests === 2,
+      "a re-logged Qwen Code turn was not deduplicated to one request",
+    );
+    assert(
+      totals?.outputTokens === 210,
+      "Qwen Code dedup did not keep the largest output count per turn",
+    );
+    log("Qwen Code: a resumed turn is counted once, at its largest total");
+  });
+
+  await test("Qwen Code: cached tokens are a subset of prompt tokens, and thoughts fold into output", async () => {
+    const home = writeQwenFixtureHome([
+      qwenAssistantLine("t1", "claude-sonnet-4-5", {
+        promptTokenCount: 1000,
+        candidatesTokenCount: 200,
+        thoughtsTokenCount: 50,
+        cachedContentTokenCount: 300,
+      }),
+    ]);
+    const report = await withHome(home, () =>
+      readAllLocalUsage({ sinceDays: Infinity }),
+    );
+    const totals = report.totals["qwen-code"];
+    assert(totals !== undefined, "the qwen-code reader produced no totals");
+    assert(
+      totals?.inputTokens === 700,
+      "Qwen Code added cached tokens on top of prompt instead of subtracting them",
+    );
+    assert(
+      totals?.cacheReadTokens === 300,
+      "Qwen Code did not carry cached tokens through as cacheReadTokens",
+    );
+    assert(
+      totals?.outputTokens === 250,
+      "Qwen Code did not fold thoughts tokens into output",
+    );
+    log(
+      "Qwen Code cached tokens are subtracted out of prompt; thoughts fold into output",
+    );
+  });
+
+  await test("Qwen Code: nested chat transcripts under chats/ are counted, not skipped", async () => {
+    const home = writeQwenFixtureHome(
+      [
+        qwenAssistantLine("top", "claude-sonnet-4-5", {
+          promptTokenCount: 1,
+          candidatesTokenCount: 10,
+        }),
+      ],
+      [
+        qwenAssistantLine("nested", "claude-sonnet-4-5", {
+          promptTokenCount: 1,
+          candidatesTokenCount: 40,
+        }),
+      ],
+    );
+    const report = await withHome(home, () =>
+      readAllLocalUsage({ sinceDays: Infinity }),
+    );
+    const totals = report.totals["qwen-code"];
+    assert(totals !== undefined, "the qwen-code reader produced no totals");
+    assert(
+      totals?.requests === 2,
+      "a Qwen Code transcript nested under chats/ was not read",
+    );
+    assert(
+      totals?.outputTokens === 50,
+      "output tokens from a nested Qwen Code transcript were not counted",
+    );
+    log(
+      "Qwen Code transcripts nested under chats/ (subagent lineage) are included",
+    );
+  });
+
+  await test("Qwen Code: non-assistant records and malformed lines are skipped, not failed", async () => {
+    const home = writeQwenFixtureHome([
+      JSON.stringify({ type: "user", uuid: "u1" }),
+      JSON.stringify({ type: "assistant", uuid: "no-usage" }),
+      qwenAssistantLine("t1", "claude-sonnet-4-5", {
+        promptTokenCount: 2,
+        candidatesTokenCount: 20,
+      }),
+      "",
+      "not json at all",
+    ]);
+    const report = await withHome(home, () =>
+      readAllLocalUsage({ sinceDays: Infinity }),
+    );
+    const totals = report.totals["qwen-code"];
+    assert(totals !== undefined, "the qwen-code reader produced no totals");
+    assert(
+      report.failures.length === 0,
+      "a non-assistant record or torn line was reported as a reader failure",
+    );
+    assert(
+      totals?.requests === 1,
+      "non-assistant or usage-less Qwen Code records were miscounted as turns",
+    );
+    log(
+      "Qwen Code tolerates non-assistant records, usage-less assistant lines, and a torn trailing line",
+    );
+  });
+
+  await test("Qwen Code: cost is always unavailable, and every turn is reported unpriced", async () => {
+    const home = writeQwenFixtureHome([
+      qwenAssistantLine("t1", "claude-sonnet-4-5", {
+        promptTokenCount: 5,
+        candidatesTokenCount: 15,
+      }),
+    ]);
+    const report = await withHome(home, () =>
+      readAllLocalUsage({ sinceDays: Infinity }),
+    );
+    const totals = report.totals["qwen-code"];
+    assert(totals !== undefined, "the qwen-code reader produced no totals");
+    assert(
+      totals?.costConfidence === "unavailable",
+      "Qwen Code reported a cost confidence other than unavailable",
+    );
+    assert(totals?.costUsd === 0, "Qwen Code invented a dollar cost");
+    assert(
+      totals?.unpricedRequests === totals?.requests,
+      "not every Qwen Code turn was reported as unpriced",
+    );
+    assert(
+      totals?.unpricedModels.includes("claude-sonnet-4-5") === true,
+      "the model behind unpriced Qwen Code turns was not named",
+    );
+    log("Qwen Code reports real tokens and an explicitly unavailable cost");
+  });
+
+  await test("Qwen Code: sinceDays filters files by mtime, not just contents", async () => {
+    const home = writeQwenFixtureHome([
+      qwenAssistantLine("t1", "claude-sonnet-4-5", {
+        promptTokenCount: 5,
+        candidatesTokenCount: 9,
+      }),
+    ]);
+    const chats = path.join(home, ".qwen", "projects", "-tmp-fixture", "chats");
+    const file = path.join(chats, "session-a.jsonl");
+    const longAgo = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+    fs.utimesSync(file, longAgo, longAgo);
+
+    const [narrow, wide] = await withHome(home, async () => [
+      await readAllLocalUsage({ sinceDays: 1 }),
+      await readAllLocalUsage({ sinceDays: Infinity }),
+    ]);
+    assert(
+      (narrow.totals["qwen-code"]?.requests ?? 0) === 0,
+      "a 1-day window read a Qwen Code transcript backdated 3 days",
+    );
+    assert(
+      (wide.totals["qwen-code"]?.requests ?? 0) === 1,
+      "an unbounded window failed to read a 3-day-old Qwen Code transcript",
+    );
+    log("Qwen Code respects sinceDays via file mtime");
+  });
+
+  await test("Qwen Code: this machine's real transcripts scan coherently", async () => {
+    const realProjects = path.join(os.homedir(), ".qwen", "projects");
+    if (!fs.existsSync(realProjects)) {
+      throw new Error("SKIP: no ~/.qwen/projects on this machine");
+    }
+    const reader = await createLocalUsageReader("qwen-code");
+    assert(
+      await reader.detect(),
+      "detect() denied a Qwen Code store that exists",
+    );
+
+    const week = await reader.scan({ sinceDays: 7 });
+    const all = await reader.scan({ sinceDays: Infinity });
+
+    if (all.totals.requests === 0) {
+      throw new Error("SKIP: no Qwen Code activity recorded on this machine");
+    }
+    assert(
+      all.filesScanned >= week.filesScanned,
+      "a wider Qwen Code window scanned fewer files than a narrower one",
+    );
+    assert(
+      all.totals.requests >= week.totals.requests,
+      "a wider Qwen Code window produced fewer requests than a narrower one",
+    );
+    assert(
+      all.totals.costConfidence === "unavailable" && all.totals.costUsd === 0,
+      "real Qwen Code data produced an invented cost",
+    );
+    assert(
+      all.totals.inputTokens >= 0 && all.totals.outputTokens >= 0,
+      "real Qwen Code totals were negative",
+    );
+    log(
+      `real Qwen Code scan: ${all.totals.requests} turns over ${all.filesScanned} files`,
+    );
+  });
+
+  await test("Gemini CLI: a message logged twice (once token-less, once with tokens) counts once", async () => {
+    // recordMessage() pushes a token-less record first; recordMessageTokens()
+    // re-pushes the same id once usage arrives. pushMessage() always appends,
+    // so the same id can appear twice in one file — see geminiCliReader.ts.
+    const home = writeGeminiFixtureHome([
+      geminiBareLine(geminiMessage("g1", "gemini-3.5-flash")),
+      geminiBareLine(
+        geminiMessage("g1", "gemini-3.5-flash", {
+          input: 100,
+          output: 40,
+          cached: 0,
+          thoughts: 10,
+          tool: 0,
+          total: 150,
+        }),
+      ),
+    ]);
+    const report = await withHome(home, () =>
+      readAllLocalUsage({ sinceDays: Infinity }),
+    );
+    const totals = report.totals["gemini-cli"];
+    assert(totals !== undefined, "the gemini-cli reader produced no totals");
+    assert(
+      totals?.requests === 1,
+      "a Gemini CLI message re-logged once tokens arrived was double-counted",
+    );
+    assert(
+      totals?.outputTokens === 50,
+      "the token-less Gemini CLI duplicate won over the token-bearing one",
+    );
+    log(
+      "Gemini CLI: a message logged before and after its tokens arrive counts once",
+    );
+  });
+
+  await test("Gemini CLI: a duplicated id with two token-bearing records keeps the largest total", async () => {
+    // Distinct from the token-less-then-filled race above: here every
+    // record carries tokens. Two ids, each duplicated with the larger
+    // total on OPPOSITE ends (g1: small then large; g2: large then small)
+    // — the only setup that defeats first-write-wins AND last-write-wins
+    // simultaneously, proving the comparison is really max-based rather
+    // than positional. Same shape as the Qwen Code and Claude Code cases.
+    const home = writeGeminiFixtureHome([
+      geminiBareLine(
+        geminiMessage("g1", "gemini-3.5-flash", {
+          input: 50,
+          output: 30,
+          cached: 0,
+          thoughts: 0,
+          tool: 0,
+          total: 80,
+        }),
+      ),
+      geminiBareLine(
+        geminiMessage("g1", "gemini-3.5-flash", {
+          input: 50,
+          output: 120,
+          cached: 0,
+          thoughts: 0,
+          tool: 0,
+          total: 170,
+        }),
+      ),
+      geminiBareLine(
+        geminiMessage("g2", "gemini-3.5-flash", {
+          input: 20,
+          output: 90,
+          cached: 0,
+          thoughts: 0,
+          tool: 0,
+          total: 110,
+        }),
+      ),
+      geminiBareLine(
+        geminiMessage("g2", "gemini-3.5-flash", {
+          input: 20,
+          output: 15,
+          cached: 0,
+          thoughts: 0,
+          tool: 0,
+          total: 35,
+        }),
+      ),
+    ]);
+    const report = await withHome(home, () =>
+      readAllLocalUsage({ sinceDays: Infinity }),
+    );
+    const totals = report.totals["gemini-cli"];
+    assert(totals !== undefined, "the gemini-cli reader produced no totals");
+    assert(
+      totals?.requests === 2,
+      "duplicated Gemini CLI ids were not deduplicated to one request each",
+    );
+    assert(
+      totals?.outputTokens === 210,
+      "Gemini CLI dedup did not keep the larger of two token-bearing records for each id",
+    );
+    log(
+      "Gemini CLI: a duplicated id keeps whichever record has the larger total, regardless of write order",
+    );
+  });
+
+  await test("Gemini CLI: cached tokens are a subset of input, and thoughts/tool fold into output", async () => {
+    const home = writeGeminiFixtureHome([
+      geminiBareLine(
+        geminiMessage("g1", "gemini-3-flash-preview", {
+          input: 12121,
+          output: 1,
+          cached: 4073,
+          thoughts: 222,
+          tool: 5,
+          total: 12349,
+        }),
+      ),
+    ]);
+    const report = await withHome(home, () =>
+      readAllLocalUsage({ sinceDays: Infinity }),
+    );
+    const totals = report.totals["gemini-cli"];
+    assert(totals !== undefined, "the gemini-cli reader produced no totals");
+    assert(
+      totals?.inputTokens === 8048,
+      "Gemini CLI added cached tokens on top of input instead of subtracting them",
+    );
+    assert(
+      totals?.cacheReadTokens === 4073,
+      "Gemini CLI did not carry cached tokens through as cacheReadTokens",
+    );
+    assert(
+      totals?.outputTokens === 228,
+      "Gemini CLI did not fold thoughts/tool tokens into output",
+    );
+    log(
+      "Gemini CLI cached tokens are subtracted out of input; thoughts/tool fold into output",
+    );
+  });
+
+  await test("Gemini CLI: both the $set bootstrap wrapper and bare-appended messages are read", async () => {
+    const home = writeGeminiFixtureHome([
+      geminiSetMessagesLine([{ id: "user-1", type: "user" }]),
+      geminiSetMessagesLine([
+        geminiMessage("g-wrapped", "gemini-3.5-flash", {
+          input: 10,
+          output: 5,
+          cached: 0,
+          thoughts: 0,
+          tool: 0,
+          total: 15,
+        }),
+      ]),
+      JSON.stringify({ $set: { lastUpdated: "2026-05-01T00:01:00.000Z" } }),
+      geminiBareLine(
+        geminiMessage("g-bare", "gemini-3.5-flash", {
+          input: 20,
+          output: 9,
+          cached: 0,
+          thoughts: 1,
+          tool: 0,
+          total: 30,
+        }),
+      ),
+    ]);
+    const report = await withHome(home, () =>
+      readAllLocalUsage({ sinceDays: Infinity }),
+    );
+    const totals = report.totals["gemini-cli"];
+    assert(totals !== undefined, "the gemini-cli reader produced no totals");
+    assert(
+      totals?.requests === 2,
+      "one of the two Gemini CLI message shapes (wrapped vs bare) was not read",
+    );
+    assert(
+      totals?.outputTokens === 15,
+      "Gemini CLI output totals did not match both message shapes combined",
+    );
+    log(
+      "Gemini CLI reads both $set.messages[]-wrapped and bare-appended message records",
+    );
+  });
+
+  await test("Gemini CLI: subagent transcripts nested under chats/<parentId>/ are counted", async () => {
+    const home = writeGeminiFixtureHome(
+      [
+        geminiBareLine(
+          geminiMessage("top", "gemini-3.5-flash", {
+            input: 1,
+            output: 10,
+            cached: 0,
+            thoughts: 0,
+            tool: 0,
+            total: 11,
+          }),
+        ),
+      ],
+      [
+        geminiBareLine(
+          geminiMessage("nested", "gemini-3.5-flash", {
+            input: 1,
+            output: 40,
+            cached: 0,
+            thoughts: 0,
+            tool: 0,
+            total: 41,
+          }),
+        ),
+      ],
+    );
+    const report = await withHome(home, () =>
+      readAllLocalUsage({ sinceDays: Infinity }),
+    );
+    const totals = report.totals["gemini-cli"];
+    assert(totals !== undefined, "the gemini-cli reader produced no totals");
+    assert(
+      totals?.requests === 2,
+      "a Gemini CLI subagent transcript nested under chats/<parentId>/ was not read",
+    );
+    assert(
+      totals?.outputTokens === 50,
+      "output tokens from a nested Gemini CLI subagent transcript were not counted",
+    );
+    log(
+      "Gemini CLI transcripts nested under chats/<parentSessionId>/ (subagent lineage) are included",
+    );
+  });
+
+  await test("Gemini CLI: non-gemini records, the header line, and malformed lines are skipped", async () => {
+    const home = writeGeminiFixtureHome([
+      geminiBareLine({ id: "u1", type: "user" }),
+      geminiBareLine({ id: "i1", type: "info" }),
+      geminiBareLine(
+        geminiMessage("g1", "gemini-3.5-flash", {
+          input: 2,
+          output: 20,
+          cached: 0,
+          thoughts: 0,
+          tool: 0,
+          total: 22,
+        }),
+      ),
+      "",
+      "not json at all",
+    ]);
+    const report = await withHome(home, () =>
+      readAllLocalUsage({ sinceDays: Infinity }),
+    );
+    const totals = report.totals["gemini-cli"];
+    assert(totals !== undefined, "the gemini-cli reader produced no totals");
+    assert(
+      report.failures.length === 0,
+      "a non-gemini record or torn line was reported as a Gemini CLI reader failure",
+    );
+    assert(
+      totals?.requests === 1,
+      "non-gemini Gemini CLI records were miscounted as turns",
+    );
+    log(
+      "Gemini CLI tolerates non-gemini records, the header line, and a torn trailing line",
+    );
+  });
+
+  await test("Gemini CLI: cost is always unavailable, and every turn is reported unpriced", async () => {
+    const home = writeGeminiFixtureHome([
+      geminiBareLine(
+        geminiMessage("g1", "gemini-3.5-flash", {
+          input: 5,
+          output: 15,
+          cached: 0,
+          thoughts: 0,
+          tool: 0,
+          total: 20,
+        }),
+      ),
+    ]);
+    const report = await withHome(home, () =>
+      readAllLocalUsage({ sinceDays: Infinity }),
+    );
+    const totals = report.totals["gemini-cli"];
+    assert(totals !== undefined, "the gemini-cli reader produced no totals");
+    assert(
+      totals?.costConfidence === "unavailable",
+      "Gemini CLI reported a cost confidence other than unavailable",
+    );
+    assert(totals?.costUsd === 0, "Gemini CLI invented a dollar cost");
+    assert(
+      totals?.unpricedRequests === totals?.requests,
+      "not every Gemini CLI turn was reported as unpriced",
+    );
+    assert(
+      totals?.unpricedModels.includes("gemini-3.5-flash") === true,
+      "the model behind unpriced Gemini CLI turns was not named",
+    );
+    log(
+      "Gemini CLI reports real tokens and an explicitly unavailable cost across all three auth modes",
+    );
+  });
+
+  await test("Gemini CLI: sinceDays filters files by mtime, not just contents", async () => {
+    const home = writeGeminiFixtureHome([
+      geminiBareLine(
+        geminiMessage("g1", "gemini-3.5-flash", {
+          input: 5,
+          output: 9,
+          cached: 0,
+          thoughts: 0,
+          tool: 0,
+          total: 14,
+        }),
+      ),
+    ]);
+    const chats = path.join(home, ".gemini", "tmp", "fixture-project", "chats");
+    const file = path.join(chats, "session-a.jsonl");
+    const longAgo = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+    fs.utimesSync(file, longAgo, longAgo);
+
+    const [narrow, wide] = await withHome(home, async () => [
+      await readAllLocalUsage({ sinceDays: 1 }),
+      await readAllLocalUsage({ sinceDays: Infinity }),
+    ]);
+    assert(
+      (narrow.totals["gemini-cli"]?.requests ?? 0) === 0,
+      "a 1-day window read a Gemini CLI transcript backdated 3 days",
+    );
+    assert(
+      (wide.totals["gemini-cli"]?.requests ?? 0) === 1,
+      "an unbounded window failed to read a 3-day-old Gemini CLI transcript",
+    );
+    log("Gemini CLI respects sinceDays via file mtime");
+  });
+
+  await test("Gemini CLI: this machine's real transcripts scan coherently", async () => {
+    const realTmp = path.join(os.homedir(), ".gemini", "tmp");
+    if (!fs.existsSync(realTmp)) {
+      throw new Error("SKIP: no ~/.gemini/tmp on this machine");
+    }
+    const reader = await createLocalUsageReader("gemini-cli");
+    assert(
+      await reader.detect(),
+      "detect() denied a Gemini CLI store that exists",
+    );
+    const week = await reader.scan({ sinceDays: 7 });
+    const all = await reader.scan({ sinceDays: Infinity });
+    if (all.totals.requests === 0) {
+      throw new Error("SKIP: no Gemini CLI activity recorded on this machine");
+    }
+    assert(
+      all.filesScanned >= week.filesScanned,
+      "a wider Gemini CLI window scanned fewer files than a narrower one",
+    );
+    assert(
+      all.totals.requests >= week.totals.requests,
+      "a wider Gemini CLI window produced fewer requests than a narrower one",
+    );
+    assert(
+      all.totals.costConfidence === "unavailable" && all.totals.costUsd === 0,
+      "real Gemini CLI data produced an invented cost",
+    );
+    assert(
+      all.totals.inputTokens >= 0 && all.totals.outputTokens >= 0,
+      "real Gemini CLI totals were negative",
+    );
+    log(
+      `real Gemini CLI scan: ${all.totals.requests} turns over ${all.filesScanned} files`,
+    );
+  });
+
+  await test("Copilot CLI: cache read and write tokens are both a subset of input tokens", async () => {
+    const home = await writeCopilotFixtureHome([
+      {
+        model: "claude-haiku-4-5",
+        input: 24050,
+        output: 3,
+        cacheRead: 0,
+        cacheWrite: 24047,
+        reasoning: 0,
+        createdAt: new Date().toISOString(),
+      },
+    ]);
+    const report = await withHome(home, () =>
+      readAllLocalUsage({ sinceDays: Infinity }),
+    );
+    const totals = report.totals["copilot"];
+    assert(totals !== undefined, "the copilot reader produced no totals");
+    assert(
+      totals?.inputTokens === 3,
+      "Copilot CLI added cache tokens on top of input instead of subtracting them",
+    );
+    assert(
+      totals?.cacheCreationTokens === 24047,
+      "Copilot CLI did not carry cache-write tokens through as cacheCreationTokens",
+    );
+    log(
+      "Copilot CLI subtracts both cache-read and cache-write out of input tokens",
+    );
+  });
+
+  await test("Copilot CLI: reasoning tokens fold into output", async () => {
+    const home = await writeCopilotFixtureHome([
+      {
+        model: "claude-sonnet-4-6",
+        input: 100,
+        output: 40,
+        cacheRead: 0,
+        cacheWrite: 0,
+        reasoning: 25,
+        createdAt: new Date().toISOString(),
+      },
+    ]);
+    const report = await withHome(home, () =>
+      readAllLocalUsage({ sinceDays: Infinity }),
+    );
+    const totals = report.totals["copilot"];
+    assert(totals !== undefined, "the copilot reader produced no totals");
+    assert(
+      totals?.outputTokens === 65,
+      "Copilot CLI did not fold reasoning tokens into output",
+    );
+    log("Copilot CLI folds reasoning tokens into output");
+  });
+
+  await test("Copilot CLI: rows with every token field zero are not counted as turns", async () => {
+    const home = await writeCopilotFixtureHome([
+      {
+        model: "claude-haiku-4-5",
+        input: 10,
+        output: 5,
+        cacheRead: 0,
+        cacheWrite: 0,
+        reasoning: 0,
+        createdAt: new Date().toISOString(),
+      },
+      {
+        model: "claude-haiku-4-5",
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        reasoning: 0,
+        createdAt: new Date().toISOString(),
+      },
+    ]);
+    const report = await withHome(home, () =>
+      readAllLocalUsage({ sinceDays: Infinity }),
+    );
+    const totals = report.totals["copilot"];
+    assert(totals !== undefined, "the copilot reader produced no totals");
+    assert(
+      totals?.requests === 1,
+      "a Copilot CLI row with every token field zero was counted as a turn",
+    );
+    log("Copilot CLI skips rows whose token fields are all zero");
+  });
+
+  await test("Copilot CLI: created_at time filtering excludes rows outside the window", async () => {
+    const old = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString();
+    const recent = new Date().toISOString();
+    const home = await writeCopilotFixtureHome([
+      {
+        model: "claude-haiku-4-5",
+        input: 10,
+        output: 5,
+        cacheRead: 0,
+        cacheWrite: 0,
+        reasoning: 0,
+        createdAt: old,
+      },
+      {
+        model: "claude-haiku-4-5",
+        input: 20,
+        output: 8,
+        cacheRead: 0,
+        cacheWrite: 0,
+        reasoning: 0,
+        createdAt: recent,
+      },
+    ]);
+    const report = await withHome(home, () =>
+      readAllLocalUsage({ sinceDays: 30 }),
+    );
+    const totals = report.totals["copilot"];
+    assert(totals !== undefined, "the copilot reader produced no totals");
+    assert(
+      totals?.requests === 1,
+      "Copilot CLI's time filter did not exclude the row outside the window",
+    );
+    assert(
+      totals?.inputTokens === 20,
+      "Copilot CLI's time filter counted the wrong row",
+    );
+    log(
+      "Copilot CLI's created_at time filter excludes rows outside the requested window",
+    );
+  });
+
+  await test("Copilot CLI: cost is always unavailable, and every turn is reported unpriced", async () => {
+    const home = await writeCopilotFixtureHome([
+      {
+        model: "claude-haiku-4-5",
+        input: 5,
+        output: 15,
+        cacheRead: 0,
+        cacheWrite: 0,
+        reasoning: 0,
+        createdAt: new Date().toISOString(),
+      },
+    ]);
+    const report = await withHome(home, () =>
+      readAllLocalUsage({ sinceDays: Infinity }),
+    );
+    const totals = report.totals["copilot"];
+    assert(totals !== undefined, "the copilot reader produced no totals");
+    assert(
+      totals?.costConfidence === "unavailable",
+      "Copilot CLI reported a cost confidence other than unavailable",
+    );
+    assert(totals?.costUsd === 0, "Copilot CLI invented a dollar cost");
+    assert(
+      totals?.unpricedRequests === totals?.requests,
+      "not every Copilot CLI turn was reported as unpriced",
+    );
+    assert(
+      totals?.unpricedModels.includes("claude-haiku-4-5") === true,
+      "the model behind unpriced Copilot CLI turns was not named",
+    );
+    log("Copilot CLI reports real tokens and an explicitly unavailable cost");
+  });
+
+  await test("Copilot CLI: this machine's real store scans coherently", async () => {
+    const realDb = path.join(os.homedir(), ".copilot", "session-store.db");
+    if (!fs.existsSync(realDb)) {
+      throw new Error("SKIP: no Copilot CLI store on this machine");
+    }
+    const reader = await createLocalUsageReader("copilot");
+    assert(
+      await reader.detect(),
+      "detect() denied a Copilot CLI store that exists",
+    );
+    const all = await reader.scan({ sinceDays: Infinity });
+    if (all.totals.requests === 0) {
+      throw new Error("SKIP: Copilot CLI store has no usage-bearing rows");
+    }
+    assert(
+      all.errors.length === 0,
+      "reading the real Copilot CLI store reported an error",
+    );
+    assert(
+      all.totals.costConfidence === "unavailable" && all.totals.costUsd === 0,
+      "Copilot CLI invented a cost despite reporting none of its own",
+    );
+    assert(
+      all.totals.unpricedRequests === all.totals.requests,
+      "not every real Copilot CLI turn was reported as unpriced",
+    );
+    assert(
+      all.totals.unpricedModels.length > 0,
+      "no models were named behind the unpriced Copilot CLI turns",
+    );
+    log(
+      `real Copilot CLI scan: ${all.totals.requests} turns, models ${all.totals.unpricedModels.slice(0, 3).join(", ")}`,
+    );
+  });
+
+  await test("Qwen Code, Gemini CLI and Copilot CLI: repeated scans of the same data agree", async () => {
+    const qHome = writeQwenFixtureHome([
+      qwenAssistantLine("t1", "claude-sonnet-4-5", {
+        promptTokenCount: 4,
+        candidatesTokenCount: 40,
+      }),
+      qwenAssistantLine("t2", "claude-sonnet-4-5", {
+        promptTokenCount: 6,
+        candidatesTokenCount: 60,
+      }),
+    ]);
+    const [qFirst, qSecond] = await withHome(qHome, async () => [
+      await readAllLocalUsage({ sinceDays: Infinity }),
+      await readAllLocalUsage({ sinceDays: Infinity }),
+    ]);
+    assert(
+      JSON.stringify(qFirst.totals["qwen-code"]) ===
+        JSON.stringify(qSecond.totals["qwen-code"]),
+      "two scans of identical Qwen Code fixture data produced different totals",
+    );
+
+    const gHome = writeGeminiFixtureHome([
+      geminiBareLine(
+        geminiMessage("g1", "gemini-3.5-flash", {
+          input: 4,
+          output: 40,
+          cached: 0,
+          thoughts: 0,
+          tool: 0,
+          total: 44,
+        }),
+      ),
+    ]);
+    const [gFirst, gSecond] = await withHome(gHome, async () => [
+      await readAllLocalUsage({ sinceDays: Infinity }),
+      await readAllLocalUsage({ sinceDays: Infinity }),
+    ]);
+    assert(
+      JSON.stringify(gFirst.totals["gemini-cli"]) ===
+        JSON.stringify(gSecond.totals["gemini-cli"]),
+      "two scans of identical Gemini CLI fixture data produced different totals",
+    );
+
+    const cHome = await writeCopilotFixtureHome([
+      {
+        model: "claude-haiku-4-5",
+        input: 4,
+        output: 40,
+        cacheRead: 0,
+        cacheWrite: 0,
+        reasoning: 0,
+        createdAt: new Date().toISOString(),
+      },
+    ]);
+    const [cFirst, cSecond] = await withHome(cHome, async () => [
+      await readAllLocalUsage({ sinceDays: Infinity }),
+      await readAllLocalUsage({ sinceDays: Infinity }),
+    ]);
+    assert(
+      JSON.stringify(cFirst.totals["copilot"]) ===
+        JSON.stringify(cSecond.totals["copilot"]),
+      "two scans of identical Copilot CLI fixture data produced different totals",
+    );
+
+    log(
+      "Qwen Code, Gemini CLI and Copilot CLI scans are idempotent across calls",
+    );
+  });
+
+  await testCursorReader();
+  await testGrokReader();
+  await testHermesReader();
+}
+
+/* ------------------------------------------------------------------ *
+ * Cursor
+ * ------------------------------------------------------------------ */
+
+/**
+ * Minimal protobuf wire encoder, enough to build a Cursor root blob.
+ *
+ * Hand-rolled rather than pulled from a library on purpose: the reader parses
+ * this format with its own hand-rolled decoder, and a fixture written by a
+ * third-party encoder would be testing that library's agreement with itself.
+ * Twenty lines here keep the fixture and the code under test independent.
+ */
+function pbVarint(value: number): number[] {
+  const out: number[] = [];
+  let v = value;
+  while (v > 127) {
+    out.push((v % 128) + 128);
+    v = Math.floor(v / 128);
+  }
+  out.push(v);
+  return out;
+}
+
+function pbTag(field: number, wire: number): number[] {
+  return pbVarint(field * 8 + wire);
+}
+
+function pbUint(field: number, value: number): number[] {
+  return [...pbTag(field, 0), ...pbVarint(value)];
+}
+
+function pbBytes(field: number, body: number[]): number[] {
+  return [...pbTag(field, 2), ...pbVarint(body.length), ...body];
+}
+
+function pbString(field: number, value: string): number[] {
+  return pbBytes(field, [...Buffer.from(value, "utf8")]);
+}
+
+/** One `{id, label, tokens, characters}` context-breakdown entry. */
+function cursorPart(name: string, tokens: number, chars: number): number[] {
+  return [
+    ...pbString(1, name),
+    ...pbString(2, name.replace(/_/g, " ")),
+    ...pbUint(3, tokens),
+    ...pbUint(4, chars),
+  ];
+}
+
+/**
+ * Build a Cursor root blob.
+ *
+ * `statedTotal` is deliberately a separate argument from the parts: the whole
+ * point of the reader's cross-check is that it refuses a blob where the two
+ * disagree, and a fixture builder that derived the total from the parts could
+ * never express that case.
+ */
+function cursorRootBlob(
+  parts: Array<{ name: string; tokens: number; chars: number }>,
+  statedTotal: number,
+  windowTokens = 200_000,
+): Buffer {
+  const inner = [
+    ...pbUint(1, statedTotal),
+    ...pbUint(2, windowTokens),
+    ...parts.flatMap((p) => pbBytes(3, cursorPart(p.name, p.tokens, p.chars))),
+  ];
+  const block = [
+    ...pbUint(1, statedTotal),
+    ...pbUint(2, windowTokens),
+    ...pbBytes(3, inner),
+  ];
+  return Buffer.from([...pbBytes(5, block), ...pbString(22, "cli")]);
+}
+
+/**
+ * A root blob carrying a legitimate breakdown container PLUS an unrelated
+ * two-string field that also holds a count, PLUS a stray varint equal to the
+ * inflated sum.
+ *
+ * All three ingredients exist in real Cursor data — field 21 is the two-string
+ * field, and a 643-byte real blob already holds seventeen distinct varints —
+ * which is why this is a fixture rather than a hypothetical.
+ */
+function cursorRootBlobWithDecoy(
+  parts: Array<{ name: string; tokens: number; chars: number }>,
+  statedTotal: number,
+  decoy: { name: string; tokens: number; chars: number },
+  collidingVarint: number,
+): Buffer {
+  const container = [
+    ...pbUint(1, statedTotal),
+    ...pbUint(2, 200_000),
+    ...parts.flatMap((p) => pbBytes(3, cursorPart(p.name, p.tokens, p.chars))),
+  ];
+  return Buffer.from([
+    ...pbBytes(5, container),
+    // The decoy sits at the ROOT, exactly where the real workspace descriptor
+    // sits — outside the container, so a container-scoped search cannot see it.
+    ...pbBytes(21, cursorPart(decoy.name, decoy.tokens, decoy.chars)),
+    ...pbUint(26, collidingVarint),
+  ]);
+}
+
+/**
+ * Build a temp HOME containing a Cursor chat store, written with the same
+ * `node:sqlite` the reader uses.
+ */
+async function writeCursorFixtureHome(
+  rootBlob: Buffer,
+  options?: {
+    latestRootBlobId?: string;
+    corruptMetaHex?: boolean;
+    /** Replaces the meta JSON text; still hex-encoded unless corruptMetaHex. */
+    metaText?: string;
+    omitMetaRow?: boolean;
+    /** Stores this exact value (a NULL or a BLOB) instead of the hex text. */
+    rawMetaValue?: null | Buffer;
+  },
+): Promise<string> {
+  const { DatabaseSync } = await import("node:sqlite");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "nl-cursorusage-"));
+  const dir = path.join(
+    home,
+    ".cursor",
+    "chats",
+    "d192d0da1542259a4cf7bc8c39559abd",
+    "9b8eb805-fce9-4c6e-80f8-bd4a0641b4db",
+  );
+  fs.mkdirSync(dir, { recursive: true });
+  const db = new DatabaseSync(path.join(dir, "store.db"));
+  db.exec("CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB)");
+  db.exec("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)");
+
+  // Content-addressed exactly as Cursor does it: the blob id is the SHA-256 of
+  // the bytes. A fixture using an arbitrary id would not exercise the lookup.
+  const { createHash } = await import("crypto");
+  const blobId =
+    options?.latestRootBlobId ??
+    createHash("sha256").update(rootBlob).digest("hex");
+  db.prepare("INSERT INTO blobs (id, data) VALUES (?, ?)").run(
+    blobId,
+    rootBlob,
+  );
+
+  const metaJson =
+    options?.metaText ??
+    JSON.stringify({
+      agentId: "9b8eb805-fce9-4c6e-80f8-bd4a0641b4db",
+      latestRootBlobId: blobId,
+      name: "Fixture",
+      mode: "default",
+      createdAt: Date.now(),
+      lastUsedModel: "default",
+    });
+  // Hex-encoded, which is how Cursor stores it — a plain-JSON fixture would
+  // pass a reader that never learned about the encoding.
+  const metaValue = options?.corruptMetaHex
+    ? metaJson
+    : Buffer.from(metaJson, "utf8").toString("hex");
+  if (!options?.omitMetaRow) {
+    db.prepare("INSERT INTO meta (key, value) VALUES (?, ?)").run(
+      "0",
+      options !== undefined && "rawMetaValue" in options
+        ? (options.rawMetaValue ?? null)
+        : metaValue,
+    );
+  }
+  db.close();
+  return home;
+}
+
+/**
+ * One `_x.ai/session/update` line as Grok Build appends it to a session's
+ * `updates.jsonl`. Shape taken from a sandboxed real run, not from the docs.
+ */
+function grokUpdate(
+  sessionId: string,
+  update: Record<string, unknown>,
+  timestamp: number,
+): string {
+  return JSON.stringify({
+    timestamp,
+    method: "_x.ai/session/update",
+    params: { sessionId, update },
+  });
+}
+
+function grokCompletedTurn(
+  sessionId: string,
+  promptId: string,
+  usage: {
+    input: number;
+    output: number;
+    cacheRead?: number;
+    cacheCreation?: number;
+    calls: number;
+    turns: number;
+    model: string;
+  },
+  timestamp: number,
+): string {
+  const row = {
+    inputTokens: usage.input,
+    outputTokens: usage.output,
+    totalTokens: usage.input + usage.output,
+    cachedReadTokens: usage.cacheRead ?? 0,
+    cacheCreationTokens: usage.cacheCreation ?? 0,
+    reasoningTokens: 0,
+    modelCalls: usage.calls,
+  };
+  return grokUpdate(
+    sessionId,
+    {
+      sessionUpdate: "turn_completed",
+      prompt_id: promptId,
+      stop_reason: "end_turn",
+      usage: {
+        ...row,
+        modelUsage: { [usage.model]: row },
+        numTurns: usage.turns,
+      },
+    },
+    timestamp,
+  );
+}
+
+/**
+ * Build a temp HOME holding Grok Build session streams. Grok groups sessions
+ * by URL-encoded working directory beneath `~/.grok/sessions/`, one directory
+ * per session, `updates.jsonl` inside — matching a sandboxed real run.
+ */
+function writeGrokFixtureHome(
+  sessions: Array<{ id: string; lines: string[] }>,
+): string {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "nl-grokusage-"));
+  for (const session of sessions) {
+    const dir = path.join(
+      home,
+      ".grok",
+      "sessions",
+      "%2Ftmp%2Ffixture",
+      session.id,
+    );
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, "updates.jsonl");
+    fs.writeFileSync(file, session.lines.join("\n") + "\n");
+    backdate(file);
+  }
+  return home;
+}
+
+async function testGrokReader(): Promise<void> {
+  const A = "01a05ecf-2840-7ab2-aefc-f63d7dd955eb";
+
+  await test("Grok Build reader sums completed turns across resumed runs and skips failed ones", async () => {
+    // The two real records from the sandboxed session, verbatim in their
+    // numbers: a first prompt, then a second one after `grok -r` resumed the
+    // session in a new process. The second is NOT cumulative — 11,034, not
+    // 21,175 — and its numTurns is back at 1, which is the signal that a new
+    // process ledger started. A failed terminal record carries no usage.
+    const home = writeGrokFixtureHome([
+      {
+        id: A,
+        lines: [
+          grokUpdate(
+            A,
+            {
+              sessionUpdate: "turn_completed",
+              prompt_id: "p-fail",
+              stop_reason: "error",
+            },
+            1,
+          ),
+          grokCompletedTurn(
+            A,
+            "4956ab01",
+            {
+              input: 10_141,
+              output: 1,
+              calls: 1,
+              turns: 1,
+              model: "deepseek-v4-flash",
+            },
+            2,
+          ),
+          grokCompletedTurn(
+            A,
+            "dc131e3a",
+            {
+              input: 11_034,
+              output: 1,
+              calls: 1,
+              turns: 1,
+              model: "deepseek-v4-flash",
+            },
+            3,
+          ),
+        ],
+      },
+    ]);
+    const result = await withHome(home, async () => {
+      const reader = await createLocalUsageReader("grok");
+      return reader.scan({ sinceDays: Infinity });
+    });
+
+    assert(result.errors.length === 0, "Grok fixture scan reported errors");
+    assert(
+      result.filesScanned === 1,
+      "Grok reader did not open exactly one session stream",
+    );
+    assert(
+      result.totals.requests === 2,
+      "Grok reader miscounted model calls across two completed turns and one failure",
+    );
+    assert(
+      result.totals.inputTokens === 21_175,
+      "Grok reader did not sum the two real per-run input totals",
+    );
+    assert(
+      result.totals.outputTokens === 2,
+      "Grok reader did not sum output tokens",
+    );
+    assert(
+      result.totals.costConfidence === "unavailable" &&
+        result.totals.costUsd === 0,
+      "Grok reader invented a cost figure",
+    );
+    assert(
+      result.totals.unpricedModels.length === 1 &&
+        result.totals.unpricedModels[0] === "deepseek-v4-flash",
+      "Grok reader did not preserve model attribution from modelUsage",
+    );
+  });
+
+  await test("Grok Build reader takes deltas inside one cumulative process run", async () => {
+    // Within one process Grok's ledger is cumulative: the persistence layer
+    // computes each turn as live minus previous. A reader has no process
+    // boundary to look at, so it uses numTurns — a strictly increasing count
+    // means the same ledger, and the delta is what that turn cost.
+    const home = writeGrokFixtureHome([
+      {
+        id: A,
+        lines: [
+          grokCompletedTurn(
+            A,
+            "t1",
+            { input: 100, output: 10, calls: 1, turns: 1, model: "grok-4.6" },
+            1,
+          ),
+          grokCompletedTurn(
+            A,
+            "t2",
+            { input: 250, output: 25, calls: 2, turns: 2, model: "grok-4.6" },
+            2,
+          ),
+          // Resumed in a new process: back to numTurns 1, whole record counts.
+          grokCompletedTurn(
+            A,
+            "t3",
+            { input: 40, output: 4, calls: 1, turns: 1, model: "grok-4.6" },
+            3,
+          ),
+        ],
+      },
+    ]);
+    const result = await withHome(home, async () => {
+      const reader = await createLocalUsageReader("grok");
+      return reader.scan({ sinceDays: Infinity });
+    });
+    assert(
+      result.totals.inputTokens === 290,
+      "Grok reader did not take the in-run delta then add the fresh run whole",
+    );
+    assert(
+      result.totals.outputTokens === 29,
+      "Grok reader mis-summed output across a cumulative run and a fresh run",
+    );
+    assert(
+      result.totals.requests === 3,
+      "Grok reader did not derive model calls from the same delta rule",
+    );
+  });
+
+  await test("Grok Build reader counts a re-emitted terminal record for one prompt once", async () => {
+    const home = writeGrokFixtureHome([
+      {
+        id: A,
+        lines: [
+          grokCompletedTurn(
+            A,
+            "same",
+            { input: 500, output: 5, calls: 1, turns: 1, model: "grok-4.6" },
+            1,
+          ),
+          grokCompletedTurn(
+            A,
+            "same",
+            { input: 500, output: 5, calls: 1, turns: 1, model: "grok-4.6" },
+            2,
+          ),
+        ],
+      },
+      {
+        // Same prompt id in ANOTHER session must not collide: ids are scoped
+        // to their session directory.
+        id: "01a05ece-e1b0-7b82-9ccb-d6b086ef8a71",
+        lines: [
+          grokCompletedTurn(
+            "01a05ece-e1b0-7b82-9ccb-d6b086ef8a71",
+            "same",
+            { input: 7, output: 1, calls: 1, turns: 1, model: "grok-4.6" },
+            1,
+          ),
+        ],
+      },
+    ]);
+    const result = await withHome(home, async () => {
+      const reader = await createLocalUsageReader("grok");
+      return reader.scan({ sinceDays: Infinity });
+    });
+    assert(
+      result.filesScanned === 2,
+      "precondition failed: both session streams were not opened",
+    );
+    assert(
+      result.totals.inputTokens === 507,
+      "Grok reader double-counted a re-emitted terminal record, or merged prompt ids across sessions",
+    );
+    assert(
+      result.totals.requests === 2,
+      "Grok reader miscounted calls across a duplicate and a second session",
+    );
+  });
+
+  await test("Grok Build reader applies the delta rule to a re-emitted prompt at the re-emit's position", async () => {
+    // p1 is written, then p2, then p1 again with the run's later ledger. The
+    // re-emit replaces p1's record and belongs after p2, where it continues
+    // the same cumulative run: p2 counts whole and p1 adds only its delta.
+    // Left at p1's first position, the two look like separate runs and both
+    // count whole (550 input, 5 calls).
+    const home = writeGrokFixtureHome([
+      {
+        id: A,
+        lines: [
+          grokCompletedTurn(
+            A,
+            "p1",
+            { input: 100, output: 10, calls: 1, turns: 1, model: "grok-4.6" },
+            1,
+          ),
+          grokCompletedTurn(
+            A,
+            "p2",
+            { input: 250, output: 25, calls: 2, turns: 2, model: "grok-4.6" },
+            2,
+          ),
+          grokCompletedTurn(
+            A,
+            "p1",
+            { input: 300, output: 30, calls: 3, turns: 3, model: "grok-4.6" },
+            3,
+          ),
+        ],
+      },
+    ]);
+    const result = await withHome(home, async () => {
+      const reader = await createLocalUsageReader("grok");
+      return reader.scan({ sinceDays: Infinity });
+    });
+    assert(
+      result.totals.inputTokens === 300,
+      `Grok reader kept a re-emitted prompt at its first position (input ${result.totals.inputTokens}, expected 300)`,
+    );
+    assert(
+      result.totals.outputTokens === 30,
+      `Grok reader mis-summed output around a re-emitted prompt (output ${result.totals.outputTokens}, expected 30)`,
+    );
+    assert(
+      result.totals.requests === 3,
+      `Grok reader miscounted calls around a re-emitted prompt (requests ${result.totals.requests}, expected 3)`,
+    );
+  });
+
+  await test("Grok Build reader rejects a usage record that is not the ledger's shape, and reports it", async () => {
+    // A completed turn whose `usage` is present but is not the ledger — empty,
+    // an array, or the same counters under renamed keys — is what a changed
+    // stream format looks like. It used to pass the "is an object" check, have
+    // every missing counter read as 0, and be billed as one request of zero
+    // tokens, so the report said "used nothing" for "could not read it".
+    const home = writeGrokFixtureHome([
+      {
+        id: A,
+        lines: [
+          grokCompletedTurn(
+            A,
+            "good",
+            { input: 100, output: 10, calls: 1, turns: 1, model: "grok-4.6" },
+            1,
+          ),
+          grokUpdate(
+            A,
+            { sessionUpdate: "turn_completed", prompt_id: "empty", usage: {} },
+            2,
+          ),
+          grokUpdate(
+            A,
+            { sessionUpdate: "turn_completed", prompt_id: "array", usage: [] },
+            3,
+          ),
+          grokUpdate(
+            A,
+            {
+              sessionUpdate: "turn_completed",
+              prompt_id: "renamed",
+              usage: { input_tokens: 5, output_tokens: 1, model_calls: 1 },
+            },
+            4,
+          ),
+        ],
+      },
+    ]);
+    const result = await withHome(home, async () => {
+      const reader = await createLocalUsageReader("grok");
+      return reader.scan({ sinceDays: Infinity });
+    });
+    assert(
+      result.filesScanned === 1,
+      "precondition failed: the session stream was never opened",
+    );
+    assert(
+      result.totals.requests === 1 &&
+        result.totals.inputTokens === 100 &&
+        result.totals.outputTokens === 10,
+      "Grok reader counted a usage record that is not the ledger's shape",
+    );
+    // One per stream, not per record: a changed format would otherwise bury the
+    // report under one entry for every turn in the file.
+    assert(
+      result.errors.length === 1 && result.errors[0]?.cliId === "grok",
+      "Grok reader dropped unrecognised usage records silently instead of reporting them",
+    );
+  });
+
+  await test("Grok Build reader rejects a usage counter that is not a finite number", async () => {
+    // `1e999` is valid JSON and parses as Infinity, which is a number but not a
+    // count. A turn carrying one used to pass the shape check, have the counter
+    // read as 0, and be billed as one request of zero tokens.
+    const marker = 123456789;
+    const huge = grokUpdate(
+      A,
+      {
+        sessionUpdate: "turn_completed",
+        prompt_id: "huge",
+        usage: { inputTokens: marker, outputTokens: 1, modelCalls: 1 },
+      },
+      2,
+    ).replace(String(marker), "1e999");
+    assert(
+      huge.includes("1e999"),
+      "precondition failed: the fixture line carries no overflowing counter",
+    );
+    const home = writeGrokFixtureHome([
+      {
+        id: A,
+        lines: [
+          grokCompletedTurn(
+            A,
+            "good",
+            { input: 100, output: 10, calls: 1, turns: 1, model: "grok-4.6" },
+            1,
+          ),
+          huge,
+        ],
+      },
+    ]);
+    const result = await withHome(home, async () => {
+      const reader = await createLocalUsageReader("grok");
+      return reader.scan({ sinceDays: Infinity });
+    });
+    assert(
+      result.filesScanned === 1,
+      "precondition failed: the session stream was never opened",
+    );
+    assert(
+      result.totals.requests === 1 && result.totals.inputTokens === 100,
+      "Grok reader counted a turn whose usage counter is not a finite number",
+    );
+    assert(
+      result.errors.length === 1 && result.errors[0]?.cliId === "grok",
+      "Grok reader dropped a non-finite usage counter silently instead of reporting it",
+    );
+  });
+
+  await test("Grok Build reader drops the earlier turn when its later replacement cannot be read", async () => {
+    // A prompt id seen twice keeps its later record (last write wins). When
+    // that later record has no recognisable usage, the earlier reading used to
+    // stay in the totals, so the report counted a turn the stream no longer
+    // vouches for.
+    const home = writeGrokFixtureHome([
+      {
+        id: A,
+        lines: [
+          grokCompletedTurn(
+            A,
+            "replaced",
+            { input: 100, output: 10, calls: 1, turns: 1, model: "grok-4.6" },
+            1,
+          ),
+          grokUpdate(
+            A,
+            {
+              sessionUpdate: "turn_completed",
+              prompt_id: "replaced",
+              usage: {},
+            },
+            2,
+          ),
+          grokCompletedTurn(
+            A,
+            "other",
+            { input: 40, output: 4, calls: 1, turns: 1, model: "grok-4.6" },
+            3,
+          ),
+        ],
+      },
+    ]);
+    const result = await withHome(home, async () => {
+      const reader = await createLocalUsageReader("grok");
+      return reader.scan({ sinceDays: Infinity });
+    });
+    assert(
+      result.filesScanned === 1,
+      "precondition failed: the session stream was never opened",
+    );
+    assert(
+      result.totals.requests === 1 && result.totals.inputTokens === 40,
+      "Grok reader kept an earlier turn after its replacement became unreadable",
+    );
+    assert(
+      result.errors.length === 1 && result.errors[0]?.cliId === "grok",
+      "Grok reader did not report the unreadable replacement",
+    );
+  });
+
+  await test("Grok Build reader honours the scan window per session stream", async () => {
+    const home = writeGrokFixtureHome([
+      {
+        id: A,
+        lines: [
+          grokCompletedTurn(
+            A,
+            "old",
+            { input: 9, output: 1, calls: 1, turns: 1, model: "grok-4.6" },
+            1,
+          ),
+        ],
+      },
+    ]);
+    const file = path.join(
+      home,
+      ".grok",
+      "sessions",
+      "%2Ftmp%2Ffixture",
+      A,
+      "updates.jsonl",
+    );
+    const old = new Date(Date.now() - 90 * 86_400_000);
+    fs.utimesSync(file, old, old);
+    const [narrow, wide] = await withHome(home, async () => {
+      const reader = await createLocalUsageReader("grok");
+      return [
+        await reader.scan({ sinceDays: 30 }),
+        await reader.scan({ sinceDays: Infinity }),
+      ];
+    });
+    assert(
+      wide.totals.inputTokens === 9,
+      "precondition failed: the wide window read nothing",
+    );
+    assert(
+      narrow.filesScanned === 0 && narrow.totals.inputTokens === 0,
+      "Grok reader read a stream older than the requested window",
+    );
+  });
+
+  await test("Grok Build reader on this machine's real store", async () => {
+    const reader = await createLocalUsageReader("grok");
+    if (!(await reader.detect())) {
+      throw new Error("SKIP: no Grok Build session store on this machine");
+    }
+    const result = await reader.scan({ sinceDays: Infinity });
+    if (result.filesScanned === 0) {
+      throw new Error(
+        "SKIP: the Grok Build sessions directory holds no update streams",
+      );
+    }
+    assert(
+      result.errors.length === 0,
+      "scanning this machine's real Grok Build store reported errors",
+    );
+    assert(
+      result.totals.inputTokens > 0,
+      "a real Grok Build stream was opened but produced no tokens and no error",
+    );
+    log(
+      `Grok Build real store: ${result.filesScanned} stream(s), ${result.totals.requests} calls`,
+    );
+  });
+}
+
+/** Build a temp HOME containing Hermes Agent's real SQLite usage shape. */
+async function writeHermesFixtureHome(): Promise<string> {
+  const { DatabaseSync } = await import("node:sqlite");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "nl-hermesusage-"));
+  const dir = path.join(home, ".hermes");
+  fs.mkdirSync(dir, { recursive: true });
+  const db = new DatabaseSync(path.join(dir, "state.db"));
+  db.exec(
+    "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT NOT NULL, model TEXT, started_at REAL NOT NULL, input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0, cache_read_tokens INTEGER DEFAULT 0, cache_write_tokens INTEGER DEFAULT 0, reasoning_tokens INTEGER DEFAULT 0, api_call_count INTEGER DEFAULT 0, estimated_cost_usd REAL, actual_cost_usd REAL, cost_status TEXT)",
+  );
+  db.exec(
+    "CREATE TABLE session_model_usage (session_id TEXT NOT NULL, model TEXT NOT NULL, billing_provider TEXT NOT NULL DEFAULT '', billing_base_url TEXT NOT NULL DEFAULT '', billing_mode TEXT NOT NULL DEFAULT '', task TEXT NOT NULL DEFAULT '', api_call_count INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_write_tokens INTEGER NOT NULL DEFAULT 0, reasoning_tokens INTEGER NOT NULL DEFAULT 0, estimated_cost_usd REAL NOT NULL DEFAULT 0, actual_cost_usd REAL NOT NULL DEFAULT 0)",
+  );
+  db.prepare(
+    "INSERT INTO sessions (id, source, model, started_at, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, api_call_count, estimated_cost_usd, actual_cost_usd, cost_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  ).run(
+    "20260902_024456_01c233",
+    "cli",
+    "gemini-3.1-flash-lite-preview",
+    1,
+    10_568,
+    1,
+    0,
+    0,
+    0,
+    1,
+    0.0026435,
+    null,
+    "estimated",
+  );
+  // Two usage rows, exactly as the real store held them: the primary task
+  // (task '') and the title generation Hermes ran alongside it. The session
+  // aggregate above repeats the primary row only, so a reader that summed the
+  // aggregate AND the rows would report 21,384 input tokens for this session.
+  const usage = db.prepare(
+    "INSERT INTO session_model_usage (session_id, model, billing_provider, billing_base_url, billing_mode, task, api_call_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, estimated_cost_usd, actual_cost_usd) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  );
+  usage.run(
+    "20260902_024456_01c233",
+    "gemini-3.1-flash-lite-preview",
+    "gemini",
+    "https://generativelanguage.googleapis.com/v1beta",
+    "",
+    "",
+    1,
+    10_568,
+    1,
+    0,
+    0,
+    0,
+    0.0026435,
+    0,
+  );
+  usage.run(
+    "20260902_024456_01c233",
+    "gemini-3.1-flash-lite-preview",
+    "gemini",
+    "https://generativelanguage.googleapis.com/v1beta",
+    "",
+    "title_generation",
+    1,
+    248,
+    8,
+    0,
+    0,
+    0,
+    0.000074,
+    0,
+  );
+  db.close();
+  return home;
+}
+
+async function testHermesReader(): Promise<void> {
+  await test("Hermes Agent reader uses the session aggregate without double-counting task rows", async () => {
+    const home = await writeHermesFixtureHome();
+    const result = await withHome(home, async () => {
+      const reader = await createLocalUsageReader("hermes");
+      return reader.scan({ sinceDays: Infinity });
+    });
+
+    assert(result.errors.length === 0, "Hermes fixture scan reported errors");
+    assert(
+      result.filesScanned === 1,
+      "Hermes reader did not open its state database",
+    );
+    // Two usage rows, two API calls: the primary task and the title
+    // generation Hermes ran alongside it. The session aggregate holds only the
+    // first, so a reader that summed sessions AND rows would report 21,384.
+    assert(
+      result.totals.requests === 2,
+      "Hermes reader did not count both recorded API calls",
+    );
+    assert(
+      result.totals.inputTokens === 10_816,
+      "Hermes reader did not sum the per-task usage rows",
+    );
+    assert(
+      result.totals.outputTokens === 9,
+      "Hermes reader did not sum per-task output tokens",
+    );
+    assert(
+      Math.abs(result.totals.costUsd - 0.0027175) < 1e-9,
+      "Hermes reader did not sum the recorded estimated costs",
+    );
+    assert(
+      result.totals.costConfidence === "modeled",
+      "Hermes reader did not mark recorded cost as modeled",
+    );
+    assert(
+      result.totals.unpricedRequests === 0,
+      "Hermes reader left a costed row unpriced",
+    );
+  });
+
+  await test("Hermes Agent reader ignores a failed session and reports its aggregate only when no usage rows exist", async () => {
+    const { DatabaseSync } = await import("node:sqlite");
+    const home = await writeHermesFixtureHome();
+    const db = new DatabaseSync(path.join(home, ".hermes", "state.db"));
+    // A failed one-shot: Hermes writes the session row with nothing in it.
+    db.prepare(
+      "INSERT INTO sessions (id, source, model, started_at, input_tokens, output_tokens, api_call_count) VALUES (?, ?, ?, ?, 0, 0, 0)",
+    ).run("failed", "cli", "meta-llama/llama-3.1-8b-instruct", 2);
+    // A pre-migration session: aggregate only, no usage rows, no cost status
+    // but a positive estimate.
+    db.prepare(
+      "INSERT INTO sessions (id, source, model, started_at, input_tokens, output_tokens, api_call_count, estimated_cost_usd) VALUES (?, ?, ?, ?, 300, 20, 3, 0.001)",
+    ).run("legacy", "cli", "gemini-3.1-flash-lite-preview", 3);
+    db.close();
+    const result = await withHome(home, async () => {
+      const reader = await createLocalUsageReader("hermes");
+      return reader.scan({ sinceDays: Infinity });
+    });
+    assert(result.errors.length === 0, "Hermes mixed fixture reported errors");
+    assert(
+      result.totals.requests === 5,
+      "Hermes reader miscounted calls across usage rows and a legacy aggregate",
+    );
+    assert(
+      result.totals.inputTokens === 11_116,
+      "Hermes reader mis-summed usage rows plus a legacy aggregate",
+    );
+    assert(
+      Math.abs(result.totals.costUsd - 0.0037175) < 1e-9,
+      "Hermes reader did not accept a positive estimate without a cost status",
+    );
+  });
+
+  await test("Hermes Agent reader reports a usage table missing a required column instead of falling back to the session aggregate", async () => {
+    const { DatabaseSync } = await import("node:sqlite");
+    const home = await writeHermesFixtureHome();
+    const db = new DatabaseSync(path.join(home, ".hermes", "state.db"));
+    // The table exists but has lost `api_call_count`. Treating that as "no
+    // usage table" read the sessions aggregate in its place, which omits every
+    // non-primary task, and reported the shortfall as a clean scan.
+    db.exec("DROP TABLE session_model_usage");
+    db.exec(
+      "CREATE TABLE session_model_usage (session_id TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0)",
+    );
+    db.prepare(
+      "INSERT INTO session_model_usage (session_id, model, input_tokens, output_tokens) VALUES (?, ?, ?, ?)",
+    ).run("20260902_024456_01c233", "gemini-3.1-flash-lite-preview", 10_568, 1);
+    db.close();
+    const result = await withHome(home, async () => {
+      const reader = await createLocalUsageReader("hermes");
+      return reader.scan({ sinceDays: Infinity });
+    });
+    assert(
+      result.filesScanned === 1,
+      "precondition failed: the state database was never opened",
+    );
+    assert(
+      result.errors.length === 1 && result.errors[0]?.cliId === "hermes",
+      "Hermes reader did not report a usage table missing a required column",
+    );
+    assert(
+      result.totals.requests === 0 && result.totals.inputTokens === 0,
+      "Hermes reader read the sessions aggregate in place of an unreadable usage table",
+    );
+  });
+}
+
+async function testCursorReader(): Promise<void> {
+  await test("Cursor reader recovers the context-token total from a real blob shape", async () => {
+    // The reference machine's actual numbers, so the fixture asserts against a
+    // measured composition rather than round invented ones.
+    const parts = [
+      { name: "system_prompt", tokens: 480, chars: 1959 },
+      { name: "tools", tokens: 11_592, chars: 47_291 },
+      { name: "rules", tokens: 9257, chars: 37_783 },
+      { name: "skills", tokens: 6621, chars: 27_024 },
+      { name: "subagents", tokens: 391, chars: 1594 },
+      { name: "conversation", tokens: 143, chars: 586 },
+    ];
+    const expected = parts.reduce((a, p) => a + p.tokens, 0);
+    assert(
+      expected === 28_484,
+      "fixture parts no longer sum to the reference total",
+    );
+
+    const home = await writeCursorFixtureHome(cursorRootBlob(parts, expected));
+    const result = await withHome(home, async () => {
+      const reader = await createLocalUsageReader("cursor");
+      return reader.scan({ sinceDays: Infinity });
+    });
+
+    assert(result.errors.length === 0, "Cursor fixture scan reported errors");
+    assert(
+      result.filesScanned === 1,
+      "Cursor scan did not open exactly one store",
+    );
+    assert(
+      result.totals.requests === 1,
+      "Cursor scan did not count exactly one session snapshot",
+    );
+    assert(
+      result.totals.inputTokens === expected,
+      "Cursor scan did not recover the summed context-token total",
+    );
+    assert(
+      result.totals.costUsd === 0 &&
+        result.totals.costConfidence === "unavailable",
+      "Cursor reader invented a cost figure for a subscription CLI",
+    );
+    log(`Cursor fixture: recovered ${expected} context tokens from 6 parts`);
+  });
+
+  await test("Cursor reader refuses a blob whose parts contradict its stated total", async () => {
+    // The non-vacuity probe for the cross-check. Same parts, but the blob
+    // claims a total they do not sum to — which is what a format change looks
+    // like from the outside. A reader without the check would happily report
+    // the parts' sum and nobody would learn the format had moved.
+    const parts = [
+      { name: "system_prompt", tokens: 480, chars: 1959 },
+      { name: "tools", tokens: 11_592, chars: 47_291 },
+    ];
+    const truthfulSum = parts.reduce((a, p) => a + p.tokens, 0);
+    const home = await writeCursorFixtureHome(
+      cursorRootBlob(parts, truthfulSum + 1),
+    );
+    const result = await withHome(home, async () => {
+      const reader = await createLocalUsageReader("cursor");
+      return reader.scan({ sinceDays: Infinity });
+    });
+
+    assert(
+      result.totals.inputTokens === 0 && result.totals.requests === 0,
+      "Cursor reader counted a blob whose parts contradict its stated total",
+    );
+    assert(
+      result.errors.length === 1,
+      "Cursor reader dropped a contradictory blob silently instead of reporting it",
+    );
+    assert(
+      result.filesScanned === 1,
+      "precondition failed: the contradictory store was never opened, so the refusal proves nothing",
+    );
+    log("Cursor cross-check rejects a contradictory blob and reports it");
+  });
+
+  await test("Cursor reader reports an unreadable meta row instead of reading it as zero usage", async () => {
+    const parts = [
+      { name: "system_prompt", tokens: 480, chars: 1959 },
+      { name: "conversation", tokens: 143, chars: 586 },
+    ];
+    // The ways a meta row can be unusable, each of which used to end in a bare
+    // `continue`: the store counted as scanned, no tokens, and nothing to tell
+    // "could not read it" from "it used nothing". A row that holds a NULL or a
+    // BLOB took the silent "no meta row yet" exit, because the lookup only
+    // keeps string values.
+    const unreadable: Array<{
+      label: string;
+      options: {
+        corruptMetaHex?: boolean;
+        metaText?: string;
+        rawMetaValue?: null | Buffer;
+      };
+    }> = [
+      { label: "not hex", options: { corruptMetaHex: true } },
+      { label: "hex but not JSON", options: { metaText: "not json at all" } },
+      {
+        label: "JSON without a root blob id",
+        options: { metaText: JSON.stringify({ name: "Fixture" }) },
+      },
+      { label: "a NULL value", options: { rawMetaValue: null } },
+      {
+        label: "a BLOB value",
+        options: { rawMetaValue: Buffer.from("00ff", "hex") },
+      },
+    ];
+    for (const { label, options } of unreadable) {
+      const home = await writeCursorFixtureHome(
+        cursorRootBlob(parts, 623),
+        options,
+      );
+      const result = await withHome(home, async () => {
+        const reader = await createLocalUsageReader("cursor");
+        return reader.scan({ sinceDays: Infinity });
+      });
+      assert(
+        result.filesScanned === 1,
+        `precondition failed: the store was never opened (${label})`,
+      );
+      assert(
+        result.totals.requests === 0,
+        `Cursor reader counted a session it could not read the meta row of (${label})`,
+      );
+      assert(
+        result.errors.length === 1 &&
+          result.errors[0]?.cliId === "cursor" &&
+          result.errors[0]?.filePath.endsWith("store.db"),
+        `Cursor reader dropped an unreadable meta row silently instead of reporting it (${label})`,
+      );
+    }
+    log("Cursor reader reports a meta row it cannot read, in all five forms");
+  });
+
+  await test("Cursor reader stays silent on a store with no meta row yet", async () => {
+    // The boundary of the rule above: a store a session has only just created
+    // has no meta row. That is a new session, not a format change, and
+    // reporting it would turn every fresh chat into a failure.
+    const parts = [
+      { name: "system_prompt", tokens: 480, chars: 1959 },
+      { name: "conversation", tokens: 143, chars: 586 },
+    ];
+    const home = await writeCursorFixtureHome(cursorRootBlob(parts, 623), {
+      omitMetaRow: true,
+    });
+    const result = await withHome(home, async () => {
+      const reader = await createLocalUsageReader("cursor");
+      return reader.scan({ sinceDays: Infinity });
+    });
+    assert(
+      result.filesScanned === 1,
+      "precondition failed: the store was never opened",
+    );
+    assert(
+      result.totals.requests === 0 && result.errors.length === 0,
+      "Cursor reader reported or counted a store that has no meta row yet",
+    );
+  });
+
+  await test("Cursor reader refuses a varint beyond the exact-integer range instead of returning it rounded", async () => {
+    // 2^53 is one past Number.MAX_SAFE_INTEGER and encodes in eight bytes, so
+    // the decoder's shift guard (which only stops a ninth) lets it through. The
+    // two parts then sum to 2^53 + 1, which a double rounds to 2^53 — exactly
+    // the stated total — so the cross-check passes by accident and the reader
+    // returns a token count that is wrong by construction.
+    const huge = 2 ** 53;
+    const parts = [
+      { name: "system_prompt", tokens: huge, chars: 1 },
+      { name: "conversation", tokens: 1, chars: 1 },
+    ];
+    const home = await writeCursorFixtureHome(cursorRootBlob(parts, huge));
+    const result = await withHome(home, async () => {
+      const reader = await createLocalUsageReader("cursor");
+      return reader.scan({ sinceDays: Infinity });
+    });
+    assert(
+      result.filesScanned === 1,
+      "precondition failed: the store was never opened",
+    );
+    assert(
+      result.totals.inputTokens === 0 && result.totals.requests === 0,
+      "Cursor reader returned a token count beyond the exact-integer range",
+    );
+    assert(
+      result.errors.length === 1,
+      "Cursor reader dropped an unparseable blob silently instead of reporting it",
+    );
+  });
+
+  await test("Cursor reader honours the scan window", async () => {
+    // Two entries, not one. A container is only recognised when it holds at
+    // least two — a lone two-string message is far likelier to be unrelated
+    // noise than a breakdown — and Cursor's real breakdown always carries its
+    // full fixed set of eight, so a one-entry fixture was never realistic.
+    const parts = [
+      { name: "system_prompt", tokens: 480, chars: 1959 },
+      { name: "conversation", tokens: 143, chars: 586 },
+    ];
+    const home = await writeCursorFixtureHome(cursorRootBlob(parts, 623));
+    const dbPath = path.join(
+      home,
+      ".cursor",
+      "chats",
+      "d192d0da1542259a4cf7bc8c39559abd",
+      "9b8eb805-fce9-4c6e-80f8-bd4a0641b4db",
+      "store.db",
+    );
+    // Age the store past a 30-day window without waiting 30 days.
+    const old = new Date(Date.now() - 90 * 86_400_000);
+    fs.utimesSync(dbPath, old, old);
+
+    const [narrow, wide] = await withHome(home, async () => {
+      const reader = await createLocalUsageReader("cursor");
+      return [
+        await reader.scan({ sinceDays: 30 }),
+        await reader.scan({ sinceDays: Infinity }),
+      ];
+    });
+    assert(
+      wide.totals.inputTokens === 623,
+      "precondition failed: the wide window read nothing, so the narrow result proves nothing",
+    );
+    assert(
+      narrow.filesScanned === 0 && narrow.totals.inputTokens === 0,
+      "Cursor reader read a store older than the requested window",
+    );
+    log("Cursor reader excludes a 90-day-old store from a 30-day window");
+  });
+
+  await test("Cursor reader is not fooled by an unrelated two-string field that carries a count", async () => {
+    // The adversarial-review case, kept as a regression. The first version of
+    // the extractor collected shape-matching submessages from ANYWHERE in the
+    // tree and accepted the total if it equalled ANY varint anywhere. This
+    // machine's real root blob already carries such a field — field 21 is
+    // {1: "/Users/…/feat/support-for-ide", 2: "feat/support-for-ide"} — and it
+    // was being folded in as a zero-token entry. Give a field like that a
+    // count, let the inflated sum collide with any other varint in the blob,
+    // and the reader returned a confidently wrong number: measured at 337
+    // where the truth was 300.
+    const parts = [
+      { name: "system_prompt", tokens: 100, chars: 400 },
+      { name: "tools", tokens: 200, chars: 800 },
+    ];
+    const trueTotal = 300;
+    const decoy = { name: "claude-3-7", tokens: 37, chars: 0 };
+    const inflated = trueTotal + decoy.tokens;
+
+    const home = await writeCursorFixtureHome(
+      cursorRootBlobWithDecoy(parts, trueTotal, decoy, inflated),
+    );
+    const result = await withHome(home, async () => {
+      const reader = await createLocalUsageReader("cursor");
+      return reader.scan({ sinceDays: Infinity });
+    });
+
+    assert(
+      result.filesScanned === 1,
+      "precondition failed: the decoy store was never opened, so this proves nothing",
+    );
+    assert(
+      result.totals.inputTokens !== inflated,
+      "Cursor reader returned the inflated total produced by an unrelated field",
+    );
+    assert(
+      result.totals.inputTokens === trueTotal,
+      "Cursor reader did not recover the true container total past the decoy",
+    );
+    log("Cursor reader ignores a counted decoy field and a colliding varint");
+  });
+
+  await test("Cursor reader on this machine's real store", async () => {
+    const real = path.join(os.homedir(), ".cursor", "chats");
+    if (!fs.existsSync(real)) {
+      throw new Error("SKIP: no ~/.cursor/chats on this machine");
+    }
+    const reader = await createLocalUsageReader("cursor");
+    assert(
+      await reader.detect(),
+      "detect() missed an existing ~/.cursor/chats",
+    );
+    const result = await reader.scan({ sinceDays: Infinity });
+    // PRECONDITION, and the reason this test was nearly worthless as written.
+    // The assertion below used to read `filesScanned === 0 || inputTokens > 0`,
+    // which is satisfied for free whenever no store was opened — an ordinary
+    // state for a machine with Cursor installed and no chat history yet.
+    // Directory-exists is not store-exists, so the skip has to key on what was
+    // actually read, not on what directory happens to be present.
+    if (result.filesScanned === 0) {
+      throw new Error("SKIP: ~/.cursor/chats holds no readable store.db");
+    }
+    assert(
+      result.errors.length === 0,
+      "scanning this machine's real Cursor store reported errors",
+    );
+    // Not an equality assertion: the real store changes as Cursor is used. With
+    // the precondition above a store WAS opened, so a zero total now means the
+    // parse found nothing and reported nothing — the exact failure being
+    // guarded against.
+    assert(
+      result.totals.inputTokens > 0,
+      "a real Cursor store was opened but produced no context tokens and no error",
+    );
+    log(
+      `Cursor real store: ${result.filesScanned} session(s), ${result.totals.inputTokens} context tokens`,
+    );
+  });
+}
+
+await runSuite(runAllTests);

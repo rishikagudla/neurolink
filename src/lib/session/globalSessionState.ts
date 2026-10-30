@@ -1,25 +1,62 @@
 import { nanoid } from "nanoid";
 import { NeuroLink } from "../neurolink.js";
 import type {
+  ClassifierRouterConfig,
   ConversationMemoryConfig,
-  NeurolinkOptions,
-} from "../types/conversation.js";
-import { buildObservabilityConfigFromEnv } from "../utils/observabilityHelpers.js";
+  LoopSessionState,
+  McpOutputStrategy,
+  NeurolinkConstructorConfig,
+  SessionVariableValue,
+  SkillsConfig,
+  ToolRoutingConfig,
+} from "../types/index.js";
 
-// Define a specific type for session variable values
-type SessionVariableValue = string | number | boolean;
+/**
+ * Build mcp.outputLimits config from environment variables.
+ * Reads NEUROLINK_MCP_OUTPUT_STRATEGY and NEUROLINK_MCP_MAX_OUTPUT_BYTES.
+ * Returns undefined when neither variable is set (no overhead).
+ */
+function buildMcpOutputLimitsFromEnv():
+  | { strategy: McpOutputStrategy; maxBytes?: number; warnBytes?: number }
+  | undefined {
+  const strategyRaw = process.env.NEUROLINK_MCP_OUTPUT_STRATEGY;
+  const maxBytesRaw = process.env.NEUROLINK_MCP_MAX_OUTPUT_BYTES;
+  const warnBytesRaw = process.env.NEUROLINK_MCP_WARN_OUTPUT_BYTES;
 
-interface LoopSessionState {
-  neurolinkInstance: NeuroLink;
-  sessionId: string;
-  isActive: boolean;
-  conversationMemoryConfig?: ConversationMemoryConfig;
-  sessionVariables: Record<string, SessionVariableValue>;
+  if (!strategyRaw && !maxBytesRaw) {
+    return undefined;
+  }
+
+  const strategy: McpOutputStrategy =
+    strategyRaw === "inline" || strategyRaw === "externalize"
+      ? strategyRaw
+      : "externalize"; // safe default when only maxBytes is set
+
+  const maxBytes = maxBytesRaw ? parseInt(maxBytesRaw, 10) : undefined;
+  const warnBytes = warnBytesRaw ? parseInt(warnBytesRaw, 10) : undefined;
+
+  return {
+    strategy,
+    ...(maxBytes !== undefined && Number.isFinite(maxBytes) && maxBytes >= 0
+      ? { maxBytes }
+      : {}),
+    ...(warnBytes !== undefined && Number.isFinite(warnBytes) && warnBytes >= 0
+      ? { warnBytes }
+      : {}),
+  };
 }
 
 export class GlobalSessionManager {
   private static instance: GlobalSessionManager;
   private loopSession: LoopSessionState | null = null;
+  /** Optional tool-routing config set by CLI handlers before SDK construction. */
+  private _toolRoutingConfig: ToolRoutingConfig | undefined = undefined;
+  /** Optional classifier-router config set by CLI handlers before SDK construction. */
+  private _classifierRouterConfig: ClassifierRouterConfig | undefined =
+    undefined;
+  /** Optional skills config set by CLI handlers before SDK construction. */
+  private _skillsConfig: SkillsConfig | undefined = undefined;
+  private _fileToolRoots: string[] | undefined = undefined;
 
   static getInstance(): GlobalSessionManager {
     if (!GlobalSessionManager.instance) {
@@ -30,7 +67,7 @@ export class GlobalSessionManager {
 
   setLoopSession(config?: ConversationMemoryConfig): string {
     const sessionId = `NL_${nanoid()}`;
-    const neurolinkOptions: NeurolinkOptions = {};
+    const neurolinkOptions: NeurolinkConstructorConfig = {};
 
     if (config?.enabled) {
       neurolinkOptions.conversationMemory = {
@@ -40,10 +77,13 @@ export class GlobalSessionManager {
       };
     }
 
-    // Add observability config from environment variables (CLI usage)
-    const observabilityConfig = buildObservabilityConfigFromEnv();
-    if (observabilityConfig) {
-      neurolinkOptions.observability = observabilityConfig;
+    // Add MCP output limits from environment variables (CLI usage)
+    const mcpOutputLimits = buildMcpOutputLimitsFromEnv();
+    if (mcpOutputLimits) {
+      neurolinkOptions.mcp = {
+        ...neurolinkOptions.mcp,
+        outputLimits: mcpOutputLimits,
+      };
     }
 
     this.loopSession = {
@@ -134,17 +174,88 @@ export class GlobalSessionManager {
     }
   }
 
+  /**
+   * Store a tool-routing config to be injected at SDK construction time.
+   * Call this BEFORE `getOrCreateNeuroLink()` inside a command handler.
+   * When a loop session is already active the config is ignored (the instance
+   * already exists).
+   */
+  setToolRoutingConfig(config: ToolRoutingConfig): void {
+    if (this.hasActiveSession()) {
+      return;
+    }
+    this._toolRoutingConfig = config;
+  }
+
+  /**
+   * Store a classifier-router config to be injected at SDK construction time.
+   * Call this BEFORE `getOrCreateNeuroLink()` inside a command handler.
+   * When a loop session is already active the config is ignored (the instance
+   * already exists).
+   */
+  setClassifierRouterConfig(config: ClassifierRouterConfig): void {
+    if (this.hasActiveSession()) {
+      return;
+    }
+    this._classifierRouterConfig = config;
+  }
+
+  /**
+   * Store a skills config to be injected at SDK construction time.
+   * Call this BEFORE `getOrCreateNeuroLink()` inside a command handler.
+   * When a loop session is already active the config is ignored (the instance
+   * already exists).
+   */
+  setSkillsConfig(config: SkillsConfig): void {
+    if (this.hasActiveSession()) {
+      return;
+    }
+    this._skillsConfig = config;
+  }
+
+  /**
+   * Store file-tool roots (`--tool-root`) to be injected at SDK construction
+   * time as `tools.fileRoots`. Call this BEFORE `getOrCreateNeuroLink()`.
+   * When a loop session is already active the roots are ignored (the
+   * instance already exists).
+   */
+  setFileToolRoots(roots: string[] | undefined): void {
+    if (this.hasActiveSession() || !roots?.length) {
+      return;
+    }
+    this._fileToolRoots = roots;
+  }
+
   getOrCreateNeuroLink(): NeuroLink {
     const session = this.getLoopSession();
     if (session) {
       return session.neurolinkInstance;
     }
 
-    // Create new NeuroLink with observability config from environment (CLI usage)
-    const observabilityConfig = buildObservabilityConfigFromEnv();
-    return new NeuroLink(
-      observabilityConfig ? { observability: observabilityConfig } : undefined,
-    );
+    const mcpOutputLimits = buildMcpOutputLimitsFromEnv();
+
+    const options: NeurolinkConstructorConfig = {};
+    if (mcpOutputLimits) {
+      options.mcp = { outputLimits: mcpOutputLimits };
+    }
+    if (this._toolRoutingConfig) {
+      options.toolRouting = this._toolRoutingConfig;
+      this._toolRoutingConfig = undefined;
+    }
+    if (this._classifierRouterConfig) {
+      options.classifierRouter = this._classifierRouterConfig;
+      this._classifierRouterConfig = undefined;
+    }
+    if (this._skillsConfig) {
+      options.skills = this._skillsConfig;
+      this._skillsConfig = undefined;
+    }
+    if (this._fileToolRoots) {
+      options.tools = { ...options.tools, fileRoots: this._fileToolRoots };
+      this._fileToolRoots = undefined;
+    }
+
+    return new NeuroLink(Object.keys(options).length ? options : undefined);
   }
 
   getCurrentSessionId(): string | undefined {

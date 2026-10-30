@@ -1,0 +1,110 @@
+name: Branch Protection Audit
+
+on:
+  schedule:
+    # Hourly. required_status_checks can be edited outside any PR — a repo
+    # admin using the Settings UI or `gh api` directly — so a scheduled
+    # sweep is the only way to catch a manually emptied contexts list
+    # before something red merges to release on its strength.
+    - cron: "0 * * * *"
+  push:
+    branches: [release]
+  workflow_dispatch: {}
+
+# Also asserts a `pull_request` rule (>= 1 approval) exists in a ruleset.
+#
+# Deliberately NOT a required status check. It audits branch protection
+# itself, so making it required would let the exact failure mode it exists
+# to catch — required_status_checks silently losing an entry — also disable
+# this workflow's ability to report on it. See CLAUDE.md's "Required status
+# checks and the release bot" section: `release` carries five required
+# contexts split across two layers (a ruleset and classic branch
+# protection), and a ruleset-only migration would silently drop
+# `security-suites` because only four of the five are duplicated there.
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: 🛡️ Required Status Checks Present
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all five required contexts are still required
+        env:
+          # The default token is enough. The admin-only
+          # `branches/release/protection` endpoint needs Administration:read,
+          # which `github.token` never carries, and the secret meant to supply
+          # it was never set, so every run failed with a 403 whatever the
+          # protection said. The same lists are readable with plain read
+          # access: `branches/release` reports classic branch protection's
+          # required contexts, and `rules/branches/release` the rulesets'.
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Keep this list in sync with CLAUDE.md's required-checks table.
+          # `security-suites` is the one that lives only on the classic layer
+          # today; .github/BRANCH_PROTECTION_CONFIG.md asks for it on the
+          # ruleset as well, and this sweep accepts either.
+          REQUIRED=(
+            "test"
+            "provider-safety-net"
+            "build-check"
+            "🔒 Single Commit Policy Validation"
+            "security-suites"
+          )
+
+          BRANCH_JSON=$(gh api "repos/${REPO}/branches/release")
+          if [ "$(jq -r '.protected' <<<"$BRANCH_JSON")" != "true" ]; then
+            echo "::error::release is not a protected branch"
+            exit 1
+          fi
+          CLASSIC=$(jq -c '.protection.required_status_checks.contexts // []' <<<"$BRANCH_JSON")
+          RULESETS=$(gh api "repos/${REPO}/rules/branches/release" \
+            --jq '[.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context]')
+
+          echo "Classic branch protection requires: $CLASSIC"
+          echo "Rulesets require: $RULESETS"
+
+          # GitHub enforces the union of the two layers. A context required on
+          # neither still runs and still reports on every pull request, but no
+          # longer blocks a merge, which is the silent failure this catches.
+          MISSING=()
+          for ctx in "${REQUIRED[@]}"; do
+            if ! jq -e -n --arg ctx "$ctx" --argjson classic "$CLASSIC" --argjson rulesets "$RULESETS" \
+              '($classic + $rulesets) | any(.[]; . == $ctx)' >/dev/null; then
+              MISSING+=("$ctx")
+            fi
+          done
+
+          if [ "${#MISSING[@]}" -gt 0 ]; then
+            printf '::error::release no longer requires status check: %s\n' "${MISSING[@]}"
+            exit 1
+          fi
+
+          echo "All five contexts are required on release."
+
+          # A pull request must be required too, with at least one approval.
+          # Without a `pull_request` rule the status checks only gate PULL
+          # REQUESTS — an admin on the classic layer, or anyone the ruleset
+          # exempts, can push a commit that carries no check runs and have it
+          # declined only by the status-check rule, which classic protection
+          # does not enforce for admins. The rule is read from the rulesets
+          # endpoint (the one layer that can bind everyone); classic
+          # `required_pull_request_reviews` is admin-only to read and is not
+          # consulted, so a review requirement that exists ONLY there reports
+          # as missing here — move it to the ruleset. See
+          # .github/BRANCH_PROTECTION_CONFIG.md for the intended ruleset.
+          PR_RULE=$(gh api "repos/${REPO}/rules/branches/release" \
+            --jq '[.[] | select(.type == "pull_request")] | first // empty')
+          if [ -z "$PR_RULE" ]; then
+            echo "::error::release has no pull_request rule in any ruleset — commits can reach it without a reviewed pull request"
+            exit 1
+          fi
+          APPROVALS=$(jq -r '.parameters.required_approving_review_count // 0' <<<"$PR_RULE")
+          if [ "$APPROVALS" -lt 1 ]; then
+            echo "::error::release's pull_request rule requires ${APPROVALS} approving reviews; at least 1 is required"
+            exit 1
+          fi
+          echo "release requires a pull request with ${APPROVALS} approving review(s)."

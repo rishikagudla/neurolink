@@ -1,0 +1,474 @@
+/**
+ * PowerPoint (PPTX) Processing Utility
+ *
+ * Extracts text content from PowerPoint (.pptx) files by treating them
+ * as ZIP archives and parsing the slide XML files within.
+ *
+ * PPTX files are ZIP archives containing:
+ * - ppt/slides/slide1.xml, slide2.xml, ... — slide content
+ * - ppt/slideMasters/ — master slide templates
+ * - ppt/slideLayouts/ — slide layout definitions
+ *
+ * Text is extracted from `<a:t>` elements in the slide XML files, with XML
+ * character references decoded (`&amp;` becomes `&`). Text inside a table is
+ * grouped by cell and row, so a table row comes out as one line
+ * (`Region | Owner | Volume`) instead of one line per run. Slides are sorted
+ * by number and presented in reading order, each followed by its speaker notes.
+ *
+ * Uses `adm-zip` (already a project dependency) for ZIP extraction.
+ *
+ * **XML-entity attacks are not applicable here.** Unlike `WordProcessor`
+ * (mammoth/@xmldom/xmldom) and `ExcelProcessor` (exceljs/saxes), this
+ * processor never hands slide XML to a DOM or SAX parser at all — extraction
+ * is a single regex (`SLIDE_TOKEN_REGEX`, below) run over the raw decoded
+ * bytes. There is no DOCTYPE/ENTITY resolution path for a payload to reach,
+ * so there is nothing for a `.pptx`-specific XXE or billion-laughs test to
+ * falsify; one is deliberately not written (see
+ * `test/continuous-test-suite-office-security.ts`'s header).
+ *
+ * @module processors/document/PptxProcessor
+ *
+ * @example
+ * ```typescript
+ * import { PptxProcessor } from "./PptxProcessor.js";
+ *
+ * const text = await PptxProcessor.extractText(buffer);
+ * if (text) {
+ *   console.log("Extracted text:", text);
+ * }
+ * ```
+ */
+
+import AdmZip from "adm-zip";
+import * as zlib from "node:zlib";
+
+import { readZipEntryWithinLimit } from "../archive/zipEntryReader.js";
+import { indexZipEntriesByName } from "../archive/zipEntryIndex.js";
+import { SIZE_LIMITS } from "../config/index.js";
+
+/**
+ * Total budget for everything read out of one presentation.
+ *
+ * This class is a static utility with no `BaseFileProcessor` behind it, so
+ * there is no `maxSizeMB` to inherit and nothing else was bounding these
+ * reads at all — not even a late check. A .pptx is a ZIP, so any entry in it
+ * can declare whatever uncompressed size its author likes.
+ */
+const PPTX_MAX_TOTAL_BYTES = SIZE_LIMITS.DOCUMENT_MAX_MB * 1024 * 1024;
+
+/**
+ * Read entries out of one presentation, refusing once the total passes budget.
+ *
+ * The budget spans the call rather than each entry: a deck of two hundred
+ * slides that each sit just under a per-entry limit is the obvious way around
+ * one. Returns null for an absent or unreadable entry, which every call site
+ * already treats as "no content here".
+ */
+function createBoundedEntryReader(): (
+  entry: Parameters<typeof readZipEntryWithinLimit>[0] | null | undefined,
+) => string | null {
+  let spent = 0;
+  return (entry) => {
+    if (!entry) {
+      return null;
+    }
+    const remaining = PPTX_MAX_TOTAL_BYTES - spent;
+    if (remaining <= 0) {
+      throw new Error(
+        `PPTX content exceeds the ${SIZE_LIMITS.DOCUMENT_MAX_MB}MB limit`,
+      );
+    }
+    const read = readZipEntryWithinLimit(entry, remaining, zlib);
+    if (read.status === "too-large") {
+      throw new Error(
+        `PPTX content exceeds the ${SIZE_LIMITS.DOCUMENT_MAX_MB}MB limit`,
+      );
+    }
+    if (read.status !== "ok") {
+      return null;
+    }
+    spent += read.buffer.length;
+    return read.buffer.toString("utf-8");
+  };
+}
+
+/**
+ * Regex that tokenises the parts of slide XML the extractor reads, in document
+ * order:
+ *
+ * - `text`: an `<a:t>` element, which holds the visible text of one run.
+ * - `closing` and `tag`: the start or end tag of a paragraph (`a:p`), table
+ *   cell (`a:tc`) or table row (`a:tr`), which decide how runs are grouped.
+ * - a `<a:br>` line break (matched with no group).
+ * - `end`: the end of the input, so the last open row or cell is flushed by the
+ *   same code that handles every other boundary.
+ *
+ * Each tag name is followed by whitespace or `>`, never by more name
+ * characters. The old pattern `<a:t[^>]*>` also matched `<a:tbl>`, `<a:tc>`,
+ * `<a:tr>`, `<a:tab>` and `<a:tailEnd>`, so a table cell was read as a run
+ * whose "text" ran from the table markup up to the next `</a:t>`.
+ *
+ * A self-closing tag (`<a:t/>`, `<a:p/>`) is not a start tag, so it is
+ * excluded by the lookbehind.
+ *
+ * Neither run text nor a tag's attributes may contain `<`: well-formed XML
+ * escapes it in text and forbids it in an attribute value. Run text is
+ * `[^<]*` rather than a lazy `[\s\S]*?`, and attributes are `[^<>]*` rather
+ * than `[^>]*`, so a match attempt stops at the next `<` instead of scanning to
+ * the end of the slide. Without that, input made of unclosed `<a:t>` elements
+ * or unterminated start tags (`<a:t `, `<a:p `, `<a:br `) rescans the rest of
+ * the slide from every start position, which is quadratic time.
+ */
+const SLIDE_TOKEN_REGEX =
+  /<a:t(?:\s[^<>]*)?(?<!\/)>(?<text>[^<]*)<\/a:t>|<(?<closing>\/?)a:(?<tag>tr|tc|p)(?:\s[^<>]*)?(?<!\/)>|<a:br(?:\s[^<>]*|\/)?>|(?<end>$)/g;
+
+/** The XML predefined entities, the only named references XML defines. */
+const XML_NAMED_ENTITIES: Readonly<Record<string, string>> = {
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+};
+
+/** A named, decimal (`&#169;`) or hexadecimal (`&#xA9;`) character reference. */
+const XML_ENTITY_REGEX = /&(?:#(\d+)|#x([0-9a-fA-F]+)|(amp|lt|gt|quot|apos));/g;
+
+/** Whether a code point is a character XML 1.0 allows in a document. */
+function isXmlChar(codePoint: number): boolean {
+  return (
+    codePoint === 0x9 ||
+    codePoint === 0xa ||
+    codePoint === 0xd ||
+    (codePoint >= 0x20 && codePoint <= 0xd7ff) ||
+    (codePoint >= 0xe000 && codePoint <= 0xfffd) ||
+    (codePoint >= 0x10000 && codePoint <= 0x10ffff)
+  );
+}
+
+/**
+ * Decode XML character references in run text.
+ *
+ * One pass over the original string, so `&amp;lt;` becomes the literal text
+ * `&lt;` and never `<`. A reference to a character XML forbids, or one outside
+ * the Unicode range, is left as written rather than turned into a control
+ * character. The slide XML is never handed to a parser, so there are no
+ * user-defined entities to resolve (see the file header).
+ */
+function decodeXmlEntities(text: string): string {
+  if (!text.includes("&")) {
+    return text;
+  }
+  return text.replace(
+    XML_ENTITY_REGEX,
+    (
+      reference: string,
+      decimal: string | undefined,
+      hex: string | undefined,
+      named: string | undefined,
+    ) => {
+      if (named !== undefined) {
+        return XML_NAMED_ENTITIES[named];
+      }
+      const codePoint =
+        decimal !== undefined
+          ? Number.parseInt(decimal, 10)
+          : Number.parseInt(hex ?? "", 16);
+      return isXmlChar(codePoint) ? String.fromCodePoint(codePoint) : reference;
+    },
+  );
+}
+
+/**
+ * Regex to match slide filenames and extract slide number.
+ * Matches entries like "ppt/slides/slide1.xml", "ppt/slides/slide12.xml".
+ */
+const SLIDE_ENTRY_REGEX = /^ppt\/slides\/slide(\d+)\.xml$/;
+
+/**
+ * A slide's per-slide relationships file, e.g.
+ * "ppt/slides/_rels/slide1.xml.rels", which links the slide to its speaker
+ * notes part (among other relationships).
+ */
+const SLIDE_RELS_NAME = (n: number) => `ppt/slides/_rels/slide${n}.xml.rels`;
+
+/** Matches a single `<Relationship .../>` tag inside a .rels document. */
+const RELATIONSHIP_TAG_REGEX = /<Relationship\b[^>]*\/?>/g;
+
+/**
+ * Static utility class for extracting text from PPTX files.
+ *
+ * Designed as a static class (not extending BaseFileProcessor) because
+ * PPTX processing is straightforward ZIP+XML extraction and does not
+ * need the full download/validate/process pipeline of BaseFileProcessor.
+ */
+export class PptxProcessor {
+  /**
+   * Extract all text content from a PPTX buffer.
+   *
+   * @param content - Raw PPTX file buffer
+   * @returns Formatted text content with slide headers, or null if no text found
+   * @throws Error if the buffer is not a valid ZIP/PPTX file
+   */
+  static async extractText(content: Buffer): Promise<string | null> {
+    const zip = new AdmZip(content);
+    const entries = zip.getEntries();
+    const readEntry = createBoundedEntryReader();
+    // First occurrence per name: a deck with two `slide1.xml` members shows
+    // the slide the listing found first, and only once.
+    const { byName } = indexZipEntriesByName(entries);
+
+    // Collect slide entries with their slide numbers for sorting
+    const slides: Array<{ slideNumber: number; xml: string }> = [];
+
+    for (const entry of byName.values()) {
+      const match = entry.entryName.match(SLIDE_ENTRY_REGEX);
+      if (match) {
+        const slideNumber = parseInt(match[1], 10);
+        const xmlContent = readEntry(entry);
+        if (xmlContent !== null) {
+          slides.push({ slideNumber, xml: xmlContent });
+        }
+      }
+    }
+
+    // Sort slides by number (slide1, slide2, ...)
+    slides.sort((a, b) => a.slideNumber - b.slideNumber);
+
+    if (slides.length === 0) {
+      return null;
+    }
+
+    const parts: string[] = [];
+    parts.push(`Presentation: ${slides.length} slide(s)\n`);
+
+    for (const slide of slides) {
+      const texts = PptxProcessor.extractTextFromXml(slide.xml);
+      const notes = PptxProcessor.extractNotesForSlide(
+        byName,
+        slide.slideNumber,
+        readEntry,
+      );
+      // Emit a slide section when it has either body text or speaker notes.
+      if (texts.length > 0 || notes) {
+        parts.push(`### Slide ${slide.slideNumber}`);
+        if (texts.length > 0) {
+          parts.push(texts.join("\n"));
+        }
+        if (notes) {
+          parts.push(`**Speaker notes:** ${notes}`);
+        }
+        parts.push(""); // blank line between slides
+      }
+    }
+
+    const result = parts.join("\n").trim();
+    return result || null;
+  }
+
+  /**
+   * Extract the speaker notes for one slide.
+   *
+   * Speaker notes live in a separate `ppt/notesSlides/notesSlideN.xml` part
+   * whose number is NOT tied to the slide number — the link is declared in the
+   * slide's own relationships file (`ppt/slides/_rels/slideN.xml.rels`) via a
+   * relationship of type `.../notesSlide`. We resolve that target, then pull the
+   * `<a:t>` runs from the notes part. Returns null when the slide has no notes.
+   *
+   * @param zip - The opened PPTX archive
+   * @param slideNumber - 1-indexed slide number
+   * @returns The notes text (runs joined by a space), or null when absent
+   */
+  private static extractNotesForSlide(
+    byName: ReadonlyMap<string, AdmZip.IZipEntry>,
+    slideNumber: number,
+    readEntry: ReturnType<typeof createBoundedEntryReader>,
+  ): string | null {
+    const relsXml = readEntry(byName.get(SLIDE_RELS_NAME(slideNumber)));
+    if (relsXml === null) {
+      return null;
+    }
+
+    let notesTarget: string | null = null;
+    RELATIONSHIP_TAG_REGEX.lastIndex = 0;
+    for (
+      let match = RELATIONSHIP_TAG_REGEX.exec(relsXml);
+      match !== null;
+      match = RELATIONSHIP_TAG_REGEX.exec(relsXml)
+    ) {
+      const tag = match[0];
+      if (/Type="[^"]*\/notesSlide"/.test(tag)) {
+        notesTarget = tag.match(/Target="([^"]+)"/)?.[1] ?? null;
+        break;
+      }
+    }
+    if (!notesTarget) {
+      return null;
+    }
+
+    // Targets are relative to the slide's folder (ppt/slides/), e.g.
+    // "../notesSlides/notesSlide1.xml" → "ppt/notesSlides/notesSlide1.xml".
+    const normalized = notesTarget
+      .replace(/^\.\.\//, "ppt/")
+      .replace(/^\/+/, "");
+    const notesXml = readEntry(byName.get(normalized));
+    if (notesXml === null) {
+      return null;
+    }
+    const notes = PptxProcessor.extractTextFromXml(notesXml).join(" ");
+    return notes.trim() || null;
+  }
+
+  /**
+   * Extract text strings from a slide XML document.
+   *
+   * Finds every `<a:t>` element and returns its decoded text, one string per
+   * run, except inside a table: there the runs of a cell are joined (runs of
+   * one paragraph directly, paragraphs and line breaks with a space) and the
+   * cells of a row come back as one `a | b | c` string. A row with no text in
+   * any cell is dropped. An empty cell keeps its separator, so the number of
+   * cells in a row can be counted from the line (`a |  |`, `| b`), but the
+   * line itself is trimmed and a literal `|` in cell text is not escaped.
+   *
+   * @param xml - Raw XML string from a slide file
+   * @returns Array of text strings found in the slide
+   */
+  private static extractTextFromXml(xml: string): string[] {
+    const lines: string[] = [];
+    // DrawingML tables do not nest, so one open row, cell and paragraph is
+    // enough. A start tag implicitly closes whatever the same or a deeper level
+    // left open, which keeps a slide with a missing end tag readable.
+    let row: string[] | null = null;
+    let cell: string[] | null = null;
+    let paragraph = "";
+
+    for (const match of xml.matchAll(SLIDE_TOKEN_REGEX)) {
+      const { text, closing, tag, end } = match.groups ?? {};
+
+      if (text !== undefined) {
+        const decoded = decodeXmlEntities(text);
+        if (cell) {
+          paragraph += decoded;
+        } else if (decoded.trim()) {
+          lines.push(decoded.trim());
+        }
+        continue;
+      }
+
+      if (tag === undefined && end === undefined) {
+        // `<a:br>`: a line break inside a cell is a space, since the row is
+        // one line. Outside a table each run is already its own line.
+        if (cell) {
+          paragraph += " ";
+        }
+        continue;
+      }
+
+      // 1 = paragraph, 2 = cell, 3 = row (also the end of the input).
+      const level = tag === "p" ? 1 : tag === "tc" ? 2 : 3;
+      if (cell && level >= 1) {
+        if (paragraph.trim()) {
+          cell.push(paragraph.trim());
+        }
+        paragraph = "";
+      }
+      if (cell && level >= 2) {
+        if (!row) {
+          row = [];
+        }
+        row.push(cell.join(" "));
+        cell = null;
+      }
+      if (row && level >= 3) {
+        if (row.some((cellText) => cellText)) {
+          lines.push(row.join(" | ").trim());
+        }
+        row = null;
+      }
+      if (closing === "") {
+        if (tag === "tr") {
+          row = [];
+        } else if (tag === "tc") {
+          cell = [];
+        }
+      }
+    }
+
+    return lines;
+  }
+
+  // ===========================================================================
+  // TARGETED EXTRACTION API
+  // ===========================================================================
+
+  /**
+   * Extract text from specific slides in a PPTX file.
+   *
+   * Called by the `extract_file_content` tool for targeted slide access. Each
+   * slide carries its speaker notes, as in {@link PptxProcessor.extractText}.
+   *
+   * @param content - Raw PPTX file buffer
+   * @param slideNumbers - Array of 1-indexed slide numbers to extract
+   * @returns Formatted text from the requested slides
+   */
+  static async extractSlides(
+    content: Buffer,
+    slideNumbers: number[],
+  ): Promise<string> {
+    const zip = new AdmZip(content);
+    const entries = zip.getEntries();
+    const readEntry = createBoundedEntryReader();
+    const { byName } = indexZipEntriesByName(entries);
+
+    // Collect all slides
+    const slides: Array<{ slideNumber: number; xml: string }> = [];
+    for (const entry of byName.values()) {
+      const match = entry.entryName.match(SLIDE_ENTRY_REGEX);
+      if (match) {
+        const slideNumber = parseInt(match[1], 10);
+        if (slideNumbers.includes(slideNumber)) {
+          const xmlContent = readEntry(entry);
+          if (xmlContent !== null) {
+            slides.push({ slideNumber, xml: xmlContent });
+          }
+        }
+      }
+    }
+
+    slides.sort((a, b) => a.slideNumber - b.slideNumber);
+
+    if (slides.length === 0) {
+      // List total slides to help the LLM
+      let totalSlides = 0;
+      for (const entry of entries) {
+        if (SLIDE_ENTRY_REGEX.test(entry.entryName)) {
+          totalSlides++;
+        }
+      }
+      return `Slides ${slideNumbers.join(", ")} not found. This presentation has ${totalSlides} slide(s).`;
+    }
+
+    const parts: string[] = [];
+    for (const slide of slides) {
+      const texts = PptxProcessor.extractTextFromXml(slide.xml);
+      const notes = PptxProcessor.extractNotesForSlide(
+        byName,
+        slide.slideNumber,
+        readEntry,
+      );
+      parts.push(`### Slide ${slide.slideNumber}`);
+      if (texts.length > 0) {
+        parts.push(texts.join("\n"));
+      }
+      if (notes) {
+        parts.push(`**Speaker notes:** ${notes}`);
+      }
+      if (texts.length === 0 && !notes) {
+        parts.push("(No text content on this slide)");
+      }
+      parts.push("");
+    }
+
+    return parts.join("\n").trim();
+  }
+}

@@ -5,9 +5,11 @@
  * Factory patterns need to work with both generate() and stream() methods
  */
 
-import type { GenerateOptions } from "../types/generateTypes.js";
-import type { StreamOptions } from "../types/streamTypes.js";
-import type { UnknownRecord } from "../types/common.js";
+import type {
+  GenerateOptions,
+  StreamOptions,
+  UnknownRecord,
+} from "../types/index.js";
 
 /**
  * Convert GenerateOptions to StreamOptions
@@ -17,8 +19,9 @@ export function convertGenerateToStreamOptions(
   generateOptions: GenerateOptions,
 ): StreamOptions {
   const streamOptions: StreamOptions = {
-    // Core input mapping
-    input: generateOptions.input,
+    // Core input mapping — GenerateOptions.input is optional (media-only callers
+    // may omit it); fall back to an empty object so StreamOptions stays valid.
+    input: generateOptions.input ?? {},
 
     // Provider and model settings
     provider: generateOptions.provider,

@@ -8,7 +8,10 @@
 import { randomUUID } from "crypto";
 import { z } from "zod";
 import { ProviderFactory } from "../../factories/providerFactory.js";
+import { withSpan } from "../../telemetry/withSpan.js";
+import { tracers } from "../../telemetry/tracers.js";
 import { logger } from "../../utils/logger.js";
+import { vetRegexPattern } from "../../middleware/utils/regexSafety.js";
 import { rerank } from "../reranker/reranker.js";
 import type {
   MetadataFilter,
@@ -16,21 +19,8 @@ import type {
   VectorQueryResponse,
   VectorQueryResult,
   VectorQueryToolConfig,
-} from "../types.js";
-
-/**
- * Abstract vector store interface
- * Vector stores should implement this interface to work with the query tool
- */
-export interface VectorStore {
-  query(params: {
-    indexName: string;
-    queryVector: number[];
-    topK?: number;
-    filter?: MetadataFilter;
-    includeVectors?: boolean;
-  }): Promise<VectorQueryResult[]>;
-}
+  VectorStore,
+} from "../../types/index.js";
 
 /**
  * Creates a vector query tool for semantic search
@@ -68,7 +58,7 @@ export function createVectorQueryTool(
       ...(enableFilter
         ? {
             filter: z
-              .record(z.unknown())
+              .record(z.string(), z.unknown())
               .optional()
               .describe("Metadata filters to narrow down results"),
           }
@@ -89,106 +79,127 @@ export function createVectorQueryTool(
       params: { query: string; filter?: MetadataFilter; topK?: number },
       context?: RequestContext,
     ): Promise<VectorQueryResponse> => {
-      const startTime = Date.now();
-
-      try {
-        // Resolve vector store if it's a function
-        const store: VectorStore =
-          typeof vectorStore === "function"
-            ? vectorStore(context || {})
-            : vectorStore;
-
-        // Generate query embedding
-        const embeddingProvider = await ProviderFactory.createProvider(
-          embeddingModel.provider,
-          embeddingModel.modelName,
-        );
-
-        // Check if provider has embed method
-        if (
-          typeof (embeddingProvider as unknown as { embed?: unknown }).embed !==
-          "function"
-        ) {
-          throw new Error(
-            `Provider ${embeddingModel.provider} does not support embeddings`,
-          );
-        }
-
-        const queryEmbedding = await (
-          embeddingProvider as unknown as {
-            embed: (s: string) => Promise<number[]>;
-          }
-        ).embed(params.query);
-
-        // Query the vector store
-        let results = await store.query({
-          indexName,
-          queryVector: queryEmbedding,
-          topK: params.topK || topK,
-          filter: params.filter,
-          includeVectors,
-          ...providerOptions,
-        });
-
-        let reranked = false;
-
-        // Apply reranking if configured
-        if (rerankerConfig && results.length > 0) {
-          const rerankerModel = await ProviderFactory.createProvider(
-            rerankerConfig.model.provider,
-            rerankerConfig.model.modelName,
-          );
-
-          const rerankedResults = await rerank(
-            results,
-            params.query,
-            rerankerModel,
-            {
-              weights: rerankerConfig.weights,
-              topK: rerankerConfig.topK,
-              queryEmbedding,
-            },
-          );
-
-          results = rerankedResults.map((r) => r.result);
-          reranked = true;
-        }
-
-        // Format results
-        const relevantContext = results
-          .map((r, i) => `[${i + 1}] ${r.metadata?.text || r.text || ""}`)
-          .join("\n\n");
-
-        const queryTime = Date.now() - startTime;
-
-        logger.info("[VectorQueryTool] Query completed", {
-          query: params.query.slice(0, 50),
-          resultsCount: results.length,
-          queryTime,
-          reranked,
-          filtered: !!params.filter,
-        });
-
-        return {
-          relevantContext,
-          sources: includeSources ? results : [],
-          totalResults: results.length,
-          metadata: {
-            queryTime,
-            reranked,
-            filtered: !!params.filter,
+      return withSpan(
+        {
+          name: "neurolink.rag.vectorQuery",
+          tracer: tracers.rag,
+          observationType: "span",
+          attributes: {
+            "rag.vector.index": indexName,
+            "rag.vector.top_k": params.topK ?? topK,
+            "rag.vector.query_length": params.query.length,
           },
-        };
-      } catch (error) {
-        logger.error("[VectorQueryTool] Query failed", {
-          query: params.query.slice(0, 50),
-          error: error instanceof Error ? error.message : String(error),
-        });
-        throw error;
-      }
+        },
+        async (span) => {
+          const startTime = Date.now();
+
+          try {
+            // Resolve vector store if it's a function
+            const store: VectorStore =
+              typeof vectorStore === "function"
+                ? vectorStore(context || {})
+                : vectorStore;
+
+            // Generate query embedding
+            const embeddingProvider = await ProviderFactory.createProvider(
+              embeddingModel.provider,
+              embeddingModel.modelName,
+            );
+
+            // Check if provider has embed method
+            if (typeof embeddingProvider.embed !== "function") {
+              throw new Error(
+                `Provider ${embeddingModel.provider} does not support embeddings`,
+              );
+            }
+
+            const queryEmbedding = await embeddingProvider.embed(params.query);
+
+            // Query the vector store
+            let results = await store.query({
+              indexName,
+              queryVector: queryEmbedding,
+              topK: params.topK || topK,
+              filter: params.filter,
+              includeVectors,
+              ...providerOptions,
+            });
+
+            let reranked = false;
+
+            // Apply reranking if configured
+            if (rerankerConfig && results.length > 0) {
+              const rerankerModel = await ProviderFactory.createProvider(
+                typeof rerankerConfig.model === "object"
+                  ? rerankerConfig.model.provider
+                  : rerankerConfig.model,
+                typeof rerankerConfig.model === "object"
+                  ? rerankerConfig.model.modelName
+                  : rerankerConfig.model,
+              );
+
+              const rerankedResults = await rerank(
+                results,
+                params.query,
+                rerankerModel,
+                {
+                  weights: rerankerConfig.weights,
+                  topK: rerankerConfig.topK,
+                  queryEmbedding,
+                },
+              );
+
+              results = rerankedResults.map((r) => r.result);
+              reranked = true;
+            }
+
+            // Format results
+            const relevantContext = results
+              .map((r, i) => `[${i + 1}] ${r.metadata?.text || r.text || ""}`)
+              .join("\n\n");
+
+            const queryTime = Date.now() - startTime;
+
+            logger.info("[VectorQueryTool] Query completed", {
+              query: params.query.slice(0, 50),
+              resultsCount: results.length,
+              queryTime,
+              reranked,
+              filtered: !!params.filter,
+            });
+
+            span.setAttribute("rag.vector.result_count", results.length);
+            span.setAttribute("rag.vector.reranked", reranked);
+
+            return {
+              relevantContext,
+              sources: includeSources ? results : [],
+              totalResults: results.length,
+              metadata: {
+                queryTime,
+                reranked,
+                filtered: !!params.filter,
+              },
+            };
+          } catch (error) {
+            logger.error("[VectorQueryTool] Query failed", {
+              query: params.query.slice(0, 50),
+              error: error instanceof Error ? error.message : String(error),
+            });
+            throw error;
+          }
+        },
+      ); // end withSpan
     },
   };
 }
+
+/** Longest `$regex` filter pattern accepted; a secondary cap behind vetting. */
+const MAX_FILTER_REGEX_LENGTH = 200;
+/** Longest metadata value a `$regex` filter is run against. */
+const MAX_FILTER_REGEX_SUBJECT = 10_000;
+/** Distinct patterns remembered per store before the verdict cache is reset. */
+const MAX_FILTER_REGEX_CACHE = 256;
 
 /**
  * In-memory vector store implementation for testing and development
@@ -198,6 +209,9 @@ export class InMemoryVectorStore implements VectorStore {
     string,
     Map<string, { vector: number[]; metadata: Record<string, unknown> }>
   > = new Map();
+
+  /** Vetted `$regex` patterns: the compiled expression, or null when refused. */
+  private readonly regexFilterCache = new Map<string, RegExp | null>();
 
   /**
    * Add vectors to an index
@@ -210,11 +224,11 @@ export class InMemoryVectorStore implements VectorStore {
       metadata?: Record<string, unknown>;
     }>,
   ): Promise<void> {
-    if (!this.vectors.has(indexName)) {
-      this.vectors.set(indexName, new Map());
+    let index = this.vectors.get(indexName);
+    if (!index) {
+      index = new Map();
+      this.vectors.set(indexName, index);
     }
-
-    const index = this.vectors.get(indexName)!;
     for (const item of items) {
       index.set(item.id, {
         vector: item.vector,
@@ -389,12 +403,21 @@ export class InMemoryVectorStore implements VectorStore {
           ) {
             return false;
           }
-          if (
-            "$regex" in ops &&
-            (typeof fieldValue !== "string" ||
-              !new RegExp(ops.$regex as string).test(fieldValue))
-          ) {
-            return false;
+          if ("$regex" in ops) {
+            // The pattern is chosen by the model and the value it runs on
+            // comes from ingested documents, so both halves of a ReDoS are
+            // attacker-influenced. A length cap alone does not bound
+            // backtracking (`^(a+)+$` is 7 characters); `vetRegexPattern`
+            // reads the pattern's structure and refuses the ones that can
+            // backtrack catastrophically. A refused or invalid pattern is a
+            // non-match, as an invalid one always was.
+            const regexMatches = this.matchesRegexFilter(
+              ops.$regex,
+              fieldValue,
+            );
+            if (!regexMatches) {
+              return false;
+            }
           }
         } else {
           // Direct equality
@@ -406,6 +429,48 @@ export class InMemoryVectorStore implements VectorStore {
     }
 
     return true;
+  }
+
+  /**
+   * Evaluate a `$regex` filter operator. Patterns are vetted once per store
+   * and the verdict cached, so a refused pattern costs one analysis.
+   */
+  private matchesRegexFilter(pattern: unknown, fieldValue: unknown): boolean {
+    if (
+      typeof pattern !== "string" ||
+      pattern.length > MAX_FILTER_REGEX_LENGTH
+    ) {
+      return false;
+    }
+    let compiled = this.regexFilterCache.get(pattern);
+    if (compiled === undefined) {
+      const verdict = vetRegexPattern(pattern);
+      if (verdict.safe) {
+        try {
+          compiled = new RegExp(pattern);
+        } catch {
+          compiled = null;
+        }
+      } else {
+        logger.debug(
+          "[InMemoryVectorStore] Refused a $regex filter pattern that could stall the process",
+          { reason: verdict.reason },
+        );
+        compiled = null;
+      }
+      if (this.regexFilterCache.size >= MAX_FILTER_REGEX_CACHE) {
+        this.regexFilterCache.clear();
+      }
+      this.regexFilterCache.set(pattern, compiled);
+    }
+    if (compiled === null) {
+      return false;
+    }
+    const testValue =
+      typeof fieldValue === "string"
+        ? fieldValue.slice(0, MAX_FILTER_REGEX_SUBJECT)
+        : "";
+    return compiled.test(testValue);
   }
 
   /**

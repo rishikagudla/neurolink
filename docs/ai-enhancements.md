@@ -223,7 +223,7 @@ Enterprise-grade multi-provider evaluation with intelligent fallback, cost optim
 
 **Key Features:**
 
-- **9 Provider Support**: Google AI, OpenAI, Anthropic, Vertex, Bedrock, Azure, Ollama, Hugging Face, Mistral
+- **Multi-Provider Support**: Google AI, OpenAI, Anthropic, Vertex, Bedrock, Azure, Ollama, Hugging Face, Mistral
 - **Intelligent Fallback**: Automatic provider selection when primary fails
 - **Cost Optimization**: Provider-specific cost calculations and budget awareness
 - **Performance Modes**: Fast, balanced, and quality evaluation options
@@ -554,12 +554,20 @@ const highQualityContent = results.filter(
 ### Cost Monitoring Dashboard
 
 ```typescript
+import type { GenerateResult } from "@juspay/neurolink";
+
 function createCostDashboard() {
   const dailyCosts = [];
   const qualityMetrics = [];
 
   // Track all AI requests
-  sdk.onResponse((result) => {
+  sdk.getEventEmitter().on("generation:end", (event) => {
+    // A failed generation emits generation:end without a result
+    const result = (event as { result?: GenerateResult }).result;
+    if (!result) {
+      return;
+    }
+
     if (result.analytics) {
       dailyCosts.push({
         date: new Date(result.analytics.timestamp),

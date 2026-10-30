@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v8.32.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -6,9 +6,7 @@
 
 # Function: createAIProviderWithFallback()
 
-> **createAIProviderWithFallback**(`primaryProvider?`, `fallbackProvider?`, `modelName?`): `Promise`\<`ProviderPairResult`\<[`AIProvider`](../type-aliases/AIProvider.md)\>\>
-
-Defined in: [index.ts:207](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/index.ts#L207)
+> **createAIProviderWithFallback**(`primaryProvider?`, `fallbackProvider?`, `modelName?`): `Promise`\<[`ProviderPairResult`](../type-aliases/ProviderPairResult.md)\<[`AIProvider`](../type-aliases/AIProvider.md)\>\>
 
 Create provider with automatic fallback for production resilience.
 
@@ -37,7 +35,7 @@ Optional model name for both providers
 
 ## Returns
 
-`Promise`\<`ProviderPairResult`\<[`AIProvider`](../type-aliases/AIProvider.md)\>\>
+`Promise`\<[`ProviderPairResult`](../type-aliases/ProviderPairResult.md)\<[`AIProvider`](../type-aliases/AIProvider.md)\>\>
 
 Promise resolving to object with primary and fallback providers
 

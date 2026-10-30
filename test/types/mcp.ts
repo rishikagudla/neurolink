@@ -5,10 +5,7 @@
 
 import type { IncomingHttpHeaders } from "http";
 import type { Mock } from "vitest";
-import type {
-  MCPServerInfo,
-  MCPToolInfo,
-} from "../../src/lib/types/mcpTypes.js";
+import type { MCPServerInfo, MCPToolInfo } from "../../src/lib/types/index.js";
 
 /**
  * Type for tracking captured HTTP requests in integration tests
@@ -160,16 +157,4 @@ export type ColorName =
   | "magenta"
   | "cyan";
 
-/**
- * Result of executing a CLI command in tests
- */
-export type CommandResult = {
-  /** Exit code of the command */
-  code: number;
-  /** Standard output content */
-  stdout: string;
-  /** Standard error content */
-  stderr: string;
-  /** Whether the command succeeded (code === 0) */
-  success: boolean;
-};
+// CommandResult has been replaced by ProcessResult in @juspay/neurolink types

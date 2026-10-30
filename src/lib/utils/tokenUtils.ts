@@ -3,68 +3,15 @@
  * Handles multiple provider formats and optional fields
  *
  * Consolidates token extraction logic from:
- * - GenerationHandler.ts
  * - analytics.ts
  * - streamAnalytics.ts
  */
 
-import type { TokenUsage } from "../types/analytics.js";
-
-/**
- * Raw usage object that may come from various AI providers
- * Supports multiple naming conventions and nested structures
- */
-export interface RawUsageObject {
-  // BaseProvider normalized format
-  input?: number;
-  output?: number;
-  total?: number;
-
-  // AI SDK format
-  inputTokens?: number;
-  outputTokens?: number;
-  totalTokens?: number;
-
-  // OpenAI/Mistral format
-  promptTokens?: number;
-  completionTokens?: number;
-
-  // Anthropic-style cache tokens
-  cacheCreationInputTokens?: number;
-  cacheReadInputTokens?: number;
-  // Alternative cache token naming
-  cacheCreationTokens?: number;
-  cacheReadTokens?: number;
-
-  // OpenAI o1/Anthropic reasoning tokens
-  reasoningTokens?: number;
-  reasoning?: number;
-  // Snake case variant (some APIs)
-  reasoning_tokens?: number;
-  // Google/other provider thinking tokens
-  thinkingTokens?: number;
-
-  // Nested usage object (some providers wrap usage)
-  usage?: RawUsageObject;
-}
-
-/**
- * Options for token extraction behavior
- */
-export interface TokenExtractionOptions {
-  /**
-   * Whether to calculate cache savings percentage
-   * @default true
-   */
-  calculateCacheSavings?: boolean;
-
-  /**
-   * How to handle missing optional fields
-   * - "zero": Return 0 for missing optional fields
-   * - "undefined": Return undefined for missing optional fields (default)
-   */
-  missingOptionalBehavior?: "zero" | "undefined";
-}
+import type {
+  TokenUsage,
+  RawUsageObject,
+  TokenExtractionOptions,
+} from "../types/index.js";
 
 /**
  * Extract input token count from various provider formats
@@ -109,10 +56,13 @@ export function extractTotalTokens(
   input: number,
   output: number,
 ): number {
-  if (typeof usage.total === "number") {
+  // A literal 0 alongside non-zero components means the provider omitted the
+  // figure (several gateways/parsers emit total: 0) — fall through to the
+  // computed sum instead of letting the zero win.
+  if (typeof usage.total === "number" && usage.total > 0) {
     return usage.total;
   }
-  if (typeof usage.totalTokens === "number") {
+  if (typeof usage.totalTokens === "number" && usage.totalTokens > 0) {
     return usage.totalTokens;
   }
   return input + output;
@@ -145,7 +95,9 @@ export function extractReasoningTokens(
 
 /**
  * Extract cache creation token count from various provider formats
- * Supports: cacheCreationInputTokens, cacheCreationTokens
+ * Supports: cacheCreationInputTokens, cacheCreationTokens, and the ai@6
+ * normalized `inputTokenDetails.cacheWriteTokens` (the only shape the native
+ * direct-Anthropic path reports through generateText).
  */
 export function extractCacheCreationTokens(
   usage: RawUsageObject,
@@ -162,12 +114,21 @@ export function extractCacheCreationTokens(
   ) {
     return usage.cacheCreationTokens;
   }
+  if (
+    typeof usage.inputTokenDetails?.cacheWriteTokens === "number" &&
+    usage.inputTokenDetails.cacheWriteTokens > 0
+  ) {
+    return usage.inputTokenDetails.cacheWriteTokens;
+  }
   return undefined;
 }
 
 /**
  * Extract cache read token count from various provider formats
- * Supports: cacheReadInputTokens, cacheReadTokens
+ * Supports: cacheReadInputTokens, cacheReadTokens, and the ai@6 normalized
+ * shapes — flat `cachedInputTokens` and nested
+ * `inputTokenDetails.cacheReadTokens` (the only shapes the native
+ * direct-Anthropic path reports through generateText).
  */
 export function extractCacheReadTokens(
   usage: RawUsageObject,
@@ -180,6 +141,38 @@ export function extractCacheReadTokens(
   }
   if (typeof usage.cacheReadTokens === "number" && usage.cacheReadTokens > 0) {
     return usage.cacheReadTokens;
+  }
+  if (
+    typeof usage.cachedInputTokens === "number" &&
+    usage.cachedInputTokens > 0
+  ) {
+    return usage.cachedInputTokens;
+  }
+  if (
+    typeof usage.inputTokenDetails?.cacheReadTokens === "number" &&
+    usage.inputTokenDetails.cacheReadTokens > 0
+  ) {
+    return usage.inputTokenDetails.cacheReadTokens;
+  }
+  return undefined;
+}
+
+/**
+ * Extract cache read token count from the OVERLAPPING-convention nested path
+ * used by OpenAI / DeepSeek / NIM / OpenAI-compatible providers:
+ * `usage.prompt_tokens_details.cached_tokens`.
+ *
+ * Unlike {@link extractCacheReadTokens} (non-overlapping Anthropic/Vertex
+ * convention where cache tokens are reported SEPARATELY from input), the value
+ * returned here is a SUBSET already included in `prompt_tokens`. Callers that
+ * use this value MUST subtract it from `input` to avoid double-counting.
+ */
+export function extractCachedInputTokensOverlapping(
+  usage: RawUsageObject,
+): number | undefined {
+  const cached = usage.prompt_tokens_details?.cached_tokens;
+  if (typeof cached === "number" && cached > 0) {
+    return cached;
   }
   return undefined;
 }
@@ -248,14 +241,71 @@ export function extractTokenUsage(
     result.usage && typeof result.usage === "object" ? result.usage : result;
 
   // Extract base token counts
-  const input = extractInputTokens(usage);
+  let input = extractInputTokens(usage);
   const output = extractOutputTokens(usage);
-  const total = extractTotalTokens(usage, input, output);
 
   // Extract optional token fields
   const reasoning = extractReasoningTokens(usage);
   const cacheCreationTokens = extractCacheCreationTokens(usage);
-  const cacheReadTokens = extractCacheReadTokens(usage);
+  let cacheReadTokens = extractCacheReadTokens(usage);
+
+  // Overlapping-convention fallback (OpenAI/DeepSeek/NIM/OpenAI-compatible):
+  // when no non-overlapping cache-read field was present, look for the nested
+  // `prompt_tokens_details.cached_tokens`. That value is a SUBSET already
+  // included in `input`, so we must subtract it from `input` to avoid
+  // double-counting (and to let calculateCost apply the cheaper cacheRead rate
+  // to the cached portion). Only do this when cached <= input so a malformed
+  // response can never produce negative input or inflate the total.
+  if (cacheReadTokens === undefined) {
+    const overlappingCached = extractCachedInputTokensOverlapping(usage);
+    if (overlappingCached !== undefined && overlappingCached <= input) {
+      cacheReadTokens = overlappingCached;
+      input = Math.max(0, input - overlappingCached);
+    }
+  }
+
+  // ai@6-shape rebase: when the cache values came ONLY from the ai@6
+  // normalized shape (cachedInputTokens / inputTokenDetails.*), the flat
+  // input is cache-INCLUSIVE — asLanguageModelUsage reports
+  // inputTokens.total = noCache + cacheRead + cacheWrite — so `input` must
+  // be rebased onto the uncached portion or calculateCost bills the cached
+  // tokens twice (full input rate + cacheRead/cacheCreation rate). The
+  // native fields excluded below (cacheReadInputTokens / cacheReadTokens /
+  // cacheCreationInputTokens / cacheCreationTokens) follow the
+  // non-overlapping convention where input is already the uncached
+  // remainder, and the overlapping snake_case shape was already rebased
+  // above — neither must be rebased again.
+  if (
+    (cacheReadTokens !== undefined || cacheCreationTokens !== undefined) &&
+    usage.cacheReadInputTokens === undefined &&
+    usage.cacheReadTokens === undefined &&
+    usage.cacheCreationInputTokens === undefined &&
+    usage.cacheCreationTokens === undefined &&
+    usage.prompt_tokens_details?.cached_tokens === undefined &&
+    (usage.cachedInputTokens !== undefined ||
+      usage.inputTokenDetails !== undefined)
+  ) {
+    const noCacheTokens = usage.inputTokenDetails?.noCacheTokens;
+    if (typeof noCacheTokens === "number") {
+      input = noCacheTokens;
+    } else {
+      input = Math.max(
+        0,
+        input -
+          (cacheReadTokens ?? 0) -
+          (usage.inputTokenDetails?.cacheWriteTokens ?? 0),
+      );
+    }
+  }
+
+  // Total: prefer the provider-reported figure; the fallback conserves every
+  // billed component — cache tokens are additive on top of the (post-rebase)
+  // uncached input. Reasoning is already inside `output`, so it is NOT added.
+  const total = extractTotalTokens(
+    usage,
+    input + (cacheReadTokens ?? 0) + (cacheCreationTokens ?? 0),
+    output,
+  );
 
   // Calculate cache savings if enabled
   const cacheSavingsPercent = calculateCacheSavings

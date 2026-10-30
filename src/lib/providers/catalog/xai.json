@@ -1,0 +1,135 @@
+{
+  "$schema": "./provider-catalog.schema.json",
+  "id": "xai",
+  "displayName": "xAI",
+  "aliases": ["grok"],
+  "tier": 2,
+  "wire": {
+    "baseURL": "https://api.x.ai/v1"
+  },
+  "models": {
+    "default": "grok-4.6",
+    "fallbacks": [
+      "grok-4.6",
+      "grok-4.5",
+      "grok-4.3",
+      "grok-3",
+      "grok-3-mini",
+      "grok-4.7"
+    ],
+    "defaultContextWindow": 131072,
+    "defaultMaxOutputTokens": 4096,
+    "catalog": {
+      "grok-4.7": {
+        "enumMember": "GROK_4_7",
+        "contextWindow": 500000,
+        "vision": true,
+        "status": "production",
+        "description": "Grok 4.7 — xAI's newest flagship as of 2026-09-27 (text + image input); not yet the SDK default, see docs.x.ai/developers/grok-4-7"
+      },
+      "grok-4.6": {
+        "enumMember": "GROK_4_6",
+        "contextWindow": 131072,
+        "vision": true,
+        "status": "production",
+        "description": "Recommended - Grok 4.6, current flagship; vision-capable"
+      },
+      "grok-4.5": {
+        "enumMember": "GROK_4_5",
+        "contextWindow": 131072,
+        "vision": true,
+        "status": "production",
+        "description": "Grok 4.5 — vision-capable"
+      },
+      "grok-4.3": {
+        "enumMember": "GROK_4_3",
+        "contextWindow": 131072,
+        "vision": true,
+        "status": "production",
+        "description": "Grok 4.3 — vision-capable"
+      },
+      "grok-3": {
+        "contextWindow": 131072,
+        "pricingPerMTok": { "input": 3.0, "output": 15.0 },
+        "vision": false,
+        "status": "production",
+        "description": "Grok 3 — still served, though absent from the /models roster"
+      },
+      "grok-3-mini": {
+        "contextWindow": 131072,
+        "pricingPerMTok": { "input": 0.3, "output": 0.5 },
+        "vision": false,
+        "status": "production",
+        "description": "Faster + cheaper Grok 3"
+      },
+      "grok-2-latest": {
+        "contextWindow": 131072,
+        "pricingPerMTok": { "input": 2.0, "output": 10.0 },
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-08 — xAI rejects it as an invalid model"
+      },
+      "grok-2-vision-latest": {
+        "contextWindow": 32768,
+        "pricingPerMTok": { "input": 2.0, "output": 10.0 },
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-08 — xAI rejects it as an invalid model; vision moved to the grok-4.x line"
+      },
+      "grok-beta": {
+        "contextWindow": 131072,
+        "pricingPerMTok": { "input": 5.0, "output": 15.0 },
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-08 — xAI rejects it as an invalid model"
+      }
+    },
+    "visionModel": "grok-4.6",
+    "topModels": ["grok-4.6", "grok-4.5", "grok-4.3", "grok-3", "grok-4.7"]
+  },
+  "capabilities": {
+    "text": true,
+    "streaming": true,
+    "tools": true,
+    "toolsWithStreaming": true,
+    "structuredOutput": true,
+    "structuredOutputWithTools": true,
+    "embeddings": false,
+    "thinking": false
+  },
+  "errorRules": [
+    {
+      "status": 401,
+      "pattern": "Invalid API key|Authentication|invalid_api_key",
+      "class": "authentication",
+      "message": "Invalid xAI API key. Please check your {apiKeyEnvVar} environment variable. Get one at https://console.x.ai/"
+    },
+    {
+      "pattern": "insufficient_quota|quota exceeded",
+      "class": "provider",
+      "message": "xAI account has insufficient quota. Top up at https://console.x.ai/"
+    }
+  ],
+  "setup": {
+    "url": "https://console.x.ai/",
+    "apiKeyFormat": null,
+    "billingPolicy": "no-free-tier",
+    "instructions": [
+      "1. Visit: https://console.x.ai/",
+      "2. Sign in with your xAI account",
+      "3. Create an API key",
+      "4. Set {apiKeyEnvVar} in your .env file"
+    ]
+  },
+  "evidence": {
+    "rosterVerified": {
+      "date": "2026-08-30",
+      "method": "GET /models against the live account, cross-checked with a real chat call per id"
+    },
+    "liveMatrix": {
+      "date": "2026-08-30",
+      "result": "grok-2-latest, grok-2-vision-latest and grok-beta are rejected as invalid models. The grok-4.x line replaces them: 4.3/4.5/4.6 all answer, and all three read a 64x64 PNG correctly, so vision moved there from the retired grok-2-vision-latest. An earlier probe with an 8x8 PNG reported no vision — that was xAI answering 'Invalid PNG image', a complaint about the file rather than the capability. grok-3 and grok-3-mini are kept because they still serve, even though xAI's /models roster omits them: roster absence is not evidence of death here. grok-4.7 added 2026-09-27 from docs.x.ai/developers/grok-4-7 and docs.x.ai/developers/pricing (official docs review only — no xAI API key was available in this environment, so unlike the rest of this file it has not been roster/chat-probed live; context 500,000 tokens and text+image input are as published, and it is deliberately left with no pricingPerMTok, matching grok-4.6/4.5/4.3, because its real rate is tiered by prompt length ($2/$0.50/$6 per 1M below 200k tokens, $4/$1/$12 at or above) and the schema's pricingPerMTok field can only hold one flat rate)."
+    },
+    "addedInPR": "https://github.com/juspay/neurolink/pull/1587"
+  }
+}

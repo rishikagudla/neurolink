@@ -4,24 +4,30 @@
  */
 
 import pLimit from "p-limit";
+import { MAX_TIMER_MS } from "../../constants/timeouts.js";
 import { AIProviderFactory } from "../../core/factory.js";
-import type { AIProvider } from "../../types/providers.js";
-import { logger } from "../../utils/logger.js";
 import type {
+  AIProvider,
   EnsembleResponse,
   ExecutionConfig,
-  ModelConfig,
+  WorkflowModelConfig,
   ModelGroup,
-} from "../types.js";
-import { WorkflowError } from "../types.js";
-import type {
   EnsembleExecutionResult,
   ExecuteEnsembleOptions,
   ExecuteLayerOptions,
   ExecuteModelOptions,
   LayerExecutionResult,
-} from "./types/index.js";
-
+} from "../../types/index.js";
+import { logger } from "../../utils/logger.js";
+import {
+  SpanSerializer,
+  SpanType,
+  SpanStatus,
+  getMetricsAggregator,
+} from "../../observability/index.js";
+import { WorkflowError } from "../../types/index.js";
+import { withSpan } from "../../telemetry/withSpan.js";
+import { tracers } from "../../telemetry/tracers.js";
 const functionTag = "EnsembleExecutor";
 
 // ============================================================================
@@ -36,9 +42,36 @@ const functionTag = "EnsembleExecutor";
 export async function executeEnsemble(
   options: ExecuteEnsembleOptions,
 ): Promise<EnsembleExecutionResult> {
+  return withSpan(
+    {
+      name: "neurolink.workflow.ensemble.execute",
+      tracer: tracers.workflow,
+      observationType: "span",
+      attributes: {
+        "workflow.model_count": options.models.length,
+        "workflow.parallelism": options.executionConfig?.parallelism ?? 10,
+      },
+    },
+    async (otelSpan) => executeEnsembleInner(options, otelSpan),
+  );
+}
+
+async function executeEnsembleInner(
+  options: ExecuteEnsembleOptions,
+  otelSpan: import("@opentelemetry/api").Span,
+): Promise<EnsembleExecutionResult> {
   const startTime = Date.now();
   const { prompt, models, executionConfig, systemPrompt, workflowDefaults } =
     options;
+  const span = SpanSerializer.createSpan(
+    SpanType.WORKFLOW,
+    "workflow.ensemble",
+    {
+      "workflow.operation": "ensemble",
+      "workflow.model_count": models.length,
+      "workflow.parallelism": executionConfig?.parallelism || 10,
+    },
+  );
 
   logger.info(`[${functionTag}] Starting ensemble execution`, {
     modelCount: models.length,
@@ -105,6 +138,19 @@ export async function executeEnsemble(
     totalResponses: responses.length,
   });
 
+  span.durationMs = totalTime;
+  const spanStatus = successCount > 0 ? SpanStatus.OK : SpanStatus.ERROR;
+  const endedSpan = SpanSerializer.endSpan(
+    span,
+    spanStatus,
+    successCount === 0 ? "No successful model responses" : undefined,
+  );
+  getMetricsAggregator().recordSpan(endedSpan);
+
+  otelSpan.setAttribute("workflow.success_count", successCount);
+  otelSpan.setAttribute("workflow.failure_count", failureCount);
+  otelSpan.setAttribute("workflow.total_time_ms", totalTime);
+
   return {
     responses,
     totalTime,
@@ -144,19 +190,38 @@ async function executeModel(
     const resolvedSystemPrompt =
       systemPrompt || model.systemPrompt || workflowDefaultSystemPrompt;
 
-    // Execute with timeout
-    const result = await executeWithTimeout(
-      async () => {
-        return await provider.generate({
-          prompt,
-          systemPrompt: resolvedSystemPrompt,
-          temperature: model.temperature,
-          maxTokens: model.maxTokens,
-        });
-      },
-      timeout,
-      `Model ${model.provider}/${model.model} timed out after ${timeout}ms`,
-    );
+    // Execute with timeout. Some upstream LLM endpoints (notably Vertex
+    // under high parallel load) occasionally respond with an empty
+    // assistant message instead of content; retry once before giving up so
+    // a transient empty response doesn't cascade into an empty ensemble
+    // result that downstream tests + judges have no way to evaluate.
+    let result: Awaited<ReturnType<typeof provider.generate>>;
+    let attempts = 0;
+    const MAX_ATTEMPTS = 2;
+    while (true) {
+      attempts++;
+      result = await executeWithTimeout(
+        async (abortSignal) => {
+          return await provider.generate({
+            prompt,
+            systemPrompt: resolvedSystemPrompt,
+            temperature: model.temperature,
+            maxTokens: model.maxTokens,
+            abortSignal,
+          });
+        },
+        timeout,
+        `Model ${model.provider}/${model.model} timed out after ${timeout}ms`,
+      );
+      const contentLen = result?.content?.length ?? 0;
+      if (contentLen > 0 || attempts >= MAX_ATTEMPTS) {
+        break;
+      }
+      logger.warn(
+        `[${functionTag}] Model returned empty content — retrying once`,
+        { provider: model.provider, model: model.model, attempt: attempts },
+      );
+    }
 
     const responseTime = Date.now() - startTime;
 
@@ -213,24 +278,39 @@ async function executeModel(
  * @param model - Model configuration
  * @returns Provider instance
  */
-async function createProvider(model: ModelConfig): Promise<AIProvider> {
+async function createProvider(model: WorkflowModelConfig): Promise<AIProvider> {
   return await AIProviderFactory.createProvider(model.provider, model.model);
 }
 
 /**
- * Execute function with timeout
- * @param fn - Async function to execute
+ * Run an abortable operation under a deadline.
+ *
+ * The operation receives the signal of an `AbortController` that this function
+ * aborts the moment the deadline lapses, so the owner of the work (the provider
+ * call and its HTTP request) is cancelled rather than abandoned. `Promise.race`
+ * alone only stops this caller waiting; it cannot stop a promise that already
+ * exists, so cancelling is the operation's job once it is handed the signal.
+ *
+ * `timeoutMs` is held at `MAX_TIMER_MS`: `setTimeout` fires after 1 ms for a
+ * longer delay, which turned the longest deadline a workflow could ask for into
+ * an immediate failure.
+ * @param run - Operation to execute; observes the signal to stop early
  * @param timeoutMs - Timeout in milliseconds
  * @param timeoutMessage - Error message for timeout
- * @returns Result of function execution
+ * @returns Result of the operation
  */
 async function executeWithTimeout<T>(
-  fn: () => Promise<T>,
+  run: (signal: AbortSignal) => Promise<T>,
   timeoutMs: number,
   timeoutMessage: string,
 ): Promise<T> {
-  let timeoutHandle!: NodeJS.Timeout;
+  const controller = new AbortController();
+  let timeoutHandle: NodeJS.Timeout | undefined;
 
+  // An explicit upper-bound comparison, and `>` rather than `<=`: NaN fails
+  // `>`, so NaN, zero and negative deadlines reach `setTimeout` as they always
+  // did, and only a value above the limit is replaced by it.
+  const delayMs = timeoutMs > MAX_TIMER_MS ? MAX_TIMER_MS : timeoutMs;
   const timeoutPromise = new Promise<never>((_, reject) => {
     timeoutHandle = setTimeout(() => {
       const error = new WorkflowError(timeoutMessage, {
@@ -239,21 +319,17 @@ async function executeWithTimeout<T>(
         phase: "ensemble",
         retryable: true,
       });
+      // Reject before aborting: the abort can make the operation's own
+      // promise fail, and the race must already hold the deadline error.
       reject(error);
-    }, timeoutMs);
+      controller.abort(error);
+    }, delayMs);
   });
 
   try {
-    const result = await Promise.race([fn(), timeoutPromise]);
-    if (timeoutHandle) {
-      clearTimeout(timeoutHandle);
-    }
-    return result;
-  } catch (error) {
-    if (timeoutHandle) {
-      clearTimeout(timeoutHandle);
-    }
-    throw error;
+    return await Promise.race([run(controller.signal), timeoutPromise]);
+  } finally {
+    clearTimeout(timeoutHandle);
   }
 }
 
@@ -350,6 +426,39 @@ export async function executeModelGroups(
   systemPrompt?: string,
   workflowDefaultSystemPrompt?: string,
 ): Promise<EnsembleExecutionResult> {
+  return withSpan(
+    {
+      name: "neurolink.workflow.layers.execute",
+      tracer: tracers.workflow,
+      observationType: "span",
+      attributes: {
+        "workflow.group_count": groups.length,
+        "workflow.total_models": groups.reduce(
+          (n, g) => n + g.models.length,
+          0,
+        ),
+      },
+    },
+    async (otelSpan) =>
+      executeModelGroupsInner(
+        groups,
+        prompt,
+        _executionConfig,
+        systemPrompt,
+        workflowDefaultSystemPrompt,
+        otelSpan,
+      ),
+  );
+}
+
+async function executeModelGroupsInner(
+  groups: ModelGroup[],
+  prompt: string,
+  _executionConfig: ExecutionConfig | undefined,
+  systemPrompt: string | undefined,
+  workflowDefaultSystemPrompt: string | undefined,
+  otelSpan: import("@opentelemetry/api").Span,
+): Promise<EnsembleExecutionResult> {
   const startTime = Date.now();
   const allResponses: EnsembleResponse[] = [];
   const allErrors: WorkflowError[] = [];
@@ -419,6 +528,10 @@ export async function executeModelGroups(
     successCount: totalSuccessCount,
     failureCount: totalFailureCount,
   });
+
+  otelSpan.setAttribute("workflow.success_count", totalSuccessCount);
+  otelSpan.setAttribute("workflow.failure_count", totalFailureCount);
+  otelSpan.setAttribute("workflow.total_time_ms", totalTime);
 
   return {
     responses: allResponses,

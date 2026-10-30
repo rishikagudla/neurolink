@@ -1,0 +1,33 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / computeToolSignature
+
+# Function: computeToolSignature()
+
+> **computeToolSignature**(`name`, `tool`): `string`
+
+Build a canonical, order-insensitive signature string for a named tool.
+
+The signature is composed of:
+
+- the tool's name
+- a normalised description (lowercased, whitespace-collapsed)
+- sorted parameter property names (with types when available)
+
+Stable regardless of property declaration order in the schema.
+
+## Parameters
+
+### name
+
+`string`
+
+### tool
+
+[`Tool`](../type-aliases/Tool.md)
+
+## Returns
+
+`string`

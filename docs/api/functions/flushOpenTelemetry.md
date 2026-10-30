@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v8.32.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,10 +8,16 @@
 
 > **flushOpenTelemetry**(): `Promise`\<`void`\>
 
-Defined in: [services/server/ai/observability/instrumentation.ts:137](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/services/server/ai/observability/instrumentation.ts#L137)
-
-Flush all pending spans to Langfuse
-
 ## Returns
 
 `Promise`\<`void`\>
+
+Resolves when every owned provider has flushed.
+
+## Description
+
+Exports pending spans and metrics from the providers NeuroLink owns and flushes its Langfuse exporter. A host provider is never flushed. The OTLP span and metric exports are waited for at most the flush budget (`observability.langfuse.flushBudgetMs`, default 3000 ms) and the Langfuse exporter within its own budget. A provider that fails to flush, or does not finish within the budget (a collector that cannot be reached, for one), is logged as a warning and makes the call reject once every provider has settled.
+
+## Throws
+
+When any provider fails to flush or does not finish within the flush budget.

@@ -1,0 +1,6244 @@
+#!/usr/bin/env tsx
+import "dotenv/config";
+
+/**
+ * Continuous Test Suite — the `decide` inference type (TypeSafe / Jev)
+ *
+ * `decide` is the third inference type, alongside `generate` and `stream`. A
+ * decision model takes one `state` plus typed questions and returns typed,
+ * calibrated answers — no text. NeuroLink uses it for model routing the moment
+ * a decision provider's key is set, and must behave exactly as it did before
+ * when that key is absent, wrong, or the service is unreachable.
+ *
+ * Strategy: drive the PUBLIC surface only — `neurolink.decide()`,
+ * `tryDecide()`, the reader helpers, the descriptor discriminator and
+ * `ClassifierRouter` — all imported from `../dist/index.js`, never from
+ * `src/lib/`, so this exercises the copy callers actually load (CLAUDE.md
+ * rule 15, "one module graph per suite").
+ *
+ * This file holds the cases that need no key and make no network call: the
+ * degradation and discriminator tests ("behaves correctly with no key" and "a
+ * text-less provider is unreachable from generation" are the contracts that
+ * matter most), the descriptor and limit checks, and every CLI and SDK case
+ * that runs against a server this file starts on 127.0.0.1. It is declared
+ * `offline`: a thrown error whose message merely looks like a provider error
+ * (a status code, "API key") is a failure, and only an explicit `SKIP:` skips.
+ * The cases that call a real vendor endpoint, and skip without the key of the
+ * provider they exercise, are in continuous-test-suite-decide-live.ts. Test
+ * numbers are shared between the two files, so this one has gaps (sections 3,
+ * 4 and 14 are live only). The setup both files read is in
+ * helpers/decideSuiteShared.ts.
+ *
+ * ⚠️ Assertion messages here never interpolate a response payload. In the live
+ * file `test()` downgrades a throw to SKIP when the message looks like a
+ * provider error, so quoting a body containing e.g. "502" turns a real failure
+ * green; keep the habit here too.
+ *
+ * Run: pnpm run build && npx tsx test/continuous-test-suite-decide.ts
+ *      pnpm run test:decide-offline
+ *      pnpm run test:decide        (this file, then the live one)
+ */
+
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { readFile } from "node:fs/promises";
+import { createServer, type IncomingHttpHeaders } from "node:http";
+import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  AIProviderName,
+  buildModelCatalog,
+  buildRegistryIndex,
+  CLASSIFIER_CONTEXT_SCOPES,
+  ClassifierRouter,
+  contextScopeToThreshold,
+  DECISION_PROVIDERS,
+  decideSearchPlan,
+  DEFAULT_COMPACTION_THRESHOLD,
+  decisionBooleanConfidence,
+  decisionKey,
+  enrichCandidate,
+  estimateDecisionStateTokens,
+  gateDecisionBoolean,
+  NeuroLink,
+  PROVIDER_DESCRIPTORS_BY_NAME,
+  rankCatalogue,
+  readDecisionBoolean,
+  readDecisionChoice,
+  renderCandidate,
+  resolveDefaultDecisionProvider,
+  resolveHistoryBudget,
+  selectIrrelevantMessages,
+  selectServersByDecision,
+  servesInferenceKind,
+  summaryPreservesContext,
+  TYPESAFE_MAX_STATE_TOKENS,
+} from "../dist/index.js";
+import type {
+  DecisionAfterEvent,
+  DecisionBeforeEvent,
+  DecisionHookAnswersContext,
+  DecisionHookContext,
+  DecisionQuestionMap,
+} from "../dist/index.js";
+import {
+  defineSuite,
+  delay,
+  logSection,
+  runCLI,
+  runCommand,
+  tempDir,
+} from "./helpers/harness.js";
+import type { ProcessResult } from "./helpers/harness.js";
+import { flatPng } from "./helpers/flatPng.js";
+import { assertDistFresh } from "./helpers/distFreshness.js";
+import {
+  ALL_THREE,
+  CATALOG,
+  HARD_PROMPT,
+  PERPLEXITY_DEAD_BASE_URL,
+  PERPLEXITY_FIXTURE_DIR,
+  PERPLEXITY_ONE_QUESTION,
+  POOL,
+  SUPPORT_TICKET,
+  TRANSCRIPT,
+  XOR_COLOR_QUESTION,
+  XOR_FIXTURE_DIR,
+  XOR_MEDIA_MODEL,
+  assert,
+  clearDecisionKeys,
+  deadPerplexity,
+  escapedRequests,
+  expectReachesTransport,
+  failureOf,
+  fetchCapture,
+  isRecordLike,
+  looksLikeStackTrace,
+  restoreEnv,
+} from "./helpers/decideSuiteShared.js";
+import type {
+  DecideOptions,
+  DecisionFailure,
+  RefusalOptions,
+} from "./helpers/decideSuiteShared.js";
+
+assertDistFresh();
+
+const { test, runSuite } = defineSuite("decide inference type (TypeSafe/Jev)", {
+  offline: true,
+  perTestTimeoutMs: 90_000,
+});
+
+// The model the registry recorded for laya: LAYA_MODEL as it read at
+// registration, else the default. The registry reads it once, so a test
+// that merely deletes LAYA_MODEL mid-run does not change what was already
+// registered — asserting against this instead of a hardcoded literal keeps
+// these tests correct on a machine or CI job that sets LAYA_MODEL.
+const EXPECTED_LAYA_MODEL = process.env.LAYA_MODEL?.trim() || "typed-decisions";
+// The model the registry recorded for xor: XOR_MODEL as it read at
+// registration, else the default. Never deleted, so this stays the truth.
+const EXPECTED_XOR_MODEL = process.env.XOR_MODEL || "xor-latest";
+
+// ───────────────────────────────────────────────────────────────────────────
+logSection("1. The inference-kind discriminator");
+// ───────────────────────────────────────────────────────────────────────────
+await test("1.1 — typesafe declares decide and only decide", async () => {
+  const descriptor = PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.TYPESAFE);
+  assert(descriptor !== undefined, "typesafe has no registered descriptor");
+  assert(
+    servesInferenceKind(descriptor!, "decide"),
+    "typesafe must declare the decide inference kind",
+  );
+  assert(
+    !servesInferenceKind(descriptor!, "generate"),
+    "a model that emits no text must not declare generate",
+  );
+  assert(
+    !servesInferenceKind(descriptor!, "stream"),
+    "a model that emits no text must not declare stream",
+  );
+});
+
+await test("1.2 — text providers keep their meaning without declaring anything", async () => {
+  const openai = PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.OPENAI);
+  assert(openai !== undefined, "openai has no registered descriptor");
+  assert(
+    servesInferenceKind(openai!, "generate") &&
+      servesInferenceKind(openai!, "stream"),
+    "an undeclared descriptor must still default to generate + stream",
+  );
+  assert(
+    !servesInferenceKind(openai!, "decide"),
+    "a text provider must not be treated as a decision provider",
+  );
+});
+
+await test("1.3 — a decision provider is excluded from generation fallback chains", async () => {
+  const descriptor = PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.TYPESAFE);
+  // These three ranks are what put a provider into auto-select and the health
+  // sweep. A provider that cannot generate text must carry none of them.
+  assert(
+    descriptor?.autoSelectPriority === undefined,
+    "a decision provider must not join the auto-select fallback chain",
+  );
+  assert(
+    descriptor?.autoSelectPreference === undefined,
+    "a decision provider must not be auto-selectable",
+  );
+  assert(
+    descriptor?.defaultHealthSweepPriority === undefined,
+    "a decision provider must not join the generation health sweep",
+  );
+  assert(
+    descriptor?.healthCheck !== "live-generate",
+    "a decision provider cannot answer a live-generate health probe",
+  );
+});
+
+await test("1.4 — DECISION_PROVIDERS is derived, not hand-maintained", async () => {
+  assert(
+    DECISION_PROVIDERS.some((d) => d.name === AIProviderName.TYPESAFE),
+    "typesafe must appear in the derived decision-provider list",
+  );
+  assert(
+    DECISION_PROVIDERS.every((d) => servesInferenceKind(d, "decide")),
+    "every entry must actually declare the decide kind",
+  );
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+logSection("2. Activation — a key is the only switch");
+// ───────────────────────────────────────────────────────────────────────────
+await test("2.1 — no key ⇒ no default decision provider", async () => {
+  clearDecisionKeys();
+  assert(
+    resolveDefaultDecisionProvider() === undefined,
+    "no decision provider may resolve when no key is set",
+  );
+  restoreEnv();
+});
+
+await test("2.2 — key present ⇒ typesafe resolves as the default", async () => {
+  process.env.TYPESAFE_API_KEY = "apikey_placeholder_for_resolution";
+  assert(
+    resolveDefaultDecisionProvider() === "typesafe",
+    "a configured key must make typesafe the default decision provider",
+  );
+  restoreEnv();
+});
+
+await test("2.3 — blank key is treated as absent", async () => {
+  // Both credentials have to be blanked: either one alone configures a
+  // provider, so leaving the gateway key set would make this pass or fail on
+  // the ambient environment rather than on the thing being asserted.
+  clearDecisionKeys();
+  process.env.TYPESAFE_API_KEY = "   ";
+  assert(
+    resolveDefaultDecisionProvider() === undefined,
+    "a whitespace-only key must not count as configured",
+  );
+  clearDecisionKeys();
+  process.env.AI_GATEWAY_API_KEY = "   ";
+  assert(
+    resolveDefaultDecisionProvider() === undefined,
+    "a whitespace-only gateway key must not count as configured either",
+  );
+  restoreEnv();
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+logSection("5. Graceful degradation — the contract that matters most");
+// ───────────────────────────────────────────────────────────────────────────
+await test("5.1 — tryDecide() returns null with no provider configured", async () => {
+  clearDecisionKeys();
+  const result = await new NeuroLink().tryDecide({
+    state: "anything",
+    questions: { q: { type: "boolean", instructions: "Is this true?" } },
+  });
+  assert(result === null, "tryDecide() must return null rather than throw");
+  restoreEnv();
+});
+
+await test("5.2 — decide() throws a clear error with no provider configured", async () => {
+  clearDecisionKeys();
+  let message = "";
+  try {
+    await new NeuroLink().decide({
+      state: "anything",
+      questions: { q: { type: "boolean", instructions: "Is this true?" } },
+    });
+  } catch (error) {
+    message = error instanceof Error ? error.message : "";
+  }
+  assert(
+    message.toLowerCase().includes("no decision provider"),
+    "the unconfigured error must say no decision provider is available",
+  );
+  restoreEnv();
+});
+
+await test("5.3 — a rejected key classifies as authentication", async () => {
+  await withRejectedDecisionKey(async (baseURL, bearers) => {
+    let kind: string | undefined;
+    try {
+      await new NeuroLink().decide({
+        state: "anything",
+        questions: { q: { type: "boolean", instructions: "Is this true?" } },
+        provider: "typesafe",
+        credentials: {
+          typesafe: {
+            apiKey: "apikey_definitely_not_valid",
+            baseURL,
+            transport: "direct",
+          },
+        },
+      });
+    } catch (error) {
+      kind = (error as { cause?: { kind?: string } }).cause?.kind;
+    }
+    assert(bearers.length === 1, "the owned rejection must be requested once");
+    assert(
+      kind === "authentication",
+      "a bad key must classify as authentication",
+    );
+  });
+});
+
+/** Mandatory auth controls use an owned response; vendor acceptance is separate. */
+function withRejectedDecisionKey<T>(
+  run: (baseURL: string, bearers: readonly string[]) => Promise<T>,
+): Promise<T> {
+  return withGateway(
+    () => ({ status: 401, body: { error: { message: "Invalid API key" } } }),
+    run,
+  );
+}
+
+await test("5.4 — tryDecide() swallows a rejected key", async () => {
+  await withRejectedDecisionKey(async (baseURL, bearers) => {
+    const result = await new NeuroLink().tryDecide({
+      state: "anything",
+      questions: { q: { type: "boolean", instructions: "Is this true?" } },
+      provider: "typesafe",
+      credentials: {
+        typesafe: {
+          apiKey: "apikey_definitely_not_valid",
+          baseURL,
+          transport: "direct",
+        },
+      },
+    });
+    assert(bearers.length === 1, "the owned rejection must be requested once");
+    assert(result === null, "a rejected key must degrade to null, not throw");
+  });
+});
+
+await test("5.6 — generating text on a decision provider fails clearly", async () => {
+  restoreEnv();
+  let message = "";
+  try {
+    await new NeuroLink().generate({
+      input: { text: "hello" },
+      provider: "typesafe",
+    });
+  } catch (error) {
+    message = error instanceof Error ? error.message : "";
+  }
+  assert(message.length > 0, "generate() on a decision provider must fail");
+  assert(
+    /decision-only|does not override generate|cannot generate text/i.test(
+      message,
+    ),
+    "the failure must explain that this provider generates no text",
+  );
+});
+
+await test("5.7 — booleanConfidence maps distance from a coin flip", async () => {
+  assert(
+    decisionBooleanConfidence(0.5) === 0,
+    "an even split must carry zero confidence",
+  );
+  assert(
+    decisionBooleanConfidence(1) === 1,
+    "certainty of yes must be full confidence",
+  );
+  assert(
+    decisionBooleanConfidence(0) === 1,
+    "certainty of no must be full confidence",
+  );
+  assert(
+    Math.abs(decisionBooleanConfidence(0.75) - 0.5) < 1e-9,
+    "0.75 must map to half confidence",
+  );
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+logSection("6. Classifier routing — auto-upgrade and silent fallback");
+// ───────────────────────────────────────────────────────────────────────────
+
+await test("6.1 — without a key the router uses the heuristic", async () => {
+  clearDecisionKeys();
+  const nl = new NeuroLink();
+  const router = new ClassifierRouter(
+    { enabled: true, pool: POOL },
+    { decide: (o) => nl.tryDecide(o) },
+  );
+  const decision = await router.route({ prompt: HARD_PROMPT });
+  assert(decision !== null, "the router must still produce a decision");
+  assert(
+    decision!.reason?.startsWith("heuristic") === true,
+    "with no key the router must fall back to the heuristic strategy",
+  );
+  restoreEnv();
+});
+
+await test("6.3 — an invalid key degrades silently to the heuristic", async () => {
+  await withRejectedDecisionKey(async (baseURL, bearers) => {
+    // ClassifierRouter's standalone default-provider detection reads env,
+    // while the injected caller uses NeuroLink's explicit local credentials.
+    const savedKey = process.env.TYPESAFE_API_KEY;
+    process.env.TYPESAFE_API_KEY = "apikey_definitely_not_valid";
+    try {
+      const nl = new NeuroLink({
+        credentials: {
+          typesafe: {
+            apiKey: "apikey_definitely_not_valid",
+            baseURL,
+            transport: "direct",
+          },
+        },
+      });
+      const router = new ClassifierRouter(
+        { enabled: true, pool: POOL },
+        { decide: (o) => nl.tryDecide(o) },
+      );
+      const decision = await router.route({ prompt: HARD_PROMPT });
+      assert(decision !== null, "a broken key must never block routing");
+      assert(
+        decision!.reason?.startsWith("heuristic") === true,
+        "a rejected key must fall through to the heuristic, not surface an error",
+      );
+      assert(
+        bearers.length === 1,
+        "the router never received its owned rejection",
+      );
+    } finally {
+      if (savedKey === undefined) {
+        delete process.env.TYPESAFE_API_KEY;
+      } else {
+        process.env.TYPESAFE_API_KEY = savedKey;
+      }
+    }
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+logSection("7. Context budget — the threshold may only ever shrink");
+// ───────────────────────────────────────────────────────────────────────────
+await test("7.1 — the scope rubric never maps above the default", async () => {
+  // The invariant the whole feature rests on. Growing a budget is not a
+  // degraded outcome but an unrecoverable one: an oversized request throws a
+  // context_window error, which ModelPool records as a PERMANENT cooldown.
+  for (let index = 0; index < CLASSIFIER_CONTEXT_SCOPES.length; index++) {
+    const threshold = contextScopeToThreshold(index);
+    assert(
+      threshold <= DEFAULT_COMPACTION_THRESHOLD,
+      `scope index ${index} maps above the default compaction threshold`,
+    );
+    assert(threshold > 0, `scope index ${index} maps to a non-positive budget`);
+  }
+});
+
+await test("7.2 — out-of-range and fractional scores clamp, never throw", async () => {
+  // A score answer is probability-weighted and lands BETWEEN levels, so the
+  // mapping is fed non-integers by construction.
+  for (const score of [-5, -0.4, 0.5, 1.5, 2.49, 99, Number.NaN]) {
+    const threshold = contextScopeToThreshold(score);
+    assert(
+      threshold > 0 && threshold <= DEFAULT_COMPACTION_THRESHOLD,
+      `score ${score} produced a threshold outside the permitted band`,
+    );
+  }
+});
+
+await test("7.3 — the rubric is ordered: narrower scope, smaller budget", async () => {
+  let previous = 0;
+  for (let index = 0; index < CLASSIFIER_CONTEXT_SCOPES.length; index++) {
+    const threshold = contextScopeToThreshold(index);
+    assert(
+      threshold >= previous,
+      `scope index ${index} is not monotonically wider than its predecessor`,
+    );
+    previous = threshold;
+  }
+});
+
+await test("7.4 — the default threshold reproduces the previous history budget exactly", async () => {
+  // Regression guard on the scale factor. Anything that changes the number a
+  // default-configured caller gets is a silent behaviour change to every
+  // existing deployment, not a new feature.
+  const budget = {
+    withinBudget: false,
+    estimatedInputTokens: 150_000,
+    availableInputTokens: 180_000,
+    usageRatio: 0.83,
+    shouldCompact: true,
+    breakdown: {
+      systemPrompt: 2_000,
+      conversationHistory: 140_000,
+      currentPrompt: 500,
+      toolDefinitions: 7_000,
+      fileAttachments: 500,
+    },
+  };
+  const unscaled = resolveHistoryBudget(budget);
+  assert(
+    resolveHistoryBudget(budget, DEFAULT_COMPACTION_THRESHOLD) === unscaled,
+    "passing the default threshold changed the history budget",
+  );
+  assert(
+    resolveHistoryBudget(budget, undefined) === unscaled,
+    "omitting the threshold changed the history budget",
+  );
+});
+
+await test("7.5 — a narrower threshold shrinks the budget and a wider one cannot grow it", async () => {
+  const budget = {
+    withinBudget: false,
+    estimatedInputTokens: 150_000,
+    availableInputTokens: 180_000,
+    usageRatio: 0.83,
+    shouldCompact: true,
+    breakdown: {
+      systemPrompt: 2_000,
+      conversationHistory: 140_000,
+      currentPrompt: 500,
+      toolDefinitions: 7_000,
+      fileAttachments: 500,
+    },
+  };
+  const base = resolveHistoryBudget(budget);
+  assert(
+    resolveHistoryBudget(budget, 0.45) < base,
+    "a narrow scope did not shrink the compaction target",
+  );
+  // The clamp is the safety property: even a caller that passes a threshold
+  // above the default gets the default's budget, never a larger one.
+  assert(
+    resolveHistoryBudget(budget, 0.99) === base,
+    "a threshold above the default grew the compaction target",
+  );
+  assert(
+    resolveHistoryBudget(budget, 5) === base,
+    "an out-of-range threshold grew the compaction target",
+  );
+});
+
+await test("7.6 — compactionThreshold is accepted on the public generate surface", async () => {
+  // It is a caller-settable knob in its own right, not only something the
+  // router fills in. Reaching it must not require widening the type.
+  const nl = new NeuroLink();
+  const rejected = await nl
+    .generate({
+      input: { text: "hi" },
+      provider: "typesafe",
+      compactionThreshold: 0.4,
+      maxTokens: 8,
+    })
+    .then(
+      () => null,
+      (error: unknown) => error,
+    );
+  assert(rejected !== null, "a decision-only provider must reject generate()");
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+logSection("8. The model catalogue");
+// ───────────────────────────────────────────────────────────────────────────
+await test("8.1 — the catalogue is off unless asked for", async () => {
+  assert(
+    buildModelCatalog(undefined).length === 0,
+    "an absent catalogue config produced members",
+  );
+  assert(
+    buildModelCatalog({ enabled: false }).length === 0,
+    "a disabled catalogue produced members",
+  );
+});
+
+await test("8.2 — catalogue members are capped and carry routing metadata", async () => {
+  const members = buildModelCatalog({ enabled: true, maxModels: 5 });
+  assert(members.length <= 5, "the catalogue exceeded its own cap");
+  for (const member of members) {
+    assert(
+      typeof member.provider === "string" && member.provider.length > 0,
+      "a catalogue member has no provider",
+    );
+    assert(
+      typeof member.model === "string" && member.model.length > 0,
+      "a catalogue member has no model",
+    );
+    // Catalogue members deliberately carry NO cost/quality. Those two fields
+    // are how a HOST states its own opinion, and renderCandidate gives a
+    // host's opinion precedence over the registry's — so setting them here
+    // would make every catalogue member look hand-declared and suppress the
+    // very registry data the catalogue exists to surface.
+    assert(
+      member.cost === undefined && member.quality === undefined,
+      "a catalogue member declared cost/quality, which would masquerade as a host statement",
+    );
+  }
+});
+
+await test("8.2b — a catalogue member renders with the registry's own data", async () => {
+  const members = buildModelCatalog({ enabled: true, maxModels: 3 });
+  if (members.length === 0) {
+    throw new Error("SKIP: no reachable providers for a catalogue here");
+  }
+  const index = buildRegistryIndex();
+  const rendered = renderCandidate(
+    enrichCandidate("probe", members[0]!, "moderate", index),
+  );
+  // The regression this pins: catalogue members once carried registry-derived
+  // cost/quality, which the declared-wins rule then mistook for a host
+  // statement — rendering "relative cost 0.002" (raw per-1K pricing wearing a
+  // relative label) and suppressing price, speed, quality and use-case scores.
+  assert(
+    !rendered.includes("relative cost"),
+    "a catalogue member rendered as if the host had declared its cost",
+  );
+  assert(
+    rendered.includes("per 1K in"),
+    "a catalogue member lost the registry's real price",
+  );
+  assert(
+    rendered.includes("quality"),
+    "a catalogue member lost the registry's quality bucket",
+  );
+});
+
+await test("8.3 — the catalogue only lists providers this host can reach", async () => {
+  const members = buildModelCatalog({ enabled: true, maxModels: 400 });
+  // Openai is the clearest case: a key the host does not hold must not put
+  // its models into a routable pool, because routing to them fails the turn.
+  const hadOpenAIKey =
+    typeof process.env.OPENAI_API_KEY === "string" &&
+    process.env.OPENAI_API_KEY.trim() !== "";
+  if (!hadOpenAIKey) {
+    assert(
+      members.every((m) => m.provider !== "openai"),
+      "an unconfigured provider appeared in the catalogue",
+    );
+  }
+});
+
+await test("8.4 — a provider filter is honoured", async () => {
+  const members = buildModelCatalog({
+    enabled: true,
+    providers: ["ollama"],
+    maxModels: 50,
+  });
+  assert(
+    members.every((m) => m.provider === "ollama"),
+    "the provider filter admitted an unrequested provider",
+  );
+});
+
+await test("8.5 — enrichment pulls the context window the registry knows", async () => {
+  const index = buildRegistryIndex();
+  const candidate = enrichCandidate(
+    "probe",
+    { provider: "anthropic", model: "claude-sonnet-5" },
+    "hard",
+    index,
+  );
+  assert(
+    typeof candidate.score === "number",
+    "enrichment produced no deterministic score",
+  );
+  // maxContextTokens existed in the registry all along and routing never read
+  // it; this is the assertion that says it now does.
+  assert(
+    candidate.contextWindow === undefined || candidate.contextWindow > 0,
+    "a registry-backed candidate reported a non-positive context window",
+  );
+});
+
+await test("8.6 — an unknown model still ranks, on what the host declared", async () => {
+  const candidate = enrichCandidate(
+    "custom",
+    {
+      provider: "litellm",
+      model: "some-self-hosted-model-that-is-not-in-any-registry",
+      description: "in-house",
+      cost: 0.001,
+      quality: 2,
+    },
+    "moderate",
+    buildRegistryIndex(),
+  );
+  assert(
+    typeof candidate.score === "number" && Number.isFinite(candidate.score),
+    "a registry-less candidate did not receive a finite score",
+  );
+  assert(
+    candidate.description === "in-house",
+    "a host-declared description was overwritten",
+  );
+});
+
+await test("8.7 — ranking drops models too small for the request", async () => {
+  const candidates = [
+    {
+      id: "tiny",
+      provider: "p",
+      model: "tiny",
+      contextWindow: 4_000,
+      score: 9,
+    },
+    {
+      id: "big",
+      provider: "p",
+      model: "big",
+      contextWindow: 200_000,
+      score: 1,
+    },
+  ];
+  const ranked = rankCatalogue(candidates, "moderate", {
+    estimatedInputTokens: 100_000,
+  });
+  assert(ranked.length === 1, "the window filter kept an unusable candidate");
+  assert(
+    ranked[0]!.id === "big",
+    "the window filter kept the wrong candidate — a higher score must not beat an unusable window",
+  );
+});
+
+await test("8.8 — the window filter never empties the pool", async () => {
+  const candidates = [
+    { id: "a", provider: "p", model: "a", contextWindow: 4_000, score: 2 },
+    { id: "b", provider: "p", model: "b", contextWindow: 8_000, score: 1 },
+  ];
+  const ranked = rankCatalogue(candidates, "moderate", {
+    estimatedInputTokens: 1_000_000,
+  });
+  assert(
+    ranked.length === 2,
+    "the window filter starved the pool instead of degrading",
+  );
+});
+
+await test("8.8b — a generous declared quality cannot outrank the registry", async () => {
+  const index = buildRegistryIndex();
+  // `quality` is an unbounded relative scale, so a host writing 10 to mean
+  // "the best in my pool" is legitimate. The registry-less branch divides by
+  // 3 to mirror the registry's own 1–3 quality rank, which turned 10 into
+  // 3.33 — above the 0–1 band every registry candidate is confined to. One
+  // such member then sorted first at EVERY difficulty, including tiers it was
+  // never meant for.
+  const registryBacked = enrichCandidate(
+    "known",
+    { provider: "openai", model: "gpt-4o-mini" },
+    "expert",
+    index,
+  );
+  const declared = enrichCandidate(
+    "unknown",
+    { provider: "self-hosted", model: "mystery", quality: 10 },
+    "expert",
+    index,
+  );
+  assert(
+    registryBacked.score !== undefined && declared.score !== undefined,
+    "enrichCandidate did not score both candidates",
+  );
+  assert(
+    declared.score! <= 1,
+    "a declared quality above the mirrored 1-3 band escaped the scale",
+  );
+  // Same clamp, so quality 10 and quality 3 must land on the same score
+  // rather than one beating the other on a scale neither shares.
+  const three = enrichCandidate(
+    "unknown",
+    { provider: "self-hosted", model: "mystery", quality: 3 },
+    "expert",
+    index,
+  );
+  assert(
+    declared.score === three.score,
+    "clamping is not saturating at the top of the band",
+  );
+  // And the ordering the bug inverted: with the cap in place a strong
+  // registry model is no longer automatically beaten by one declaration.
+  const ranked = rankCatalogue([declared, registryBacked], "expert", {});
+  assert(
+    ranked.length === 2,
+    "ranking dropped a candidate it should have kept",
+  );
+});
+
+await test("8.9 — host-declared ranking suppresses the registry's opinion", async () => {
+  const index = buildRegistryIndex();
+  // The pool member says "use this only for rote work" (quality 2 of 10).
+  // The registry rates the same model highly on general benchmarks. The
+  // host must win: rendering both put five registry clauses against one
+  // line of host prose and routed hard tasks to the cheap model.
+  const declared = renderCandidate(
+    enrichCandidate(
+      "fast",
+      {
+        provider: "google-ai",
+        model: "gemini-2.5-flash",
+        description: "Cheap and fast; rote edits and simple lookups",
+        tiers: ["trivial", "simple"],
+        cost: 1,
+        quality: 2,
+      },
+      "hard",
+      index,
+    ),
+  );
+  assert(
+    declared.includes("capability 2"),
+    "the host's declared capability never reached the model",
+  );
+  assert(
+    declared.includes("relative cost 1"),
+    "the host's declared cost never reached the model",
+  );
+  assert(
+    declared.includes("intended for trivial/simple tasks"),
+    "declared tier eligibility was dropped from the rendering",
+  );
+  assert(
+    !declared.includes("high quality"),
+    "the registry's quality bucket contradicted the host's own ranking",
+  );
+  assert(
+    !declared.includes("strong at"),
+    "the registry's use-case scores contradicted the host's own ranking",
+  );
+  // A capability FLAG is a fact about the model, not an opinion about its
+  // quality, so it must survive.
+  assert(
+    declared.includes("supports"),
+    "capability flags were suppressed along with the quality opinion",
+  );
+});
+
+await test("8.10 — with nothing declared, the registry fills in", async () => {
+  const rendered = renderCandidate(
+    enrichCandidate(
+      "bare",
+      { provider: "google-ai", model: "gemini-2.5-flash" },
+      "moderate",
+      buildRegistryIndex(),
+    ),
+  );
+  assert(
+    rendered.includes("per 1K in"),
+    "a member with no declared ranking got no price from the registry",
+  );
+  assert(
+    rendered.includes("quality"),
+    "a member with no declared ranking got no quality from the registry",
+  );
+});
+
+await test("8.11 — a relative cost is never rendered as a currency", async () => {
+  // `cost` is documented as a relative scale. Rendering `cost: 20` as
+  // "2000.00c per 1K in" would be three orders of magnitude off and would
+  // make the model refuse a model the host actually wanted used.
+  const rendered = renderCandidate(
+    enrichCandidate(
+      "custom",
+      {
+        provider: "litellm",
+        model: "not-in-any-registry-model",
+        description: "in-house",
+        cost: 20,
+        quality: 10,
+      },
+      "hard",
+      buildRegistryIndex(),
+    ),
+  );
+  assert(
+    !rendered.includes("per 1K in"),
+    "a relative cost was rendered as a per-1K-token price",
+  );
+  assert(
+    rendered.includes("relative cost 20"),
+    "the relative cost was not rendered at all",
+  );
+});
+
+await test("8.12 — a rendered candidate stays terse enough to batch", async () => {
+  const members = buildModelCatalog({ enabled: true, maxModels: 120 });
+  const index = buildRegistryIndex();
+  let total = 0;
+  for (const member of members) {
+    const line = renderCandidate(
+      enrichCandidate(
+        `${member.provider}/${member.model}`,
+        member,
+        "moderate",
+        index,
+      ),
+    );
+    total += line.length;
+  }
+  // The rendered catalogue is a QUESTION, and the binding ceiling is state
+  // plus the single longest question at ~33K tokens. At ~4 chars per token a
+  // 120-model catalogue must stay far inside that, with room for a long
+  // request alongside it.
+  const approxTokens = total / 4;
+  assert(
+    approxTokens < TYPESAFE_MAX_STATE_TOKENS / 2,
+    "the rendered catalogue is too large to batch alongside a request",
+  );
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+logSection("9. Tool routing — a server is dropped only on a confident no");
+// ───────────────────────────────────────────────────────────────────────────
+
+await test("9.1 — no decision provider ⇒ null, so the LLM router still runs", async () => {
+  clearDecisionKeys();
+  const nl = new NeuroLink();
+  const outcome = await selectServersByDecision(
+    "open a pull request for the fix",
+    CATALOG,
+    (o) => nl.tryDecide(o),
+  );
+  assert(
+    outcome === null,
+    "an unconfigured decision provider must not produce a routing outcome",
+  );
+  restoreEnv();
+});
+
+await test("9.2 — a single routable server is never routed", async () => {
+  restoreEnv();
+  const nl = new NeuroLink();
+  const outcome = await selectServersByDecision(
+    "open a pull request",
+    CATALOG.slice(0, 1),
+    (o) => nl.tryDecide(o),
+  );
+  assert(
+    outcome === null,
+    "routing ran over a catalog with nothing to choose between",
+  );
+});
+
+await test("9.5 — question keys round-trip distinctly", async () => {
+  const keys = new Set(CATALOG.map((_, i) => decisionKey("server", i)));
+  assert(
+    keys.size === CATALOG.length,
+    "two servers collided on one question key",
+  );
+});
+
+await test("9.6 — tool routing serializes each server capability once", async () => {
+  let requestJson = "";
+  let questionsJson = "";
+
+  const outcome = await selectServersByDecision(
+    "open a pull request",
+    CATALOG,
+    async (options) => {
+      requestJson = JSON.stringify({
+        state: options.state,
+        questions: options.questions,
+      });
+      questionsJson = JSON.stringify(options.questions);
+      return {
+        model: "test-decider",
+        provider: "test",
+        answers: Object.fromEntries(
+          Object.keys(options.questions).map((id) => [
+            id,
+            { type: "boolean" as const, probability: 0 },
+          ]),
+        ),
+        usage: { inputTokens: 0, outputTokens: 0 },
+        latencyMs: 0,
+      };
+    },
+  );
+
+  assert(outcome !== null, "the captured routing decision produced no outcome");
+  assert(
+    questionsJson.includes('"true":"Needed."') &&
+      questionsJson.includes('"false":"Not needed."'),
+    "routing questions did not use compact decision criteria",
+  );
+  CATALOG.forEach((server, index) => {
+    const capabilityOccurrences =
+      requestJson.split(server.description).length - 1;
+    assert(
+      capabilityOccurrences === 1,
+      "a server capability was duplicated in the routing request",
+    );
+    assert(
+      !questionsJson.includes(server.description),
+      "a server capability was copied into its question",
+    );
+    assert(
+      questionsJson.includes(`available_servers[${index}].does`),
+      "a routing question did not reference its indexed capability",
+    );
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+logSection("10. Context relevance — Stage 0 of compaction");
+// ───────────────────────────────────────────────────────────────────────────
+
+await test("10.1 — no decision provider ⇒ null, positional stages unaffected", async () => {
+  clearDecisionKeys();
+  const nl = new NeuroLink();
+  const result = await selectIrrelevantMessages(
+    TRANSCRIPT,
+    "What retry budget did we settle on for the payments worker?",
+    (o) => nl.tryDecide(o),
+  );
+  assert(result === null, "relevance ran without a decision provider");
+  restoreEnv();
+});
+
+await test("10.2 — an empty request is never acted on", async () => {
+  restoreEnv();
+  const nl = new NeuroLink();
+  const result = await selectIrrelevantMessages(TRANSCRIPT, "   ", (o) =>
+    nl.tryDecide(o),
+  );
+  assert(
+    result === null,
+    "relevance ran with no request to judge relevance against",
+  );
+});
+
+await test("10.2b — context relevance serializes each message once", async () => {
+  let requestJson = "";
+  let questionsJson = "";
+
+  const result = await selectIrrelevantMessages(
+    TRANSCRIPT,
+    "What retry budget did we settle on for the payments worker?",
+    async (options) => {
+      requestJson = JSON.stringify({
+        state: options.state,
+        questions: options.questions,
+      });
+      questionsJson = JSON.stringify(options.questions);
+      return {
+        model: "test-decider",
+        provider: "test",
+        answers: Object.fromEntries(
+          Object.keys(options.questions).map((id) => [
+            id,
+            { type: "boolean" as const, probability: 0 },
+          ]),
+        ),
+        usage: { inputTokens: 0, outputTokens: 0 },
+        latencyMs: 0,
+      };
+    },
+    { protectRecent: 0 },
+  );
+
+  assert(result !== null, "the captured relevance decision produced no result");
+  new Set(TRANSCRIPT.map((message) => message.content)).forEach((content) => {
+    const expectedOccurrences = TRANSCRIPT.filter(
+      (message) => message.content === content,
+    ).length;
+    const messageOccurrences = requestJson.split(content).length - 1;
+    assert(
+      messageOccurrences === expectedOccurrences,
+      "a conversation message was duplicated in the relevance request",
+    );
+    assert(
+      !questionsJson.includes(content),
+      "a conversation message was copied into its question",
+    );
+  });
+  TRANSCRIPT.forEach((_, index) => {
+    assert(
+      questionsJson.includes(`conversation[${index}]`),
+      "a relevance question did not reference its indexed message",
+    );
+  });
+});
+
+await test("10.6 — a summary gate fails OPEN when unconfigured", async () => {
+  clearDecisionKeys();
+  const nl = new NeuroLink();
+  const accepted = await summaryPreservesContext(
+    "A summary.",
+    TRANSCRIPT,
+    (o) => nl.tryDecide(o),
+  );
+  assert(
+    accepted === true,
+    "an unconfigured summary gate rejected a summary — rejecting falls through to truncation, which loses more",
+  );
+  restoreEnv();
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+logSection("11. Per-search retrieval planning");
+// ───────────────────────────────────────────────────────────────────────────
+await test("11.1 — no decision provider ⇒ null, config stands", async () => {
+  clearDecisionKeys();
+  const nl = new NeuroLink();
+  const plan = await decideSearchPlan(
+    "what is the refund window?",
+    (o) => nl.tryDecide(o),
+    { defaultTopK: 5, canHybrid: true, canGraph: true, canRerank: true },
+  );
+  assert(plan === null, "a plan was produced with no decision provider");
+  restoreEnv();
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+logSection("12. The shared boolean gate");
+// ───────────────────────────────────────────────────────────────────────────
+await test("12.1 — three outcomes stay distinguishable", async () => {
+  const answers = {
+    yes: { type: "boolean" as const, probability: 0.95 },
+    no: { type: "boolean" as const, probability: 0.03 },
+    unsure: { type: "boolean" as const, probability: 0.52 },
+    wrongType: {
+      type: "choice" as const,
+      choice: "a",
+      probabilities: { a: 1 },
+      confidence: 1,
+    },
+  };
+  assert(
+    gateDecisionBoolean(answers, "yes") === true,
+    "a confident yes did not read as true",
+  );
+  assert(
+    gateDecisionBoolean(answers, "no") === false,
+    "a confident no did not read as false",
+  );
+  assert(
+    gateDecisionBoolean(answers, "unsure") === undefined,
+    "a near-coin-flip was treated as an answer",
+  );
+  assert(
+    gateDecisionBoolean(answers, "missing") === undefined,
+    "an absent id produced an answer",
+  );
+  assert(
+    gateDecisionBoolean(answers, "wrongType") === undefined,
+    "a mismatched answer type produced a boolean",
+  );
+});
+
+await test("12.2 — raising the bar turns an answer into an abstention", async () => {
+  const answers = { q: { type: "boolean" as const, probability: 0.8 } };
+  assert(
+    gateDecisionBoolean(answers, "q") === true,
+    "0.8 did not clear the default bar",
+  );
+  assert(
+    gateDecisionBoolean(answers, "q", { minConfidence: 0.9 }) === undefined,
+    "a raised confidence bar did not force an abstention",
+  );
+  assert(
+    decisionBooleanConfidence(0.5) === 0,
+    "a coin flip reported non-zero confidence",
+  );
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+logSection("13. Telemetry — a fail-open path has to be observable");
+// ───────────────────────────────────────────────────────────────────────────
+
+await test("13.5 — a failed decision records an ERROR span, not silence", async () => {
+  await withRejectedDecisionKey(async (baseURL, bearers) => {
+    const nl = new NeuroLink({
+      credentials: {
+        typesafe: {
+          apiKey: "apikey_definitely-not-a-valid-key",
+          baseURL,
+          transport: "direct",
+        },
+      },
+    });
+    nl.resetMetrics();
+    let threw = false;
+    try {
+      await nl.decide({
+        state: "x",
+        questions: { q: { type: "boolean", instructions: "?" } },
+      });
+    } catch {
+      threw = true;
+    }
+    assert(
+      bearers.length === 1,
+      "the telemetry control never reached its owned rejection",
+    );
+    assert(threw, "an invalid key did not surface an error from decide()");
+    const spans = nl.getSpans().filter((s) => s.type === "model.decision");
+    assert(spans.length === 1, "a failed decision recorded no span");
+    assert(
+      spans[0]!.status === 2,
+      "a failed decision was not recorded with ERROR status",
+    );
+  });
+});
+
+await test("13.6 — tryDecide stays silent to callers but not to telemetry", async () => {
+  await withRejectedDecisionKey(async (baseURL, bearers) => {
+    const nl = new NeuroLink({
+      credentials: {
+        typesafe: {
+          apiKey: "apikey_definitely-not-a-valid-key",
+          baseURL,
+          transport: "direct",
+        },
+      },
+    });
+    nl.resetMetrics();
+    const result = await nl.tryDecide({
+      state: "x",
+      questions: { q: { type: "boolean", instructions: "?" } },
+    });
+    assert(
+      bearers.length === 1,
+      "the swallowed failure never reached its owned rejection",
+    );
+    // This is the pairing that makes a fail-open design operable: the caller
+    // sees null and carries on, while the failure is still recorded. Without
+    // the span, a decision path that quietly stopped working would be
+    // indistinguishable from one that was never configured.
+    assert(result === null, "tryDecide surfaced a failure to its caller");
+    const spans = nl.getSpans().filter((s) => s.type === "model.decision");
+    assert(
+      spans.length === 1 && spans[0]!.status === 2,
+      "a swallowed failure left no trace in telemetry",
+    );
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+logSection("15. The decide command (CLI)");
+// ───────────────────────────────────────────────────────────────────────────
+// Drives the BUILT CLI (`node dist/cli/index.js decide ...`) via `runCLI`,
+// never the source command module — the same "one module graph" discipline
+// as the SDK tests above, just for the CLI surface instead of `dist/index.js`.
+
+// Deterministic: every decision-provider env var is blanked for the child
+// regardless of what the parent process has ambient, so this behaves the
+// same in a shell with TYPESAFE_API_KEY exported and one without.
+const NO_PROVIDER_ENV = {
+  TYPESAFE_API_KEY: "",
+  AI_GATEWAY_API_KEY: "",
+  LAYA_API_KEY: "",
+  LAYA_BASE_URL: "",
+  XOR_API_KEY: "",
+  XOR_BASE_URL: "",
+  PERPLEXITY_API_KEY: "",
+  PERPLEXITY_DECIDER_BASE_URL: "",
+  PERPLEXITY_DECIDER_MODEL: "",
+  CLOUDFLARE_API_KEY: "",
+  CLOUDFLARE_ACCOUNT_ID: "",
+  CLOUDFLARE_CLEF_BASE_URL: "",
+  CLOUDFLARE_CLEF_MODEL: "",
+  SUBQ_API_KEY: "",
+  SUBQ_BASE_URL: "",
+  SUBQ_MODEL: "",
+  OPENAI_API_KEY: "",
+  OPENAI_BASE_URL: "",
+  OPENAI_API_BASE: "",
+  OPENAI_DECISIONS_BASE_URL: "",
+  OPENAI_DECISIONS_MODEL: "",
+  SCALEDOWN_API_KEY: "",
+  SCALEDOWN_BASE_URL: "",
+  SCALEDOWN_MODEL: "",
+};
+
+await test("15.1 — no decision provider configured ⇒ clean one-line error, no stack trace", async () => {
+  const result = await runCLI(
+    [
+      "decide",
+      "Refund request for a damaged item",
+      "--questions",
+      JSON.stringify({
+        urgent: { type: "boolean", instructions: "Is this urgent?" },
+      }),
+    ],
+    { env: NO_PROVIDER_ENV, timeoutMs: 30_000 },
+  );
+  assert(
+    result.exitCode !== 0,
+    "decide must fail when no decision provider is configured",
+  );
+  assert(
+    result.stderr.includes(
+      "Error: No decision provider is configured. Set TYPESAFE_API_KEY or AI_GATEWAY_API_KEY for typesafe, or LAYA_API_KEY and LAYA_BASE_URL for laya, or XOR_API_KEY and XOR_BASE_URL for xor, or SUBQ_API_KEY for subq, or PERPLEXITY_API_KEY for perplexity-decider, or CLOUDFLARE_API_KEY and CLOUDFLARE_ACCOUNT_ID for cloudflare-clef, or OPENAI_API_KEY for openai-decisions (ignored while OPENAI_BASE_URL, OPENAI_API_BASE or credentials.openai.baseURL names a host outside https://api.openai.com, unless OPENAI_DECISIONS_BASE_URL is set), or SCALEDOWN_API_KEY for scaledown.",
+    ),
+    "the no-provider case did not print the expected one-line error",
+  );
+  assert(
+    !looksLikeStackTrace(result.stdout + result.stderr),
+    "the no-provider error printed a stack trace instead of a clean message",
+  );
+});
+
+await test("15.2 — malformed --questions fails validation before any provider work", async () => {
+  const result = await runCLI(
+    ["decide", "some state", "--questions", "{not valid json"],
+    { env: NO_PROVIDER_ENV, timeoutMs: 30_000 },
+  );
+  assert(
+    result.exitCode !== 0,
+    "a malformed --questions payload must exit non-zero",
+  );
+  assert(
+    result.stderr.includes("Error: --questions is not valid JSON."),
+    "the malformed-JSON case did not print the expected validation message",
+  );
+  assert(
+    !looksLikeStackTrace(result.stdout + result.stderr),
+    "a validation failure printed a stack trace instead of a clean message",
+  );
+});
+
+// Debug logging at debug level is the noisiest the CLI gets, and most of it
+// is emitted while modules are still importing — before any CLI middleware
+// runs — so it is the case that would leak into a JSON payload first.
+const DEBUG_LOG_ENV = { ...NO_PROVIDER_ENV, NEUROLINK_LOG_LEVEL: "debug" };
+const ONE_QUESTION = JSON.stringify({
+  urgent: { type: "boolean", instructions: "Is this urgent?" },
+});
+
+await test("15.4 — --format json keeps diagnostics off stdout, even with --debug", async () => {
+  const json = await runCLI(
+    [
+      "decide",
+      "some state",
+      "--questions",
+      ONE_QUESTION,
+      "--format",
+      "json",
+      "--debug",
+    ],
+    { env: DEBUG_LOG_ENV, timeoutMs: 30_000 },
+  );
+  // Precondition: diagnostics were actually emitted. Without it, a clean
+  // stdout would prove nothing.
+  assert(
+    json.stderr.includes("[NEUROLINK:DEBUG]"),
+    "no debug output was produced, so the routing could not be observed",
+  );
+  assert(
+    !json.stdout.includes("[NEUROLINK:"),
+    "a diagnostic line reached stdout in JSON mode",
+  );
+
+  // Control: text mode keeps the existing behaviour, diagnostics on stdout.
+  const text = await runCLI(
+    ["decide", "some state", "--questions", ONE_QUESTION, "--debug"],
+    { env: DEBUG_LOG_ENV, timeoutMs: 30_000 },
+  );
+  assert(
+    text.stdout.includes("[NEUROLINK:DEBUG]"),
+    "text mode no longer writes debug output to stdout",
+  );
+});
+
+await test("15.5 — a provider error keeps the provider's own detail", async () => {
+  await withRejectedDecisionKey(async (baseURL, bearers) => {
+    const result = await runCLI(
+      ["decide", "some state", "--questions", ONE_QUESTION],
+      {
+        env: {
+          TYPESAFE_API_KEY: "apikey_definitely_not_valid",
+          TYPESAFE_BASE_URL: baseURL,
+          TYPESAFE_TRANSPORT: "direct",
+          AI_GATEWAY_API_KEY: "",
+        },
+        timeoutMs: 60_000,
+      },
+    );
+    assert(bearers.length === 1, "the CLI never reached its owned rejection");
+    assert(result.exitCode !== 0, "a rejected key must exit non-zero");
+    assert(
+      /Error: Authentication failed[^\n]*\(.+\)/.test(result.stderr),
+      "the rejected-credential message lost the provider's detail",
+    );
+    assert(
+      !looksLikeStackTrace(result.stdout + result.stderr),
+      "the rejected-credential message printed a stack trace",
+    );
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+logSection("16. Laya — a decision provider at a configured endpoint");
+// ───────────────────────────────────────────────────────────────────────────
+await test("16.1 — laya declares decide and only decide, and no generation rank", async () => {
+  const laya = PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.LAYA);
+  assert(laya !== undefined, "laya has no registered descriptor");
+  assert(servesInferenceKind(laya!, "decide"), "laya must declare decide");
+  assert(
+    !servesInferenceKind(laya!, "generate") &&
+      !servesInferenceKind(laya!, "stream"),
+    "a model that emits no text must not declare generate or stream",
+  );
+  assert(
+    laya!.autoSelectPriority === undefined &&
+      laya!.autoSelectPreference === undefined &&
+      laya!.defaultHealthSweepPriority === undefined,
+    "a decision provider must stay out of every generation fallback chain",
+  );
+});
+
+// Every section-16 test that swaps in placeholder credentials restores the real
+// ones in `finally`: the harness records a failed test and moves on, so an
+// early throw would otherwise run every later live test with a placeholder key.
+await test("16.2 — typesafe wins when both are configured; laya when alone", async () => {
+  try {
+    clearDecisionKeys();
+    process.env.TYPESAFE_API_KEY = "apikey_placeholder_for_resolution";
+    process.env.LAYA_API_KEY = "sk-placeholder-for-resolution";
+    process.env.LAYA_BASE_URL = "https://laya.placeholder.invalid";
+    const both = resolveDefaultDecisionProvider();
+    delete process.env.TYPESAFE_API_KEY;
+    const alone = resolveDefaultDecisionProvider();
+    delete process.env.LAYA_BASE_URL;
+    const keyOnly = resolveDefaultDecisionProvider();
+    process.env.LAYA_BASE_URL = "https://laya.placeholder.invalid";
+    process.env.LAYA_API_KEY = "   ";
+    const blank = resolveDefaultDecisionProvider();
+    assert(
+      both === "typesafe",
+      "with both configured, typesafe must stay the default",
+    );
+    assert(
+      alone === "laya",
+      "with only laya configured, laya must become the default",
+    );
+    assert(
+      keyOnly === undefined,
+      "a laya key without LAYA_BASE_URL must not count as configured",
+    );
+    assert(
+      blank === undefined,
+      "a whitespace-only laya credential must not count as configured",
+    );
+  } finally {
+    restoreEnv();
+  }
+});
+
+await test("16.3 — descriptor order is the precedence: typesafe before laya", async () => {
+  const names: string[] = DECISION_PROVIDERS.map((d) => d.name);
+  assert(
+    names.indexOf("typesafe") !== -1 &&
+      names.indexOf("laya") !== -1 &&
+      names.indexOf("typesafe") < names.indexOf("laya"),
+    "typesafe must precede laya in the derived decision-provider list",
+  );
+});
+
+await test("16.4 — an ambient laya credential cannot leak into a keyless test", async () => {
+  try {
+    process.env.LAYA_API_KEY = "sk-ambient-placeholder";
+    clearDecisionKeys();
+    const resolved = resolveDefaultDecisionProvider();
+    assert(
+      resolved === undefined,
+      "clearDecisionKeys must clear the laya credential too",
+    );
+  } finally {
+    restoreEnv();
+  }
+});
+
+await test("16.5 — only a laya credential + a long prompt ⇒ heuristic, nothing sent", async () => {
+  // Laya points at a dead local address, so a request that escaped would be
+  // recorded (and fail) instead of reaching a real server, whatever
+  // LAYA_BASE_URL a developer's .env holds.
+  try {
+    clearDecisionKeys();
+    process.env.LAYA_BASE_URL = "http://127.0.0.1:9/laya";
+    process.env.LAYA_API_KEY = "sk-placeholder-for-routing";
+    fetchCapture.reset();
+    const nl = new NeuroLink();
+    const router = new ClassifierRouter(
+      { enabled: true, pool: POOL },
+      { decide: (o) => nl.tryDecide(o) },
+    );
+    // ~4,500 characters of state: far past laya's window, so the decision must
+    // be refused locally and routing must fall back without a round trip.
+    const decision = await router.route({ prompt: HARD_PROMPT.repeat(30) });
+    const sent = fetchCapture
+      .list()
+      .filter((c) => c.url.endsWith("/predict")).length;
+    assert(decision !== null, "the router must still produce a decision");
+    assert(
+      decision!.reason?.startsWith("heuristic") === true,
+      "an over-window prompt must fall back to the heuristic strategy",
+    );
+    assert(sent === 0, "a refused decision must never reach the proxy");
+  } finally {
+    restoreEnv();
+  }
+});
+
+await test("16.6 — the SDK's nothing-configured error names every provider's variable", async () => {
+  clearDecisionKeys();
+  let message = "";
+  try {
+    await new NeuroLink().decide({
+      state: "x",
+      questions: { q: { type: "boolean", instructions: "?" } },
+    });
+  } catch (error) {
+    message = error instanceof Error ? error.message : "";
+  }
+  restoreEnv();
+  assert(
+    message.includes("LAYA_") && message.includes("TYPESAFE_"),
+    "the error must name the variable for each decision provider",
+  );
+});
+
+await test("16.7 — decide --provider laya with no credential ⇒ one clean line", async () => {
+  const result = await runCLI(
+    [
+      "decide",
+      "Refund request for a damaged item",
+      "--provider",
+      "laya",
+      "--questions",
+      JSON.stringify({
+        urgent: { type: "boolean", instructions: "Is this urgent?" },
+      }),
+    ],
+    { env: NO_PROVIDER_ENV, timeoutMs: 30_000 },
+  );
+  assert(result.exitCode !== 0, "decide must fail without a laya credential");
+  assert(
+    result.stderr.includes("LAYA_"),
+    "the failure line must say which variable to set",
+  );
+  assert(
+    !looksLikeStackTrace(result.stdout + result.stderr),
+    "the failure printed a stack trace instead of a clean message",
+  );
+});
+
+restoreEnv();
+logSection(
+  "17. XOR — a decision provider that also reads an image and audio, and extracts values",
+);
+
+await test("17.1 — xor declares decide and only decide, and no generation rank", async () => {
+  const xor = PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.XOR);
+  assert(xor !== undefined, "xor has no registered descriptor");
+  assert(servesInferenceKind(xor!, "decide"), "xor must declare decide");
+  assert(
+    !servesInferenceKind(xor!, "generate") &&
+      !servesInferenceKind(xor!, "stream"),
+    "a model that emits no text must not declare generate or stream",
+  );
+  assert(
+    xor!.autoSelectPriority === undefined &&
+      xor!.autoSelectPreference === undefined &&
+      xor!.defaultHealthSweepPriority === undefined,
+    "a decision provider must stay out of every generation fallback chain",
+  );
+});
+
+await test("17.2 — precedence: typesafe, then laya, then xor when alone", async () => {
+  try {
+    clearDecisionKeys();
+    process.env.TYPESAFE_API_KEY = "apikey_placeholder_for_resolution";
+    process.env.LAYA_API_KEY = "sk-placeholder-for-resolution";
+    process.env.LAYA_BASE_URL = "https://laya.placeholder.invalid";
+    process.env.XOR_API_KEY = "sk-placeholder-for-resolution";
+    process.env.XOR_BASE_URL = "https://xor.placeholder.invalid";
+    const all = resolveDefaultDecisionProvider();
+    delete process.env.TYPESAFE_API_KEY;
+    const withoutTypeSafe = resolveDefaultDecisionProvider();
+    delete process.env.LAYA_API_KEY;
+    const xorAlone = resolveDefaultDecisionProvider();
+    delete process.env.XOR_BASE_URL;
+    const keyOnly = resolveDefaultDecisionProvider();
+    process.env.XOR_BASE_URL = "https://xor.placeholder.invalid";
+    process.env.XOR_API_KEY = "   ";
+    const blank = resolveDefaultDecisionProvider();
+    assert(
+      all === "typesafe",
+      "with all three configured, typesafe must stay the default",
+    );
+    assert(
+      withoutTypeSafe === "laya",
+      "without typesafe, laya must stay ahead of xor",
+    );
+    assert(
+      xorAlone === "xor",
+      "with only xor configured, xor must become the default",
+    );
+    assert(
+      keyOnly === undefined,
+      "an xor key without XOR_BASE_URL must not count as configured",
+    );
+    assert(
+      blank === undefined,
+      "a whitespace-only xor credential must not count as configured",
+    );
+  } finally {
+    restoreEnv();
+  }
+});
+
+await test("17.3 — descriptor order is the precedence: typesafe, laya, xor", async () => {
+  const names: string[] = DECISION_PROVIDERS.map((d) => d.name);
+  assert(
+    names.indexOf("typesafe") !== -1 &&
+      names.indexOf("typesafe") < names.indexOf("laya") &&
+      names.indexOf("laya") < names.indexOf("xor"),
+    "the derived decision-provider list must read typesafe, laya, xor",
+  );
+});
+
+await test("17.4 — an ambient xor credential cannot leak into a keyless test", async () => {
+  try {
+    process.env.XOR_API_KEY = "sk-ambient-placeholder";
+    process.env.XOR_BASE_URL = "https://xor.ambient.invalid";
+    clearDecisionKeys();
+    assert(
+      resolveDefaultDecisionProvider() === undefined,
+      "clearDecisionKeys must clear the xor credential too",
+    );
+  } finally {
+    restoreEnv();
+  }
+});
+
+await test("17.5 — the SDK's nothing-configured error names xor's variables too", async () => {
+  clearDecisionKeys();
+  let message = "";
+  try {
+    await new NeuroLink().decide({
+      state: "x",
+      questions: { q: { type: "boolean", instructions: "?" } },
+    });
+  } catch (error) {
+    message = error instanceof Error ? error.message : "";
+  }
+  restoreEnv();
+  assert(
+    message.includes("XOR_") &&
+      message.includes("LAYA_") &&
+      message.includes("TYPESAFE_"),
+    "the error must name the variable for each decision provider",
+  );
+});
+
+await test("17.6 — decide --provider xor with no credential ⇒ one clean line", async () => {
+  const result = await runCLI(
+    [
+      "decide",
+      "Refund request for a damaged item",
+      "--provider",
+      "xor",
+      "--questions",
+      JSON.stringify({
+        urgent: { type: "boolean", instructions: "Is this urgent?" },
+      }),
+    ],
+    { env: NO_PROVIDER_ENV, timeoutMs: 30_000 },
+  );
+  assert(result.exitCode !== 0, "decide must fail without an xor credential");
+  assert(
+    result.stderr.includes("XOR_"),
+    "the failure line must say which variable to set",
+  );
+  assert(
+    !looksLikeStackTrace(result.stdout + result.stderr),
+    "the failure printed a stack trace instead of a clean message",
+  );
+});
+
+// The CLI media tests use a dead local address, so a request that escaped to
+// the network would surface as a connection error instead of the refusal.
+const XOR_CLI_ENV = {
+  ...NO_PROVIDER_ENV,
+  XOR_API_KEY: "sk-placeholder-for-cli",
+  XOR_BASE_URL: "http://127.0.0.1:9/xor",
+  TYPESAFE_API_KEY: "apikey_placeholder_for_cli",
+  TYPESAFE_BASE_URL: "http://127.0.0.1:9/typesafe",
+};
+await test("17.7 — decide --help lists --image, --video and --audio", async () => {
+  const result = await runCLI(["decide", "--help"], { timeoutMs: 30_000 });
+  assert(
+    result.stdout.includes("--image") &&
+      result.stdout.includes("--video") &&
+      result.stdout.includes("--audio"),
+    "the help must list all three flags",
+  );
+});
+
+await test("17.8 — a positional state after --image is still the state", async () => {
+  const result = await runCLI(
+    [
+      "decide",
+      "--image",
+      `${XOR_FIXTURE_DIR}red.png`,
+      "The state text",
+      "--provider",
+      "typesafe",
+      "--questions",
+      ONE_QUESTION,
+    ],
+    { env: XOR_CLI_ENV, timeoutMs: 30_000 },
+  );
+  assert(result.exitCode !== 0, "typesafe must refuse an image");
+  assert(
+    result.stderr.includes("does not accept images"),
+    "the image must reach the provider",
+  );
+  assert(
+    !result.stderr.includes("provide state"),
+    "the state must not be swallowed by --image",
+  );
+});
+
+await test("17.9 — two --image flags ⇒ refused locally, one clean line", async () => {
+  const args = [
+    "decide",
+    "The state text",
+    "--provider",
+    "xor",
+    "--questions",
+    ONE_QUESTION,
+  ];
+  for (let i = 0; i < 2; i++) {
+    args.push("--image", `${XOR_FIXTURE_DIR}red.png`);
+  }
+  const result = await runCLI(args, { env: XOR_CLI_ENV, timeoutMs: 30_000 });
+  assert(result.exitCode !== 0, "two images must be refused");
+  assert(result.stderr.includes("at most 1"), "the refusal must say the limit");
+  assert(
+    !/ECONNREFUSED|network/i.test(result.stderr),
+    "the refusal must happen before any request",
+  );
+  assert(
+    !looksLikeStackTrace(result.stdout + result.stderr),
+    "the refusal printed a stack trace",
+  );
+});
+
+await test("17.10 — a missing --image file ⇒ one clean line naming the image", async () => {
+  const result = await runCLI(
+    [
+      "decide",
+      "The state text",
+      "--provider",
+      "xor",
+      "--image",
+      `${XOR_FIXTURE_DIR}no-such-file.png`,
+      "--questions",
+      ONE_QUESTION,
+    ],
+    { env: XOR_CLI_ENV, timeoutMs: 30_000 },
+  );
+  assert(result.exitCode !== 0, "a missing image must fail");
+  assert(
+    result.stderr.includes("Could not read Image 1"),
+    "the failure must name the image",
+  );
+  assert(
+    !looksLikeStackTrace(result.stdout + result.stderr),
+    "the failure printed a stack trace",
+  );
+});
+
+await test("17.11 — --video on a provider that takes none ⇒ refused before any request", async () => {
+  const result = await runCLI(
+    [
+      "decide",
+      "The state text",
+      "--provider",
+      "laya",
+      "--video",
+      `${XOR_FIXTURE_DIR}red.mp4`,
+      "--questions",
+      ONE_QUESTION,
+    ],
+    {
+      env: {
+        ...XOR_CLI_ENV,
+        LAYA_API_KEY: "sk-placeholder",
+        LAYA_BASE_URL: "http://127.0.0.1:9/laya",
+      },
+      timeoutMs: 30_000,
+    },
+  );
+  assert(result.exitCode !== 0, "laya must refuse a video");
+  assert(
+    result.stderr.includes("does not accept images or video"),
+    "the refusal must say why",
+  );
+  assert(
+    !/ECONNREFUSED|network/i.test(result.stderr),
+    "the refusal must happen before any request",
+  );
+});
+
+await test("17.14 — a video is refused before any request: XOR's gateway drops video, so an answer would be blind", async () => {
+  try {
+    clearDecisionKeys();
+    const refusal = await new NeuroLink({
+      credentials: {
+        xor: {
+          apiKey: "sk-placeholder-for-video",
+          baseURL: "http://127.0.0.1:9",
+        },
+      },
+    })
+      .decide({
+        provider: "xor",
+        model: XOR_MEDIA_MODEL,
+        state: "Look at the attached video.",
+        questions: XOR_COLOR_QUESTION,
+        video: `${XOR_FIXTURE_DIR}red.mp4`,
+      })
+      .then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+    const cause =
+      refusal instanceof Error
+        ? (refusal as Error & { cause?: { kind?: string } }).cause
+        : undefined;
+    // A network failure would mean the request left: port 9 refuses it.
+    assert(
+      cause?.kind === "invalid_request",
+      "the video must be refused locally as an invalid request",
+    );
+    assert(
+      refusal instanceof Error &&
+        refusal.message.includes("does not accept video"),
+      "the refusal must say XOR does not accept video",
+    );
+  } finally {
+    restoreEnv();
+  }
+});
+
+await test('17.16 — --video "" ⇒ one clean line, never silently dropped', async () => {
+  const result = await runCLI(
+    [
+      "decide",
+      "The state text",
+      "--provider",
+      "xor",
+      "--video",
+      "",
+      "--questions",
+      ONE_QUESTION,
+    ],
+    { env: XOR_CLI_ENV, timeoutMs: 30_000 },
+  );
+  assert(result.exitCode !== 0, "an empty --video must fail");
+  // XOR reads no video, so the refusal is that, before the value is looked at.
+  assert(
+    result.stderr.includes("empty string") ||
+      result.stderr.includes("does not accept video"),
+    "the failure must say the video is empty or not accepted",
+  );
+  assert(
+    !/ECONNREFUSED|network/i.test(result.stderr),
+    "the failure must happen before any request",
+  );
+  assert(
+    !looksLikeStackTrace(result.stdout + result.stderr),
+    "the failure printed a stack trace",
+  );
+});
+
+await test("17.17 — two --video flags ⇒ refused, one clean line", async () => {
+  const result = await runCLI(
+    [
+      "decide",
+      "The state text",
+      "--provider",
+      "xor",
+      "--video",
+      `${XOR_FIXTURE_DIR}red.mp4`,
+      "--video",
+      `${XOR_FIXTURE_DIR}blue.mp4`,
+      "--questions",
+      ONE_QUESTION,
+    ],
+    { env: XOR_CLI_ENV, timeoutMs: 30_000 },
+  );
+  assert(result.exitCode !== 0, "two videos must be refused");
+  assert(
+    result.stderr.includes("at most one --video"),
+    "the refusal must say only one video is allowed",
+  );
+  assert(
+    !/ECONNREFUSED|network/i.test(result.stderr),
+    "the refusal must happen before any request",
+  );
+});
+
+await test("17.18 — a bare --video with no value ⇒ refused, never dropped", async () => {
+  const result = await runCLI(
+    [
+      "decide",
+      "The state text",
+      "--provider",
+      "xor",
+      "--questions",
+      ONE_QUESTION,
+      "--video",
+    ],
+    { env: XOR_CLI_ENV, timeoutMs: 30_000 },
+  );
+  assert(result.exitCode !== 0, "a bare --video must fail");
+  assert(
+    /video/i.test(result.stderr),
+    "the failure must name the flag it is about",
+  );
+  assert(
+    !/ECONNREFUSED|network/i.test(result.stderr),
+    "the failure must happen before any request",
+  );
+});
+
+await test("17.24 — two --audio flags ⇒ refused, one clean line", async () => {
+  const result = await runCLI(
+    [
+      "decide",
+      "--provider",
+      "xor",
+      "--audio",
+      "a.wav",
+      "--audio",
+      "b.wav",
+      "--questions",
+      ONE_QUESTION,
+    ],
+    { env: XOR_CLI_ENV, timeoutMs: 30_000 },
+  );
+  assert(result.exitCode !== 0, "two clips must be refused");
+  assert(
+    result.stderr.includes("at most one --audio"),
+    "the refusal must say only one clip is allowed",
+  );
+});
+
+await test("17.25 — --audio with no state: an M4A clip is refused before any request, one clean line", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "nl-decide-audio-"));
+  const clip = join(dir, "clip.m4a");
+  writeFileSync(
+    clip,
+    Buffer.concat([
+      Buffer.from([0, 0, 0, 0x20]),
+      Buffer.from("ftypM4A ", "latin1"),
+      Buffer.alloc(24),
+    ]),
+  );
+  try {
+    const result = await runCLI(
+      [
+        "decide",
+        "--provider",
+        "xor",
+        "--audio",
+        clip,
+        "--questions",
+        ONE_QUESTION,
+      ],
+      { env: XOR_CLI_ENV, timeoutMs: 30_000 },
+    );
+    assert(result.exitCode !== 0, "an M4A clip must be refused");
+    assert(
+      result.stderr.includes("AAC or M4A"),
+      "the refusal must name the format the model cannot decode",
+    );
+    assert(
+      !result.stderr.includes("provide state"),
+      "a clip must stand in for the state",
+    );
+    assert(
+      !/ECONNREFUSED|network/i.test(result.stderr),
+      "the refusal must happen before any request",
+    );
+    assert(
+      !looksLikeStackTrace(result.stdout + result.stderr),
+      "the refusal printed a stack trace",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+restoreEnv();
+logSection("18. Perplexity Decisions — a hosted decision provider");
+
+await test("18.1 — perplexity-decider declares decide and only decide, and no generation rank", async () => {
+  const decider = PROVIDER_DESCRIPTORS_BY_NAME.get(
+    AIProviderName.PERPLEXITY_DECIDER,
+  );
+  assert(
+    decider !== undefined,
+    "perplexity-decider has no registered descriptor",
+  );
+  assert(
+    servesInferenceKind(decider!, "decide"),
+    "perplexity-decider must declare decide",
+  );
+  assert(
+    !servesInferenceKind(decider!, "generate") &&
+      !servesInferenceKind(decider!, "stream"),
+    "a model that emits no text must not declare generate or stream",
+  );
+  assert(
+    decider!.autoSelectPriority === undefined &&
+      decider!.autoSelectPreference === undefined &&
+      decider!.defaultHealthSweepPriority === undefined,
+    "a decision provider must stay out of every generation fallback chain",
+  );
+  assert(
+    decider!.toolSupport === "none" && decider!.healthCheck !== "live-generate",
+    "a decision provider has no tools and cannot answer a live-generate probe",
+  );
+  assert(
+    decider!.credentialsKey === "perplexityDecider",
+    "the credentials slice must be the decider's own, not the text provider's",
+  );
+});
+
+await test("18.2 — it shares its key with the perplexity text provider, which stays a text provider", async () => {
+  const decider = PROVIDER_DESCRIPTORS_BY_NAME.get(
+    AIProviderName.PERPLEXITY_DECIDER,
+  );
+  const text = PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.PERPLEXITY);
+  assert(
+    decider !== undefined && text !== undefined,
+    "both perplexity descriptors must be registered",
+  );
+  assert(
+    decider!.envVars.apiKey === "PERPLEXITY_API_KEY" &&
+      text!.envVars.apiKey === decider!.envVars.apiKey,
+    "the two providers must read the same key variable",
+  );
+  assert(
+    servesInferenceKind(text!, "generate") &&
+      !servesInferenceKind(text!, "decide"),
+    "the text provider must keep generating and must not become a decision provider",
+  );
+  assert(
+    (decider!.envVars.extraRequired ?? []).length === 0,
+    "a hosted endpoint needs no second variable: the key alone configures it",
+  );
+});
+
+await test("18.3 — it declares the limits that were measured: a state window, a question cap, images and no video", async () => {
+  const decider = PROVIDER_DESCRIPTORS_BY_NAME.get(
+    AIProviderName.PERPLEXITY_DECIDER,
+  );
+  const limits = decider?.decisionLimits;
+  assert(
+    limits !== undefined,
+    "perplexity-decider must declare decisionLimits",
+  );
+  assert(
+    limits!.maxStateTokens === 100_000,
+    "the state window must stay at the measured 100,000 estimated tokens",
+  );
+  assert(
+    limits!.maxStateTokens < 262_144,
+    "the local window must sit inside the documented 262,144-token ceiling",
+  );
+  assert(
+    limits!.nonAsciiTokensPerChar === 0.5,
+    "non-ASCII text must be charged at the measured half a token per character",
+  );
+  assert(
+    limits!.maxQuestions === 128,
+    "the documented 128-question cap must be declared",
+  );
+  assert(
+    limits!.media !== undefined && limits!.media.maxImages === 8,
+    "up to 8 images per request must be declared",
+  );
+  assert(
+    limits!.media!.video === false,
+    "the API reads no video, so none may be declared",
+  );
+  assert(
+    limits!.media!.maxRequestBytes === 32 * 1024 * 1024,
+    "the documented 32 MiB body cap must be declared",
+  );
+  assert(
+    decider!.timeouts?.decideMs === 10_000,
+    "the default timeout must stay at 10 seconds",
+  );
+});
+
+await test("18.4 — descriptor order is the precedence: typesafe, laya, xor, subq, perplexity-decider, cloudflare-clef, openai-decisions, and scaledown last", async () => {
+  const names: string[] = DECISION_PROVIDERS.map((d) => d.name);
+  const index = (name: string) => names.indexOf(name);
+  assert(
+    index("typesafe") !== -1 &&
+      index("typesafe") < index("laya") &&
+      index("laya") < index("xor") &&
+      index("xor") < index("subq") &&
+      index("subq") < index("perplexity-decider") &&
+      index("perplexity-decider") < index("cloudflare-clef") &&
+      index("cloudflare-clef") < index("openai-decisions") &&
+      index("openai-decisions") < index("scaledown"),
+    "the derived decision-provider list must read typesafe, laya, xor, subq, perplexity-decider, cloudflare-clef, openai-decisions, scaledown",
+  );
+  assert(
+    DECISION_PROVIDERS.map((d) => d.decideOrder).join(",") ===
+      "1,2,3,4,5,6,7,8",
+    "the decide orders must run 1 to 8 without a gap",
+  );
+  // Perplexity, Cloudflare Clef and OpenAI Decisions each share an environment
+  // key with a text provider, so they must come after every provider a host
+  // sets up on purpose. SubQ is ahead of them because its key, SUBQ_API_KEY, is
+  // shared with no other provider. ScaleDown's key is shared with no other
+  // provider either, yet it sits behind all of them by the owner's decision of
+  // 2026-10-15 (order 8), so an ambient shared key outranks a ScaleDown key a
+  // host set on purpose. That is pinned here rather than hidden.
+  assert(
+    names[names.length - 1] === "scaledown",
+    "scaledown must be the last entry in the precedence order",
+  );
+});
+
+await test("18.5 — precedence: a shared ambient key activates it only when nothing ahead is configured", async () => {
+  try {
+    clearDecisionKeys();
+    process.env.TYPESAFE_API_KEY = "apikey_placeholder_for_resolution";
+    process.env.LAYA_API_KEY = "sk-placeholder-for-resolution";
+    process.env.LAYA_BASE_URL = "https://laya.placeholder.invalid";
+    process.env.XOR_API_KEY = "sk-placeholder-for-resolution";
+    process.env.XOR_BASE_URL = "https://xor.placeholder.invalid";
+    process.env.PERPLEXITY_API_KEY = "pplx-placeholder-for-resolution";
+    const all = resolveDefaultDecisionProvider();
+    delete process.env.TYPESAFE_API_KEY;
+    const withoutTypeSafe = resolveDefaultDecisionProvider();
+    delete process.env.LAYA_API_KEY;
+    const withoutLaya = resolveDefaultDecisionProvider();
+    delete process.env.XOR_API_KEY;
+    const perplexityAlone = resolveDefaultDecisionProvider();
+    process.env.PERPLEXITY_API_KEY = "   ";
+    const blank = resolveDefaultDecisionProvider();
+    assert(
+      all === "typesafe",
+      "with everything configured, typesafe must stay the default",
+    );
+    assert(
+      withoutTypeSafe === "laya",
+      "without typesafe, laya must stay ahead of xor and perplexity-decider",
+    );
+    assert(
+      withoutLaya === "xor",
+      "without laya, xor must stay ahead of perplexity-decider",
+    );
+    assert(
+      perplexityAlone === "perplexity-decider",
+      "a key alone must configure perplexity-decider: it has no second variable",
+    );
+    assert(
+      blank === undefined,
+      "a whitespace-only perplexity key must not count as configured",
+    );
+  } finally {
+    restoreEnv();
+  }
+});
+
+await test("18.6 — credentials passed to the SDK count: its own slice alone, and a base URL alone does not", async () => {
+  try {
+    clearDecisionKeys();
+    assert(
+      resolveDefaultDecisionProvider({
+        perplexityDecider: { apiKey: "pplx-placeholder-from-config" },
+      }) === "perplexity-decider",
+      "the decider's own credentials slice must configure it on its own",
+    );
+    assert(
+      resolveDefaultDecisionProvider({
+        perplexityDecider: { baseURL: "https://pplx.placeholder.invalid" },
+      }) === undefined,
+      "a base URL without a key must not count as configured",
+    );
+    assert(
+      resolveDefaultDecisionProvider({
+        perplexityDecider: { apiKey: "   " },
+      }) === undefined,
+      "a whitespace-only configured key must not count as configured",
+    );
+    process.env.PERPLEXITY_DECIDER_BASE_URL =
+      "https://pplx.placeholder.invalid";
+    assert(
+      resolveDefaultDecisionProvider() === undefined,
+      "the optional base URL variable must not configure it without a key",
+    );
+  } finally {
+    restoreEnv();
+  }
+});
+
+await test("18.7 — the key is shared through the environment only: the text provider's credentials do not configure decide", async () => {
+  try {
+    clearDecisionKeys();
+    const textOnly = {
+      perplexity: { apiKey: "pplx-placeholder-for-the-text-provider" },
+    };
+    assert(
+      resolveDefaultDecisionProvider(textOnly) === undefined,
+      "the text provider's credentials slice must not configure the decision provider",
+    );
+    process.env.PERPLEXITY_API_KEY = "pplx-placeholder-from-the-environment";
+    assert(
+      resolveDefaultDecisionProvider() === "perplexity-decider",
+      "the shared environment variable must configure the decision provider",
+    );
+    delete process.env.PERPLEXITY_API_KEY;
+
+    fetchCapture.reset();
+    const unnamed = await failureOf(() =>
+      new NeuroLink({ credentials: textOnly }).decide({
+        state: "x",
+        questions: PERPLEXITY_ONE_QUESTION,
+      }),
+    );
+    assert(
+      unnamed !== undefined &&
+        unnamed.message.includes("No decision provider is configured"),
+      "the text provider's slice alone must leave decide with no provider to use",
+    );
+
+    const named = await failureOf(() =>
+      new NeuroLink({
+        credentials: {
+          ...textOnly,
+          perplexityDecider: { baseURL: PERPLEXITY_DEAD_BASE_URL },
+        },
+      }).decide({
+        provider: "perplexity-decider",
+        state: "x",
+        questions: PERPLEXITY_ONE_QUESTION,
+      }),
+    );
+    assert(
+      named?.kind === "authentication" &&
+        named.message.includes("PERPLEXITY_API_KEY"),
+      "naming the decider with only the text provider's slice must be refused, saying which variable to set",
+    );
+    assert(
+      escapedRequests() === 0,
+      "a call with no key of its own must not send anything",
+    );
+  } finally {
+    restoreEnv();
+  }
+});
+
+await test("18.8 — an ambient perplexity key cannot leak into a keyless test", async () => {
+  try {
+    // A developer's own TypeSafe, Laya, XOR or SubQ key outranks this one, and the
+    // suite loads their .env, so start from nothing configured.
+    clearDecisionKeys();
+    process.env.PERPLEXITY_API_KEY = "pplx-ambient-placeholder";
+    process.env.PERPLEXITY_DECIDER_BASE_URL = "https://pplx.ambient.invalid";
+    process.env.PERPLEXITY_DECIDER_MODEL = "ambient-placeholder-model";
+    assert(
+      resolveDefaultDecisionProvider() === "perplexity-decider",
+      "precondition: with nothing ahead configured, the ambient key must be seen",
+    );
+    clearDecisionKeys();
+    assert(
+      resolveDefaultDecisionProvider() === undefined,
+      "clearDecisionKeys must clear the perplexity key too",
+    );
+    assert(
+      process.env.PERPLEXITY_DECIDER_BASE_URL === undefined &&
+        process.env.PERPLEXITY_DECIDER_MODEL === undefined,
+      "clearDecisionKeys must clear the perplexity base URL and model too",
+    );
+  } finally {
+    restoreEnv();
+  }
+});
+
+await test("18.9 — the SDK's nothing-configured error names perplexity's variable too", async () => {
+  let failure: DecisionFailure | undefined;
+  try {
+    clearDecisionKeys();
+    failure = await failureOf(() =>
+      new NeuroLink().decide({
+        state: "x",
+        questions: { q: { type: "boolean", instructions: "?" } },
+      }),
+    );
+  } finally {
+    restoreEnv();
+  }
+  assert(failure !== undefined, "decide must fail with nothing configured");
+  assert(
+    failure.message.includes("PERPLEXITY_API_KEY") &&
+      failure.message.includes("XOR_") &&
+      failure.message.includes("LAYA_") &&
+      failure.message.includes("TYPESAFE_"),
+    "the error must name the variable for each decision provider",
+  );
+});
+
+await test("18.10 — decide --provider perplexity-decider with no credential ⇒ one clean line", async () => {
+  const result = await runCLI(
+    [
+      "decide",
+      "Refund request for a damaged item",
+      "--provider",
+      "perplexity-decider",
+      "--questions",
+      ONE_QUESTION,
+    ],
+    { env: NO_PROVIDER_ENV, timeoutMs: 30_000 },
+  );
+  assert(
+    result.exitCode !== 0,
+    "decide must fail without a perplexity credential",
+  );
+  assert(
+    result.stderr.includes("PERPLEXITY_API_KEY") &&
+      result.stderr.includes("credentials.perplexityDecider.apiKey"),
+    "the failure line must be perplexity-decider's own: the variable and the credentials slice to set",
+  );
+  assert(
+    !looksLikeStackTrace(result.stdout + result.stderr),
+    "the failure printed a stack trace instead of a clean message",
+  );
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// Local refusals. Each one is a request the API would answer badly or not at
+// all (a 400, or a minute's stall and a 504), so the provider turns it away
+// before any request. The dead address and the fetch capture prove "before any
+// request" rather than assume it.
+// ───────────────────────────────────────────────────────────────────────────
+
+/** A request that must be refused locally: its kind and wording, and zero requests sent. */
+async function expectLocalRefusal(
+  label: string,
+  options: RefusalOptions,
+  expected: { kind: string; text: string },
+): Promise<void> {
+  fetchCapture.reset();
+  const failure = await failureOf(() =>
+    deadPerplexity().decide({
+      provider: "perplexity-decider",
+      questions: PERPLEXITY_ONE_QUESTION,
+      ...options,
+    }),
+  );
+  assert(
+    failure !== undefined,
+    `${label}: the request must be refused, not answered`,
+  );
+  assert(
+    failure.kind === expected.kind,
+    `${label}: the refusal has the wrong kind`,
+  );
+  assert(
+    failure.message.includes(expected.text),
+    `${label}: the refusal must say why`,
+  );
+  assert(
+    failure.retryable === false,
+    `${label}: a refusal must not be retryable`,
+  );
+  assert(
+    escapedRequests() === 0,
+    `${label}: a refused request must never reach the transport`,
+  );
+}
+
+await test("18.11 — positive control: a valid request reaches the transport, however the base URL is spelled", async () => {
+  // Without this, every zero-request assertion below could pass because the
+  // capture sees nothing at all.
+  for (const baseURL of [
+    PERPLEXITY_DEAD_BASE_URL,
+    `${PERPLEXITY_DEAD_BASE_URL}/`,
+    `${PERPLEXITY_DEAD_BASE_URL}/v1`,
+    `${PERPLEXITY_DEAD_BASE_URL}/v1/`,
+  ]) {
+    fetchCapture.reset();
+    const failure = await failureOf(() =>
+      deadPerplexity(baseURL).decide({
+        provider: "perplexity-decider",
+        state: "x",
+        questions: PERPLEXITY_ONE_QUESTION,
+      }),
+    );
+    assert(
+      failure?.kind === "network",
+      "a request to a dead address must fail at the transport",
+    );
+    assert(
+      escapedRequests() >= 1,
+      "every spelling of the base URL must reach the same route, recorded on its way out",
+    );
+  }
+  // The same filter also has to see a request to a .invalid host, which the
+  // remote-URL refusal below relies on.
+  fetchCapture.reset();
+  await fetch("http://control.example.invalid/", {
+    signal: AbortSignal.timeout(5000),
+  }).catch(() => undefined);
+  assert(
+    escapedRequests() === 1,
+    "a request to a .invalid host must be recorded too",
+  );
+});
+
+const TINY_GIF = Buffer.from(
+  "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7",
+  "base64",
+);
+
+await test("18.12 — a GIF is refused locally, as a Buffer and as a data: URL", async () => {
+  const refusal = { kind: "invalid_request", text: "PNG, JPEG or WebP" };
+  await expectLocalRefusal(
+    "a GIF Buffer",
+    { state: "x", images: [TINY_GIF] },
+    refusal,
+  );
+  await expectLocalRefusal(
+    "a GIF data URL",
+    {
+      state: "x",
+      images: [`data:image/gif;base64,${TINY_GIF.toString("base64")}`],
+    },
+    refusal,
+  );
+});
+
+await test("18.13 — a remote image URL is refused locally, and never fetched for you", async () => {
+  await expectLocalRefusal(
+    "a remote image URL",
+    { state: "x", images: ["https://images.example.invalid/red.png"] },
+    { kind: "invalid_request", text: "remote URL" },
+  );
+});
+
+await test("18.14 — a video is refused locally: the API reads images only", async () => {
+  const refusal = { kind: "invalid_request", text: "does not accept video" };
+  await expectLocalRefusal(
+    "a video",
+    { state: "x", video: `${XOR_FIXTURE_DIR}red.mp4` },
+    refusal,
+  );
+  await expectLocalRefusal(
+    "a video beside a valid image",
+    {
+      state: "x",
+      images: [`${PERPLEXITY_FIXTURE_DIR}red.png`],
+      video: `${XOR_FIXTURE_DIR}red.mp4`,
+    },
+    refusal,
+  );
+});
+
+await test("18.15 — nine images are refused locally, and eight are sent", async () => {
+  const image = `${PERPLEXITY_FIXTURE_DIR}red.png`;
+  await expectLocalRefusal(
+    "nine images",
+    { state: "x", images: Array.from({ length: 9 }, () => image) },
+    { kind: "invalid_request", text: "at most 8 images" },
+  );
+  await expectReachesTransport("eight images", {
+    state: "x",
+    images: Array.from({ length: 8 }, () => image),
+  });
+});
+
+await test("18.16 — an image past 2,048 tiles of 32x32 pixels is refused locally, in every format the API reads", async () => {
+  // The API does not refuse these: it holds the request for about a minute and
+  // answers 504. 1600x1310 is the documentation's own example of one that does
+  // not fit: 50 x 41 tiles once each side is rounded to a multiple of 32.
+  const refusal = (size: string) => ({
+    kind: "invalid_request",
+    text: `${size} pixels`,
+  });
+  await expectLocalRefusal(
+    "a 2048x2048 PNG",
+    { state: "x", images: [flatPng(2048, 2048)] },
+    refusal("2048x2048"),
+  );
+  await expectLocalRefusal(
+    "a 1600x1310 PNG",
+    { state: "x", images: [flatPng(1600, 1310)] },
+    refusal("1600x1310"),
+  );
+  await expectLocalRefusal(
+    "a 1600x1310 JPEG",
+    {
+      state: "x",
+      images: [`${PERPLEXITY_FIXTURE_DIR}too-large-1600x1310.jpg`],
+    },
+    refusal("1600x1310"),
+  );
+  // A WebP header comes in three layouts that put the size in different
+  // places: lossy (VP8), lossless (VP8L) and extended (VP8X, what an alpha
+  // channel produces). One real file of each.
+  for (const [layout, file] of [
+    ["lossy", "too-large-1600x1310.webp"],
+    ["lossless", "too-large-1600x1310-lossless.webp"],
+    ["extended", "too-large-1600x1310-alpha.webp"],
+  ]) {
+    await expectLocalRefusal(
+      `a 1600x1310 ${layout} WebP`,
+      { state: "x", images: [`${PERPLEXITY_FIXTURE_DIR}${file}`] },
+      refusal("1600x1310"),
+    );
+  }
+});
+
+await test("18.17 — the sizes the API documents as fitting are sent", async () => {
+  await expectReachesTransport("a 1440x1440 PNG", {
+    state: "x",
+    images: [flatPng(1440, 1440)],
+  });
+  await expectReachesTransport("a 2048x1024 PNG", {
+    state: "x",
+    images: [flatPng(2048, 1024)],
+  });
+});
+
+await test("18.18 — a state past the window is refused locally, and one inside it is sent", async () => {
+  // ASCII is estimated at a quarter of a token per character plus a 5% margin,
+  // against a window of 100,000 tokens: roughly 381,000 characters.
+  await expectLocalRefusal(
+    "a 390,000-character ASCII state",
+    { state: "x".repeat(390_000) },
+    { kind: "max_tokens_exceeded", text: "Shorten the state" },
+  );
+  await expectReachesTransport("a 370,000-character ASCII state", {
+    state: "x".repeat(370_000),
+  });
+});
+
+await test("18.19 — the CJK charge is pinned from both sides: 190,000 characters are sent and 210,000 are refused", async () => {
+  // Half a token per character: 95,000 and 105,000 estimated tokens against the
+  // same 100,000. What the server charges per CJK character depends on the text
+  // (0.46 and 0.55 were measured live for two different texts), so half a token
+  // is a mid-range charge, not an upper bound; the window sitting well inside
+  // the server's 262,144-token ceiling is what absorbs the difference. The
+  // first state goes out, and the live test below shows the API accepts it.
+  await expectReachesTransport("190,000 CJK characters", {
+    state: "中".repeat(190_000),
+  });
+  await expectLocalRefusal(
+    "210,000 CJK characters",
+    { state: "中".repeat(210_000) },
+    { kind: "max_tokens_exceeded", text: "Shorten the state" },
+  );
+});
+
+await test("18.20 — 129 questions are refused locally, and 128 are sent", async () => {
+  const questions = (count: number) =>
+    Object.fromEntries(
+      Array.from({ length: count }, (_, i) => [
+        `q${i}`,
+        { type: "boolean" as const, instructions: "Is this a test?" },
+      ]),
+    );
+  await expectLocalRefusal(
+    "129 questions",
+    { state: "x", questions: questions(129) },
+    { kind: "max_tokens_exceeded", text: "at most 128 questions" },
+  );
+  await expectReachesTransport("128 questions", {
+    state: "x",
+    questions: questions(128),
+  });
+});
+
+// The CLI refusals use a dead local address too, so a request that escaped to
+// the network would surface as a connection error instead of the refusal. The
+// positive control below proves that address really is where a sent request
+// lands, so the refusals after it are not passing vacuously.
+const PERPLEXITY_CLI_ENV = {
+  ...NO_PROVIDER_ENV,
+  PERPLEXITY_API_KEY: "pplx-placeholder-for-cli",
+  PERPLEXITY_DECIDER_BASE_URL: "http://127.0.0.1:9/pplx",
+};
+
+await test("18.21 — positive control: a valid image request does reach the transport", async () => {
+  const result = await runCLI(
+    [
+      "decide",
+      "The state text",
+      "--provider",
+      "perplexity-decider",
+      "--image",
+      `${PERPLEXITY_FIXTURE_DIR}red.png`,
+      "--questions",
+      ONE_QUESTION,
+    ],
+    { env: PERPLEXITY_CLI_ENV, timeoutMs: 30_000 },
+  );
+  assert(result.exitCode !== 0, "nothing listens on the dead address");
+  assert(
+    /ECONNREFUSED|network|fetch failed/i.test(result.stderr),
+    "a valid request must fail at the transport, which is what the refusals below must not do",
+  );
+});
+
+await test("18.22 — nine --image flags ⇒ refused locally, one clean line", async () => {
+  const args = [
+    "decide",
+    "The state text",
+    "--provider",
+    "perplexity-decider",
+    "--questions",
+    ONE_QUESTION,
+  ];
+  for (let i = 0; i < 9; i++) {
+    args.push("--image", `${PERPLEXITY_FIXTURE_DIR}red.png`);
+  }
+  const result = await runCLI(args, {
+    env: PERPLEXITY_CLI_ENV,
+    timeoutMs: 30_000,
+  });
+  assert(result.exitCode !== 0, "nine images must be refused");
+  assert(result.stderr.includes("at most 8"), "the refusal must say the limit");
+  assert(
+    !/ECONNREFUSED|network/i.test(result.stderr),
+    "the refusal must happen before any request",
+  );
+  assert(
+    !looksLikeStackTrace(result.stdout + result.stderr),
+    "the refusal printed a stack trace",
+  );
+});
+
+await test("18.23 — --video ⇒ refused before any request, because the API reads no video", async () => {
+  const result = await runCLI(
+    [
+      "decide",
+      "The state text",
+      "--provider",
+      "perplexity-decider",
+      "--video",
+      `${XOR_FIXTURE_DIR}red.mp4`,
+      "--questions",
+      ONE_QUESTION,
+    ],
+    { env: PERPLEXITY_CLI_ENV, timeoutMs: 30_000 },
+  );
+  assert(result.exitCode !== 0, "a video must be refused");
+  assert(
+    result.stderr.includes("does not accept video"),
+    "the refusal must say why",
+  );
+  assert(
+    !/ECONNREFUSED|network/i.test(result.stderr),
+    "the refusal must happen before any request",
+  );
+  assert(
+    !looksLikeStackTrace(result.stdout + result.stderr),
+    "the refusal printed a stack trace",
+  );
+});
+
+await test("18.24 — a missing --image file ⇒ one clean line naming the image", async () => {
+  const result = await runCLI(
+    [
+      "decide",
+      "The state text",
+      "--provider",
+      "perplexity-decider",
+      "--image",
+      `${PERPLEXITY_FIXTURE_DIR}no-such-file.png`,
+      "--questions",
+      ONE_QUESTION,
+    ],
+    { env: PERPLEXITY_CLI_ENV, timeoutMs: 30_000 },
+  );
+  assert(result.exitCode !== 0, "a missing image must fail");
+  assert(
+    result.stderr.includes("Could not read Image 1"),
+    "the failure must name the image",
+  );
+  assert(
+    !/ECONNREFUSED|network/i.test(result.stderr),
+    "the failure must happen before any request",
+  );
+  assert(
+    !looksLikeStackTrace(result.stdout + result.stderr),
+    "the failure printed a stack trace",
+  );
+});
+
+await test("18.25 — a base URL that carries a credential ⇒ refused locally, never echoed", async () => {
+  const result = await runCLI(
+    [
+      "decide",
+      "The state text",
+      "--provider",
+      "perplexity-decider",
+      "--questions",
+      ONE_QUESTION,
+    ],
+    {
+      env: {
+        ...PERPLEXITY_CLI_ENV,
+        PERPLEXITY_DECIDER_BASE_URL:
+          "https://ops:hunter2-basic@pplx.internal.invalid/proxy",
+      },
+      timeoutMs: 30_000,
+    },
+  );
+  assert(result.exitCode !== 0, "a credentialed base URL must be refused");
+  assert(
+    result.stderr.includes("PERPLEXITY_DECIDER_BASE_URL"),
+    "the refusal must say which variable to fix",
+  );
+  assert(
+    !(result.stdout + result.stderr).includes("hunter2"),
+    "nothing from the base URL may be echoed",
+  );
+  assert(
+    !/ECONNREFUSED|network/i.test(result.stderr),
+    "the refusal must happen before any request",
+  );
+});
+
+await test("18.26 — typesafe refuses an image and names perplexity-decider as one that takes it", async () => {
+  const result = await runCLI(
+    [
+      "decide",
+      "The state text",
+      "--provider",
+      "typesafe",
+      "--image",
+      `${PERPLEXITY_FIXTURE_DIR}red.png`,
+      "--questions",
+      ONE_QUESTION,
+    ],
+    {
+      env: {
+        ...PERPLEXITY_CLI_ENV,
+        TYPESAFE_API_KEY: "apikey_placeholder_for_cli",
+        TYPESAFE_BASE_URL: "http://127.0.0.1:9/typesafe",
+      },
+      timeoutMs: 30_000,
+    },
+  );
+  assert(result.exitCode !== 0, "typesafe must refuse an image");
+  assert(
+    result.stderr.includes("does not accept images") &&
+      result.stderr.includes("perplexity-decider"),
+    "the refusal must name the providers that do read images",
+  );
+});
+
+// The real API's 401 never repeats the key, so no live call can show that a
+// repeated one is stripped. A gateway at PERPLEXITY_DECIDER_BASE_URL can, so
+// this one does: it answers 401 and repeats the bearer token it was sent,
+// beside a key-shaped string that was never configured. The configured key is
+// not shaped like a Perplexity key, so only an exact-match strip can remove it.
+const ECHOED_KEY = "placeholder-key-the-gateway-repeats";
+const ECHOED_STRANGER = `pplx-${"k".repeat(48)}`;
+
+type GatewayAnswer = { status: number; body: unknown };
+
+/** Runs `run` against a local gateway that answers each request as `answer` says, handing it the bearer token of every request the gateway has received. */
+async function withGateway<T>(
+  answer: (bearer: string) => GatewayAnswer,
+  run: (baseURL: string, bearers: readonly string[]) => Promise<T>,
+): Promise<T> {
+  const bearers: string[] = [];
+  const gateway = createServer((request, response) => {
+    request.resume();
+    const bearer = (request.headers.authorization ?? "").replace(
+      /^Bearer /,
+      "",
+    );
+    bearers.push(bearer);
+    const { status, body } = answer(bearer);
+    response.writeHead(status, {
+      "content-type": "application/json",
+      connection: "close",
+    });
+    response.end(JSON.stringify(body));
+  });
+  await new Promise<void>((resolve) => gateway.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = gateway.address();
+    const port =
+      typeof address === "object" && address !== null ? address.port : 0;
+    assert(port > 0, "the test gateway must listen on a port");
+    return await run(`http://127.0.0.1:${port}`, bearers);
+  } finally {
+    gateway.closeAllConnections();
+    await new Promise<void>((resolve) => gateway.close(() => resolve()));
+  }
+}
+
+/** A gateway that refuses with a 401 and repeats the bearer token it was sent, beside a key-shaped string it never saw. */
+const withEchoingGateway = <T>(
+  run: (baseURL: string, bearers: readonly string[]) => Promise<T>,
+): Promise<T> =>
+  withGateway(
+    (bearer) => ({
+      status: 401,
+      body: {
+        error: {
+          message: `Invalid key ${bearer}, and ${ECHOED_STRANGER} is not on file`,
+          type: "invalid_request_error",
+          code: 401,
+        },
+      },
+    }),
+    run,
+  );
+
+await test("18.26b — a gateway that repeats the key in its error text: the reason stays and the key does not, in the SDK and the CLI", async () => {
+  await withEchoingGateway(async (baseURL, bearers) => {
+    const failure = await failureOf(() =>
+      new NeuroLink({
+        credentials: { perplexityDecider: { apiKey: ECHOED_KEY, baseURL } },
+      }).decide({
+        provider: "perplexity-decider",
+        state: "x",
+        questions: PERPLEXITY_ONE_QUESTION,
+      }),
+    );
+    const message = failure?.message ?? "";
+    // The gateway's body repeats whatever bearer it received, so this is what
+    // makes the keys' absence below mean something: they were sent, and repeated.
+    // Read into a number first: asserting on `bearers.length` itself narrows it
+    // to the literal 1, and the count after the CLI call could not be compared.
+    const sentBySdk: number = bearers.length;
+    assert(
+      sentBySdk === 1 && bearers[0] === ECHOED_KEY,
+      "precondition: the configured key must reach the gateway, once",
+    );
+    assert(
+      failure?.kind === "authentication" && failure.status === 401,
+      "the gateway's refusal must come back as authentication with its own status",
+    );
+    assert(
+      !message.includes(ECHOED_KEY),
+      "the configured key must be stripped from the failure",
+    );
+    assert(
+      !message.includes(ECHOED_STRANGER),
+      "a key-shaped string must be stripped from the failure",
+    );
+    assert(
+      message.includes("is not on file"),
+      "the gateway's own reason must be kept",
+    );
+
+    const result = await runCLI(
+      [
+        "decide",
+        "The state text",
+        "--provider",
+        "perplexity-decider",
+        "--questions",
+        ONE_QUESTION,
+      ],
+      {
+        env: {
+          ...NO_PROVIDER_ENV,
+          PERPLEXITY_API_KEY: ECHOED_KEY,
+          PERPLEXITY_DECIDER_BASE_URL: baseURL,
+        },
+        timeoutMs: 30_000,
+      },
+    );
+    const output = result.stdout + result.stderr;
+    assert(result.exitCode !== 0, "a refused key must exit non-zero");
+    assert(
+      bearers.length === 2 && bearers[1] === ECHOED_KEY,
+      "precondition: the CLI must send the configured key to the gateway too",
+    );
+    assert(
+      !output.includes(ECHOED_KEY) && !output.includes(ECHOED_STRANGER),
+      "neither repeated key may reach the CLI's output",
+    );
+    assert(
+      output.includes("is not on file"),
+      "the CLI must print the gateway's own reason",
+    );
+  });
+});
+
+// The CLI's success path, without a key or a network: the one live test of it
+// (18.34) skips whenever the service does not answer, and a CLI that never
+// exits would otherwise be invisible here. The harness reports a command it had
+// to kill as exit code -1, which this test does not accept.
+await test("18.26c — the CLI against a gateway that answers: exit 0, clean JSON on stdout, the key sent once", async () => {
+  await withGateway(
+    () => ({
+      status: 200,
+      body: {
+        model: "pplx-decider-v1-27b",
+        answers: { urgent: { type: "noul", noul: 0.75 } },
+        usage: { input_tokens: 7, output_tokens: 1 },
+      },
+    }),
+    async (baseURL, bearers) => {
+      const result = await runCLI(
+        [
+          "decide",
+          "The state text",
+          "--provider",
+          "perplexity-decider",
+          "--format",
+          "json",
+          "--questions",
+          ONE_QUESTION,
+        ],
+        {
+          env: {
+            ...NO_PROVIDER_ENV,
+            PERPLEXITY_API_KEY: ECHOED_KEY,
+            PERPLEXITY_DECIDER_BASE_URL: baseURL,
+          },
+          timeoutMs: 30_000,
+        },
+      );
+      assert(
+        result.exitCode === 0,
+        "the CLI must exit 0 once the gateway has answered",
+      );
+      const sent: number = bearers.length;
+      assert(
+        sent === 1 && bearers[0] === ECHOED_KEY,
+        "the configured key must reach the gateway, once",
+      );
+      const parsed: unknown = JSON.parse(result.stdout);
+      assert(
+        isRecordLike(parsed) && parsed.provider === "perplexity-decider",
+        "stdout must be the raw JSON result",
+      );
+      const answers = isRecordLike(parsed) ? parsed.answers : undefined;
+      const urgent = isRecordLike(answers) ? answers.urgent : undefined;
+      assert(
+        isRecordLike(urgent) &&
+          urgent.type === "boolean" &&
+          urgent.probability === 0.75,
+        "the gateway's answer must come through as a boolean probability",
+      );
+      assert(
+        !looksLikeStackTrace(result.stderr),
+        "stderr must not hold a stack trace",
+      );
+    },
+  );
+});
+
+await test("18.27 — an owned rejection is authentication and is sent once", async () => {
+  await withRejectedDecisionKey(async (baseURL, bearers) => {
+    const failure = await failureOf(() =>
+      new NeuroLink({
+        credentials: {
+          perplexityDecider: { apiKey: "pplx-owned-rejection-key", baseURL },
+        },
+      }).decide({
+        provider: "perplexity-decider",
+        state: "x",
+        questions: PERPLEXITY_ONE_QUESTION,
+      }),
+    );
+    assert(bearers.length === 1, "the owned rejection must be requested once");
+    assert(
+      failure?.kind === "authentication" && failure.status === 401,
+      "the owned rejection must preserve authentication and its status",
+    );
+    assert(
+      failure.retryable === false,
+      "an authentication rejection must not retry",
+    );
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────
+// 19. Cloudflare Clef (decide-only), on Workers AI
+// ───────────────────────────────────────────────────────────────────────
+
+await test("19.1 — cloudflare-clef declares decide and only decide, and no generation rank", async () => {
+  const clef = PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.CLOUDFLARE_CLEF);
+  assert(clef !== undefined, "cloudflare-clef has no registered descriptor");
+  assert(
+    servesInferenceKind(clef!, "decide"),
+    "cloudflare-clef must declare decide",
+  );
+  assert(
+    !servesInferenceKind(clef!, "generate") &&
+      !servesInferenceKind(clef!, "stream"),
+    "a model that emits no text must not declare generate or stream",
+  );
+  assert(
+    clef!.autoSelectPriority === undefined &&
+      clef!.autoSelectPreference === undefined &&
+      clef!.defaultHealthSweepPriority === undefined,
+    "a decision provider must stay out of every generation fallback chain",
+  );
+  assert(
+    clef!.toolSupport === "none" && clef!.healthCheck !== "live-generate",
+    "a decision provider has no tools and cannot answer a live-generate probe",
+  );
+  assert(
+    clef!.credentialsKey === "cloudflareClef",
+    "the credentials slice must be Clef's own, not the text provider's",
+  );
+});
+
+await test("19.2 — it shares its token and account id with the cloudflare text provider, which stays a text provider", async () => {
+  const clef = PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.CLOUDFLARE_CLEF);
+  const text = PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.CLOUDFLARE);
+  assert(
+    clef !== undefined && text !== undefined,
+    "both cloudflare descriptors must be registered",
+  );
+  assert(
+    clef!.envVars.apiKey === "CLOUDFLARE_API_KEY" &&
+      text!.envVars.apiKey === clef!.envVars.apiKey,
+    "the two providers must read the same token variable",
+  );
+  assert(
+    servesInferenceKind(text!, "generate") &&
+      !servesInferenceKind(text!, "decide"),
+    "the text provider must keep generating and must not become a decision provider",
+  );
+  assert(
+    (clef!.envVars.extraRequired ?? []).join() === "CLOUDFLARE_ACCOUNT_ID",
+    "the route carries the account id, so it must be required beside the token",
+  );
+  assert(
+    clef!.envVars.extraRequiredCredentialFields?.CLOUDFLARE_ACCOUNT_ID ===
+      "accountId",
+    "credentials.cloudflareClef.accountId must stand in for CLOUDFLARE_ACCOUNT_ID",
+  );
+});
+
+await test("19.3 — it declares limits chosen from what was measured: a state window inside what was read in full, a question cap, four images and no video", async () => {
+  const limits = PROVIDER_DESCRIPTORS_BY_NAME.get(
+    AIProviderName.CLOUDFLARE_CLEF,
+  )?.decisionLimits;
+  assert(limits !== undefined, "cloudflare-clef must declare decisionLimits");
+  // 16,000 is a chosen figure, in the estimator's tokens. On 2026-10-07 the
+  // estimate ran 35% over the real token count for prose and 14% under it for a
+  // JSON array of digits, so the limit is at most about 18,400 real tokens.
+  assert(
+    limits!.maxStateTokens === 16_000,
+    "the state window must stay at the chosen 16,000 estimated tokens",
+  );
+  assert(
+    limits!.maxStateTokens * 1.15 < 52_154,
+    "the local window, at the worst measured real-to-estimated ratio (1.15), must sit inside the 52,154 tokens clef was seen to read in full on 2026-10-07",
+  );
+  assert(
+    limits!.digitTokensPerChar === 1,
+    "digits must be charged a token each: the tokenizer reads them one by one",
+  );
+  assert(
+    limits!.symbolTokensPerChar === 0.75,
+    "punctuation must be charged 0.75 a character: a JSON array of digits costs a real token a character, commas included",
+  );
+  assert(
+    limits!.astralTokensPerChar === 3,
+    "emoji must be charged 3 tokens each: measured 2.9",
+  );
+  assert(
+    limits!.nonAsciiTokensPerChar === 1.5,
+    "non-ASCII text must be charged 1.5 tokens per character",
+  );
+  assert(
+    limits!.maxQuestions === 64,
+    "the documented 64-question cap must be declared",
+  );
+  assert(
+    limits!.media !== undefined && limits!.media.maxImages === 4,
+    "up to 4 images per request must be declared",
+  );
+  assert(
+    limits!.media!.video === false,
+    "the API refuses video, so none may be declared",
+  );
+  assert(
+    limits!.media!.maxRequestBytes === 256_000,
+    "the request cap must stay under Cloudflare's measured 262,144-character estimate",
+  );
+});
+
+await test("19.4 — it comes after subq and perplexity-decider and before openai-decisions and scaledown, which is last", async () => {
+  const names: string[] = DECISION_PROVIDERS.map((d) => d.name);
+  assert(
+    names.indexOf("subq") !== -1 &&
+      names.indexOf("subq") < names.indexOf("perplexity-decider") &&
+      names.indexOf("perplexity-decider") < names.indexOf("cloudflare-clef"),
+    "cloudflare-clef must come after subq and perplexity-decider",
+  );
+  assert(
+    names.indexOf("cloudflare-clef") < names.indexOf("openai-decisions") &&
+      names.indexOf("openai-decisions") < names.indexOf("scaledown") &&
+      names[names.length - 1] === "scaledown",
+    "cloudflare-clef must come before openai-decisions and scaledown, the last entry",
+  );
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+logSection("20. Decision hooks, limits and per-call credentials");
+// ───────────────────────────────────────────────────────────────────────────
+/** One request a fake Laya server received, as much as the tests inspect. */
+type FakePredictRequest = {
+  path: string;
+  authorization: string | null;
+  body: Record<string, unknown>;
+};
+
+/**
+ * A local stand-in for a System One server (Laya's `/predict`, XOR's
+ * `/v1/decisions` — same wire): answers whatever questions it receives
+ * with well-formed, confident answers, so a decision can be driven
+ * end-to-end — hooks, namespacing, caps, events, credentials, media —
+ * with no network and no key. Answers are deterministic: a `noul` is 0.9 —
+ * except a per-server routing question (`server__N`) and the summary gate's
+ * `is_refusal`, which get a confident 0.05 so tool routing has something to
+ * drop and a summary is accepted — a `choice` picks "hard" when offered (so
+ * the classifier's difficulty verdict clears the upgrade bar) and the first
+ * option otherwise, and a `score` lands on the last level. The recorded
+ * body keeps `images` / `video` exactly as they arrived, so a test can
+ * check what a media request put on the wire.
+ */
+async function startFakeSystemOne(): Promise<{
+  port: number;
+  requests: FakePredictRequest[];
+  close: () => Promise<void>;
+}> {
+  const requests: FakePredictRequest[] = [];
+  const server = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString());
+      const body = isRecordLike(parsed) ? parsed : {};
+      requests.push({
+        path: req.url ?? "",
+        authorization: req.headers.authorization ?? null,
+        body,
+      });
+      const questions = isRecordLike(body.questions) ? body.questions : {};
+      const answers: Record<string, unknown> = {};
+      for (const [id, raw] of Object.entries(questions)) {
+        const question = isRecordLike(raw) ? raw : {};
+        if (question.type === "noul") {
+          const confidentNo = id.startsWith("server__") || id === "is_refusal";
+          answers[id] = { type: "noul", noul: confidentNo ? 0.05 : 0.9 };
+        } else if (question.type === "choice") {
+          const options = isRecordLike(question.criteria)
+            ? Object.keys(question.criteria)
+            : [];
+          const choice = options.includes("hard") ? "hard" : (options[0] ?? "");
+          const probabilities: Record<string, number> = {};
+          for (const option of options) {
+            probabilities[option] =
+              option === choice ? 0.85 : 0.15 / Math.max(1, options.length - 1);
+          }
+          answers[id] = {
+            type: "choice",
+            choice,
+            probabilities,
+            confidence: 0.8,
+          };
+        } else if (question.type === "score") {
+          const levels = Array.isArray(question.criteria)
+            ? question.criteria
+            : [];
+          const last = Math.max(0, levels.length - 1);
+          const legend: Record<string, string> = {};
+          const probabilities: Record<string, number> = {};
+          levels.forEach((level, index) => {
+            legend[String(index)] = typeof level === "string" ? level : "";
+            probabilities[String(index)] =
+              index === last ? 0.9 : 0.1 / Math.max(1, last);
+          });
+          answers[id] = {
+            type: "score",
+            score: last,
+            legend,
+            probabilities,
+            confidence: 0.9,
+          };
+        }
+      }
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          model:
+            typeof body.model === "string" ? body.model : "typed-decisions",
+          answers,
+          usage: { input_tokens: 120, output_tokens: 0 },
+        }),
+      );
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  return {
+    port,
+    requests,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
+
+/** The fake as a Laya deployment: `LAYA_BASE_URL` is the route prefix. */
+async function startFakeLaya(): Promise<{
+  baseURL: string;
+  requests: FakePredictRequest[];
+  close: () => Promise<void>;
+}> {
+  const fake = await startFakeSystemOne();
+  return { ...fake, baseURL: `http://127.0.0.1:${fake.port}/laya` };
+}
+
+/**
+ * The fake as an XOR deployment: `XOR_BASE_URL` is the origin, and the
+ * provider appends `/v1/decisions` itself.
+ */
+async function startFakeXor(): Promise<{
+  baseURL: string;
+  requests: FakePredictRequest[];
+  close: () => Promise<void>;
+}> {
+  const fake = await startFakeSystemOne();
+  return { ...fake, baseURL: `http://127.0.0.1:${fake.port}` };
+}
+
+/** Question ids a fake request carried, in wire order. */
+function questionIdsOf(request: FakePredictRequest): string[] {
+  return isRecordLike(request.body.questions)
+    ? Object.keys(request.body.questions)
+    : [];
+}
+
+const HOST_QUESTIONS: DecisionQuestionMap = {
+  tone: {
+    type: "boolean",
+    instructions: "Is the request phrased politely?",
+  },
+  team: {
+    type: "choice",
+    instructions: "Which team owns this?",
+    criteria: { payments: "Money movement", platform: "Everything else" },
+  },
+};
+
+await test("20.1 — decisionLimits() is null with no decision provider configured", async () => {
+  try {
+    clearDecisionKeys();
+    const nl = new NeuroLink();
+    assert(
+      nl.decisionLimits() === null,
+      "a reading was produced with no decision provider configured",
+    );
+  } finally {
+    restoreEnv();
+  }
+});
+
+await test("20.2 — laya limits flatten per model and are enforced locally", async () => {
+  try {
+    // A developer's own LAYA_MODEL must not decide which model "the default" is.
+    clearDecisionKeys();
+    const nl = new NeuroLink();
+    const unlisted = nl.decisionLimits({ provider: "laya", model: "en" });
+    assert(unlisted !== null, "no reading for an unlisted laya model");
+    assert(
+      unlisted!.provider === "laya" &&
+        unlisted!.maxStateTokens === 320 &&
+        unlisted!.maxQuestions === 64 &&
+        unlisted!.nonAsciiTokensPerChar === 1.5 &&
+        unlisted!.enforcedLocally === true,
+      "an unlisted laya model must read the base 320/64/1.5, enforced locally",
+    );
+    const typed = nl.decisionLimits({
+      provider: "laya",
+      model: "typed-decisions",
+    });
+    assert(
+      typed !== null &&
+        typed.maxStateTokens === 768 &&
+        typed.nonAsciiTokensPerChar === 1.5 &&
+        typed.maxQuestions === 64,
+      "typed-decisions must override the state window and inherit the rest",
+    );
+    const multilingual = nl.decisionLimits({
+      provider: "laya",
+      model: "multilingual",
+    });
+    assert(
+      multilingual !== null &&
+        multilingual.maxStateTokens === 768 &&
+        multilingual.nonAsciiTokensPerChar === 0.6,
+      "multilingual must override both the window and the non-ASCII rate",
+    );
+    // No model named: the model decide() sends — the one registered for the
+    // provider (LAYA_MODEL as read at registration, else the default).
+    // EXPECTED_LAYA_MODEL mirrors that read, so this holds whether or not
+    // LAYA_MODEL is set in this run's environment; 20.19 proves the
+    // agreement with the wire either way.
+    const byDefault = nl.decisionLimits({ provider: "laya" });
+    assert(
+      byDefault !== null &&
+        byDefault.model === EXPECTED_LAYA_MODEL &&
+        (EXPECTED_LAYA_MODEL !== "typed-decisions" ||
+          byDefault.maxStateTokens === 768),
+      "the default laya model must be the one decide() would send",
+    );
+  } finally {
+    restoreEnv();
+  }
+});
+
+await test("20.3 — typesafe limits are advisory: reported, not enforced", async () => {
+  const nl = new NeuroLink();
+  const reading = nl.decisionLimits({ provider: "typesafe" });
+  assert(reading !== null, "no reading for typesafe");
+  assert(
+    reading!.maxStateTokens === TYPESAFE_MAX_STATE_TOKENS,
+    "the descriptor's advisory window must equal the exported constant",
+  );
+  assert(
+    reading!.enforcedLocally === false,
+    "typesafe limits must not be enforced locally",
+  );
+  assert(
+    reading!.maxQuestions === undefined,
+    "typesafe caps a request by tokens, not by question count",
+  );
+  assert(
+    reading!.model === "jev-latest",
+    "the default typesafe model must be reported",
+  );
+  // An alias resolves the same as the canonical name, as it does in decide().
+  const viaAlias = nl.decisionLimits({ provider: "jev" });
+  assert(
+    viaAlias !== null && viaAlias.provider === "typesafe",
+    "a provider alias must resolve to the canonical descriptor",
+  );
+  // A text provider has no decision limits to read.
+  assert(
+    nl.decisionLimits({ provider: "openai" }) === null,
+    "a text provider must not produce a decision reading",
+  );
+});
+
+await test("20.4 — decisionLimits() resolves the default provider from SDK credentials", async () => {
+  try {
+    clearDecisionKeys();
+    const nl = new NeuroLink({
+      credentials: {
+        laya: { apiKey: "sk-placeholder", baseURL: "http://127.0.0.1:9/laya" },
+      },
+    });
+    const reading = nl.decisionLimits();
+    assert(
+      reading !== null && reading.provider === "laya",
+      "credentials given to the constructor must configure the default provider",
+    );
+    // Per-call credentials count too, as they do for decide().
+    const bare = new NeuroLink();
+    const perCall = bare.decisionLimits({
+      credentials: {
+        laya: { apiKey: "sk-placeholder", baseURL: "http://127.0.0.1:9/laya" },
+      },
+    });
+    assert(
+      perCall !== null && perCall.provider === "laya",
+      "per-call credentials must configure the default provider",
+    );
+    // A named model wins over the registered default, and the reading is
+    // flattened for it.
+    const named = nl.decisionLimits({ model: "english" });
+    assert(
+      named !== null &&
+        named.model === "english" &&
+        named.maxStateTokens === 320,
+      "query.model must select the model the reading is flattened for",
+    );
+  } finally {
+    restoreEnv();
+  }
+});
+
+await test("20.5 — estimateDecisionStateTokens is the pre-flight refusal's own estimator", async () => {
+  const fake = await startFakeLaya();
+  try {
+    clearDecisionKeys();
+    const nl = new NeuroLink({
+      credentials: { laya: { apiKey: "sk-fake", baseURL: fake.baseURL } },
+    });
+    const limits = nl.decisionLimits({
+      provider: "laya",
+      model: "typed-decisions",
+    });
+    assert(limits !== null, "no laya reading");
+    // Non-ASCII text is exactly where the two estimates could disagree: the
+    // reading carries the rate, so the estimate must too.
+    // 22 characters per repeat, 4 of them non-ASCII: 100 repeats estimate to
+    // ~550 tokens at 4 chars/token but ~1,050 once the 1.5-per-character
+    // rate is charged, which is what puts the fixture over a 768 window.
+    const fits = "Wörter über Prüfung — ".repeat(20);
+    const overflows = "Wörter über Prüfung — ".repeat(100);
+    const fitsTokens = estimateDecisionStateTokens(fits, limits!);
+    const overflowTokens = estimateDecisionStateTokens(overflows, limits!);
+    assert(
+      fitsTokens <= limits!.maxStateTokens &&
+        overflowTokens > limits!.maxStateTokens,
+      "the two fixtures must sit on opposite sides of the reading's window",
+    );
+    // Without the rate the over-window state would be estimated as fitting —
+    // which is why the reading's rate is part of the contract.
+    assert(
+      estimateDecisionStateTokens(overflows) <= limits!.maxStateTokens,
+      "the fixture must only overflow once non-ASCII characters are charged at the rate",
+    );
+
+    fetchCapture.reset();
+    const accepted = await nl.decide({
+      provider: "laya",
+      model: "typed-decisions",
+      state: fits,
+      questions: { urgent: ALL_THREE.urgent },
+    });
+    assert(
+      accepted.answers.urgent !== undefined,
+      "the in-window state was not answered",
+    );
+    assert(
+      fake.requests.length === 1,
+      "the in-window state must reach the server exactly once",
+    );
+
+    let refused: unknown = null;
+    try {
+      await nl.decide({
+        provider: "laya",
+        model: "typed-decisions",
+        state: overflows,
+        questions: { urgent: ALL_THREE.urgent },
+      });
+    } catch (error) {
+      refused = error;
+    }
+    assert(refused !== null, "the over-window state was not refused");
+    const cause = (refused as { cause?: { kind?: string } }).cause;
+    assert(
+      cause?.kind === "max_tokens_exceeded",
+      "the refusal must be classified as max_tokens_exceeded",
+    );
+    assert(
+      fake.requests.length === 1,
+      "a locally refused state must never reach the server",
+    );
+  } finally {
+    await fake.close();
+    restoreEnv();
+  }
+});
+
+await test("20.6 — through generate(): the routing site runs the hooks, namespaces host ids, answers under the host's", async () => {
+  const fake = await startFakeLaya();
+  try {
+    clearDecisionKeys();
+    const seen: DecisionHookContext[] = [];
+    const answered: DecisionHookAnswersContext[] = [];
+    const before: DecisionBeforeEvent[] = [];
+    const after: DecisionAfterEvent[] = [];
+    const nl = new NeuroLink({
+      credentials: { laya: { apiKey: "sk-fake", baseURL: fake.baseURL } },
+      classifierRouter: { enabled: true, pool: POOL },
+      decisionHooks: {
+        extendQuestions: (context) => {
+          seen.push(context);
+          return HOST_QUESTIONS;
+        },
+        onAnswers: (context) => {
+          answered.push(context);
+        },
+      },
+    });
+    const emitter = nl.getEventEmitter();
+    emitter.on("decision:before", (event) =>
+      before.push(event as DecisionBeforeEvent),
+    );
+    emitter.on("decision:after", (event) =>
+      after.push(event as DecisionAfterEvent),
+    );
+
+    // `typesafe` generates no text, so the turn fails locally right after
+    // routing — which is the only part under test — with no LLM call.
+    await nl
+      .generate({ input: { text: HARD_PROMPT }, provider: "typesafe" })
+      .then(
+        () => null,
+        () => null,
+      );
+
+    assert(
+      seen.length === 1,
+      "extendQuestions must run exactly once per routing turn",
+    );
+    assert(
+      seen[0]!.site === "routing",
+      "the classifier's call must be stamped as the routing site",
+    );
+    assert(
+      "difficulty" in seen[0]!.questions && !("tone" in seen[0]!.questions),
+      "the hook must see NeuroLink's own questions, not its own",
+    );
+
+    assert(
+      fake.requests.length === 1,
+      "exactly one decision request must reach the server",
+    );
+    const wireIds = questionIdsOf(fake.requests[0]!);
+    assert(
+      wireIds.includes("difficulty") &&
+        wireIds.includes("host__0") &&
+        wireIds.includes("host__1") &&
+        !wireIds.includes("tone") &&
+        !wireIds.includes("team"),
+      "host questions must travel under the host namespace, never their own ids",
+    );
+
+    assert(answered.length === 1, "onAnswers must run exactly once");
+    const hostAnswers = answered[0]!.answers;
+    assert(
+      readDecisionBoolean(hostAnswers, "tone") === 0.9 &&
+        readDecisionChoice(hostAnswers, "team")?.choice === "payments",
+      "host answers must come back under the host's original ids",
+    );
+    assert(
+      !("host__0" in hostAnswers) && !("difficulty" in hostAnswers),
+      "the host's answer map must hold only the host's answers",
+    );
+    assert(
+      "difficulty" in answered[0]!.result.answers &&
+        "host__0" in answered[0]!.result.answers,
+      "the full result must still carry every answer under its wire id",
+    );
+
+    assert(
+      before.length === 1 && after.length === 1,
+      "one before/after pair must fire for the turn",
+    );
+    assert(
+      before[0]!.site === "routing" && before[0]!.hostQuestionCount === 2,
+      "decision:before must name the site and count the host questions",
+    );
+    assert(
+      after[0]!.site === "routing" &&
+        after[0]!.provider === "laya" &&
+        after[0]!.model === EXPECTED_LAYA_MODEL &&
+        typeof after[0]!.latencyMs === "number" &&
+        "difficulty" in after[0]!.answers &&
+        !("host__0" in after[0]!.answers) &&
+        readDecisionBoolean(after[0]!.hostAnswers, "tone") === 0.9,
+      "decision:after must split NeuroLink's answers from the host's",
+    );
+  } finally {
+    await fake.close();
+    restoreEnv();
+  }
+});
+
+await test("20.7 — host additions are capped at the provider's question limit, and warned about", async () => {
+  const fake = await startFakeLaya();
+  const previousDebug = process.env.NEUROLINK_DEBUG;
+  try {
+    clearDecisionKeys();
+    // Warnings are hidden unless debugging; the cap warning is part of the contract.
+    process.env.NEUROLINK_DEBUG = "true";
+    const tooMany: Record<string, { type: "boolean"; instructions: string }> =
+      {};
+    for (let index = 0; index < 100; index++) {
+      tooMany[`q${index}`] = {
+        type: "boolean",
+        instructions: `Host question ${index}?`,
+      };
+    }
+    const warnings: string[] = [];
+    let hostAnswerCount = -1;
+    const nl = new NeuroLink({
+      credentials: { laya: { apiKey: "sk-fake", baseURL: fake.baseURL } },
+      classifierRouter: { enabled: true, pool: POOL },
+      decisionHooks: {
+        extendQuestions: () => tooMany,
+        onAnswers: (context) => {
+          hostAnswerCount = Object.keys(context.answers).length;
+        },
+      },
+    });
+    nl.getEventEmitter().on("log-event", (event) => {
+      const entry = event as { level?: string; message?: string };
+      if (entry.level === "warn" && typeof entry.message === "string") {
+        warnings.push(entry.message);
+      }
+    });
+    await nl
+      .generate({ input: { text: HARD_PROMPT }, provider: "typesafe" })
+      .then(
+        () => null,
+        () => null,
+      );
+    const limits = nl.decisionLimits({ provider: "laya" });
+    assert(limits !== null, "no laya reading");
+    assert(
+      fake.requests.length === 1,
+      "the capped request must still be sent, once",
+    );
+    const wireIds = questionIdsOf(fake.requests[0]!);
+    assert(
+      wireIds.length === limits!.maxQuestions,
+      "the request must carry exactly the provider's maximum, not one more",
+    );
+    const ownCount = wireIds.filter((id) => !id.startsWith("host__")).length;
+    assert(
+      ownCount > 0 &&
+        wireIds.filter((id) => id.startsWith("host__")).length ===
+          limits!.maxQuestions - ownCount,
+      "every one of NeuroLink's own questions must survive; only host questions are dropped",
+    );
+    assert(
+      hostAnswerCount === limits!.maxQuestions - ownCount,
+      "the host must get an answer for every question that was sent",
+    );
+    assert(
+      warnings.some(
+        (message) =>
+          message.includes("dropped") && message.includes("host question"),
+      ),
+      "dropping host questions must be warned about",
+    );
+  } finally {
+    if (previousDebug === undefined) {
+      delete process.env.NEUROLINK_DEBUG;
+    } else {
+      process.env.NEUROLINK_DEBUG = previousDebug;
+    }
+    await fake.close();
+    restoreEnv();
+  }
+});
+
+await test("20.8 — a throwing hook, or a malformed question, never changes the routing verdict", async () => {
+  const fake = await startFakeLaya();
+  try {
+    clearDecisionKeys();
+    // A host-wired ClassifierRouter decides its strategy from the
+    // environment (no `hasDecisionProvider` dep here), so the fake is
+    // configured there; the instances below inherit it.
+    process.env.LAYA_API_KEY = "sk-fake";
+    process.env.LAYA_BASE_URL = fake.baseURL;
+    // Reference verdict: same fake, no hooks.
+    const plain = new ClassifierRouter(
+      { enabled: true, pool: POOL },
+      { decide: (o) => new NeuroLink().tryDecide(o) },
+    );
+    const reference = await plain.route({ prompt: HARD_PROMPT });
+    assert(
+      reference !== null && reference.reason?.startsWith("jev") === true,
+      "the fake server must drive the jev strategy for the reference verdict",
+    );
+
+    const throwing = new NeuroLink({
+      decisionHooks: {
+        extendQuestions: () => {
+          throw new Error("host hook exploded");
+        },
+        onAnswers: () => {
+          throw new Error("host observer exploded");
+        },
+      },
+    });
+    const throwingRouter = new ClassifierRouter(
+      { enabled: true, pool: POOL },
+      { decide: (o) => throwing.tryDecide(o) },
+    );
+    const withThrow = await throwingRouter.route({ prompt: HARD_PROMPT });
+    assert(
+      withThrow !== null &&
+        withThrow.difficulty === reference!.difficulty &&
+        withThrow.model === reference!.model &&
+        withThrow.provider === reference!.provider,
+      "a throwing hook must leave the routing verdict exactly as without hooks",
+    );
+    assert(
+      questionIdsOf(fake.requests[fake.requests.length - 1]!).every(
+        (id) => !id.startsWith("host__"),
+      ),
+      "a throwing hook must add nothing to the wire",
+    );
+
+    // A malformed question is dropped on its own; a valid sibling still rides along.
+    const malformed = new NeuroLink({
+      decisionHooks: {
+        extendQuestions: () =>
+          ({
+            broken: {
+              type: "choice",
+              instructions: "one option only",
+              criteria: { only: "x" },
+            },
+            missing: { type: "boolean" },
+            fine: { type: "boolean", instructions: "Is it fine?" },
+          }) as unknown as DecisionQuestionMap,
+      },
+    });
+    const malformedRouter = new ClassifierRouter(
+      { enabled: true, pool: POOL },
+      { decide: (o) => malformed.tryDecide(o) },
+    );
+    const withMalformed = await malformedRouter.route({ prompt: HARD_PROMPT });
+    assert(
+      withMalformed !== null &&
+        withMalformed.difficulty === reference!.difficulty,
+      "a malformed host question must not change the verdict",
+    );
+    const lastIds = questionIdsOf(fake.requests[fake.requests.length - 1]!);
+    assert(
+      lastIds.filter((id) => id.startsWith("host__")).length === 1,
+      "only the well-formed host question may reach the wire",
+    );
+  } finally {
+    await fake.close();
+    restoreEnv();
+  }
+});
+
+await test("20.13 — a hung hook, a throwing listener and an onAnswers mutation are all contained", async () => {
+  const fake = await startFakeLaya();
+  try {
+    clearDecisionKeys();
+    process.env.LAYA_API_KEY = "sk-fake";
+    process.env.LAYA_BASE_URL = fake.baseURL;
+    const plain = new ClassifierRouter(
+      { enabled: true, pool: POOL },
+      { decide: (o) => new NeuroLink().tryDecide(o) },
+    );
+    const reference = await plain.route({ prompt: HARD_PROMPT });
+    assert(
+      reference !== null && reference.reason?.startsWith("jev") === true,
+      "the fake server must drive the jev strategy for the reference verdict",
+    );
+
+    // 1. extendQuestions that never resolves: bounded by hookTimeoutMs, the
+    //    call proceeds with NeuroLink's own questions and finishes promptly.
+    let mutatedByHost = false;
+    const nl = new NeuroLink({
+      decisionHooks: {
+        hookTimeoutMs: 100,
+        extendQuestions: () => new Promise<undefined>(() => undefined),
+        onAnswers: ({ result }) => {
+          // 3. Edit what the host is handed; the consumer must not see it.
+          for (const answer of Object.values(result.answers)) {
+            // Every variant carries a probability-ish number; flipping it to
+            // an impossible value would derail the classifier if it leaked.
+            if (answer.type === "boolean") {
+              (answer as { probability: number }).probability = -1;
+            } else if (answer.type === "choice") {
+              (answer as { choice: string }).choice = "tampered";
+            } else {
+              (answer as { score: number }).score = -1;
+            }
+          }
+          mutatedByHost = true;
+        },
+      },
+    });
+    // 2. A listener that throws on both events.
+    const emitter = nl.getEventEmitter();
+    const boom = () => {
+      throw new Error("listener exploded");
+    };
+    emitter.on("decision:before", boom);
+    emitter.on("decision:after", boom);
+    const router = new ClassifierRouter(
+      { enabled: true, pool: POOL },
+      { decide: (o) => nl.tryDecide(o) },
+    );
+    const startedAt = Date.now();
+    const verdict = await router.route({ prompt: HARD_PROMPT });
+    const elapsed = Date.now() - startedAt;
+    emitter.off("decision:before", boom);
+    emitter.off("decision:after", boom);
+    assert(
+      verdict !== null &&
+        verdict.difficulty === reference!.difficulty &&
+        verdict.model === reference!.model,
+      "a hung hook and a throwing listener must leave the verdict as without hooks",
+    );
+    assert(
+      elapsed < 5_000,
+      "a hung extendQuestions must be cut off at hookTimeoutMs, not stall the turn",
+    );
+    assert(
+      questionIdsOf(fake.requests[fake.requests.length - 1]!).every(
+        (id) => !id.startsWith("host__"),
+      ),
+      "a timed-out hook must add nothing to the wire",
+    );
+    assert(mutatedByHost, "onAnswers must still run after the hook timeout");
+    assert(
+      verdict!.reason?.startsWith("jev") === true,
+      "the consumer's answers must be unaffected by the host's mutation",
+    );
+  } finally {
+    await fake.close();
+    restoreEnv();
+  }
+});
+
+await test("20.9 — every built-in site is stamped, and a host-wired consumer gets the hooks too", async () => {
+  const fake = await startFakeLaya();
+  try {
+    clearDecisionKeys();
+    const sites: string[] = [];
+    const before: string[] = [];
+    const after: string[] = [];
+    const nl = new NeuroLink({
+      credentials: { laya: { apiKey: "sk-fake", baseURL: fake.baseURL } },
+      decisionHooks: {
+        extendQuestions: (context) => {
+          sites.push(context.site);
+          return undefined;
+        },
+      },
+    });
+    const emitter = nl.getEventEmitter();
+    emitter.on("decision:before", (event) =>
+      before.push((event as DecisionBeforeEvent).site),
+    );
+    emitter.on("decision:after", (event) =>
+      after.push((event as DecisionAfterEvent).site),
+    );
+    // The same wiring a host uses for its own RAGPipeline / ClassifierRouter.
+    const decide = (o: Parameters<typeof nl.tryDecide>[0]) => nl.tryDecide(o);
+
+    const servers = await selectServersByDecision(
+      "open a pull request",
+      CATALOG,
+      decide,
+    );
+    assert(
+      servers !== null,
+      "tool routing produced no outcome against the fake",
+    );
+    const dropped = await selectIrrelevantMessages(
+      TRANSCRIPT,
+      "rename the retry constant",
+      decide,
+      { protectRecent: 1 },
+    );
+    // The fake answers every message as needed, so nothing is dropped — the
+    // call itself is what is under test here.
+    assert(dropped === null, "the fake must answer every message as needed");
+    const kept = await summaryPreservesContext(
+      "A faithful summary.",
+      TRANSCRIPT,
+      decide,
+    );
+    assert(kept === true, "a confident yes must accept the summary");
+    const plan = await decideSearchPlan("what is the refund window?", decide, {
+      defaultTopK: 5,
+      canHybrid: true,
+      canGraph: true,
+      canRerank: true,
+    });
+    assert(plan !== null, "RAG planning produced no plan against the fake");
+
+    const expected = [
+      "toolRouting",
+      "contextRelevance",
+      "summaryGate",
+      "ragPlan",
+    ];
+    assert(
+      JSON.stringify(sites) === JSON.stringify(expected),
+      "each consumer must stamp its own site, in call order",
+    );
+    assert(
+      JSON.stringify(before) === JSON.stringify(expected) &&
+        JSON.stringify(after) === JSON.stringify(expected),
+      "one decision:before and one decision:after must fire per site call",
+    );
+    assert(
+      fake.requests.length === 4,
+      "each site must cost exactly one round trip",
+    );
+
+    // A host's own tryDecide call is not a site: no hook, no event.
+    await nl.tryDecide({
+      state: SUPPORT_TICKET,
+      questions: { urgent: ALL_THREE.urgent },
+    });
+    assert(
+      sites.length === 4 && before.length === 4,
+      "a plain tryDecide call must run no hook and emit no site event",
+    );
+  } finally {
+    await fake.close();
+    restoreEnv();
+  }
+});
+
+await test("20.10 — the decision span names its site and counts the host's questions", async () => {
+  const fake = await startFakeLaya();
+  try {
+    clearDecisionKeys();
+    const nl = new NeuroLink({
+      credentials: { laya: { apiKey: "sk-fake", baseURL: fake.baseURL } },
+      decisionHooks: { extendQuestions: () => HOST_QUESTIONS },
+    });
+    nl.resetMetrics();
+    await decideSearchPlan(
+      "what is the refund window?",
+      (o) => nl.tryDecide(o),
+      {
+        defaultTopK: 5,
+        canHybrid: true,
+        canGraph: true,
+        canRerank: true,
+      },
+    );
+    const span = nl.getSpans().find((s) => s.type === "model.decision");
+    assert(span !== undefined, "no decision span was recorded");
+    assert(
+      span!.attributes["decision.site"] === "ragPlan",
+      "the span must name the site that asked",
+    );
+    assert(
+      span!.attributes["decision.host_question_count"] === 2,
+      "the span must count the host's questions",
+    );
+    assert(
+      span!.attributes["decision.question_count"] === 6,
+      "question_count must count everything sent, NeuroLink's four plus the host's two",
+    );
+    // A plain call carries neither attribute — it is not a site.
+    nl.resetMetrics();
+    await nl.tryDecide({
+      state: SUPPORT_TICKET,
+      questions: { urgent: ALL_THREE.urgent },
+    });
+    const plain = nl.getSpans().find((s) => s.type === "model.decision");
+    assert(
+      plain !== undefined && !("decision.site" in plain.attributes),
+      "a host's own decision must not be attributed to a site",
+    );
+  } finally {
+    await fake.close();
+    restoreEnv();
+  }
+});
+
+await test("20.11 — per-call credentials reach the classifier's decision, not the instance's", async () => {
+  const fake = await startFakeLaya();
+  try {
+    clearDecisionKeys();
+    fetchCapture.reset();
+    // The instance points at a dead address: if the routing decision used the
+    // instance credentials it would be recorded there and fail, not answered.
+    const nl = new NeuroLink({
+      credentials: {
+        laya: { apiKey: "sk-instance", baseURL: "http://127.0.0.1:9/laya" },
+      },
+      classifierRouter: { enabled: true, pool: POOL },
+    });
+    await nl
+      .generate({
+        input: { text: HARD_PROMPT },
+        provider: "typesafe",
+        credentials: { laya: { apiKey: "sk-per-call", baseURL: fake.baseURL } },
+      })
+      .then(
+        () => null,
+        () => null,
+      );
+    assert(
+      fake.requests.length === 1,
+      "the per-call server must see exactly one decision request",
+    );
+    assert(
+      fake.requests[0]!.authorization === "Bearer sk-per-call",
+      "the decision must carry the per-call key, not the instance key",
+    );
+    assert(
+      fake.requests[0]!.path === "/laya/predict",
+      "the decision must go to the per-call base URL",
+    );
+    assert(
+      fetchCapture.list().filter((c) => c.url.startsWith("http://127.0.0.1:9/"))
+        .length === 0,
+      "nothing may be sent to the instance-level base URL",
+    );
+  } finally {
+    await fake.close();
+    restoreEnv();
+  }
+});
+
+await test("20.12 — a host-wired consumer can pass per-call credentials on the options it hands tryDecide", async () => {
+  const fake = await startFakeLaya();
+  try {
+    clearDecisionKeys();
+    const sitesSeen: string[] = [];
+    const nl = new NeuroLink({
+      credentials: {
+        laya: { apiKey: "sk-instance", baseURL: "http://127.0.0.1:9/laya" },
+      },
+      decisionHooks: {
+        extendQuestions: (context) => {
+          sitesSeen.push(context.site);
+          return undefined;
+        },
+      },
+    });
+    const perCall = { laya: { apiKey: "sk-per-call", baseURL: fake.baseURL } };
+    // Tool routing, as generate() wires it: the outer request's credentials
+    // travel on the options the site hands to tryDecide.
+    const servers = await selectServersByDecision(
+      "open a pull request",
+      CATALOG,
+      (o) => nl.tryDecide({ ...o, credentials: perCall }),
+    );
+    assert(
+      servers !== null,
+      "tool routing produced no outcome against the fake",
+    );
+    assert(
+      fake.requests.length === 1 &&
+        fake.requests[0]!.authorization === "Bearer sk-per-call",
+      "the tool routing decision must carry the per-call key",
+    );
+    assert(
+      sitesSeen.length === 1 && sitesSeen[0] === "toolRouting",
+      "the hook must see the tool routing site",
+    );
+  } finally {
+    await fake.close();
+    restoreEnv();
+  }
+});
+
+/** Warn-level log messages from `nl`, visible only with NEUROLINK_DEBUG. */
+function collectWarnings(nl: InstanceType<typeof NeuroLink>): string[] {
+  const warnings: string[] = [];
+  nl.getEventEmitter().on("log-event", (event) => {
+    const entry = event as { level?: string; message?: string };
+    if (entry.level === "warn" && typeof entry.message === "string") {
+      warnings.push(entry.message);
+    }
+  });
+  return warnings;
+}
+
+/** Runs `fn` with warnings visible, restoring NEUROLINK_DEBUG afterwards. */
+async function withDebugLogs<T>(fn: () => Promise<T>): Promise<T> {
+  const previous = process.env.NEUROLINK_DEBUG;
+  process.env.NEUROLINK_DEBUG = "true";
+  try {
+    return await fn();
+  } finally {
+    if (previous === undefined) {
+      delete process.env.NEUROLINK_DEBUG;
+    } else {
+      process.env.NEUROLINK_DEBUG = previous;
+    }
+  }
+}
+
+/** A site-stamped request, as a host-wired consumer hands it to tryDecide. */
+const RAG_PLAN_REQUEST = {
+  site: "ragPlan" as const,
+  state: SUPPORT_TICKET,
+  questions: { urgent: ALL_THREE.urgent },
+};
+
+await test("20.14 — an out-of-range hookTimeoutMs falls back to the default with one warning, instead of timing every hook out", async () => {
+  const fake = await startFakeLaya();
+  try {
+    clearDecisionKeys();
+    await withDebugLogs(async () => {
+      // Infinity is the natural way to say "no bound" — a timer given it
+      // fires at once, so a 150 ms hook would never contribute a question.
+      const nl = new NeuroLink({
+        credentials: { laya: { apiKey: "sk-fake", baseURL: fake.baseURL } },
+        decisionHooks: {
+          hookTimeoutMs: Number.POSITIVE_INFINITY,
+          extendQuestions: async () => {
+            await delay(150);
+            return HOST_QUESTIONS;
+          },
+        },
+      });
+      const warnings = collectWarnings(nl);
+      const first = await nl.tryDecide(RAG_PLAN_REQUEST);
+      const second = await nl.tryDecide(RAG_PLAN_REQUEST);
+      assert(
+        first !== null && second !== null,
+        "both site calls must produce a result",
+      );
+      assert(
+        fake.requests.length === 2 &&
+          fake.requests.every((request) =>
+            questionIdsOf(request).includes("host__1"),
+          ),
+        "the slow hook must still contribute its questions under the default bound",
+      );
+      assert(
+        warnings.filter((message) => message.includes("hookTimeoutMs"))
+          .length === 1,
+        "the invalid bound must be warned about exactly once per instance",
+      );
+      // Every other unusable value takes the same fallback.
+      for (const bad of [0, -5, Number.NaN, 2 ** 31]) {
+        const other = new NeuroLink({
+          credentials: { laya: { apiKey: "sk-fake", baseURL: fake.baseURL } },
+          decisionHooks: {
+            hookTimeoutMs: bad,
+            extendQuestions: async () => {
+              await delay(50);
+              return HOST_QUESTIONS;
+            },
+          },
+        });
+        const otherWarnings = collectWarnings(other);
+        await other.tryDecide(RAG_PLAN_REQUEST);
+        assert(
+          questionIdsOf(fake.requests[fake.requests.length - 1]!).includes(
+            "host__0",
+          ) && otherWarnings.some((m) => m.includes("hookTimeoutMs")),
+          "an unusable bound must fall back to the default and be warned about",
+        );
+      }
+    });
+  } finally {
+    await fake.close();
+    restoreEnv();
+  }
+});
+
+await test("20.15 — without a decision provider the hooks and events are inert: no hook runs, no event fires, null as before", async () => {
+  try {
+    clearDecisionKeys();
+    let extendCalls = 0;
+    let answerCalls = 0;
+    let events = 0;
+    const nl = new NeuroLink({
+      decisionHooks: {
+        extendQuestions: () => {
+          extendCalls += 1;
+          return HOST_QUESTIONS;
+        },
+        onAnswers: () => {
+          answerCalls += 1;
+        },
+      },
+    });
+    const emitter = nl.getEventEmitter();
+    emitter.on("decision:before", () => (events += 1));
+    emitter.on("decision:after", () => (events += 1));
+    // Precondition: nothing is configured.
+    assert(
+      nl.decisionLimits() === null,
+      "precondition: no decision provider may be configured",
+    );
+    const result = await nl.tryDecide({
+      site: "toolRouting",
+      state: SUPPORT_TICKET,
+      questions: { urgent: ALL_THREE.urgent },
+    });
+    assert(result === null, "with no provider the site call must return null");
+    assert(
+      extendCalls === 0 && answerCalls === 0,
+      "no hook may run when no decision request can be made",
+    );
+    assert(
+      events === 0,
+      "no decision event may fire when no decision request can be made",
+    );
+  } finally {
+    restoreEnv();
+  }
+});
+
+await test("20.16 — a host cannot turn a site decision into an exception: unreadable hook returns, a missing question map", async () => {
+  const fake = await startFakeLaya();
+  try {
+    clearDecisionKeys();
+    const credentials = {
+      laya: { apiKey: "sk-fake", baseURL: fake.baseURL },
+    };
+    const own = { urgent: ALL_THREE.urgent };
+    // A return value whose keys cannot even be listed.
+    const proxied = new NeuroLink({
+      credentials,
+      decisionHooks: {
+        extendQuestions: () =>
+          new Proxy(
+            {},
+            {
+              ownKeys: () => {
+                throw new Error("boom-ownKeys");
+              },
+            },
+          ) as DecisionQuestionMap,
+      },
+    });
+    const viaProxy = await proxied.tryDecide(RAG_PLAN_REQUEST);
+    assert(
+      viaProxy !== null && "urgent" in viaProxy.answers,
+      "a proxy that throws on enumeration must still yield NeuroLink's own answers",
+    );
+    // A question whose getter throws, beside a well-formed sibling.
+    const throwingGetter = new NeuroLink({
+      credentials,
+      decisionHooks: {
+        extendQuestions: () => {
+          const bag: Record<string, unknown> = { fine: HOST_QUESTIONS.tone };
+          Object.defineProperty(bag, "broken", {
+            enumerable: true,
+            get: () => {
+              throw new Error("boom-getter");
+            },
+          });
+          return bag as DecisionQuestionMap;
+        },
+      },
+    });
+    const viaGetter = await throwingGetter.tryDecide(RAG_PLAN_REQUEST);
+    assert(
+      viaGetter !== null && "urgent" in viaGetter.answers,
+      "a throwing getter must still yield NeuroLink's own answers",
+    );
+    assert(
+      Object.keys(viaGetter!.answers).every((id) => !id.startsWith("host__")),
+      "the consumer must never see a host id, whichever path answered",
+    );
+    // A site-stamped request with no question map at all: null, never a throw.
+    const plain = new NeuroLink({ credentials });
+    const withoutQuestions = await plain.tryDecide({
+      site: "ragPlan",
+      state: SUPPORT_TICKET,
+      questions: undefined as unknown as DecisionQuestionMap,
+    });
+    assert(
+      withoutQuestions === null,
+      "a malformed site request must resolve to null, exactly as without a site",
+    );
+    // A listener that throws only AFTER the wire call returned: the consumer
+    // still gets the answers that call produced, and no second call is made.
+    const before = fake.requests.length;
+    const lateThrow = new NeuroLink({
+      credentials,
+      decisionHooks: { extendQuestions: () => HOST_QUESTIONS },
+    });
+    lateThrow.getEventEmitter().on("decision:after", () => {
+      throw new Error("after-listener exploded");
+    });
+    const afterThrow = await lateThrow.tryDecide({
+      site: "ragPlan",
+      state: SUPPORT_TICKET,
+      questions: own,
+    });
+    assert(
+      afterThrow !== null &&
+        "urgent" in afterThrow.answers &&
+        !("host__0" in afterThrow.answers),
+      "a throwing after-listener must leave the consumer its own answers",
+    );
+    assert(
+      fake.requests.length === before + 1,
+      "a failure after the call must not cost a second round trip",
+    );
+  } finally {
+    await fake.close();
+    restoreEnv();
+  }
+});
+
+await test("20.17 — a listener or hook that edits what it is handed changes neither the wire nor the next call", async () => {
+  const fake = await startFakeLaya();
+  try {
+    clearDecisionKeys();
+    process.env.LAYA_API_KEY = "sk-fake";
+    process.env.LAYA_BASE_URL = fake.baseURL;
+    const nl = new NeuroLink({
+      decisionHooks: {
+        extendQuestions: (context) => {
+          // Edit the consumer's own question and state in place.
+          (
+            context.questions as Record<string, { instructions: unknown }>
+          ).difficulty!.instructions = "HOOK-REWRITTEN";
+          (context.state as Record<string, unknown>).injected_by_hook = true;
+          return undefined;
+        },
+      },
+    });
+    nl.getEventEmitter().on("decision:before", (event) => {
+      const payload = event as DecisionBeforeEvent;
+      const difficulty = (
+        payload.questions as Record<
+          string,
+          { criteria: Record<string, string> }
+        >
+      ).difficulty!;
+      // The rubric is a module constant inside the classifier: an edit that
+      // reached it would rewrite every later routing call in the process.
+      difficulty.criteria.trivial = "LISTENER-REWRITTEN RUBRIC";
+      (payload.state as Record<string, unknown>).injected_by_listener = true;
+    });
+    const router = new ClassifierRouter(
+      { enabled: true, pool: POOL },
+      { decide: (o) => nl.tryDecide(o) },
+    );
+    await router.route({ prompt: HARD_PROMPT });
+    // Second call with the listener still attached, then a third from a
+    // fresh instance with no hooks or listeners at all.
+    await router.route({ prompt: HARD_PROMPT });
+    const bare = new ClassifierRouter(
+      { enabled: true, pool: POOL },
+      { decide: (o) => new NeuroLink().tryDecide(o) },
+    );
+    await bare.route({ prompt: HARD_PROMPT });
+    assert(fake.requests.length === 3, "three routing requests must be sent");
+    for (const request of fake.requests) {
+      const questions = request.body.questions as Record<
+        string,
+        { instructions?: unknown; criteria?: Record<string, string> }
+      >;
+      const state = request.body.state as Record<string, unknown>;
+      assert(
+        questions.difficulty?.instructions !== "HOOK-REWRITTEN" &&
+          questions.difficulty?.criteria?.trivial !==
+            "LISTENER-REWRITTEN RUBRIC",
+        "no edit made by a hook or listener may reach the wire",
+      );
+      assert(
+        !("injected_by_hook" in state) && !("injected_by_listener" in state),
+        "no state field added by a hook or listener may reach the wire",
+      );
+    }
+    const trivialRubrics = new Set(
+      fake.requests.map(
+        (request) =>
+          (
+            request.body.questions as Record<
+              string,
+              { criteria?: Record<string, string> }
+            >
+          ).difficulty?.criteria?.trivial,
+      ),
+    );
+    assert(
+      trivialRubrics.size === 1,
+      "every call must send the same rubric: the consumer's constant was never edited",
+    );
+  } finally {
+    await fake.close();
+    restoreEnv();
+  }
+});
+
+await test("20.18 — a host question id of __proto__ or constructor keeps its answer", async () => {
+  const fake = await startFakeLaya();
+  try {
+    clearDecisionKeys();
+    // An object literal with a "__proto__" key sets the prototype; only
+    // fromEntries makes it an own key, which is what a host mapping
+    // user-defined names to question ids ends up with.
+    const hostQuestions = Object.fromEntries([
+      ["__proto__", HOST_QUESTIONS.tone],
+      ["constructor", HOST_QUESTIONS.tone],
+      ["ok", HOST_QUESTIONS.tone],
+    ]) as DecisionQuestionMap;
+    let answered: DecisionHookAnswersContext | undefined;
+    const nl = new NeuroLink({
+      credentials: { laya: { apiKey: "sk-fake", baseURL: fake.baseURL } },
+      decisionHooks: {
+        extendQuestions: () => hostQuestions,
+        onAnswers: (context) => {
+          answered = context;
+        },
+      },
+    });
+    const after: DecisionAfterEvent[] = [];
+    nl.getEventEmitter().on("decision:after", (event) =>
+      after.push(event as DecisionAfterEvent),
+    );
+    const result = await nl.tryDecide(RAG_PLAN_REQUEST);
+    assert(result !== null, "the site call must produce a result");
+    assert(
+      questionIdsOf(fake.requests[0]!).filter((id) => id.startsWith("host__"))
+        .length === 3,
+      "all three host questions must travel on the wire",
+    );
+    assert(answered !== undefined, "onAnswers must have run");
+    for (const id of ["__proto__", "constructor", "ok"]) {
+      assert(
+        Object.hasOwn(answered!.answers, id) &&
+          readDecisionBoolean(answered!.answers, id) === 0.9,
+        `the host's answer under "${id}" must come back as an own key`,
+      );
+      assert(
+        Object.hasOwn(after[0]!.hostAnswers, id),
+        `decision:after must carry the host's "${id}" answer as an own key`,
+      );
+    }
+    assert(
+      Object.keys(result!.answers).length === 1 && "urgent" in result!.answers,
+      "the consumer must see only its own answer",
+    );
+  } finally {
+    await fake.close();
+    restoreEnv();
+  }
+});
+
+await test("20.19 — every site call dispatches through decide(): a subclass override and an instance patch both see it", async () => {
+  const fake = await startFakeLaya();
+  try {
+    clearDecisionKeys();
+    // A host-wired ClassifierRouter decides its strategy from the
+    // environment (no `hasDecisionProvider` dep), so the fake is configured
+    // there; every instance below inherits it.
+    process.env.LAYA_API_KEY = "sk-fake";
+    process.env.LAYA_BASE_URL = fake.baseURL;
+    let overrideCalls = 0;
+    class CountingNeuroLink extends NeuroLink {
+      override async decide(
+        options: Parameters<NeuroLink["decide"]>[0],
+      ): ReturnType<NeuroLink["decide"]> {
+        overrideCalls += 1;
+        return super.decide(options);
+      }
+    }
+    const subclassed = new CountingNeuroLink();
+    const routed = await new ClassifierRouter(
+      { enabled: true, pool: POOL },
+      { decide: (o) => subclassed.tryDecide(o) },
+    ).route({ prompt: HARD_PROMPT });
+    assert(
+      routed !== null && routed.reason?.startsWith("jev") === true,
+      "the routing site must have used the decision model",
+    );
+    // Read through fresh consts: an `asserts` narrowing of the counter to a
+    // literal would otherwise make the second comparison a type error.
+    const afterRouting = overrideCalls;
+    assert(
+      afterRouting === 1,
+      "the routing site's call must go through the subclass's decide()",
+    );
+    await subclassed.tryDecide(RAG_PLAN_REQUEST);
+    const afterSite = overrideCalls;
+    assert(
+      afterSite === 2,
+      "a host-wired site call must go through the override too",
+    );
+
+    // An instance patch — a per-tenant cache or rate limit — is honoured the
+    // same way, and its throw stays inside tryDecide's null contract.
+    let patchCalls = 0;
+    const patched = new NeuroLink();
+    const original = patched.decide.bind(patched);
+    patched.decide = async (options) => {
+      patchCalls += 1;
+      if (patchCalls > 1) {
+        throw new Error("tenant over quota");
+      }
+      return original(options);
+    };
+    const first = await patched.tryDecide(RAG_PLAN_REQUEST);
+    const second = await patched.tryDecide(RAG_PLAN_REQUEST);
+    assert(
+      patchCalls === 2 && first !== null && second === null,
+      "an instance patch must see every site call, and its throw must become null",
+    );
+  } finally {
+    await fake.close();
+    restoreEnv();
+  }
+});
+
+await test("20.20 — decisionLimits() names the model decide() sends, whatever LAYA_MODEL says now", async () => {
+  const fake = await startFakeLaya();
+  try {
+    clearDecisionKeys();
+    const nl = new NeuroLink({
+      credentials: { laya: { apiKey: "sk-fake", baseURL: fake.baseURL } },
+    });
+    const sentModel = async (): Promise<string | undefined> => {
+      const index = fake.requests.length;
+      await nl.decide({
+        state: SUPPORT_TICKET,
+        questions: { urgent: ALL_THREE.urgent },
+      });
+      const model = fake.requests[index]?.body.model;
+      return typeof model === "string" ? model : undefined;
+    };
+    // The variable is flipped between calls; decide() sends the model the
+    // provider was registered with, and the reading must say the same —
+    // sizing a state against a window the pre-flight check will not apply
+    // is exactly the mismatch this guards against.
+    for (const value of [
+      "english",
+      "multilingual",
+      " typed-decisions ",
+      undefined,
+    ]) {
+      if (value === undefined) {
+        delete process.env.LAYA_MODEL;
+      } else {
+        process.env.LAYA_MODEL = value;
+      }
+      const sent = await sentModel();
+      const reading = nl.decisionLimits();
+      assert(
+        sent !== undefined && reading !== null && reading.model === sent,
+        "the reading must name exactly the model the decision request carried",
+      );
+      assert(
+        nl.decisionLimits({ provider: "laya" })?.model === sent,
+        "naming the provider must not change which model the reading is for",
+      );
+    }
+  } finally {
+    await fake.close();
+    restoreEnv();
+  }
+});
+
+await test("20.21 — the routing site carries the documented top-level requestId, and activates on per-call credentials alone", async () => {
+  const fake = await startFakeLaya();
+  try {
+    clearDecisionKeys();
+    const seen: Array<{ site: string; requestId?: string }> = [];
+    // No decision key at instance or environment level: the request's own
+    // credentials are the only way to a decision model.
+    const nl = new NeuroLink({
+      classifierRouter: { enabled: true, pool: POOL },
+    });
+    nl.getEventEmitter().on("decision:before", (event) => {
+      const payload = event as DecisionBeforeEvent;
+      seen.push({ site: payload.site, requestId: payload.requestId });
+    });
+    await nl
+      .generate({
+        input: { text: HARD_PROMPT },
+        provider: "typesafe",
+        requestId: "req-top-level",
+        credentials: { laya: { apiKey: "sk-per-call", baseURL: fake.baseURL } },
+      })
+      .then(
+        () => null,
+        () => null,
+      );
+    assert(
+      fake.requests.length === 1 &&
+        fake.requests[0]!.authorization === "Bearer sk-per-call",
+      "per-call credentials alone must activate the routing site, on the caller's account",
+    );
+    assert(
+      seen.length === 1 &&
+        seen[0]!.site === "routing" &&
+        seen[0]!.requestId === "req-top-level",
+      "the routing event must carry the top-level requestId",
+    );
+    // Without per-call credentials the same instance routes by heuristic:
+    // no request, no event.
+    await nl
+      .generate({ input: { text: HARD_PROMPT }, provider: "typesafe" })
+      .then(
+        () => null,
+        () => null,
+      );
+    assert(
+      fake.requests.length === 1 && seen.length === 1,
+      "with no credentials anywhere the routing site must stay inert",
+    );
+  } finally {
+    await fake.close();
+    restoreEnv();
+  }
+});
+
+await test("20.22 — xor through the routing site: hooks run, host ids are namespaced, the image reaches the wire as a data URL", async () => {
+  const fake = await startFakeXor();
+  try {
+    clearDecisionKeys();
+    const image = await readFile(`${XOR_FIXTURE_DIR}red.png`);
+    const expectedDataUrl = `data:image/png;base64,${image.toString("base64")}`;
+    // The request carries an image and names no model, so with XOR_MODEL
+    // unset it goes to the model that reads images (decide.capableModel).
+    const expectedModel = process.env.XOR_MODEL
+      ? EXPECTED_XOR_MODEL
+      : "xor-omni";
+    const seen: DecisionHookContext[] = [];
+    const answered: DecisionHookAnswersContext[] = [];
+    const before: DecisionBeforeEvent[] = [];
+    const after: DecisionAfterEvent[] = [];
+    const nl = new NeuroLink({
+      decisionHooks: {
+        extendQuestions: (context) => {
+          seen.push(context);
+          return HOST_QUESTIONS;
+        },
+        onAnswers: (context) => {
+          answered.push(context);
+        },
+      },
+    });
+    const emitter = nl.getEventEmitter();
+    emitter.on("decision:before", (event) =>
+      before.push(event as DecisionBeforeEvent),
+    );
+    emitter.on("decision:after", (event) =>
+      after.push(event as DecisionAfterEvent),
+    );
+
+    // A host-wired consumer stamps the site itself. The request names xor,
+    // carries one image (which only xor reads) and its own per-call
+    // credentials — everything the funnel has to keep intact on its way to
+    // the wire.
+    const result = await nl.tryDecide({
+      site: "routing",
+      provider: "xor",
+      credentials: { xor: { apiKey: "sk-fake-xor", baseURL: fake.baseURL } },
+      state: "A product photo from a listing.",
+      questions: { urgent: ALL_THREE.urgent },
+      images: [image],
+    });
+    assert(result !== null, "the fake must answer the xor request");
+    assert(
+      seen.length === 1 && seen[0]!.site === "routing",
+      "extendQuestions must run once, stamped as the routing site",
+    );
+    assert(
+      "urgent" in seen[0]!.questions && !("tone" in seen[0]!.questions),
+      "the hook must see the consumer's own questions, not its own",
+    );
+
+    assert(
+      fake.requests.length === 1,
+      "exactly one decision request must reach the server",
+    );
+    const request = fake.requests[0]!;
+    assert(
+      request.path === "/v1/decisions" &&
+        request.authorization === "Bearer sk-fake-xor",
+      "the request must reach xor's route on the per-call credentials",
+    );
+    assert(
+      request.body.model === expectedModel,
+      "the body must name xor-omni for an image when no model was chosen, else the configured model",
+    );
+    const wireIds = questionIdsOf(request);
+    assert(
+      wireIds.includes("urgent") &&
+        wireIds.includes("host__0") &&
+        wireIds.includes("host__1") &&
+        !wireIds.includes("tone") &&
+        !wireIds.includes("team"),
+      "host questions must travel under the host namespace, never their own ids",
+    );
+    const images = request.body.images;
+    assert(
+      Array.isArray(images) &&
+        images.length === 1 &&
+        images[0] === expectedDataUrl,
+      "the wire body must carry the image as one data URL, byte for byte",
+    );
+    assert(
+      !("video" in request.body),
+      "no video was sent, so none may appear on the wire",
+    );
+
+    // The consumer's result: its own ids only, media accounting intact.
+    assert(
+      result!.provider === "xor" &&
+        "urgent" in result!.answers &&
+        !("host__0" in result!.answers) &&
+        !("tone" in result!.answers),
+      "the consumer must see only its own answers",
+    );
+    assert(
+      result!.mediaBytes === expectedDataUrl.length,
+      "mediaBytes must survive the answer split",
+    );
+    assert(answered.length === 1, "onAnswers must run exactly once");
+    assert(
+      readDecisionBoolean(answered[0]!.answers, "tone") === 0.9 &&
+        readDecisionChoice(answered[0]!.answers, "team")?.choice ===
+          "payments" &&
+        answered[0]!.result.mediaBytes === expectedDataUrl.length,
+      "onAnswers must get the host's answers under its own ids, and the full result with its media accounting",
+    );
+    assert(
+      before.length === 1 &&
+        before[0]!.site === "routing" &&
+        before[0]!.hostQuestionCount === 2,
+      "decision:before must name the site and count the host questions",
+    );
+    assert(
+      after.length === 1 &&
+        after[0]!.site === "routing" &&
+        after[0]!.provider === "xor" &&
+        after[0]!.model === expectedModel &&
+        after[0]!.result?.mediaBytes === expectedDataUrl.length &&
+        "urgent" in after[0]!.answers &&
+        !("host__0" in after[0]!.answers) &&
+        readDecisionBoolean(after[0]!.hostAnswers, "tone") === 0.9,
+      "decision:after must split the answers and carry the media accounting",
+    );
+    assert(
+      Buffer.isBuffer(image) &&
+        image.equals(await readFile(`${XOR_FIXTURE_DIR}red.png`)),
+      "the caller's image Buffer must be left exactly as it was handed in",
+    );
+  } finally {
+    await fake.close();
+    restoreEnv();
+  }
+});
+
+await test("20.23 — decisionLimits({ provider: 'xor' }): a per-model state window, a 128-question cap, its question types and media limits, enforced locally", async () => {
+  try {
+    clearDecisionKeys();
+    const nl = new NeuroLink();
+    const reading = nl.decisionLimits({ provider: "xor" });
+    assert(reading !== null, "no reading for xor");
+    assert(
+      reading!.provider === "xor" && reading!.model === EXPECTED_XOR_MODEL,
+      "the reading must name xor and the model decide() would send",
+    );
+    assert(
+      reading!.maxStateTokens ===
+        (EXPECTED_XOR_MODEL === "xor-latest" ? 120_000 : 28_000),
+      "xor must read the window of the model decide() would send",
+    );
+    assert(
+      reading!.nonAsciiTokensPerChar === 1,
+      "xor must charge non-ASCII text at one token per character",
+    );
+    assert(
+      reading!.maxQuestions === 128,
+      "xor must read its gateway's 128-question cap",
+    );
+    assert(
+      JSON.stringify(reading!.questionTypes) ===
+        JSON.stringify([
+          "boolean",
+          "choice",
+          "score",
+          "value",
+          "choice-unknown",
+        ]),
+      "xor must read value and choice-unknown beside the default types",
+    );
+    assert(
+      reading!.maxScoreLevels === 10 && reading!.maxChoiceOptions === 64,
+      "xor must read its per-question caps",
+    );
+    assert(
+      reading!.media !== undefined &&
+        reading!.media.maxImages === 1 &&
+        reading!.media.video === false &&
+        reading!.media.maxRequestBytes === 25_000_000 &&
+        reading!.media.audio?.maxSeconds === 30,
+      "the reading must carry xor's media limits: one image, no video, 30 seconds of audio, a 25 MB body",
+    );
+    assert(
+      reading!.enforcedLocally === true,
+      "xor's limits are enforced locally, unlike typesafe's advisory row",
+    );
+    // The two text-only providers still read no media, so a host can tell
+    // from the reading alone where an image may go.
+    assert(
+      nl.decisionLimits({ provider: "laya", model: "typed-decisions" })!
+        .media === undefined &&
+        nl.decisionLimits({ provider: "typesafe" })!.media === undefined,
+      "laya and typesafe must read no media limits",
+    );
+  } finally {
+    restoreEnv();
+  }
+});
+
+await test("20.24 — within XOR's 128-question cap every well-formed host addition goes: 100 for xor, where laya would keep 63", async () => {
+  const fake = await startFakeXor();
+  const previousDebug = process.env.NEUROLINK_DEBUG;
+  try {
+    clearDecisionKeys();
+    // Warnings are hidden unless debugging; the absence of the drop warning
+    // is part of the contract here.
+    process.env.NEUROLINK_DEBUG = "true";
+    const HOST_COUNT = 100;
+    const many: Record<string, DecisionQuestionMap[string]> = {};
+    for (let index = 0; index < HOST_COUNT; index += 1) {
+      many[`q${index}`] = {
+        type: "boolean",
+        instructions: `Host question ${index}?`,
+      };
+    }
+    const hostIds = new Set<string>();
+    const warnings: string[] = [];
+    const nl = new NeuroLink({
+      credentials: { xor: { apiKey: "sk-fake-xor", baseURL: fake.baseURL } },
+      decisionHooks: {
+        extendQuestions: () => many,
+        onAnswers: (context) => {
+          for (const id of Object.keys(context.answers)) {
+            hostIds.add(id);
+          }
+        },
+      },
+    });
+    nl.getEventEmitter().on("log-event", (event) => {
+      const entry = event as { level?: string; message?: string };
+      if (entry.level === "warn" && typeof entry.message === "string") {
+        warnings.push(entry.message);
+      }
+    });
+    const result = await nl.tryDecide({
+      site: "toolRouting",
+      state: SUPPORT_TICKET,
+      questions: { urgent: ALL_THREE.urgent },
+    });
+    assert(result !== null, "the fake must answer the xor request");
+    assert(fake.requests.length === 1, "one request must reach the server");
+    const wireIds = questionIdsOf(fake.requests[0]!);
+    assert(
+      wireIds.length === HOST_COUNT + 1 &&
+        wireIds.filter((id) => id.startsWith("host__")).length === HOST_COUNT,
+      "every host question must reach the wire while the cap leaves room for it",
+    );
+    assert(
+      hostIds.size === HOST_COUNT && [...hostIds].every((id) => id in many),
+      "every host answer must come back under the host's own id",
+    );
+    assert(
+      Object.keys(result!.answers).length === 1 && "urgent" in result!.answers,
+      "the consumer must still see only its own answer",
+    );
+    assert(
+      !warnings.some(
+        (message) =>
+          message.includes("dropped") && message.includes("host question"),
+      ),
+      "nothing was dropped, so no drop warning may be logged",
+    );
+  } finally {
+    await fake.close();
+    if (previousDebug === undefined) {
+      delete process.env.NEUROLINK_DEBUG;
+    } else {
+      process.env.NEUROLINK_DEBUG = previousDebug;
+    }
+    restoreEnv();
+  }
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+logSection(
+  "21. OpenAI Decisions — the CLI against a local server, and the live smoke script's refusal",
+);
+// ───────────────────────────────────────────────────────────────────────────
+// No key, no network: every request goes to a server this file starts on
+// 127.0.0.1, and the replies are fixtures. Nothing here says what OpenAI's
+// endpoint returned for a real request.
+const OPENAI_CLI_KEY = "test-fake-openai-cli-credential";
+
+type FakeOpenAIRequest = {
+  method: string;
+  path: string;
+  authorization: string | null;
+  contentType: string | null;
+  body: unknown;
+};
+
+type FakeOpenAIReply = {
+  status: number;
+  headers?: Record<string, string>;
+  body: unknown;
+};
+
+/** Runs `run` against a local server that records every request and answers as `reply` says. */
+async function withFakeOpenAI<T>(
+  reply: (request: FakeOpenAIRequest) => FakeOpenAIReply,
+  run: (baseURL: string, requests: readonly FakeOpenAIRequest[]) => Promise<T>,
+): Promise<T> {
+  const requests: FakeOpenAIRequest[] = [];
+  const server = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      let body: unknown;
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString());
+      } catch {
+        body = undefined;
+      }
+      const seen: FakeOpenAIRequest = {
+        method: req.method ?? "",
+        path: req.url ?? "",
+        authorization: req.headers.authorization ?? null,
+        contentType: req.headers["content-type"] ?? null,
+        body,
+      };
+      requests.push(seen);
+      const { status, headers, body: answer } = reply(seen);
+      res.writeHead(status, {
+        "content-type": "application/json",
+        connection: "close",
+        ...headers,
+      });
+      res.end(JSON.stringify(answer));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const { port } = server.address() as AddressInfo;
+    assert(port > 0, "the local server must listen on a port");
+    return await run(`http://127.0.0.1:${port}`, requests);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}
+
+const OPENAI_CLI_REPLY: FakeOpenAIReply = {
+  status: 200,
+  headers: { "x-request-id": "req-cli-stand-in" },
+  body: {
+    model: "gpt-6-luna",
+    answers: [{ type: "predicate", name: "urgent", probability: 0.92 }],
+    usage: { input_tokens: 250_000, output_tokens: 0, total_tokens: 250_000 },
+  },
+};
+
+/** The CLI's environment: nothing configured but the key and the local server. */
+const openaiCliEnv = (baseURL: string): Record<string, string> => ({
+  ...NO_PROVIDER_ENV,
+  OPENAI_API_KEY: OPENAI_CLI_KEY,
+  OPENAI_DECISIONS_BASE_URL: baseURL,
+});
+
+/** The one request a CLI run sent, narrowed enough to read its body. */
+function soleOpenAIRequest(requests: readonly FakeOpenAIRequest[]): {
+  request: FakeOpenAIRequest;
+  body: Record<string, unknown>;
+} {
+  const count: number = requests.length;
+  assert(count === 1, "exactly one request must reach the server");
+  const request = requests[0];
+  assert(
+    request !== undefined && isRecordLike(request.body),
+    "the request body must be a JSON object",
+  );
+  return { request, body: request.body };
+}
+
+await test("21.1 — decide --provider openai-decisions --format json: exit 0, clean JSON, one POST /v1/decisions with the Bearer key and the OpenAI body", async () => {
+  await withFakeOpenAI(
+    () => OPENAI_CLI_REPLY,
+    async (baseURL, requests) => {
+      const result = await runCLI(
+        [
+          "decide",
+          "The state text",
+          "--provider",
+          "openai-decisions",
+          "--format",
+          "json",
+          "--questions",
+          ONE_QUESTION,
+        ],
+        { env: openaiCliEnv(baseURL), timeoutMs: 60_000 },
+      );
+      assert(
+        result.exitCode === 0,
+        "the CLI must exit 0 once the server has answered",
+      );
+      const { request, body } = soleOpenAIRequest(requests);
+      assert(
+        request.method === "POST" && request.path === "/v1/decisions",
+        "the request must be a POST to /v1/decisions",
+      );
+      assert(
+        request.authorization === `Bearer ${OPENAI_CLI_KEY}`,
+        "the key must travel as a Bearer token",
+      );
+      assert(
+        request.contentType?.startsWith("application/json") === true,
+        "the body must be sent as JSON",
+      );
+      assert(
+        Object.keys(body).sort().join(",") === "input,model,questions",
+        "the body must hold the model, the input and the questions, and nothing else",
+      );
+      assert(body.model === "gpt-6-luna", "the default model must be sent");
+      assert(
+        body.input === "The state text",
+        "the state must be the input, as given",
+      );
+      const question = Array.isArray(body.questions)
+        ? body.questions[0]
+        : undefined;
+      assert(
+        Array.isArray(body.questions) &&
+          body.questions.length === 1 &&
+          isRecordLike(question) &&
+          question.type === "predicate" &&
+          question.name === "urgent" &&
+          question.instructions === "Is this urgent?" &&
+          Object.keys(question).length === 3,
+        "the question must be a named predicate carrying its instructions",
+      );
+
+      const parsed: unknown = JSON.parse(result.stdout);
+      assert(
+        isRecordLike(parsed) &&
+          parsed.provider === "openai-decisions" &&
+          parsed.model === "gpt-6-luna" &&
+          parsed.requestId === "req-cli-stand-in",
+        "stdout must be the raw result: provider, model and request id",
+      );
+      const answers = isRecordLike(parsed) ? parsed.answers : undefined;
+      const urgent = isRecordLike(answers) ? answers.urgent : undefined;
+      assert(
+        isRecordLike(urgent) &&
+          urgent.type === "boolean" &&
+          urgent.probability === 0.92,
+        "the answer must be the server's probability, as a boolean answer",
+      );
+      assert(
+        !(result.stdout + result.stderr).includes(OPENAI_CLI_KEY),
+        "the key must not appear in the CLI's output",
+      );
+    },
+  );
+});
+
+await test("21.2 — decide --provider openai-decisions in text mode prints the answer, the model and the price from the table", async () => {
+  await withFakeOpenAI(
+    () => OPENAI_CLI_REPLY,
+    async (baseURL, requests) => {
+      const result = await runCLI(
+        [
+          "decide",
+          "The state text",
+          "--provider",
+          "openai-decisions",
+          "--questions",
+          ONE_QUESTION,
+        ],
+        { env: openaiCliEnv(baseURL), timeoutMs: 60_000 },
+      );
+      assert(result.exitCode === 0, "the CLI must exit 0");
+      soleOpenAIRequest(requests);
+      assert(
+        result.stdout.includes("urgent: probability 0.92"),
+        "the answer line must show the probability",
+      );
+      assert(
+        result.stdout.includes("Model: gpt-6-luna"),
+        "the model line must show the model the reply names",
+      );
+      // 250,000 input tokens x $0.10 per 1M, input only: from the pricing table.
+      assert(
+        result.stdout.includes("Cost: $0.025000"),
+        "the cost line must be input tokens at the table's rate",
+      );
+      assert(
+        !looksLikeStackTrace(result.stdout + result.stderr),
+        "the run printed a stack trace",
+      );
+    },
+  );
+});
+
+await test("21.3 — decide --provider openai-decisions --image: the image rides in the input as an input_image data URL beside the text", async () => {
+  await withFakeOpenAI(
+    () => OPENAI_CLI_REPLY,
+    async (baseURL, requests) => {
+      const imagePath = `${PERPLEXITY_FIXTURE_DIR}blue.png`;
+      const result = await runCLI(
+        [
+          "decide",
+          "Inspect the product in this photo.",
+          "--provider",
+          "openai-decisions",
+          "--image",
+          imagePath,
+          "--format",
+          "json",
+          "--questions",
+          ONE_QUESTION,
+        ],
+        { env: openaiCliEnv(baseURL), timeoutMs: 60_000 },
+      );
+      assert(result.exitCode === 0, "the CLI must exit 0");
+      const { body } = soleOpenAIRequest(requests);
+      const url = `data:image/png;base64,${readFileSync(imagePath).toString("base64")}`;
+      const message = Array.isArray(body.input) ? body.input[0] : undefined;
+      const parts =
+        isRecordLike(message) && Array.isArray(message.content)
+          ? message.content
+          : [];
+      assert(
+        Array.isArray(body.input) &&
+          body.input.length === 1 &&
+          isRecordLike(message) &&
+          message.role === "user" &&
+          parts.length === 2,
+        "the input must be one user message of two parts",
+      );
+      const [text, image] = parts;
+      assert(
+        isRecordLike(text) &&
+          text.type === "input_text" &&
+          text.text === "Inspect the product in this photo.",
+        "the first part must be the state text",
+      );
+      assert(
+        isRecordLike(image) &&
+          image.type === "input_image" &&
+          image.image_url === url &&
+          Object.keys(image).length === 2,
+        "the second part must be the image as a data URL, with no other field",
+      );
+    },
+  );
+});
+
+await test("21.4 — decide --provider openai-decisions with a rejected key: one clean line naming the failure, key absent, sent once", async () => {
+  await withFakeOpenAI(
+    () => ({
+      status: 401,
+      body: {
+        error: {
+          message: `stand-in: Incorrect API key provided: ${OPENAI_CLI_KEY}`,
+          type: "invalid_request_error",
+          code: "invalid_api_key",
+        },
+      },
+    }),
+    async (baseURL, requests) => {
+      const result = await runCLI(
+        [
+          "decide",
+          "The state text",
+          "--provider",
+          "openai-decisions",
+          "--questions",
+          ONE_QUESTION,
+        ],
+        { env: openaiCliEnv(baseURL), timeoutMs: 60_000 },
+      );
+      const output = result.stdout + result.stderr;
+      assert(result.exitCode !== 0, "a refused key must exit non-zero");
+      soleOpenAIRequest(requests);
+      assert(
+        !output.includes(OPENAI_CLI_KEY),
+        "the key the server repeated must not reach the CLI's output",
+      );
+      assert(
+        output.includes("Incorrect API key provided"),
+        "the server's own reason must be kept",
+      );
+      assert(!looksLikeStackTrace(output), "the failure printed a stack trace");
+    },
+  );
+});
+
+await test("21.5 — the --provider choices the CLI builds name openai-decisions, and decide --help documents --provider", async () => {
+  const generate = await runCLI(["generate", "--help"], { timeoutMs: 60_000 });
+  assert(generate.exitCode === 0, "generate --help must exit 0");
+  assert(
+    generate.stdout.includes('"openai-decisions"'),
+    "the --provider choices the CLI builds must name openai-decisions",
+  );
+  const decide = await runCLI(["decide", "--help"], { timeoutMs: 60_000 });
+  assert(decide.exitCode === 0, "decide --help must exit 0");
+  assert(
+    decide.stdout.includes("--provider"),
+    "decide --help must document --provider",
+  );
+});
+
+// The live smoke script spends real money, and nothing in this suite may start
+// it for real: every run below leaves RUN_LIVE unset, empty or not "1", so the
+// script must refuse. The fake key and the local server are there to make a
+// skipped guard visible (a request would reach the server), not to be used.
+const SMOKE_SCRIPT = fileURLToPath(
+  new URL("../scripts/liveSmokeOpenAIDecisions.ts", import.meta.url),
+);
+const LOCAL_TSX = join(process.cwd(), "node_modules", ".bin", "tsx");
+const SMOKE_FAKE_KEY = "test-fake-smoke-credential";
+
+const runSmoke = (
+  script: string,
+  env: Record<string, string>,
+): Promise<ProcessResult> =>
+  runCommand(LOCAL_TSX, [script], {
+    cwd: process.cwd(),
+    env: { ...process.env, ...NO_PROVIDER_ENV, ...env },
+    timeoutMs: 90_000,
+  });
+
+await test("21.6 — the live smoke script without RUN_LIVE: exit 2, the refusal line names RUN_LIVE and no value, nothing reaches the server", async () => {
+  await withFakeOpenAI(
+    () => OPENAI_CLI_REPLY,
+    async (baseURL, requests) => {
+      const result = await runSmoke(SMOKE_SCRIPT, {
+        RUN_LIVE: "",
+        OPENAI_API_KEY: SMOKE_FAKE_KEY,
+        OPENAI_DECISIONS_BASE_URL: baseURL,
+      });
+      assert(result.exitCode === 2, "a refused run must exit with code 2");
+      assert(
+        result.stderr.includes(
+          "liveSmokeOpenAIDecisions: refusing to run, no request was made. Missing: RUN_LIVE (must be 1).",
+        ),
+        "the refusal line must say what is missing, and only that",
+      );
+      assert(
+        result.stdout === "",
+        "a refused run must print nothing on stdout",
+      );
+      assert(
+        !(result.stdout + result.stderr).includes(SMOKE_FAKE_KEY),
+        "the key must not appear in the output",
+      );
+      const seen: number = requests.length;
+      assert(seen === 0, "no request may reach the server");
+    },
+  );
+});
+
+await test("21.7 — the live smoke script wants RUN_LIVE to be exactly 1 and a non-blank key, and names both when both are missing", async () => {
+  await withFakeOpenAI(
+    () => OPENAI_CLI_REPLY,
+    async (baseURL, requests) => {
+      const notOne = await runSmoke(SMOKE_SCRIPT, {
+        RUN_LIVE: "true",
+        OPENAI_API_KEY: SMOKE_FAKE_KEY,
+        OPENAI_DECISIONS_BASE_URL: baseURL,
+      });
+      assert(
+        notOne.exitCode === 2 &&
+          notOne.stderr.includes("Missing: RUN_LIVE (must be 1)."),
+        "a RUN_LIVE other than 1 must be refused",
+      );
+      const blankKey = await runSmoke(SMOKE_SCRIPT, {
+        RUN_LIVE: "",
+        OPENAI_API_KEY: "   ",
+        OPENAI_DECISIONS_BASE_URL: baseURL,
+      });
+      assert(
+        blankKey.exitCode === 2 &&
+          blankKey.stderr.includes(
+            "Missing: RUN_LIVE (must be 1), OPENAI_API_KEY (must be set and non-blank).",
+          ),
+        "both missing variables must be named",
+      );
+      const seen: number = requests.length;
+      assert(seen === 0, "no request may reach the server");
+    },
+  );
+});
+
+await test("21.8 — the live smoke script refuses before it imports the package: with no dist beside it, it still exits 2 with the refusal line", async () => {
+  const dir = tempDir("smoke-no-dist-");
+  mkdirSync(join(dir, "scripts"));
+  const copy = join(dir, "scripts", "liveSmokeOpenAIDecisions.ts");
+  copyFileSync(SMOKE_SCRIPT, copy);
+  const result = await runSmoke(copy, {
+    RUN_LIVE: "",
+    OPENAI_API_KEY: "",
+  });
+  assert(
+    result.exitCode === 2,
+    "a refusal must come before the import that cannot succeed here",
+  );
+  assert(
+    result.stderr.includes("refusing to run, no request was made"),
+    "the refusal line must be printed",
+  );
+});
+
+await test("21.9 — the live smoke script holds the documented limits and price, and never reads an error's message or the key's value", async () => {
+  const source = readFileSync(SMOKE_SCRIPT, "utf8");
+  const has = (pattern: RegExp): boolean => pattern.test(source);
+  assert(
+    has(/const OPTION_COUNT = 77;/) &&
+      has(/const CHOICE_REQUESTS = 5;/) &&
+      has(/const MAX_REQUESTS = CHOICE_REQUESTS \+ 2;/),
+    "five 77-option choices, a predicate and a score make seven requests",
+  );
+  assert(
+    has(/const USD_PER_INPUT_TOKEN = 0\.1 \/ 1_000_000;/),
+    "the price must be $0.10 per 1M input tokens",
+  );
+  assert(
+    has(/https:\/\/developers\.openai\.com\/api\/docs\/guides\/decisions/) &&
+      source.includes("2026-10-07"),
+    "the price must carry its source URL and date",
+  );
+  assert(
+    !has(/\.message\b/),
+    "an error's message can quote the response and must not be read",
+  );
+  // The bare identifiers only: `JSON.stringify(result.model.slice(0, 64))` is
+  // the one allowed way to print a field, and `String(cause.status)` another.
+  assert(
+    !has(
+      /String\(\s*(?:error|result)\s*[,)]|\$\{\s*(?:error\b|result\s*\})|JSON\.stringify\(\s*(?:error|result)\s*[,)]/,
+    ),
+    "an error or the whole result must not be turned into text for the output",
+  );
+  assert(
+    !has(/\$\{[^}]*process\.env/),
+    "an environment value must not be interpolated into output",
+  );
+  assert(
+    (source.match(/await import\(/g) ?? []).length === 1,
+    "the package is imported once, dynamically, after the guard",
+  );
+});
+
+await test("22.1 — decide with no --provider: the shared OPENAI_API_KEY beside a gateway OPENAI_BASE_URL is not a decision provider, and nothing reaches the gateway", async () => {
+  await withFakeOpenAI(
+    () => OPENAI_CLI_REPLY,
+    async (gateway, requests) => {
+      for (const name of ["OPENAI_BASE_URL", "OPENAI_API_BASE"] as const) {
+        const result = await runCLI(
+          ["decide", "The state text", "--questions", ONE_QUESTION],
+          {
+            env: {
+              ...NO_PROVIDER_ENV,
+              OPENAI_API_KEY: OPENAI_CLI_KEY,
+              [name]: gateway,
+            },
+            timeoutMs: 60_000,
+          },
+        );
+        assert(
+          result.exitCode !== 0,
+          `${name}: the decision must be refused, not sent`,
+        );
+        assert(
+          result.stderr.includes(
+            "Error: No decision provider is configured.",
+          ) &&
+            result.stderr.includes(
+              "OPENAI_API_KEY for openai-decisions (ignored while OPENAI_BASE_URL, OPENAI_API_BASE or credentials.openai.baseURL names a host outside https://api.openai.com, unless OPENAI_DECISIONS_BASE_URL is set)",
+            ),
+          `${name}: the error must say why the key is ignored`,
+        );
+        assert(
+          !looksLikeStackTrace(result.stdout + result.stderr),
+          `${name}: the refusal printed a stack trace`,
+        );
+        assert(
+          !(result.stdout + result.stderr).includes(OPENAI_CLI_KEY),
+          `${name}: the key must not appear in the output`,
+        );
+        assert(requests.length === 0, `${name}: nothing may reach the gateway`);
+      }
+    },
+  );
+});
+
+await test("22.2 — decide with no --provider: OPENAI_DECISIONS_BASE_URL is intent, so the same environment decides, at that URL and with the key as the Bearer token", async () => {
+  await withFakeOpenAI(
+    () => OPENAI_CLI_REPLY,
+    async (baseURL, requests) => {
+      const result = await runCLI(
+        [
+          "decide",
+          "The state text",
+          "--format",
+          "json",
+          "--questions",
+          ONE_QUESTION,
+        ],
+        {
+          env: {
+            ...NO_PROVIDER_ENV,
+            OPENAI_API_KEY: OPENAI_CLI_KEY,
+            OPENAI_BASE_URL: "http://127.0.0.1:9/v1",
+            OPENAI_DECISIONS_BASE_URL: baseURL,
+          },
+          timeoutMs: 60_000,
+        },
+      );
+      assert(result.exitCode === 0, "the CLI must exit 0 once answered");
+      const { request } = soleOpenAIRequest(requests);
+      assert(
+        request.method === "POST" && request.path === "/v1/decisions",
+        "the request must go to the decisions base URL, not the chat host",
+      );
+      assert(
+        request.authorization === `Bearer ${OPENAI_CLI_KEY}`,
+        "the environment key must travel as the Bearer token",
+      );
+      const parsed: unknown = JSON.parse(result.stdout);
+      assert(
+        isRecordLike(parsed) && parsed.provider === "openai-decisions",
+        "the default provider must have been chosen without being named",
+      );
+    },
+  );
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+logSection(
+  "23. Cleartext base URLs and redirects — the key and the state stay off the wire",
+);
+// ───────────────────────────────────────────────────────────────────────────
+// A plain-http base URL to another machine would send the Bearer key and the
+// decision in the clear, and a redirect would replay the decision wherever the
+// server pointed. Every case runs against a host under the reserved .invalid
+// TLD or against servers this file starts on 127.0.0.1.
+const CLEARTEXT_HOST = "decide-cleartext.invalid";
+const CLEARTEXT_SECRET = "SECRETPW-cleartext";
+const CLEARTEXT_KEY = "sk-placeholder-cleartext";
+const CLEARTEXT_QUESTIONS = {
+  urgent: { type: "boolean" as const, instructions: "Is this urgent?" },
+};
+
+type KeyedDecider = {
+  provider: NonNullable<DecideOptions["provider"]>;
+  variable: string;
+  client: (baseURL: string) => NeuroLink;
+};
+
+const KEYED_DECIDERS: readonly KeyedDecider[] = [
+  {
+    provider: "xor",
+    variable: "XOR_BASE_URL",
+    client: (baseURL) =>
+      new NeuroLink({
+        credentials: { xor: { apiKey: CLEARTEXT_KEY, baseURL } },
+      }),
+  },
+  {
+    provider: "openai-decisions",
+    variable: "OPENAI_DECISIONS_BASE_URL",
+    client: (baseURL) =>
+      new NeuroLink({
+        credentials: { openaiDecisions: { apiKey: CLEARTEXT_KEY, baseURL } },
+      }),
+  },
+  {
+    provider: "perplexity-decider",
+    variable: "PERPLEXITY_DECIDER_BASE_URL",
+    client: (baseURL) =>
+      new NeuroLink({
+        credentials: { perplexityDecider: { apiKey: CLEARTEXT_KEY, baseURL } },
+      }),
+  },
+  {
+    provider: "cloudflare-clef",
+    variable: "CLOUDFLARE_CLEF_BASE_URL",
+    client: (baseURL) =>
+      new NeuroLink({
+        credentials: {
+          cloudflareClef: {
+            apiKey: CLEARTEXT_KEY,
+            accountId: "account-placeholder",
+            baseURL,
+          },
+        },
+      }),
+  },
+];
+
+/** Requests the fetch capture recorded for the reserved cleartext host since its last reset. */
+function cleartextRequests(): number {
+  return fetchCapture.list().filter((c) => c.url.includes(CLEARTEXT_HOST))
+    .length;
+}
+
+await test("23.1 — positive control: a request to the cleartext host is recorded by the capture", async () => {
+  // Without this, every zero-request assertion below could pass because the
+  // capture sees nothing at all.
+  fetchCapture.reset();
+  await fetch(`http://${CLEARTEXT_HOST}/`, {
+    signal: AbortSignal.timeout(5000),
+  }).catch(() => undefined);
+  assert(
+    cleartextRequests() === 1,
+    "a request to the cleartext host must be recorded",
+  );
+});
+
+await test("23.2 — every keyed decision provider refuses http:// to another host before any request, naming the setting and never the URL", async () => {
+  try {
+    clearDecisionKeys();
+    for (const decider of KEYED_DECIDERS) {
+      for (const baseURL of [
+        `http://${CLEARTEXT_HOST}:8080`,
+        `http://${CLEARTEXT_HOST}/base`,
+        `HTTP://${CLEARTEXT_HOST.toUpperCase()}`,
+        // Credentials and a query in the value do not change the verdict, and
+        // none of them may come back in the message.
+        `http://ops:${CLEARTEXT_SECRET}@${CLEARTEXT_HOST}/base?token=${CLEARTEXT_SECRET}`,
+        // A name that only starts or ends like a loopback one.
+        "http://localhost.decide-cleartext.invalid",
+        "http://127.0.0.1.decide-cleartext.invalid",
+        // Userinfo cannot make a remote host look local.
+        `http://localhost@${CLEARTEXT_HOST}`,
+        // The rest of 127/8 is not this machine's name here.
+        "http://127.0.0.2:9",
+      ]) {
+        fetchCapture.reset();
+        const failure = await failureOf(() =>
+          decider.client(baseURL).decide({
+            provider: decider.provider,
+            state: "x",
+            questions: CLEARTEXT_QUESTIONS,
+          }),
+        );
+        const label = `${decider.provider} with ${baseURL.replace(CLEARTEXT_SECRET, "…")}`;
+        assert(failure !== undefined, `${label}: the request must be refused`);
+        assert(
+          failure.kind === "invalid_request" && failure.retryable === false,
+          `${label}: the refusal must be a non-retryable invalid_request`,
+        );
+        assert(
+          failure.message.includes(decider.variable) &&
+            failure.message.includes("must use https://"),
+          `${label}: the refusal must say why and name ${decider.variable}`,
+        );
+        assert(
+          !failure.message.toLowerCase().includes("decide-cleartext") &&
+            !failure.message.includes(CLEARTEXT_SECRET) &&
+            !failure.message.includes("127.0.0.2"),
+          `${label}: the refusal must not repeat any part of the URL`,
+        );
+        assert(
+          fetchCapture.list().length === 0,
+          `${label}: a refused base URL must never reach the transport`,
+        );
+      }
+    }
+  } finally {
+    restoreEnv();
+  }
+});
+
+await test("23.3 — the environment variable is refused the same way, so a configured key never leaves the machine", async () => {
+  try {
+    for (const decider of KEYED_DECIDERS) {
+      clearDecisionKeys();
+      process.env[decider.variable] = `http://${CLEARTEXT_HOST}:8080`;
+      fetchCapture.reset();
+      const failure = await failureOf(() =>
+        new NeuroLink({
+          credentials: {
+            xor: { apiKey: CLEARTEXT_KEY },
+            openaiDecisions: { apiKey: CLEARTEXT_KEY },
+            perplexityDecider: { apiKey: CLEARTEXT_KEY },
+            cloudflareClef: {
+              apiKey: CLEARTEXT_KEY,
+              accountId: "account-placeholder",
+            },
+          },
+        }).decide({
+          provider: decider.provider,
+          state: "x",
+          questions: CLEARTEXT_QUESTIONS,
+        }),
+      );
+      assert(
+        failure?.kind === "invalid_request" &&
+          failure.message.includes(decider.variable) &&
+          !failure.message.includes(CLEARTEXT_HOST),
+        `${decider.provider}: ${decider.variable} must be refused without repeating it`,
+      );
+      assert(
+        fetchCapture.list().length === 0,
+        `${decider.provider}: a refused environment base URL must never reach the transport`,
+      );
+    }
+  } finally {
+    restoreEnv();
+  }
+});
+
+await test("23.4 — decide --provider xor with an http:// XOR_BASE_URL to another host: exits non-zero, names the variable, never repeats the host, sends nothing", async () => {
+  const result = await runCLI(
+    [
+      "decide",
+      "The state text",
+      "--provider",
+      "xor",
+      "--questions",
+      ONE_QUESTION,
+    ],
+    {
+      env: {
+        ...NO_PROVIDER_ENV,
+        XOR_API_KEY: CLEARTEXT_KEY,
+        XOR_BASE_URL: `http://ops:${CLEARTEXT_SECRET}@${CLEARTEXT_HOST}:8080`,
+      },
+      timeoutMs: 30_000,
+    },
+  );
+  const output = result.stdout + result.stderr;
+  assert(result.exitCode !== 0, "a cleartext base URL must be refused");
+  assert(
+    result.stderr.includes("XOR_BASE_URL") &&
+      result.stderr.includes("must use https://"),
+    "the refusal must say why and which variable to fix",
+  );
+  assert(
+    !output.includes(CLEARTEXT_HOST) && !output.includes(CLEARTEXT_SECRET),
+    "nothing from the base URL may be echoed",
+  );
+  assert(
+    !/ENOTFOUND|ECONNREFUSED|network/i.test(output),
+    "the refusal must happen before any request",
+  );
+  assert(!looksLikeStackTrace(output), "the refusal printed a stack trace");
+});
+
+await test("23.5 — positive control: http:// to 127.0.0.1 still reaches the server, with the Bearer key", async () => {
+  const fake = await startFakeXor();
+  try {
+    clearDecisionKeys();
+    const result = await KEYED_DECIDERS[0].client(fake.baseURL).decide({
+      provider: "xor",
+      state: "x",
+      questions: CLEARTEXT_QUESTIONS,
+    });
+    assert(result.provider === "xor", "the loopback server must have answered");
+    assert(
+      fake.requests.length === 1 &&
+        fake.requests[0]?.authorization === `Bearer ${CLEARTEXT_KEY}`,
+      "exactly one request, carrying the key, must reach the loopback server",
+    );
+  } finally {
+    await fake.close();
+    restoreEnv();
+  }
+  await withFakeOpenAI(
+    () => OPENAI_CLI_REPLY,
+    async (baseURL, requests) => {
+      const result = await KEYED_DECIDERS[1].client(baseURL).decide({
+        provider: "openai-decisions",
+        state: "x",
+        questions: CLEARTEXT_QUESTIONS,
+      });
+      assert(
+        result.provider === "openai-decisions",
+        "the loopback server must have answered",
+      );
+      const { request } = soleOpenAIRequest(requests);
+      assert(
+        request.authorization === `Bearer ${CLEARTEXT_KEY}`,
+        "the key must reach the loopback server",
+      );
+    },
+  );
+});
+
+type Landing = {
+  method: string;
+  authorization: string | null;
+  bytes: number;
+};
+
+/**
+ * A loopback server that answers every request with `status` and a Location
+ * naming a second loopback server, which records whatever lands on it.
+ */
+async function withRedirector<T>(
+  status: number,
+  run: (
+    baseURL: string,
+    arrivals: { first: number; landed: readonly Landing[]; landingURL: string },
+  ) => Promise<T>,
+): Promise<T> {
+  const landed: Landing[] = [];
+  const target = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      landed.push({
+        method: req.method ?? "",
+        authorization: req.headers.authorization ?? null,
+        bytes: Buffer.concat(chunks).length,
+      });
+      res.writeHead(200, {
+        "content-type": "application/json",
+        connection: "close",
+      });
+      res.end("{}");
+    });
+  });
+  await new Promise<void>((resolve) => target.listen(0, "127.0.0.1", resolve));
+  const landingURL = `http://127.0.0.1:${(target.address() as AddressInfo).port}/landed`;
+  const arrivals = { first: 0, landed, landingURL };
+  const first = createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      arrivals.first += 1;
+      res.writeHead(status, { location: landingURL, connection: "close" });
+      res.end();
+    });
+  });
+  await new Promise<void>((resolve) => first.listen(0, "127.0.0.1", resolve));
+  try {
+    const { port } = first.address() as AddressInfo;
+    return await run(`http://127.0.0.1:${port}`, arrivals);
+  } finally {
+    first.closeAllConnections();
+    target.closeAllConnections();
+    await new Promise<void>((resolve) => first.close(() => resolve()));
+    await new Promise<void>((resolve) => target.close(() => resolve()));
+  }
+}
+
+await test("23.6 — positive control: a plain fetch follows a 307 and replays the body at the new address", async () => {
+  // This is the behaviour the next test shuts off. If it did not happen here,
+  // "nothing landed" below would prove nothing.
+  await withRedirector(307, async (baseURL, arrivals) => {
+    const response = await fetch(`${baseURL}/v1/systemone`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${CLEARTEXT_KEY}` },
+      body: JSON.stringify({ state: "the state" }),
+    });
+    assert(response.ok, "the redirected request must have been answered");
+    assert(
+      arrivals.landed.length === 1 && arrivals.landed[0]?.bytes > 0,
+      "the redirect must have replayed the body at the second server",
+    );
+  });
+});
+
+await test("23.7 — a redirect from the endpoint is refused, not followed: no body lands anywhere else, one request, not retried, the address not repeated", async () => {
+  try {
+    clearDecisionKeys();
+    for (const status of [301, 302, 303, 307, 308]) {
+      for (const decider of KEYED_DECIDERS.slice(0, 2)) {
+        await withRedirector(status, async (baseURL, arrivals) => {
+          const failure = await failureOf(() =>
+            decider.client(baseURL).decide({
+              provider: decider.provider,
+              state: "the state",
+              questions: CLEARTEXT_QUESTIONS,
+            }),
+          );
+          const label = `${decider.provider} after a ${status}`;
+          assert(
+            arrivals.landed.length === 0,
+            `${label}: nothing may land at the address the redirect named`,
+          );
+          assert(failure !== undefined, `${label}: must not be answered`);
+          assert(
+            failure.kind === "network" && failure.retryable === false,
+            `${label}: must be a non-retryable failure of kind "network"`,
+          );
+          assert(
+            /redirect/i.test(failure.message),
+            `${label}: the message must say a redirect was refused`,
+          );
+          assert(
+            !failure.message.includes(arrivals.landingURL) &&
+              !failure.message.includes("/landed") &&
+              !failure.message.includes(CLEARTEXT_KEY),
+            `${label}: the message must not repeat the address or the key`,
+          );
+          assert(
+            arrivals.first === 1,
+            `${label}: the endpoint must be asked once, not retried`,
+          );
+        });
+      }
+    }
+  } finally {
+    restoreEnv();
+  }
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+logSection("24. ScaleDown — the CLI against a local server");
+// ───────────────────────────────────────────────────────────────────────────
+// No key, no network: every request goes to a server this file starts on
+// 127.0.0.1, and the replies are fixtures. Nothing here says what ScaleDown's
+// endpoint returned for a real request, and no request is made to it.
+const SCALEDOWN_CLI_KEY = "test-fake-scaledown-cli-credential";
+
+type FakeScaleDownRequest = {
+  method: string;
+  path: string;
+  headers: IncomingHttpHeaders;
+  body: unknown;
+};
+
+type FakeScaleDownReply = { status: number; body: unknown };
+
+/** Runs `run` against a local server that records every request and answers as `reply` says. */
+async function withFakeScaleDown<T>(
+  reply: (request: FakeScaleDownRequest) => FakeScaleDownReply,
+  run: (
+    baseURL: string,
+    requests: readonly FakeScaleDownRequest[],
+  ) => Promise<T>,
+): Promise<T> {
+  const requests: FakeScaleDownRequest[] = [];
+  const server = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      let body: unknown;
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString());
+      } catch {
+        body = undefined;
+      }
+      const seen: FakeScaleDownRequest = {
+        method: req.method ?? "",
+        path: req.url ?? "",
+        headers: req.headers,
+        body,
+      };
+      requests.push(seen);
+      const { status, body: answer } = reply(seen);
+      res.writeHead(status, {
+        "content-type": "application/json",
+        connection: "close",
+      });
+      res.end(JSON.stringify(answer));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const { port } = server.address() as AddressInfo;
+    assert(port > 0, "the local server must listen on a port");
+    return await run(`http://127.0.0.1:${port}`, requests);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}
+
+const SCALEDOWN_CLI_REPLY: FakeScaleDownReply = {
+  status: 200,
+  body: {
+    model: "classify-1",
+    answers: { urgent: { type: "noul", noul: 0.92 } },
+    // A cost that is not the table's price, so a Cost line equal to the table's
+    // figure cannot have come from the reply.
+    usage: { input_tokens: 250_000, output_tokens: 0, cost: 0.9 },
+  },
+};
+
+/** The CLI's environment: nothing configured but the key and the local server. */
+const scaledownCliEnv = (baseURL: string): Record<string, string> => ({
+  ...NO_PROVIDER_ENV,
+  SCALEDOWN_API_KEY: SCALEDOWN_CLI_KEY,
+  SCALEDOWN_BASE_URL: baseURL,
+});
+
+/** The one request a CLI run sent, narrowed enough to read its body. */
+function soleScaleDownRequest(requests: readonly FakeScaleDownRequest[]): {
+  request: FakeScaleDownRequest;
+  body: Record<string, unknown>;
+} {
+  const count: number = requests.length;
+  assert(count === 1, "exactly one request must reach the server");
+  const request = requests[0];
+  assert(
+    request !== undefined && isRecordLike(request.body),
+    "the request body must be a JSON object",
+  );
+  return { request, body: request.body };
+}
+
+await test("24.1 — decide --provider scaledown --format json: exit 0, clean JSON, one POST /v1/scaledown with x-api-key, no Authorization, and a string state", async () => {
+  await withFakeScaleDown(
+    () => SCALEDOWN_CLI_REPLY,
+    async (baseURL, requests) => {
+      const result = await runCLI(
+        [
+          "decide",
+          "The state text",
+          "--provider",
+          "scaledown",
+          "--format",
+          "json",
+          "--questions",
+          ONE_QUESTION,
+        ],
+        { env: scaledownCliEnv(baseURL), timeoutMs: 60_000 },
+      );
+      assert(
+        result.exitCode === 0,
+        "the CLI must exit 0 once the server has answered",
+      );
+      const { request, body } = soleScaleDownRequest(requests);
+      assert(
+        request.method === "POST" && request.path === "/v1/scaledown",
+        "the request must be a POST to /v1/scaledown",
+      );
+      assert(
+        request.headers["x-api-key"] === SCALEDOWN_CLI_KEY,
+        "the credential must travel in the header the entry names",
+      );
+      assert(
+        !Object.keys(request.headers).some(
+          (name) => name.toLowerCase() === "authorization",
+        ),
+        "no Authorization header may be sent",
+      );
+      assert(
+        request.headers["content-type"]?.startsWith("application/json") ===
+          true,
+        "the body must be sent as JSON",
+      );
+      assert(
+        Object.keys(body).sort().join(",") === "model,questions,state",
+        "the body must hold the model, the questions and the state, and nothing else",
+      );
+      assert(body.model === "classify-1", "the default model must be sent");
+      assert(
+        body.state === "The state text",
+        "the state must be a string, as given",
+      );
+      const question = isRecordLike(body.questions)
+        ? body.questions.urgent
+        : undefined;
+      assert(
+        isRecordLike(question) &&
+          question.type === "noul" &&
+          question.instructions === "Is this urgent?" &&
+          Object.keys(question).length === 2,
+        "the yes/no question must go out as a noul question carrying its instructions",
+      );
+
+      const parsed: unknown = JSON.parse(result.stdout);
+      assert(
+        isRecordLike(parsed) &&
+          parsed.provider === "scaledown" &&
+          parsed.model === "classify-1",
+        "stdout must be the raw result: provider and model",
+      );
+      const answers = isRecordLike(parsed) ? parsed.answers : undefined;
+      const urgent = isRecordLike(answers) ? answers.urgent : undefined;
+      assert(
+        isRecordLike(urgent) &&
+          urgent.type === "boolean" &&
+          urgent.probability === 0.92,
+        "the answer must be the server's probability, as a boolean answer",
+      );
+      assert(
+        !(result.stdout + result.stderr).includes(SCALEDOWN_CLI_KEY),
+        "the key must not appear in the CLI's output",
+      );
+    },
+  );
+});
+
+await test("24.2 — decide --provider scaledown in text mode prints the answer, the model and the price from the table", async () => {
+  await withFakeScaleDown(
+    () => SCALEDOWN_CLI_REPLY,
+    async (baseURL, requests) => {
+      const result = await runCLI(
+        [
+          "decide",
+          "The state text",
+          "--provider",
+          "scaledown",
+          "--questions",
+          ONE_QUESTION,
+        ],
+        { env: scaledownCliEnv(baseURL), timeoutMs: 60_000 },
+      );
+      assert(result.exitCode === 0, "the CLI must exit 0");
+      soleScaleDownRequest(requests);
+      assert(
+        result.stdout.includes("urgent: probability 0.92"),
+        "the answer line must show the probability",
+      );
+      assert(
+        result.stdout.includes("Model: classify-1"),
+        "the model line must show the model the reply names",
+      );
+      // 250,000 input tokens x $0.05 per million input tokens, input only: from
+      // the pricing table. The stand-in reply reports a different cost.
+      assert(
+        result.stdout.includes("Cost: $0.012500"),
+        "the cost line must be input tokens at the table's rate",
+      );
+      assert(
+        !looksLikeStackTrace(result.stdout + result.stderr),
+        "the run printed a stack trace",
+      );
+    },
+  );
+});
+
+await test("24.3 — a JSON object as the state, and --model, reach the server: the state as one JSON string, the model as named", async () => {
+  await withFakeScaleDown(
+    () => SCALEDOWN_CLI_REPLY,
+    async (baseURL, requests) => {
+      const result = await runCLI(
+        [
+          "decide",
+          '{ "ticket": { "id": 7 }, "tags": ["a", "b"] }',
+          "--provider",
+          "scaledown",
+          "--model",
+          "classify",
+          "--format",
+          "json",
+          "--questions",
+          ONE_QUESTION,
+        ],
+        { env: scaledownCliEnv(baseURL), timeoutMs: 60_000 },
+      );
+      assert(result.exitCode === 0, "the CLI must exit 0");
+      const { body } = soleScaleDownRequest(requests);
+      assert(
+        body.state === '{"ticket":{"id":7},"tags":["a","b"]}',
+        "an object state must go out as its compact JSON text, one string",
+      );
+      assert(body.model === "classify", "--model must name the model sent");
+    },
+  );
+});
+
+await test("24.4 — a state of only whitespace is refused by the provider before any request: non-zero exit, one clean line, nothing reaches the server", async () => {
+  await withFakeScaleDown(
+    () => SCALEDOWN_CLI_REPLY,
+    async (baseURL, requests) => {
+      const result = await runCLI(
+        [
+          "decide",
+          "   ",
+          "--provider",
+          "scaledown",
+          "--questions",
+          ONE_QUESTION,
+        ],
+        { env: scaledownCliEnv(baseURL), timeoutMs: 60_000 },
+      );
+      const output = result.stdout + result.stderr;
+      assert(result.exitCode !== 0, "a blank state must exit non-zero");
+      assert(
+        output.includes("needs non-blank state text"),
+        "the refusal must say what rule it is",
+      );
+      assert(!looksLikeStackTrace(output), "the refusal printed a stack trace");
+      const seen: number = requests.length;
+      assert(seen === 0, "no request may reach the server");
+    },
+  );
+});
+
+await test("24.5 — decide --provider scaledown with a rejected key: one clean line naming the failure, key absent, sent once", async () => {
+  await withFakeScaleDown(
+    () => ({
+      status: 401,
+      body: { detail: `stand-in: bad key ${SCALEDOWN_CLI_KEY}` },
+    }),
+    async (baseURL, requests) => {
+      const result = await runCLI(
+        [
+          "decide",
+          "The state text",
+          "--provider",
+          "scaledown",
+          "--questions",
+          ONE_QUESTION,
+        ],
+        { env: scaledownCliEnv(baseURL), timeoutMs: 60_000 },
+      );
+      const output = result.stdout + result.stderr;
+      assert(result.exitCode !== 0, "a refused key must exit non-zero");
+      soleScaleDownRequest(requests);
+      assert(
+        !output.includes(SCALEDOWN_CLI_KEY),
+        "the key the server repeated must not reach the CLI's output",
+      );
+      assert(
+        output.includes("Authentication failed") &&
+          output.includes("stand-in: bad key"),
+        "the failure kind and the server's own reason must be kept",
+      );
+      assert(!looksLikeStackTrace(output), "the failure printed a stack trace");
+    },
+  );
+});
+
+await test("24.6 — decide --image with scaledown: refused locally, the media refusal on one clean line, nothing reaches the server", async () => {
+  await withFakeScaleDown(
+    () => SCALEDOWN_CLI_REPLY,
+    async (baseURL, requests) => {
+      const result = await runCLI(
+        [
+          "decide",
+          "The state text",
+          "--provider",
+          "scaledown",
+          "--image",
+          `${PERPLEXITY_FIXTURE_DIR}blue.png`,
+          "--questions",
+          ONE_QUESTION,
+        ],
+        { env: scaledownCliEnv(baseURL), timeoutMs: 60_000 },
+      );
+      const output = result.stdout + result.stderr;
+      assert(result.exitCode !== 0, "an image must be refused");
+      assert(
+        output.includes("does not accept images or video"),
+        "the refusal must be the media refusal",
+      );
+      assert(!looksLikeStackTrace(output), "the refusal printed a stack trace");
+      const seen: number = requests.length;
+      assert(seen === 0, "no request may reach the server");
+    },
+  );
+});
+
+await test("24.7 — the --provider choices the CLI builds name scaledown, and decide --help documents --provider", async () => {
+  const generate = await runCLI(["generate", "--help"], { timeoutMs: 60_000 });
+  assert(generate.exitCode === 0, "generate --help must exit 0");
+  assert(
+    generate.stdout.includes('"scaledown"'),
+    "the --provider choices the CLI builds must name scaledown",
+  );
+  const decide = await runCLI(["decide", "--help"], { timeoutMs: 60_000 });
+  assert(decide.exitCode === 0, "decide --help must exit 0");
+  assert(
+    decide.stdout.includes("--provider"),
+    "decide --help must document --provider",
+  );
+});
+
+await test("24.8 — decide with no --provider: SCALEDOWN_API_KEY alone makes ScaleDown the default, at SCALEDOWN_BASE_URL, with the key in x-api-key", async () => {
+  await withFakeScaleDown(
+    () => SCALEDOWN_CLI_REPLY,
+    async (baseURL, requests) => {
+      const result = await runCLI(
+        [
+          "decide",
+          "The state text",
+          "--format",
+          "json",
+          "--questions",
+          ONE_QUESTION,
+        ],
+        { env: scaledownCliEnv(baseURL), timeoutMs: 60_000 },
+      );
+      assert(result.exitCode === 0, "the CLI must exit 0 once answered");
+      const { request } = soleScaleDownRequest(requests);
+      assert(
+        request.headers["x-api-key"] === SCALEDOWN_CLI_KEY,
+        "the environment credential must travel in the header the entry names",
+      );
+      const parsed: unknown = JSON.parse(result.stdout);
+      assert(
+        isRecordLike(parsed) && parsed.provider === "scaledown",
+        "the default provider must have been chosen without being named",
+      );
+    },
+  );
+});
+
+await test("24.9 — SCALEDOWN_MODEL names the model a fresh process sends, and --model beats it", async () => {
+  await withFakeScaleDown(
+    () => SCALEDOWN_CLI_REPLY,
+    async (baseURL, requests) => {
+      const env = { ...scaledownCliEnv(baseURL), SCALEDOWN_MODEL: "classify" };
+      const fromEnv = await runCLI(
+        [
+          "decide",
+          "The state text",
+          "--provider",
+          "scaledown",
+          "--format",
+          "json",
+          "--questions",
+          ONE_QUESTION,
+        ],
+        { env, timeoutMs: 60_000 },
+      );
+      assert(fromEnv.exitCode === 0, "the CLI must exit 0");
+      assert(
+        soleScaleDownRequest(requests).body.model === "classify",
+        "SCALEDOWN_MODEL must name the model sent",
+      );
+      const overridden = await runCLI(
+        [
+          "decide",
+          "The state text",
+          "--provider",
+          "scaledown",
+          "--model",
+          "classify-1",
+          "--format",
+          "json",
+          "--questions",
+          ONE_QUESTION,
+        ],
+        { env, timeoutMs: 60_000 },
+      );
+      assert(overridden.exitCode === 0, "the CLI must exit 0");
+      const total: number = requests.length;
+      assert(total === 2, "the two runs must have sent one request each");
+      assert(
+        soleScaleDownRequest(requests.slice(1)).body.model === "classify-1",
+        "--model must beat SCALEDOWN_MODEL",
+      );
+    },
+  );
+});
+
+restoreEnv();
+
+await runSuite();

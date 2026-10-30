@@ -1,0 +1,2429 @@
+/**
+ * Shared utilities for Gemini 3 native SDK support.
+ *
+ * Both GoogleAIStudioProvider and GoogleVertexProvider route Gemini 3 models
+ * with tools to the native @google/genai SDK (bypassing the Vercel AI SDK)
+ * in order to properly handle thought_signature in multi-turn tool calling.
+ *
+ * This module extracts the functions that are duplicated between the two
+ * providers so they can share a single implementation.
+ */
+
+import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { extname } from "node:path";
+import {
+  DEFAULT_CONTEXT_GUARD_RATIO,
+  DEFAULT_MAX_STEPS,
+  DEFAULT_TOOL_MAX_RETRIES,
+  DEFAULT_WRAPUP_TIME_LEAD_MS,
+} from "../../core/constants.js";
+import type {
+  GenerateStopReason,
+  ZodUnknownSchema,
+  ThinkingConfig,
+  AgenticLoopOptions,
+  ChatMessage,
+  CollectedChunkResult,
+  MinimalChatMessage,
+  NativeFunctionCall,
+  NativeFunctionDeclaration,
+  NativeFunctionResponse,
+  NativeToolDeclarationsResult,
+  NativeToolsConfig,
+  StreamChannel,
+  ToolWithLegacyParams,
+  VertexNativePart,
+  VertexSegment,
+  VertexToolStep,
+  GeminiMultimodalInput,
+  MultimodalAudioEntry,
+  MultimodalVideoEntry,
+  ModelMessage,
+  TextPart,
+  ImagePart,
+  FilePart,
+  ToolCallPart,
+  ToolResultPart,
+  UserContent,
+  AssistantContent,
+  ToolContent,
+  DataContent,
+} from "../../types/index.js";
+import {
+  needsAudioTranscode,
+  toProviderCompatibleAudio,
+} from "../../adapters/audioFormatSupport.js";
+import { canDeliverVideoNatively } from "../../adapters/videoFormatSupport.js";
+import { logger } from "../../utils/logger.js";
+import { guardToolExecutor } from "../../core/toolExecutionGuards.js";
+import { resolveSamplingParams } from "../../models/modelRegistry.js";
+import {
+  convertZodToJsonSchema,
+  ensureNestedSchemaTypes,
+  inlineJsonSchema,
+  isZodSchema,
+} from "../../utils/schemaConversion.js";
+
+import { createNativeThinkingConfig } from "../../utils/thinkingConfig.js";
+import { resolveLiveTool } from "../../tools/toolDiscovery.js";
+import type {
+  ToolExecuteFunction,
+  Tool,
+  ToolExecutionGuards,
+} from "../../types/index.js";
+
+// ── Functions ──
+
+/** Stable, key-order-independent serialization of tool args for the dedup key. */
+function stableStringifyForDedup(value: unknown): string {
+  return JSON.stringify(value, (_key, val) =>
+    val && typeof val === "object" && !Array.isArray(val)
+      ? Object.keys(val as Record<string, unknown>)
+          .sort()
+          .reduce<Record<string, unknown>>((acc, key) => {
+            acc[key] = (val as Record<string, unknown>)[key];
+            return acc;
+          }, {})
+      : val,
+  );
+}
+
+/**
+ * A per-turn tool execute map that deduplicates identical tool calls.
+ *
+ * Gemini occasionally re-emits a tool call with identical arguments across
+ * agentic steps even though the prior result is already in the conversation
+ * history (BZ-3327). Re-executing produces duplicate side effects and
+ * duplicate reports for the user, plus wasted tokens. This map caches the
+ * result of each {tool name + args} executed within the turn and returns it
+ * for any identical re-request instead of running the tool again.
+ *
+ * Providers build a fresh executeMap per request, so the cache scope is
+ * exactly one turn. Only `.get()` is overridden (the sole access path used by
+ * the native agentic loops), so iteration still yields the raw executors.
+ */
+export class DedupExecuteMap extends Map<string, Tool["execute"]> {
+  private readonly resultCache = new Map<string, unknown>();
+
+  override get(name: string): Tool["execute"] | undefined {
+    const execute = super.get(name);
+    if (!execute) {
+      return execute;
+    }
+    const resultCache = this.resultCache;
+    const wrapped: ToolExecuteFunction<unknown, unknown> = async (
+      args,
+      options,
+    ) => {
+      const key = `${name}::${stableStringifyForDedup(args)}`;
+      if (resultCache.has(key)) {
+        logger.warn(
+          `[DedupExecuteMap] Tool "${name}" re-requested with identical arguments in the same turn — reusing the previous result instead of re-executing.`,
+        );
+        return resultCache.get(key);
+      }
+      const result = await execute(args, options);
+      resultCache.set(key, result);
+      return result;
+    };
+    return wrapped as Tool["execute"];
+  }
+}
+
+/**
+ * Google's `function_declarations[].name` validator regex.
+ *
+ * Empirically (and per the Vertex/AI Studio API error message), the server
+ * enforces `[A-Za-z_][A-Za-z0-9_.:-]{0,127}`. Tool names that don't match
+ * fail with HTTP 400 "Invalid function name", which surfaces as a misleading
+ * tool-calling failure for the whole request.
+ *
+ * MCP-imported or user-registered tools may legally contain characters
+ * outside this set (e.g. `/`, spaces, unicode), so we sanitize defensively
+ * before sending to Google. The sanitized name is also used as the
+ * `executeMap` key so the round-trip from Google's function-call response
+ * back to our executor still works.
+ */
+const GOOGLE_FN_NAME_REGEX = /^[A-Za-z_][A-Za-z0-9_.:-]{0,127}$/;
+
+const GOOGLE_FN_NAME_MAX_LENGTH = 128;
+
+function sanitizeForGoogleFunctionName(name: string): string {
+  if (GOOGLE_FN_NAME_REGEX.test(name)) {
+    return name;
+  }
+  let sanitized = name.replace(/[^A-Za-z0-9_.:-]/g, "_");
+  if (!/^[A-Za-z_]/.test(sanitized)) {
+    sanitized = `_${sanitized}`;
+  }
+  if (sanitized.length > GOOGLE_FN_NAME_MAX_LENGTH) {
+    sanitized = sanitized.slice(0, GOOGLE_FN_NAME_MAX_LENGTH);
+  }
+  return sanitized;
+}
+
+/**
+ * Resolve a sanitized Gemini tool name to one that is both unique within
+ * the current request and at most 128 characters. When the candidate
+ * collides with an already-used name we append `_2`, `_3`, … — but
+ * reserve room for the suffix by truncating the base first so the
+ * resolved name never exceeds Google's `function_declarations[].name`
+ * limit.
+ *
+ * @param base       The already-sanitized candidate name.
+ * @param isTaken    Predicate that returns true if `name` is already used.
+ */
+function resolveUniqueGoogleFunctionName(
+  base: string,
+  isTaken: (name: string) => boolean,
+): string {
+  if (!isTaken(base)) {
+    return base;
+  }
+  let suffix = 2;
+  while (true) {
+    const suffixStr = `_${suffix}`;
+    const trimmedBase = base.slice(
+      0,
+      GOOGLE_FN_NAME_MAX_LENGTH - suffixStr.length,
+    );
+    const candidate = `${trimmedBase}${suffixStr}`;
+    if (!isTaken(candidate)) {
+      return candidate;
+    }
+    suffix++;
+  }
+}
+
+/**
+ * Sanitize a JSON Schema for Gemini's proto-based API.
+ *
+ * Gemini cannot handle `anyOf`/`oneOf` union types in function declarations
+ * because its proto format expects a single `type` field, not a list of types.
+ * This function recursively converts unions to `string` type (the most
+ * permissive primitive that can represent any value as text).
+ *
+ * Also removes `$schema`, `additionalProperties`, and `default` keys that
+ * Gemini's proto format doesn't support.
+ */
+function sanitizeSchemaForGemini(
+  schema: Record<string, unknown>,
+): Record<string, unknown> {
+  // If this node has anyOf/oneOf, collapse to string type
+  if (Array.isArray(schema.anyOf) || Array.isArray(schema.oneOf)) {
+    const unionKey = schema.anyOf ? "anyOf" : "oneOf";
+    const variants = schema[unionKey] as Record<string, unknown>[];
+
+    // Check if it's a nullable union (e.g., anyOf: [{type: "string"}, {type: "null"}])
+    const nonNullVariants = variants.filter(
+      (v) => v.type !== "null" && v.type !== "undefined",
+    );
+
+    if (nonNullVariants.length === 1) {
+      // Simple nullable — use the non-null type with nullable flag
+      const base = sanitizeSchemaForGemini({ ...nonNullVariants[0] });
+      base.nullable = true;
+      if (schema.description) {
+        base.description = schema.description;
+      }
+      return base;
+    }
+
+    // Multi-type union — collapse to string with description noting the original types
+    const types = nonNullVariants.map((v) => v.type || "unknown").join(" | ");
+    const result: Record<string, unknown> = { type: "string" };
+    const desc = schema.description
+      ? `${schema.description} (accepts: ${types})`
+      : `Value as string (accepts: ${types})`;
+    result.description = desc;
+    if (variants.some((v) => v.type === "null")) {
+      result.nullable = true;
+    }
+    return result;
+  }
+
+  const result: Record<string, unknown> = {};
+
+  for (const [key, value] of Object.entries(schema)) {
+    // Skip keys unsupported by Gemini proto format
+    if (
+      key === "$schema" ||
+      key === "additionalProperties" ||
+      key === "default"
+    ) {
+      continue;
+    }
+
+    if (key === "properties" && value && typeof value === "object") {
+      const properties: Record<string, unknown> = {};
+      for (const [propName, propSchema] of Object.entries(
+        value as Record<string, unknown>,
+      )) {
+        if (propSchema && typeof propSchema === "object") {
+          properties[propName] = sanitizeSchemaForGemini(
+            propSchema as Record<string, unknown>,
+          );
+        } else {
+          properties[propName] = propSchema;
+        }
+      }
+      result[key] = properties;
+    } else if (key === "items" && value && typeof value === "object") {
+      if (Array.isArray(value)) {
+        result[key] = value.map((item) =>
+          item && typeof item === "object"
+            ? sanitizeSchemaForGemini(item as Record<string, unknown>)
+            : item,
+        );
+      } else {
+        result[key] = sanitizeSchemaForGemini(value as Record<string, unknown>);
+      }
+    } else {
+      result[key] = value;
+    }
+  }
+
+  // Recurse through composed schema branches
+  if (Array.isArray(result.allOf)) {
+    result.allOf = result.allOf.map((s: Record<string, unknown>) =>
+      sanitizeSchemaForGemini(s),
+    );
+  }
+  if (result.not && typeof result.not === "object") {
+    result.not = sanitizeSchemaForGemini(result.not as Record<string, unknown>);
+  }
+  for (const branch of ["if", "then", "else"] as const) {
+    if (result[branch] && typeof result[branch] === "object") {
+      result[branch] = sanitizeSchemaForGemini(
+        result[branch] as Record<string, unknown>,
+      );
+    }
+  }
+
+  // JSON Schema Draft-4 `exclusiveMinimum: true` / `exclusiveMaximum: true`
+  // (boolean form) is rejected by Gemini's OpenAPI 3.0 validator, which
+  // expects a numeric bound. zod-to-json-schema's openApi3 target still
+  // emits the Draft-4 form for `z.number().positive()` etc. Translate to
+  // the numeric form when paired with `minimum`/`maximum`, or drop.
+  if (typeof result.exclusiveMinimum === "boolean") {
+    if (
+      result.exclusiveMinimum === true &&
+      typeof result.minimum === "number"
+    ) {
+      result.exclusiveMinimum = result.minimum;
+      delete result.minimum;
+    } else {
+      delete result.exclusiveMinimum;
+    }
+  }
+  if (typeof result.exclusiveMaximum === "boolean") {
+    if (
+      result.exclusiveMaximum === true &&
+      typeof result.maximum === "number"
+    ) {
+      result.exclusiveMaximum = result.maximum;
+      delete result.maximum;
+    } else {
+      delete result.exclusiveMaximum;
+    }
+  }
+  // Clamp `maximum`/`minimum` past int32 — Gemini's protobuf serializer
+  // treats `type: "integer"` as int32 and rejects bounds beyond ~2.1e9.
+  const INT32_MAX = 2147483647;
+  if (typeof result.maximum === "number" && result.maximum > INT32_MAX) {
+    delete result.maximum;
+  }
+  if (typeof result.minimum === "number" && result.minimum < -INT32_MAX) {
+    delete result.minimum;
+  }
+
+  return result;
+}
+
+/**
+ * Convert Vercel AI SDK tools to @google/genai FunctionDeclarations and an execute map.
+ *
+ * This handles both Zod schemas and plain JSON Schema objects for tool parameters.
+ */
+export function buildNativeToolDeclarations(
+  tools: Record<string, Tool>,
+  reservedNames?: ReadonlySet<string>,
+): NativeToolDeclarationsResult {
+  const functionDeclarations: NativeFunctionDeclaration[] = [];
+  const executeMap = new DedupExecuteMap();
+
+  const skippedTools: string[] = [];
+  const renamedTools: Array<{ from: string; to: string }> = [];
+
+  // Disambiguate distinct originals that collapse onto the same sanitized
+  // name (e.g. "my/tool" and "my-tool" both → "my_tool") via
+  // resolveUniqueGoogleFunctionName, which appends `_N` while keeping the
+  // final string within Google's 128-char limit. Track all assigned names
+  // regardless of whether the tool has an `execute` function (tools without
+  // execute are still pushed to functionDeclarations). The originalNameMap
+  // lets the calling stream loop translate Google-returned function-call
+  // names back to the consumer-facing identifier so the sanitization is
+  // transport-only. `reservedNames` seeds the collision set so a mid-turn
+  // refresh (see refreshNativeToolDeclarations) never re-issues a safe name
+  // already assigned by the pre-loop snapshot.
+  const usedNames = new Set<string>(reservedNames ?? []);
+  const originalNameMap = new Map<string, string>();
+
+  for (const [name, tool] of Object.entries(tools)) {
+    try {
+      const candidate = sanitizeForGoogleFunctionName(name);
+      const safeName = resolveUniqueGoogleFunctionName(candidate, (n) =>
+        usedNames.has(n),
+      );
+      originalNameMap.set(safeName, name);
+      if (safeName !== name) {
+        renamedTools.push({ from: name, to: safeName });
+      }
+      const decl: NativeFunctionDeclaration = {
+        name: safeName,
+        description: tool.description || `Tool: ${safeName}`,
+      };
+
+      // Access legacy `parameters` (AI SDK v3/v4) or current `inputSchema` (v6)
+      const legacyTool = tool as ToolWithLegacyParams;
+      if (legacyTool.parameters || tool.inputSchema) {
+        let rawSchema: Record<string, unknown>;
+        const toolParams = legacyTool.parameters || tool.inputSchema;
+
+        if (isZodSchema(toolParams)) {
+          rawSchema = convertZodToJsonSchema(
+            toolParams as ZodUnknownSchema,
+            "openApi3",
+          ) as Record<string, unknown>;
+        } else if (typeof toolParams === "object") {
+          rawSchema = toolParams as Record<string, unknown>;
+        } else {
+          rawSchema = { type: "object", properties: {} };
+        }
+
+        // Unwrap Vercel AI SDK's jsonSchema() wrapper: { jsonSchema: { type: "object", ... } }
+        if (
+          rawSchema.jsonSchema &&
+          typeof rawSchema.jsonSchema === "object" &&
+          !rawSchema.type
+        ) {
+          rawSchema = rawSchema.jsonSchema as Record<string, unknown>;
+        }
+
+        decl.parametersJsonSchema = sanitizeSchemaForGemini(
+          inlineJsonSchema(rawSchema),
+        );
+      }
+
+      functionDeclarations.push(decl);
+      usedNames.add(safeName);
+
+      if (tool.execute) {
+        executeMap.set(decl.name, tool.execute);
+      }
+    } catch (err) {
+      skippedTools.push(name);
+      logger.error(
+        `[buildNativeToolDeclarations] Failed to convert tool "${name}":`,
+        err,
+      );
+    }
+  }
+
+  if (skippedTools.length > 0) {
+    logger.warn(
+      `[buildNativeToolDeclarations] ${skippedTools.length} tool(s) skipped due to schema errors: ${skippedTools.join(", ")}`,
+    );
+  }
+
+  if (renamedTools.length > 0) {
+    logger.warn(
+      `[buildNativeToolDeclarations] ${renamedTools.length} tool name(s) sanitized for Google's function-name regex: ${renamedTools
+        .map((r) => `"${r.from}" -> "${r.to}"`)
+        .join(", ")}`,
+    );
+  }
+
+  return {
+    toolsConfig: [{ functionDeclarations }],
+    executeMap,
+    originalNameMap,
+  };
+}
+
+/**
+ * Build the tool record handed to `runAgenticLoop`, routed through the turn's
+ * DedupExecuteMap.
+ *
+ * The engine looks tools up by the name the adapter reports, which is the
+ * ORIGINAL caller-facing name; `executeMap` is keyed by the SANITIZED wire
+ * name Google actually declares. `originalNameMap` is the bridge, and it
+ * carries an entry for every converted tool (identity mappings included), so
+ * iterating it yields exactly the declared, executable set.
+ *
+ * Going through `executeMap.get()` rather than the raw `tool.execute` is the
+ * entire point: `.get()` returns the dedup wrapper, so an identical
+ * {name, args} repeated within one turn is answered from the per-turn cache
+ * instead of running the tool again (BZ-3327). Passing the raw executor looks
+ * identical in every test that calls a tool once, and silently reintroduces
+ * duplicate side effects the moment the model repeats itself.
+ */
+export function buildDedupedEngineTools(
+  declarations: NativeToolDeclarationsResult | undefined,
+  tools: Record<string, Tool> | undefined,
+  guards?: ToolExecutionGuards,
+): NonNullable<AgenticLoopOptions["tools"]> {
+  const engineTools: NonNullable<AgenticLoopOptions["tools"]> = {};
+
+  /**
+   * Everything a loop needs around a tool call that the engine does not do
+   * itself, in one place so both the declared and the fallback path get it.
+   *
+   * Order matters. `raceWithAbort` sits INSIDE `withTimeout` so a turn-level
+   * abort is observed the moment it fires rather than after the tool settles,
+   * and the timeout still bounds a tool that neither settles nor honours its
+   * signal. The progress pings bracket the await because the stall watchdog
+   * is a whole-turn interval comparing wall-clock against the last progress
+   * mark — without them a legitimately slow tool reads as a stalled turn and
+   * gets killed.
+   */
+  const guard = (
+    name: string,
+    execute: NonNullable<Tool["execute"]>,
+  ): ((args: Record<string, unknown>, opts: unknown) => Promise<unknown>) =>
+    guards
+      ? guardToolExecutor(name, execute, guards)
+      : async (args: Record<string, unknown>, opts: unknown) =>
+          execute(args, opts as Parameters<typeof execute>[1]);
+
+  if (declarations) {
+    for (const [safeName, originalName] of declarations.originalNameMap) {
+      const execute = declarations.executeMap.get(safeName);
+      if (!execute) {
+        continue;
+      }
+      engineTools[originalName] = { execute: guard(originalName, execute) };
+    }
+    return engineTools;
+  }
+  // No declarations were built (no tools, or a path that skips the snapshot).
+  // Fall back to the caller's own executors so this helper can never REMOVE a
+  // tool that would otherwise have been callable.
+  for (const [name, tool] of Object.entries(tools ?? {})) {
+    const execute = tool?.execute;
+    if (!execute) {
+      continue;
+    }
+    engineTools[name] = { execute: guard(name, execute) };
+  }
+  return engineTools;
+}
+
+/**
+ * Mid-turn tool sync for the native Gemini loops that build their snapshot
+ * via buildNativeToolDeclarations. `search_tools` (tools.discovery) hydrates
+ * discovered tools into the live record between steps; without this refresh
+ * they stay invisible to the rest of the turn and every call dies as
+ * TOOL_NOT_FOUND. Mutates the snapshot in place — the request config holds
+ * `toolsConfig` by reference — and returns the original names of the tools it
+ * added (empty when nothing was added).
+ */
+export function refreshNativeToolDeclarations(
+  liveTools: Record<string, Tool> | undefined,
+  current: NativeToolDeclarationsResult,
+): string[] {
+  if (!liveTools) {
+    return [];
+  }
+  const declaredOriginals = new Set(current.originalNameMap.values());
+  const missing = Object.entries(liveTools).filter(
+    ([name]) => !declaredOriginals.has(name),
+  );
+  if (missing.length === 0) {
+    return [];
+  }
+  const built = buildNativeToolDeclarations(
+    Object.fromEntries(missing),
+    new Set(current.originalNameMap.keys()),
+  );
+  current.toolsConfig[0].functionDeclarations.push(
+    ...built.toolsConfig[0].functionDeclarations,
+  );
+  for (const [safeName, originalName] of built.originalNameMap) {
+    current.originalNameMap.set(safeName, originalName);
+  }
+  for (const [safeName, execute] of built.executeMap) {
+    current.executeMap.set(safeName, execute);
+  }
+  logger.info(
+    `[buildNativeToolDeclarations] ${missing.length} tool(s) hydrated mid-turn via discovery: ${missing
+      .map(([name]) => name)
+      .join(", ")}`,
+  );
+  // The ORIGINAL names, which is what a caller's breaker is keyed by. A tool
+  // that accrued TOOL_NOT_FOUND strikes while it was still deferred was never
+  // really failing — those strikes are snapshot artifacts, and leaving them in
+  // place disables the tool for the rest of the turn at the very moment it
+  // becomes callable.
+  return missing.map(([name]) => name);
+}
+
+/**
+ * Build the native @google/genai config object shared by stream and generate.
+ *
+ * Caller is responsible for the tools-vs-JSON conflict resolution: Gemini's
+ * function calling cannot be combined with `responseMimeType:
+ * "application/json"`, and `responseSchema` requires that mime type. So
+ * when tools are active, callers must NOT pass `wantsJsonOutput`/
+ * `responseSchema` here; when JSON/schema output is requested, callers
+ * must omit `toolsConfig`. The AI Studio path enforces this by forcing
+ * `disableTools: true` whenever JSON/schema output is requested.
+ */
+export function buildNativeConfig(
+  options: {
+    temperature?: number;
+    /**
+     * Nucleus sampling. Subject to the same registry-driven
+     * sampling-param strip as `temperature` — a model that rejects
+     * classic sampling params (see `SAMPLING_PARAM_REJECTING_FAMILIES`)
+     * gets neither on the wire.
+     */
+    topP?: number;
+    maxTokens?: number;
+    systemPrompt?: string;
+    /**
+     * Model id, used for the registry-driven sampling-param strip and to
+     * pick the right thinkingConfig wire shape (thinkingLevel for Gemini 3,
+     * a translated numeric thinkingBudget for Gemini 2.5).
+     */
+    model?: string;
+    thinkingConfig?: ThinkingConfig;
+    /**
+     * When true (and `toolsConfig` is undefined), set
+     * `responseMimeType: "application/json"` to enforce native JSON output.
+     */
+    wantsJsonOutput?: boolean;
+    /**
+     * Pre-converted JSON Schema for native `responseSchema`. Implies
+     * `wantsJsonOutput`. Ignored if `toolsConfig` is present.
+     */
+    responseSchema?: Record<string, unknown>;
+  },
+  toolsConfig?: NativeToolsConfig,
+): Record<string, unknown> {
+  // Registry-driven sampling strip applied for uniformity with every other
+  // provider path (inert for current Gemini models).
+  const samplingParams = resolveSamplingParams(
+    "google-ai",
+    options.model,
+    { temperature: options.temperature ?? 1.0, topP: options.topP }, // Gemini 3 requires 1.0 for tool calling
+    "googleAiStudio.buildNativeConfig",
+  );
+  const config: Record<string, unknown> = {
+    ...(samplingParams.temperature !== undefined && {
+      temperature: samplingParams.temperature,
+    }),
+    ...(samplingParams.topP !== undefined && {
+      topP: samplingParams.topP,
+    }),
+    maxOutputTokens: options.maxTokens,
+  };
+
+  if (toolsConfig) {
+    config.tools = toolsConfig;
+  }
+
+  if (options.systemPrompt) {
+    config.systemInstruction = options.systemPrompt;
+  }
+
+  // Add thinking config. `options.model` is the resolved model id (both
+  // call sites in googleAiStudio/client.ts pass their effective `modelName`
+  // in) — createNativeThinkingConfig picks the wire shape from it: Gemini 3
+  // gets thinkingLevel passthrough, Gemini 2.5 gets a translated numeric
+  // thinkingBudget (see thinkingConfig.ts). Mirrors the Vertex call sites
+  // in googleVertex/client.ts, which this native path was previously
+  // missing — Google AI Studio's identical native SDK rejects
+  // thinkingLevel on Gemini 2.5 exactly like Vertex does.
+  const nativeThinkingConfig = createNativeThinkingConfig(
+    options.thinkingConfig,
+    options.model,
+  );
+  if (nativeThinkingConfig) {
+    config.thinkingConfig = nativeThinkingConfig;
+  }
+
+  // Native JSON / schema enforcement. Only set when tools are NOT being sent
+  // (Gemini rejects the combination). responseSchema implies JSON mime type.
+  if (!toolsConfig) {
+    if (options.responseSchema || options.wantsJsonOutput) {
+      config.responseMimeType = "application/json";
+    }
+    if (options.responseSchema) {
+      config.responseSchema = options.responseSchema;
+    }
+  }
+
+  return config;
+}
+
+/**
+ * Safety cap for native Gemini 3 SDK agentic tool-calling loops.
+ * Lower than DEFAULT_MAX_STEPS (200) to prevent runaway iterations
+ * in the native SDK path which bypasses Vercel AI SDK step limits.
+ */
+const GEMINI3_NATIVE_MAX_STEPS = 100;
+
+/**
+ * Compute a safe, clamped maxSteps value.
+ */
+export function computeMaxSteps(rawMaxSteps?: number): number {
+  const value = rawMaxSteps || DEFAULT_MAX_STEPS;
+  return Number.isFinite(value) && value > 0
+    ? Math.min(Math.floor(value), GEMINI3_NATIVE_MAX_STEPS)
+    : Math.min(DEFAULT_MAX_STEPS, GEMINI3_NATIVE_MAX_STEPS);
+}
+
+/**
+ * Map a `@google/genai` `Candidate.finishReason` enum value onto NeuroLink's
+ * unified finish reason, mirroring anthropic.ts `mapAnthropicStopReason`.
+ *
+ * Every member of `@google/genai`'s `FinishReason` and where it lands:
+ *
+ * - "length": MAX_TOKENS, and CONTINUATION (the response hit the per-request
+ *   token limit before the model was done; it can be continued with the
+ *   returned continuation token)
+ * - "tool-calls": TOO_MANY_TOOL_CALLS (the model called tools consecutively
+ *   until the system cut the turn off, so it still wanted tools)
+ * - "error": MALFORMED_FUNCTION_CALL, UNEXPECTED_TOOL_CALL
+ * - "content-filter": SAFETY, RECITATION, BLOCKLIST, PROHIBITED_CONTENT, SPII,
+ *   LANGUAGE (generation stopped over an unsupported language), and the image
+ *   refusals IMAGE_SAFETY, IMAGE_PROHIBITED_CONTENT, IMAGE_RECITATION
+ * - "stop": STOP, and the members that name no cause the unified type can
+ *   carry: OTHER, IMAGE_OTHER, NO_IMAGE, FINISH_REASON_UNSPECIFIED. An unknown
+ *   or unset value also reads "stop" (a clean completion is the safe
+ *   assumption), so a member a newer SDK adds needs an explicit case here.
+ *
+ * Returns a plain string (not a `{ unified, raw }` object): the Vertex result
+ * builders and the consuming layer (neurolink.ts `finishReason || "unknown"`
+ * and `finishReason === "length"`) compare against plain strings.
+ *
+ * MALFORMED_FUNCTION_CALL / UNEXPECTED_TOOL_CALL map to "error", NOT
+ * "tool-calls": they are provider/model failures, while "tool-calls" means the
+ * turn ended with the model still wanting tools because a tool-call budget ran
+ * out: the loop's own step cap, or Gemini's TOO_MANY_TOOL_CALLS limit. Consumers
+ * (e.g. curator's step-cap intercept) branch on it and were rendering fake
+ * step-limit messages for 2-4-step malformed-call turns. `stopReason` is the
+ * discriminator that tells the two budgets apart: TOO_MANY_TOOL_CALLS reads
+ * "tool-calls" here but stays `stopReason: "completed"`, because `maxSteps` did
+ * not run out.
+ */
+export function mapGeminiFinishReason(
+  raw: string | null | undefined,
+): "stop" | "length" | "tool-calls" | "content-filter" | "error" {
+  switch (raw) {
+    case "MAX_TOKENS":
+    case "CONTINUATION":
+      return "length";
+    case "TOO_MANY_TOOL_CALLS":
+      return "tool-calls";
+    case "MALFORMED_FUNCTION_CALL":
+    case "UNEXPECTED_TOOL_CALL":
+      return "error";
+    case "SAFETY":
+    case "RECITATION":
+    case "BLOCKLIST":
+    case "PROHIBITED_CONTENT":
+    case "SPII":
+    case "LANGUAGE":
+    case "IMAGE_SAFETY":
+    case "IMAGE_PROHIBITED_CONTENT":
+    case "IMAGE_RECITATION":
+      return "content-filter";
+    default:
+      return "stop";
+  }
+}
+
+/**
+ * Append a step's text to a running cross-step accumulator, ignoring empty
+ * steps and inserting a single newline between non-empty contributions.
+ *
+ * The native Gemini loops overwrite per-step text into `lastStepText`, so when
+ * the loop is force-terminated by the step cap the intermediate tool-step prose
+ * is lost and a canned placeholder becomes the answer. Accumulating here mirrors
+ * the Vertex-Claude loop's `aggregatedTurnText += block.text` so the gathered
+ * text can be surfaced at the maxSteps-exhaustion exit instead of the placeholder.
+ */
+export function appendStepText(accumulated: string, stepText: string): string {
+  if (!stepText) {
+    return accumulated;
+  }
+  return accumulated ? `${accumulated}\n${stepText}` : stepText;
+}
+
+/**
+ * Process stream chunks to extract raw response parts, function calls, and usage metadata.
+ *
+ * Consumes the full async iterable and returns all collected data.
+ */
+export async function collectStreamChunks(
+  stream: AsyncIterable<{
+    functionCalls?: NativeFunctionCall[];
+    [key: string]: unknown;
+  }>,
+): Promise<CollectedChunkResult> {
+  const rawResponseParts: unknown[] = [];
+  const stepFunctionCalls: NativeFunctionCall[] = [];
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cacheReadTokens = 0;
+  let reasoningTokens = 0;
+
+  for await (const chunk of stream) {
+    // Extract raw parts from candidates FIRST
+    // This avoids using chunk.text which triggers SDK warning when
+    // non-text parts (thoughtSignature, functionCall) are present
+    const chunkRecord = chunk as Record<string, unknown>;
+    const candidates = chunkRecord.candidates as
+      | Array<Record<string, unknown>>
+      | undefined;
+    const firstCandidate = candidates?.[0];
+    const chunkContent = firstCandidate?.content as
+      | Record<string, unknown>
+      | undefined;
+    if (chunkContent && Array.isArray(chunkContent.parts)) {
+      rawResponseParts.push(...chunkContent.parts);
+    }
+    if (chunk.functionCalls) {
+      stepFunctionCalls.push(...chunk.functionCalls);
+    }
+
+    // Accumulate usage metadata from chunks
+    const usage = chunkRecord.usageMetadata as
+      | {
+          promptTokenCount?: number;
+          candidatesTokenCount?: number;
+          cachedContentTokenCount?: number;
+          thoughtsTokenCount?: number;
+        }
+      | undefined;
+    if (usage) {
+      inputTokens = Math.max(inputTokens, usage.promptTokenCount || 0);
+      outputTokens = Math.max(outputTokens, usage.candidatesTokenCount || 0);
+      // cachedContentTokenCount is OVERLAPPING (a subset already inside
+      // promptTokenCount). Surface it so the call site subtracts once.
+      cacheReadTokens = Math.max(
+        cacheReadTokens,
+        usage.cachedContentTokenCount || 0,
+      );
+      // thoughtsTokenCount (thinking tokens, billed at the output rate) is
+      // NOT part of candidatesTokenCount — surface it separately.
+      reasoningTokens = Math.max(
+        reasoningTokens,
+        usage.thoughtsTokenCount || 0,
+      );
+    }
+  }
+
+  return {
+    rawResponseParts,
+    stepFunctionCalls,
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    reasoningTokens,
+  };
+}
+
+/**
+ * Iterate a single stream step incrementally, pushing text parts to `channel`
+ * as they arrive from the network while simultaneously accumulating the full
+ * `CollectedChunkResult` needed for history and token accounting.
+ *
+ * Used for all steps (both intermediate tool-calling steps and the final
+ * text-only step).  Text parts are pushed to the channel as they arrive,
+ * enabling truly incremental streaming.  The complete `rawResponseParts`
+ * (including thoughtSignature) are still returned at the end for use by
+ * `pushModelResponseToHistory`.
+ */
+export async function collectStreamChunksIncremental(
+  stream: AsyncIterable<{
+    functionCalls?: NativeFunctionCall[];
+    [key: string]: unknown;
+  }>,
+  channel: StreamChannel<{ content: string }>,
+): Promise<CollectedChunkResult> {
+  const rawResponseParts: unknown[] = [];
+  const stepFunctionCalls: NativeFunctionCall[] = [];
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cacheReadTokens = 0;
+  let reasoningTokens = 0;
+  // Surfaced so a caller can map SAFETY / MALFORMED_FUNCTION_CALL rather
+  // than inferring the turn ended normally. Additive: existing callers that
+  // ignore it are unaffected.
+  let finishReason: string | undefined;
+
+  for await (const chunk of stream) {
+    const chunkRecord = chunk as Record<string, unknown>;
+    const candidates = chunkRecord.candidates as
+      | Array<Record<string, unknown>>
+      | undefined;
+    const firstCandidate = candidates?.[0];
+    const candidateFinish = firstCandidate?.finishReason;
+    if (typeof candidateFinish === "string") {
+      finishReason = candidateFinish;
+    }
+    const chunkContent = firstCandidate?.content as
+      | Record<string, unknown>
+      | undefined;
+    if (chunkContent && Array.isArray(chunkContent.parts)) {
+      for (const part of chunkContent.parts as Array<Record<string, unknown>>) {
+        rawResponseParts.push(part);
+        // Forward text parts to the consumer immediately
+        if (typeof part.text === "string" && part.text.length > 0) {
+          channel.push({ content: part.text });
+        }
+      }
+    }
+    if (chunk.functionCalls) {
+      stepFunctionCalls.push(...chunk.functionCalls);
+    }
+
+    const usage = chunkRecord.usageMetadata as
+      | {
+          promptTokenCount?: number;
+          candidatesTokenCount?: number;
+          cachedContentTokenCount?: number;
+          thoughtsTokenCount?: number;
+        }
+      | undefined;
+    if (usage) {
+      inputTokens = Math.max(inputTokens, usage.promptTokenCount || 0);
+      outputTokens = Math.max(outputTokens, usage.candidatesTokenCount || 0);
+      // cachedContentTokenCount is OVERLAPPING (a subset already inside
+      // promptTokenCount). Surface it so the call site subtracts once.
+      cacheReadTokens = Math.max(
+        cacheReadTokens,
+        usage.cachedContentTokenCount || 0,
+      );
+      // thoughtsTokenCount (thinking tokens, billed at the output rate) is
+      // NOT part of candidatesTokenCount — surface it separately.
+      reasoningTokens = Math.max(
+        reasoningTokens,
+        usage.thoughtsTokenCount || 0,
+      );
+    }
+  }
+
+  return {
+    rawResponseParts,
+    stepFunctionCalls,
+    finishReason,
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    reasoningTokens,
+  };
+}
+
+/**
+ * Extract the thoughtSignature token from raw response parts.
+ * Returns the last thoughtSignature found (each step may produce one).
+ */
+export function extractThoughtSignature(
+  rawResponseParts: unknown[],
+): string | undefined {
+  for (let i = rawResponseParts.length - 1; i >= 0; i--) {
+    const part = rawResponseParts[i];
+    if (
+      part !== null &&
+      part !== undefined &&
+      typeof part === "object" &&
+      "thoughtSignature" in part &&
+      typeof (part as { thoughtSignature: unknown }).thoughtSignature ===
+        "string"
+    ) {
+      return (part as { thoughtSignature: string }).thoughtSignature;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Extract text from raw response parts, filtering out non-text parts
+ * (thoughtSignature, functionCall) to avoid SDK warnings.
+ */
+export function extractTextFromParts(rawResponseParts: unknown[]): string {
+  return rawResponseParts
+    .filter(
+      (part): part is { text: string } =>
+        typeof (part as Record<string, unknown>).text === "string",
+    )
+    .map((part) => part.text)
+    .join("");
+}
+
+/**
+ * Execute a batch of native function calls with retry tracking and permanent failure detection.
+ *
+ * @param logLabel - Label for log messages (e.g. "[GoogleAIStudio]" or "[GoogleVertex]")
+ * @param stepFunctionCalls - The function calls from the model
+ * @param executeMap - Map of tool name to execute function
+ * @param failedTools - Mutable map tracking per-tool failure counts
+ * @param allToolCalls - Mutable array accumulating all tool call records
+ * @param options - Optional settings for execution tracking and cancellation,
+ *                  plus an `originalNameMap` (Google-safe → consumer-supplied
+ *                  identifier) so the sanitization stays transport-only and
+ *                  consumers see the names they registered.
+ * @returns Array of function responses for conversation history
+ */
+export async function executeNativeToolCalls(
+  logLabel: string,
+  stepFunctionCalls: NativeFunctionCall[],
+  executeMap: Map<string, Tool["execute"]>,
+  failedTools: Map<string, { count: number; lastError: string }>,
+  allToolCalls: Array<{ toolName: string; args: Record<string, unknown> }>,
+  options?: {
+    toolExecutions?: Array<{
+      name: string;
+      input: Record<string, unknown>;
+      output: unknown;
+    }>;
+    abortSignal?: AbortSignal;
+    originalNameMap?: Map<string, string>;
+    /**
+     * Live tool record + declaration snapshot for mid-turn discovery: on a
+     * dispatch miss the executor re-resolves against `liveTools` (hydrated
+     * by search_tools, or auto-hydrated from the deferred catalog) and syncs
+     * `declarations` in place. `declarations.executeMap` must be the same
+     * map passed as the `executeMap` argument (true at every call site).
+     */
+    liveTools?: Record<string, Tool>;
+    declarations?: NativeToolDeclarationsResult;
+  },
+): Promise<NativeFunctionResponse[]> {
+  const functionResponses: NativeFunctionResponse[] = [];
+
+  // Translate a Google-safe sanitized name back to the consumer-facing
+  // original name. Falls back to the safe name if the map is missing or
+  // doesn't contain the call (e.g. tool added mid-conversation).
+  const externalName = (safeName: string): string =>
+    options?.originalNameMap?.get(safeName) ?? safeName;
+
+  // Note: tool:start / tool:end events are emitted by ToolsManager's
+  // `execute` wrapper (see src/lib/core/modules/ToolsManager.ts:355 and :790)
+  // around every tool's execute function. The native paths invoke that same
+  // wrapped execute via the executeMap, so emitting here would duplicate.
+
+  for (const call of stepFunctionCalls) {
+    const exposedName = externalName(call.name);
+    allToolCalls.push({ toolName: exposedName, args: call.args });
+
+    // Check if this tool has already exceeded retry limit
+    const failedInfo = failedTools.get(call.name);
+    if (failedInfo && failedInfo.count >= DEFAULT_TOOL_MAX_RETRIES) {
+      logger.warn(
+        `${logLabel} Tool "${exposedName}" has exceeded retry limit (${DEFAULT_TOOL_MAX_RETRIES}), skipping execution`,
+      );
+
+      const errorOutput = {
+        error: `TOOL_PERMANENTLY_FAILED: The tool "${exposedName}" has failed ${failedInfo.count} times and will not be retried. Last error: ${failedInfo.lastError}. Please proceed without using this tool or inform the user that this functionality is unavailable.`,
+        status: "permanently_failed",
+        do_not_retry: true,
+      };
+
+      // Wire transport-side `name: call.name` (Google needs the sanitized
+      // form to match the function declaration) while exposing the
+      // consumer-facing name in toolExecutions metadata.
+      functionResponses.push({
+        functionResponse: { name: call.name, response: errorOutput },
+      });
+      options?.toolExecutions?.push({
+        name: exposedName,
+        input: call.args,
+        output: errorOutput,
+      });
+      continue;
+    }
+
+    let execute = executeMap.get(call.name);
+    if (!execute && options?.declarations) {
+      // Snapshot miss: the tool may have been hydrated into the live record
+      // by search_tools within this very step batch, or the model called a
+      // deferred catalog tool directly by its advertised name.
+      const liveTool = resolveLiveTool(options.liveTools, exposedName);
+      if (liveTool?.execute) {
+        refreshNativeToolDeclarations(options.liveTools, options.declarations);
+        // NOT_FOUND strikes accrued while the tool was deferred are snapshot
+        // artifacts, not real failures — reset so the breaker starts clean.
+        failedTools.delete(call.name);
+        // The refresh registered the executor under its Google-safe name —
+        // resolve it for this dispatch (later calls use the declared name).
+        for (const [safeName, originalName] of options.declarations
+          .originalNameMap) {
+          if (originalName === exposedName) {
+            execute = executeMap.get(safeName);
+            break;
+          }
+        }
+        if (execute) {
+          logger.info(
+            `${logLabel} Tool "${exposedName}" resolved mid-turn via discovery — executing.`,
+          );
+        }
+      }
+    }
+    if (execute) {
+      try {
+        // AI SDK Tool execute requires (args, options) - provide minimal options
+        // Use randomUUID to avoid toolCallId collisions across concurrent calls
+        const toolOptions = {
+          toolCallId: `${call.name}-${randomUUID()}`,
+          messages: [],
+          abortSignal: options?.abortSignal,
+        };
+        const result = await execute(call.args, toolOptions);
+        functionResponses.push({
+          functionResponse: { name: call.name, response: { result } },
+        });
+        options?.toolExecutions?.push({
+          name: exposedName,
+          input: call.args,
+          output: result,
+        });
+      } catch (error) {
+        const errorMessage =
+          error instanceof Error ? error.message : "Unknown error";
+
+        // Track this failure
+        const currentFailInfo = failedTools.get(call.name) || {
+          count: 0,
+          lastError: "",
+        };
+        currentFailInfo.count++;
+        currentFailInfo.lastError = errorMessage;
+        failedTools.set(call.name, currentFailInfo);
+
+        logger.warn(
+          `${logLabel} Tool "${exposedName}" failed (attempt ${currentFailInfo.count}/${DEFAULT_TOOL_MAX_RETRIES}): ${errorMessage}`,
+        );
+
+        // Determine if this is a permanent failure
+        const isPermanentFailure =
+          currentFailInfo.count >= DEFAULT_TOOL_MAX_RETRIES;
+
+        const errorOutput = {
+          error: isPermanentFailure
+            ? `TOOL_PERMANENTLY_FAILED: The tool "${exposedName}" has failed ${currentFailInfo.count} times with error: ${errorMessage}. This tool will not be retried. Please proceed without using this tool or inform the user that this functionality is unavailable.`
+            : `TOOL_EXECUTION_ERROR: ${errorMessage}. Retry attempt ${currentFailInfo.count}/${DEFAULT_TOOL_MAX_RETRIES}.`,
+          status: isPermanentFailure ? "permanently_failed" : "failed",
+          do_not_retry: isPermanentFailure,
+          retry_count: currentFailInfo.count,
+          max_retries: DEFAULT_TOOL_MAX_RETRIES,
+        };
+
+        functionResponses.push({
+          functionResponse: { name: call.name, response: errorOutput },
+        });
+        options?.toolExecutions?.push({
+          name: exposedName,
+          input: call.args,
+          output: errorOutput,
+        });
+      }
+    } else {
+      // Tool not found is a permanent error
+      const errorOutput = {
+        error: `TOOL_NOT_FOUND: The tool "${exposedName}" does not exist. Do not attempt to call this tool again.`,
+        status: "permanently_failed",
+        do_not_retry: true,
+      };
+
+      functionResponses.push({
+        functionResponse: { name: call.name, response: errorOutput },
+      });
+      options?.toolExecutions?.push({
+        name: exposedName,
+        input: call.args,
+        output: errorOutput,
+      });
+    }
+  }
+
+  return functionResponses;
+}
+
+/**
+ * Handle maxSteps termination by producing a final answer when the model was
+ * still calling tools as the step limit was reached.
+ *
+ * Resolution order (always returns a non-empty string): the caller's
+ * `finalText` if present; else the `lastStepText` gathered from the final step;
+ * else a graceful, user-facing cap message from {@link buildToolLoopCapMessage}
+ * — which replaced the legacy bracketed step-limit placeholder string.
+ *
+ * @param logLabel - Label for log messages (e.g. "[GoogleAIStudio]" or "[GoogleVertex]")
+ * @returns The resolved final answer text (never the legacy placeholder).
+ */
+export function handleMaxStepsTermination(
+  logLabel: string,
+  step: number,
+  maxSteps: number,
+  finalText: string,
+  lastStepText: string,
+): string {
+  if (step >= maxSteps && !finalText) {
+    logger.warn(
+      `${logLabel} Tool call loop terminated after reaching maxSteps (${maxSteps}). ` +
+        `Model was still calling tools. Using accumulated text from last step.`,
+    );
+    return lastStepText || buildToolLoopCapMessage(maxSteps, 0);
+  }
+  return finalText;
+}
+
+/**
+ * Detect whether an error represents an abort/cancellation (from an
+ * AbortSignal firing during a fetch/stream drain). Used by the native
+ * Gemini-3 agentic loops to break gracefully rather than re-throw.
+ */
+export function isAbortError(error: unknown): boolean {
+  if (!error) {
+    return false;
+  }
+  const e = error as { name?: string; message?: string; code?: number };
+  return (
+    e.name === "AbortError" ||
+    (typeof e.message === "string" && /abort/i.test(e.message)) ||
+    (typeof DOMException !== "undefined" &&
+      error instanceof DOMException &&
+      e.code === 20)
+  );
+}
+
+/**
+ * Build a graceful, user-facing message for when a single agentic turn hits
+ * the step cap without producing a final answer. Replaces the legacy
+ * bracketed "Tool execution limit reached" placeholder.
+ *
+ * Emit this ONLY when `step >= maxSteps` genuinely terminated the loop —
+ * aborted/timed-out/stalled turns must use {@link buildAbortedTurnMessage},
+ * {@link buildTurnTimeoutMessage}, or {@link buildTurnStalledMessage}, never
+ * this text (a killed 23-step turn once claimed "reached the 200-step limit").
+ */
+export function buildToolLoopCapMessage(
+  maxSteps: number,
+  toolCallCount: number,
+): string {
+  const calls =
+    toolCallCount > 0
+      ? `I gathered information across ${toolCallCount} tool call${
+          toolCallCount === 1 ? "" : "s"
+        } but `
+      : "I ";
+  return (
+    `${calls}reached the ${maxSteps}-step limit for a single turn before I could finish. ` +
+    `Please narrow the request or break it into smaller asks and I'll continue.`
+  );
+}
+
+/**
+ * Honest message for a turn stopped by the in-loop context guard
+ * (stopReason "context-cap") without a synthesized answer. Sibling of
+ * {@link buildToolLoopCapMessage} — context exits must never claim a step
+ * limit was reached.
+ */
+export function buildContextCapMessage(toolCallCount: number): string {
+  const calls =
+    toolCallCount > 0
+      ? `I gathered information across ${toolCallCount} tool call${
+          toolCallCount === 1 ? "" : "s"
+        } but `
+      : "I ";
+  return (
+    `${calls}had to stop because the gathered material filled this turn's ` +
+    `context window before I could finish. Please narrow the request or ` +
+    `break it into smaller asks and I'll continue.`
+  );
+}
+
+/** Format an elapsed duration as "Xm Ys" (or "Ys" under a minute). */
+function formatElapsed(elapsedMs: number): string {
+  const totalSeconds = Math.max(0, Math.round(elapsedMs / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+}
+
+/**
+ * Honest message for a turn ended by the `turnTimeoutMs` wall-clock deadline
+ * (stopReason "time-limit"). Sibling of {@link buildToolLoopCapMessage} —
+ * time exits must never claim a step limit was reached.
+ */
+export function buildTurnTimeoutMessage(
+  elapsedMs: number,
+  toolCallCount: number,
+): string {
+  const calls =
+    toolCallCount > 0
+      ? ` I completed ${toolCallCount} tool call${
+          toolCallCount === 1 ? "" : "s"
+        } before stopping;`
+      : "";
+  return (
+    `I had to stop after ${formatElapsed(elapsedMs)} — this turn hit its ` +
+    `processing time limit.${calls} ask me to continue and I'll pick up from there.`
+  );
+}
+
+/**
+ * Honest message for a turn ended by the `stallTimeoutMs` no-progress
+ * watchdog (stopReason "stalled") — typically a wedged tool or a hung
+ * model call.
+ */
+export function buildTurnStalledMessage(
+  stallTimeoutMs: number,
+  toolCallCount: number,
+): string {
+  const calls =
+    toolCallCount > 0
+      ? ` I completed ${toolCallCount} tool call${
+          toolCallCount === 1 ? "" : "s"
+        } before stopping;`
+      : "";
+  return (
+    `I had to stop because this turn made no progress for ` +
+    `${formatElapsed(stallTimeoutMs)} — a tool or model call appears to be stuck.` +
+    `${calls} ask me to continue and I'll pick up from there.`
+  );
+}
+
+/**
+ * Honest message for a caller-aborted turn (admin kill, coding-task
+ * short-circuit — stopReason "aborted").
+ */
+export function buildAbortedTurnMessage(toolCallCount: number): string {
+  const calls =
+    toolCallCount > 0
+      ? ` I completed ${toolCallCount} tool call${
+          toolCallCount === 1 ? "" : "s"
+        } before stopping.`
+      : "";
+  return `This turn was stopped before I could finish.${calls}`;
+}
+
+/**
+ * Pick the honest terminal message for a native-loop exit by its ACTUAL
+ * cause. The step-cap text is the fallback for genuine budget exhaustion
+ * only — time/stall/abort exits must never claim a step limit was reached
+ * (the 2026-07-03 "reached the 200-step limit" incident was a wall-clock
+ * abort wearing the cap message).
+ *
+ * Takes plain booleans rather than a turn clock so a loop whose wall-clock
+ * deadline is owned by something other than `createTurnClock` — AI Studio's
+ * pre-existing per-request timeout controller — can report through the same
+ * builders instead of growing a second set.
+ */
+export function buildLoopExitMessage(params: {
+  timedOut: boolean;
+  stalled: boolean;
+  /** Turn duration so far, for the time-limit message. */
+  elapsedMs: number;
+  wasAborted: boolean;
+  stallTimeoutMs?: number;
+  maxSteps: number;
+  toolCallCount: number;
+}): string {
+  if (params.timedOut) {
+    return buildTurnTimeoutMessage(params.elapsedMs, params.toolCallCount);
+  }
+  if (params.stalled) {
+    return buildTurnStalledMessage(
+      params.stallTimeoutMs ?? 0,
+      params.toolCallCount,
+    );
+  }
+  if (params.wasAborted) {
+    return buildAbortedTurnMessage(params.toolCallCount);
+  }
+  return buildToolLoopCapMessage(params.maxSteps, params.toolCallCount);
+}
+
+/**
+ * Wrap-up nudge injected when the remaining turn time drops inside the
+ * `wrapupTimeLeadMs` window — the time-budget twin of the soft step-budget
+ * nudge. Rides as a trailing text block on the tool-result user turn.
+ */
+export function buildWrapupNudgeText(useFinalResultTool: boolean): string {
+  return (
+    "NOTE: processing time for this turn is nearly up. Consolidate what you have and " +
+    (useFinalResultTool
+      ? "call final_result with your best answer now."
+      : "provide your final answer now.")
+  );
+}
+
+/**
+ * Resolve the turn's `stopReason` discriminator from the loop's exit
+ * bookkeeping. Precedence: time conditions beat the generic abort flag
+ * (the deadline/stall watchdogs abort through the same internal controller),
+ * abort beats step-cap, and a provider-error finishReason (e.g. persistent
+ * MALFORMED_FUNCTION_CALL) beats "completed".
+ */
+export function resolveTurnStopReason(params: {
+  timedOut: boolean;
+  stalled: boolean;
+  wasAborted: boolean;
+  /** Step budget ran out AND no clean/forced answer was produced. */
+  cappedWithoutAnswer: boolean;
+  /** Context guard stopped the loop AND no clean/forced answer was produced. */
+  contextCappedWithoutAnswer?: boolean;
+  /** The turn's resolved unified finishReason. */
+  finishReason?: string;
+}): GenerateStopReason {
+  if (params.timedOut) {
+    return "time-limit";
+  }
+  if (params.stalled) {
+    return "stalled";
+  }
+  if (params.wasAborted) {
+    return "aborted";
+  }
+  if (params.contextCappedWithoutAnswer) {
+    return "context-cap";
+  }
+  if (params.cappedWithoutAnswer) {
+    return "step-cap";
+  }
+  if (params.finishReason === "error") {
+    return "provider-error";
+  }
+  return "completed";
+}
+
+/**
+ * Wall-clock + progress watchdogs for a native agentic turn.
+ *
+ * - Deadline: `turnTimeoutMs` (caller knob) or `defaultTurnTimeoutMs` (the
+ *   loop's pre-existing defensive bound) arms a whole-turn timer.
+ * - Stall: when `stallTimeoutMs` is set, a low-frequency interval checks the
+ *   time since the last recorded progress (chunk received, tool started or
+ *   finished, step started).
+ *
+ * Both fire `onDeadline(kind)` exactly once each and latch a flag the loop's
+ * terminal handling reads to pick the honest exit message and `stopReason`.
+ * Timers are unref'd so they never hold the process open; call `dispose()`
+ * in the loop's finally.
+ */
+export function createTurnClock(params: {
+  /** Explicit whole-turn deadline (ms); wins over defaultTurnTimeoutMs. */
+  turnTimeoutMs?: number;
+  /** Loop-specific defensive default when turnTimeoutMs is unset (undefined = no deadline). */
+  defaultTurnTimeoutMs?: number;
+  /** No-progress watchdog (ms); undefined = disabled. */
+  stallTimeoutMs?: number;
+  /** Wrap-up lead (ms); only honored when turnTimeoutMs is explicitly set. */
+  wrapupTimeLeadMs?: number;
+  onDeadline: (kind: "timeout" | "stall") => void;
+}) {
+  const startedAt = Date.now();
+  const isValidMs = (value: number | undefined): value is number =>
+    value !== undefined && Number.isFinite(value) && value > 0;
+  const effectiveTurnTimeoutMs = isValidMs(params.turnTimeoutMs)
+    ? params.turnTimeoutMs
+    : isValidMs(params.defaultTurnTimeoutMs)
+      ? params.defaultTurnTimeoutMs
+      : undefined;
+  // Nudging against the loop's defensive default would inject prompt text
+  // into turns whose caller never opted into a time budget — only nudge
+  // against an explicit turnTimeoutMs.
+  const wrapupLeadMs = isValidMs(params.turnTimeoutMs)
+    ? (params.wrapupTimeLeadMs ?? DEFAULT_WRAPUP_TIME_LEAD_MS)
+    : undefined;
+  let timedOut = false;
+  let stalled = false;
+  let lastProgressAt = startedAt;
+  let deadlineTimer: NodeJS.Timeout | undefined;
+  let stallTimer: NodeJS.Timeout | undefined;
+  if (effectiveTurnTimeoutMs !== undefined) {
+    deadlineTimer = setTimeout(() => {
+      timedOut = true;
+      params.onDeadline("timeout");
+    }, effectiveTurnTimeoutMs);
+    deadlineTimer.unref?.();
+  }
+  if (isValidMs(params.stallTimeoutMs)) {
+    const stallTimeoutMs = params.stallTimeoutMs;
+    const checkEveryMs = Math.min(
+      Math.max(1000, Math.floor(stallTimeoutMs / 4)),
+      15_000,
+    );
+    stallTimer = setInterval(() => {
+      if (
+        !stalled &&
+        !timedOut &&
+        Date.now() - lastProgressAt >= stallTimeoutMs
+      ) {
+        stalled = true;
+        params.onDeadline("stall");
+      }
+    }, checkEveryMs);
+    stallTimer.unref?.();
+  }
+  return {
+    get timedOut(): boolean {
+      return timedOut;
+    },
+    get stalled(): boolean {
+      return stalled;
+    },
+    /** True when the turn ended on a time condition (deadline or stall). */
+    get expired(): boolean {
+      return timedOut || stalled;
+    },
+    /** The effective whole-turn deadline in ms (explicit or defensive default). */
+    get turnTimeoutMs(): number | undefined {
+      return effectiveTurnTimeoutMs;
+    },
+    elapsedMs(): number {
+      return Date.now() - startedAt;
+    },
+    /** Record progress: chunk received, tool started/finished, step started. */
+    noteProgress(): void {
+      lastProgressAt = Date.now();
+    },
+    /** True when an explicit deadline exists and remaining time is inside the wrap-up lead. */
+    shouldNudgeWrapup(): boolean {
+      if (effectiveTurnTimeoutMs === undefined || wrapupLeadMs === undefined) {
+        return false;
+      }
+      const remaining = effectiveTurnTimeoutMs - (Date.now() - startedAt);
+      return remaining > 0 && remaining <= wrapupLeadMs;
+    },
+    dispose(): void {
+      if (deadlineTimer) {
+        clearTimeout(deadlineTimer);
+      }
+      if (stallTimer) {
+        clearInterval(stallTimer);
+      }
+    },
+  };
+}
+
+/**
+ * In-loop context guard for native agentic turns.
+ *
+ * The provider reports the ACTUAL prompt size of every model call
+ * (usage.input_tokens + cache reads/writes on Anthropic;
+ * usageMetadata.promptTokenCount on Gemini). The guard tracks that number
+ * plus an estimate of what the current step appends (assistant output, tool
+ * results), and tells the loop to stop calling tools once the projected next
+ * prompt crosses `thresholdRatio` of the model's context window — the turn
+ * then synthesizes a final answer from what it has instead of stepping into
+ * a provider 400 ("prompt is too long") that destroys all completed work.
+ *
+ * Fail-open: until the first usage report arrives, `shouldStop()` is false.
+ */
+export function createContextGuard(
+  contextWindowTokens: number,
+  thresholdRatio: number = DEFAULT_CONTEXT_GUARD_RATIO,
+) {
+  const thresholdTokens = Math.floor(contextWindowTokens * thresholdRatio);
+  let observedPromptTokens = 0;
+  let projectedGrowthTokens = 0;
+  return {
+    /** Tokens at which the guard trips (ratio × window). */
+    get thresholdTokens(): number {
+      return thresholdTokens;
+    },
+    /** Last observed prompt size plus estimated growth since. */
+    get projectedNextPromptTokens(): number {
+      return observedPromptTokens + projectedGrowthTokens;
+    },
+    /**
+     * Record a model call's reported usage. `promptTokens` must be the FULL
+     * prompt size (uncached input + cache read + cache creation for
+     * Anthropic). The response's own output is counted as growth — it is
+     * appended to the conversation for the next call.
+     */
+    noteUsage(promptTokens: number, outputTokens: number): void {
+      if (promptTokens > 0) {
+        observedPromptTokens = promptTokens;
+        projectedGrowthTokens = Math.max(0, outputTokens);
+      }
+    },
+    /**
+     * Add growth for content appended since the last model call (tool
+     * results, nudge text) using the ~4 chars/token heuristic.
+     */
+    noteAppendedChars(chars: number): void {
+      if (chars > 0) {
+        projectedGrowthTokens += Math.ceil(chars / 4);
+      }
+    },
+    /**
+     * Clear the projection after the caller has reclaimed context.
+     *
+     * The observed prompt size reflects the pre-reclaim conversation, so
+     * leaving it in place would keep `shouldStop()` true forever and defeat
+     * the reclaim. Resetting to the fail-open state means the guard stays
+     * quiet until the next real usage report re-establishes the truth.
+     */
+    resetAfterReclaim(): void {
+      observedPromptTokens = 0;
+      projectedGrowthTokens = 0;
+    },
+    /** True when issuing another model call risks crossing the threshold. */
+    shouldStop(): boolean {
+      return (
+        observedPromptTokens > 0 &&
+        observedPromptTokens + projectedGrowthTokens >= thresholdTokens
+      );
+    },
+  };
+}
+
+/**
+ * Push model response parts to conversation history, preserving thoughtSignature
+ * for Gemini 3 multi-turn tool calling.
+ */
+export function pushModelResponseToHistory(
+  currentContents: Array<{ role: string; parts: unknown[] }>,
+  rawResponseParts: unknown[],
+  stepFunctionCalls: NativeFunctionCall[],
+): void {
+  currentContents.push({
+    role: "model",
+    parts:
+      rawResponseParts.length > 0
+        ? rawResponseParts
+        : stepFunctionCalls.map((fc) => ({ functionCall: fc })),
+  });
+}
+
+/**
+ * Convert a Zod schema (or AI SDK `jsonSchema()` wrapper) into the shape
+ * `@google/genai` accepts as `responseSchema`. Mirrors the inline pipeline
+ * the Vertex Gemini paths already use:
+ *
+ *   convertZodToJsonSchema → inlineJsonSchema → strip `$schema` → ensure
+ *   every nested schema has a `type` (Vertex/Gemini reject schemas missing
+ *   that field, even on nested objects).
+ *
+ * Lives here so the AI Studio and Vertex paths can share the same
+ * sanitization without duplicating the schema-conversion churn.
+ */
+export function buildGeminiResponseSchema(
+  schema: unknown,
+): Record<string, unknown> {
+  const raw = convertZodToJsonSchema(
+    schema as Parameters<typeof convertZodToJsonSchema>[0],
+    "openApi3",
+  ) as Record<string, unknown>;
+  const inlined = inlineJsonSchema(raw);
+  if (inlined.$schema) {
+    delete inlined.$schema;
+  }
+  return ensureNestedSchemaTypes(inlined);
+}
+
+/**
+ * Map NeuroLink ChatMessage[] history into the @google/genai content format
+ * and push the entries onto a contents array.
+ *
+ * Used by the native Vertex Gemini and Google AI Studio paths to honor
+ * `options.conversationMessages` so multi-turn conversations (memory, loop
+ * REPL, agent flows) actually carry prior turns into the request.
+ *
+ * Behavior notes:
+ *  - Only `user` and `assistant` roles are forwarded; system messages are
+ *    expected to be wired via `systemInstruction`, and tool-call /
+ *    tool-result roles only appear inside intra-call tool loops which build
+ *    their own model/function entries.
+ *  - String content is wrapped as a single `{ text }` part. Empty strings
+ *    are skipped to avoid sending empty parts that some Gemini regions
+ *    reject.
+ *  - The current user input should be appended AFTER calling this helper
+ *    so the prior turns appear first in chronological order.
+ */
+export function prependConversationMessages(
+  contents: Array<{ role: string; parts: unknown[] }>,
+  // Accept either the full ChatMessage shape (when callers pass real Redis-
+  // backed history) or the reduced MinimalChatMessage shape (tests / synthetic
+  // callers). Only role, content, tool, args, and metadata.* are read here.
+  conversationMessages?: Array<ChatMessage | MinimalChatMessage>,
+): void {
+  if (!conversationMessages || conversationMessages.length === 0) {
+    return;
+  }
+
+  // Walk prior turns building ordered segments. Tool_call / tool_result rows
+  // get grouped by (turnCounter, stepIndex) so parallel calls within a step
+  // stay together and don't bleed across turn boundaries. Regular user/
+  // assistant messages act as those boundaries.
+  //
+  // Without this reconstruction, a text-only mapper would strip tool rows
+  // from history — leaving the model unaware of any tools it called in
+  // prior turns. The grouped emit (model with functionCall parts → user
+  // with functionResponse parts) is what @google/genai's own
+  // automaticFunctionCalling produces, so the SDK validates it as a
+  // well-formed multi-turn conversation.
+  const stepMap = new Map<string, VertexToolStep>();
+  const segments: VertexSegment[] = [];
+  let turnCounter = 0;
+
+  const makeKey = (stepIndex: number | undefined): string =>
+    `${turnCounter}:${stepIndex ?? "undefined"}`;
+
+  const getOrCreateStep = (stepIndex: number | undefined): VertexToolStep => {
+    const key = makeKey(stepIndex);
+    const existing = stepMap.get(key);
+    if (existing) {
+      return existing;
+    }
+    const step: VertexToolStep = {
+      type: "tool_step",
+      callParts: [],
+      resultParts: [],
+    };
+    stepMap.set(key, step);
+    segments.push(step);
+    return step;
+  };
+
+  for (const msg of conversationMessages) {
+    if (msg.role === "tool_call") {
+      const step = getOrCreateStep(msg.metadata?.stepIndex);
+      const fcPart: Record<string, unknown> = {
+        functionCall: {
+          name: msg.tool || "unknown",
+          args: msg.args || {},
+        },
+      };
+      if (msg.metadata?.thoughtSignature) {
+        fcPart.thoughtSignature = msg.metadata.thoughtSignature;
+      }
+      step.callParts.push(fcPart);
+      continue;
+    }
+
+    if (msg.role === "tool_result") {
+      const step = getOrCreateStep(msg.metadata?.stepIndex);
+      let responsePayload: unknown;
+      try {
+        responsePayload =
+          msg.content !== undefined && msg.content !== null
+            ? { result: JSON.parse(msg.content) }
+            : { result: "success" };
+      } catch {
+        responsePayload = { result: msg.content ?? "success" };
+      }
+      step.resultParts.push({
+        functionResponse: {
+          name: msg.tool || "unknown",
+          response: responsePayload,
+        },
+      });
+      continue;
+    }
+
+    // Regular (user / assistant) message — acts as a turn boundary.
+    const role = msg.role === "assistant" ? "model" : msg.role;
+    if (role !== "user" && role !== "model") {
+      continue;
+    }
+    if (!msg.content || msg.content.trim().length === 0) {
+      continue;
+    }
+
+    // Increment turn counter BEFORE pushing the segment so any tool_calls
+    // that follow this message get a fresh (turnCounter, stepIndex) namespace.
+    turnCounter++;
+
+    const textPart: Record<string, unknown> = { text: msg.content };
+    if (msg.metadata?.thoughtSignature) {
+      textPart.thoughtSignature = msg.metadata.thoughtSignature;
+    }
+    segments.push({ type: "regular", role, parts: [textPart] });
+  }
+
+  // Emit in order: each ToolStep → model turn (calls) + user turn (results)
+  // — same ordering @google/genai's automaticFunctionCalling produces.
+  for (const seg of segments) {
+    if (seg.type === "regular") {
+      contents.push({ role: seg.role, parts: seg.parts });
+      continue;
+    }
+    if (seg.callParts.length === 0) {
+      if (seg.resultParts.length > 0) {
+        logger.debug(
+          "[GoogleNativeGemini3] Dropping orphan tool_result segment with no matching tool_call rows",
+          { resultCount: seg.resultParts.length },
+        );
+      }
+      continue;
+    }
+    contents.push({ role: "model", parts: seg.callParts });
+    if (seg.resultParts.length > 0) {
+      contents.push({ role: "user", parts: seg.resultParts });
+    }
+  }
+}
+
+// ── Gemini contents ↔ V3 prompt conversion ──
+//
+// Caller model middleware (transformParams / wrapGenerate / wrapStream)
+// operates on the generic `ModelMessage[]` prompt shape, not on Gemini's
+// native `contents`. These two functions are the boundary: the native
+// stream/generate loops build `contents` exactly as they always have, hand
+// it through `geminiContentsToV3Prompt` before invoking middleware, and
+// rebuild `contents` from whatever prompt the middleware settled on via
+// `v3PromptToGeminiContents`.
+
+function hasTextField(part: unknown): part is { text: string } {
+  if (typeof part !== "object" || part === null || !("text" in part)) {
+    return false;
+  }
+  return typeof part.text === "string";
+}
+
+function hasInlineDataField(
+  part: unknown,
+): part is { inlineData: { mimeType: string; data: string } } {
+  if (typeof part !== "object" || part === null || !("inlineData" in part)) {
+    return false;
+  }
+  const inline = part.inlineData;
+  return (
+    typeof inline === "object" &&
+    inline !== null &&
+    "mimeType" in inline &&
+    "data" in inline
+  );
+}
+
+function hasFunctionCallField(
+  part: unknown,
+): part is { functionCall: NativeFunctionCall; thoughtSignature?: string } {
+  return typeof part === "object" && part !== null && "functionCall" in part;
+}
+
+function hasFunctionResponseField(
+  part: unknown,
+): part is NativeFunctionResponse {
+  return (
+    typeof part === "object" && part !== null && "functionResponse" in part
+  );
+}
+
+function readThoughtSignature(part: unknown): string | undefined {
+  if (
+    typeof part !== "object" ||
+    part === null ||
+    !("thoughtSignature" in part)
+  ) {
+    return undefined;
+  }
+  return typeof part.thoughtSignature === "string"
+    ? part.thoughtSignature
+    : undefined;
+}
+
+function withThoughtSignature<
+  T extends { providerOptions?: Record<string, Record<string, unknown>> },
+>(part: T, thoughtSignature: string | undefined): T {
+  if (!thoughtSignature) {
+    return part;
+  }
+  return {
+    ...part,
+    providerOptions: {
+      ...part.providerOptions,
+      googleAiStudio: {
+        ...part.providerOptions?.googleAiStudio,
+        thoughtSignature,
+      },
+    },
+  };
+}
+
+function readProviderThoughtSignature(
+  providerOptions: unknown,
+): string | undefined {
+  if (typeof providerOptions !== "object" || providerOptions === null) {
+    return undefined;
+  }
+  const studio = (providerOptions as Record<string, unknown>).googleAiStudio;
+  if (typeof studio !== "object" || studio === null) {
+    return undefined;
+  }
+  const sig = (studio as Record<string, unknown>).thoughtSignature;
+  return typeof sig === "string" ? sig : undefined;
+}
+
+function isFunctionResponseOnlyEntry(parts: unknown[]): boolean {
+  return parts.length > 0 && parts.every(hasFunctionResponseField);
+}
+
+function toV3ToolResultPart(part: unknown): ToolResultPart | undefined {
+  if (!hasFunctionResponseField(part)) {
+    return undefined;
+  }
+  return {
+    type: "tool-result",
+    // Gemini pairs a function response to its call by position, not by id —
+    // nothing downstream of this conversion reads this value back.
+    toolCallId: `gemini-tool-${randomUUID()}`,
+    toolName: part.functionResponse.name,
+    output: part.functionResponse.response,
+  };
+}
+
+function toV3UserPart(
+  part: unknown,
+): TextPart | ImagePart | FilePart | undefined {
+  if (hasTextField(part)) {
+    return withThoughtSignature<TextPart>(
+      { type: "text", text: part.text },
+      readThoughtSignature(part),
+    );
+  }
+  if (hasInlineDataField(part)) {
+    return {
+      type: "file",
+      data: part.inlineData.data,
+      mediaType: part.inlineData.mimeType,
+    };
+  }
+  return undefined;
+}
+
+function toV3AssistantPart(part: unknown): TextPart | ToolCallPart | undefined {
+  if (hasTextField(part)) {
+    return withThoughtSignature<TextPart>(
+      { type: "text", text: part.text },
+      readThoughtSignature(part),
+    );
+  }
+  if (hasFunctionCallField(part)) {
+    return withThoughtSignature<ToolCallPart>(
+      {
+        type: "tool-call",
+        toolCallId: `gemini-tool-${randomUUID()}`,
+        toolName: part.functionCall.name,
+        input: part.functionCall.args ?? {},
+      },
+      part.thoughtSignature,
+    );
+  }
+  return undefined;
+}
+
+/**
+ * Convert a native Gemini `contents` array (the shape this module builds and
+ * `prependConversationMessages` emits) into the generic V3 prompt shape that
+ * caller model middleware operates on.
+ *
+ * Gemini has no wire-visible `system` role — `systemInstruction` rides
+ * separately on `config` — so this only ever emits `user` / `assistant` /
+ * `tool` messages. A `functionResponse`-only `user` entry becomes a V3
+ * `tool` message rather than `user`: `UserModelMessage.content` cannot carry
+ * a `ToolResultPart`, only `ToolModelMessage.content` can, and that grouping
+ * (a `model` turn of `functionCall` parts followed by a `user` turn of
+ * matching `functionResponse` parts) is exactly what
+ * `prependConversationMessages` above produces.
+ */
+export function geminiContentsToV3Prompt(
+  contents: Array<{ role: string; parts: unknown[] }>,
+): ModelMessage[] {
+  const messages: ModelMessage[] = [];
+  for (const entry of contents) {
+    const parts = Array.isArray(entry.parts) ? entry.parts : [];
+    if (entry.role === "user" && isFunctionResponseOnlyEntry(parts)) {
+      const content = parts
+        .map(toV3ToolResultPart)
+        .filter((p): p is ToolResultPart => p !== undefined);
+      if (content.length > 0) {
+        messages.push({ role: "tool", content });
+      }
+      continue;
+    }
+    if (entry.role === "user") {
+      const content = parts
+        .map(toV3UserPart)
+        .filter((p): p is TextPart | ImagePart | FilePart => p !== undefined);
+      if (content.length > 0) {
+        messages.push({ role: "user", content });
+      }
+      continue;
+    }
+    if (entry.role === "model") {
+      const content = parts
+        .map(toV3AssistantPart)
+        .filter((p): p is TextPart | ToolCallPart => p !== undefined);
+      if (content.length > 0) {
+        messages.push({ role: "assistant", content });
+      }
+    }
+  }
+  return messages;
+}
+
+function dataContentToBase64(data: DataContent): string {
+  if (typeof data === "string") {
+    return data;
+  }
+  if (Buffer.isBuffer(data)) {
+    return data.toString("base64");
+  }
+  if (data instanceof ArrayBuffer) {
+    return Buffer.from(data).toString("base64");
+  }
+  return Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString(
+    "base64",
+  );
+}
+
+function userContentToGeminiParts(content: UserContent): unknown[] {
+  if (typeof content === "string") {
+    return content.length > 0 ? [{ text: content }] : [];
+  }
+  const parts: unknown[] = [];
+  for (const part of content) {
+    if (part.type === "text") {
+      if (part.text.length > 0) {
+        const sig = readProviderThoughtSignature(part.providerOptions);
+        parts.push(
+          sig
+            ? { text: part.text, thoughtSignature: sig }
+            : { text: part.text },
+        );
+      }
+    } else if (part.type === "image" && !(part.image instanceof URL)) {
+      parts.push({
+        inlineData: {
+          mimeType: part.mediaType ?? "application/octet-stream",
+          data: dataContentToBase64(part.image),
+        },
+      });
+    } else if (part.type === "file" && !(part.data instanceof URL)) {
+      parts.push({
+        inlineData: {
+          mimeType: part.mediaType,
+          data: dataContentToBase64(part.data),
+        },
+      });
+    }
+  }
+  return parts;
+}
+
+function assistantContentToGeminiParts(content: AssistantContent): unknown[] {
+  if (typeof content === "string") {
+    return content.length > 0 ? [{ text: content }] : [];
+  }
+  const parts: unknown[] = [];
+  for (const part of content) {
+    if (part.type === "text") {
+      if (part.text.length > 0) {
+        const sig = readProviderThoughtSignature(part.providerOptions);
+        parts.push(
+          sig
+            ? { text: part.text, thoughtSignature: sig }
+            : { text: part.text },
+        );
+      }
+    } else if (part.type === "tool-call") {
+      const sig = readProviderThoughtSignature(part.providerOptions);
+      const call: Record<string, unknown> = {
+        functionCall: {
+          name: part.toolName,
+          args: (part.input ?? {}) as Record<string, unknown>,
+        },
+      };
+      if (sig) {
+        call.thoughtSignature = sig;
+      }
+      parts.push(call);
+    }
+    // `reasoning` / `file` / `tool-result` / `tool-approval-request` parts on
+    // an assistant message have no native Gemini wire shape and are dropped
+    // — this path never emitted them into `contents` before this conversion
+    // existed either.
+  }
+  return parts;
+}
+
+function toolContentToGeminiParts(content: ToolContent): unknown[] {
+  const parts: unknown[] = [];
+  for (const item of content) {
+    if (item.type === "tool-result") {
+      parts.push({
+        functionResponse: {
+          name: item.toolName,
+          response:
+            item.output && typeof item.output === "object"
+              ? (item.output as Record<string, unknown>)
+              : { result: item.output },
+        },
+      });
+    }
+  }
+  return parts;
+}
+
+/**
+ * Reverse of `geminiContentsToV3Prompt`: rebuild a native Gemini `contents`
+ * array from a (possibly middleware-rewritten) V3 prompt. A `system`
+ * message has no `contents` entry of its own — Gemini carries it on
+ * `config.systemInstruction` — so its text is returned separately
+ * (`systemText`) and the caller folds it into the request config.
+ *
+ * The synthesized `toolCallId` from the forward direction is intentionally
+ * discarded: Gemini pairs a call to its result by position, not by id, so
+ * reconstruction only needs `{name, args}` / `{name, response}`.
+ */
+export function v3PromptToGeminiContents(prompt: ModelMessage[]): {
+  contents: Array<{ role: string; parts: unknown[] }>;
+  systemText?: string;
+} {
+  const contents: Array<{ role: string; parts: unknown[] }> = [];
+  const systemChunks: string[] = [];
+  for (const message of prompt) {
+    if (message.role === "system") {
+      if (message.content.length > 0) {
+        systemChunks.push(message.content);
+      }
+      continue;
+    }
+    if (message.role === "user") {
+      const parts = userContentToGeminiParts(message.content);
+      if (parts.length > 0) {
+        contents.push({ role: "user", parts });
+      }
+      continue;
+    }
+    if (message.role === "assistant") {
+      const parts = assistantContentToGeminiParts(message.content);
+      if (parts.length > 0) {
+        contents.push({ role: "model", parts });
+      }
+      continue;
+    }
+    const parts = toolContentToGeminiParts(message.content);
+    if (parts.length > 0) {
+      contents.push({ role: "user", parts });
+    }
+  }
+  return systemChunks.length > 0
+    ? { contents, systemText: systemChunks.join("\n\n") }
+    : { contents };
+}
+
+/**
+ * Build the `parts` array for the current user turn of a Gemini native
+ * `generateContent` request, including inline image + PDF blobs.
+ *
+ * Both providers that hit the native `@google/genai` SDK — `GoogleVertex`
+ * and `GoogleAIStudio` — need this. The previous AI Studio code only
+ * pushed a single `{ text }` part, which silently dropped `input.images`
+ * and `input.pdfFiles` on the floor: the model received text only and
+ * legitimately reported "no image attached". Extracting this from the
+ * Vertex copy keeps both providers on one definition.
+ *
+ * Accepted shapes per element (mirroring the runtime behaviour the Vertex
+ * code already supported):
+ *   - `Buffer` → used as-is
+ *   - local file path → read via `readFileSync`, MIME guessed from extension
+ *   - `data:<mime>;base64,...` URL → mime parsed, data base64-decoded
+ *   - `http(s)://...` URL → fetched, mime from `content-type`
+ *   - any other string → assumed to be a base64-encoded payload
+ *
+ * Image MIME guessing is conservative — only known extensions override the
+ * default `image/jpeg`. Fetch failures are logged and the offending entry
+ * is skipped rather than aborting the entire request, matching prior
+ * Vertex behaviour.
+ */
+/**
+ * Append audio to a Gemini request as `inlineData` parts.
+ *
+ * Shared by both Gemini front ends. Vertex assembles its request here and AI
+ * Studio assembles it in `buildUserPartsWithMultimodal`; when this lived only in
+ * the Vertex client, AI Studio advertised audio support through
+ * `NATIVE_AUDIO_PROVIDERS` and then silently dropped the bytes.
+ *
+ * Gemini's native request shape is assembled directly rather than taken from the
+ * AI SDK's `file` parts, so audio has to be added explicitly the same way PDFs
+ * and images are — a `{ type: "file" }` part built upstream simply never
+ * reaches this request body. That asymmetry is why attaching a recording
+ * produced only the metadata summary even after the message builder learned to
+ * carry the bytes.
+ *
+ * A container Gemini does not accept is converted first; one that cannot be
+ * converted is skipped rather than sent, because an unsupported inlineData
+ * mimeType fails the whole request, and the caller still has the metadata
+ * summary in the text part.
+ */
+export async function appendNativeAudioParts(
+  userParts: VertexNativePart[],
+  audioFiles: MultimodalAudioEntry[] | undefined,
+  logPrefix: string = "[GeminiNative]",
+): Promise<void> {
+  if (!audioFiles || audioFiles.length === 0) {
+    return;
+  }
+  for (const audio of audioFiles) {
+    // Split on both separators: a Windows-style name reaching a POSIX host
+    // would otherwise keep its whole path, and the extension lookup below
+    // needs the bare filename.
+    const base = audio.filename.split(/[\\/]/).pop() ?? audio.filename;
+    const dot = base.lastIndexOf(".");
+    const extension = dot > 0 ? base.slice(dot) : ".bin";
+    const compatible = await toProviderCompatibleAudio(
+      audio.buffer,
+      audio.mimeType,
+      extension,
+    );
+    if (needsAudioTranscode(compatible.mimeType)) {
+      logger.warn(
+        `${logPrefix} Skipping native audio for ${base}: ${compatible.mimeType} ` +
+          `is not accepted and could not be converted. The metadata summary was ` +
+          `still included.`,
+      );
+      continue;
+    }
+    userParts.push({
+      inlineData: {
+        mimeType: compatible.mimeType,
+        data: compatible.buffer.toString("base64"),
+      },
+    });
+    logger.debug(
+      `${logPrefix} Added native audio part for ${base} (${compatible.mimeType})`,
+    );
+  }
+}
+
+/**
+ * Append video to a Gemini request as `inlineData` parts.
+ *
+ * The native request body is assembled by hand rather than taken from the AI
+ * SDK's `file` parts, so — exactly as with audio — a `{ type: "file" }` part
+ * built upstream never arrives here. Video has to be added explicitly or it
+ * is silently dropped on both Gemini front ends while the capability table
+ * says it is supported.
+ *
+ * A clip the provider will not take inline is skipped rather than sent: an
+ * oversized or unsupported `inlineData` part fails the whole request, whereas
+ * skipping leaves the caller with the metadata summary and the keyframes,
+ * which is what it had before native delivery existed.
+ *
+ * `model` is forwarded to `canDeliverVideoNatively` so a Claude-on-Vertex
+ * request — same `providerName` ("vertex") as a Gemini-on-Vertex one, routed
+ * to the native Anthropic SDK instead by `GoogleVertexProvider.isAnthropicModel`
+ * — is answered as not natively video-capable rather than inheriting Vertex's
+ * Gemini row. Optional because AI Studio's caller never has a Claude model to
+ * pass.
+ */
+export async function appendNativeVideoParts(
+  userParts: VertexNativePart[],
+  videoFiles: MultimodalVideoEntry[] | undefined,
+  providerName: string,
+  model?: string,
+  logPrefix: string = "[GeminiNative]",
+): Promise<void> {
+  if (!videoFiles || videoFiles.length === 0) {
+    return;
+  }
+  // Tracks source bytes already committed to this request's shared inline
+  // budget. This is the sole place video ceiling enforcement happens: the AI
+  // SDK `file`-part assembly in messageBuilder.ts never delivers video for
+  // either Gemini provider class (both own their request assembly end to
+  // end), so a duplicate of this check used to sit there too — permanently
+  // inert and unreachable by any test — and has been removed rather than
+  // left as a second, silently-driftable copy of the same logic.
+  //
+  // Seeded from the PDF, image and audio `inlineData` parts the caller has
+  // already pushed onto `userParts` before this runs, not just from sibling
+  // video clips: the 20MB Gemini request ceiling is shared by every inline
+  // part, so a clip that would fit alone can still overflow the request
+  // once those other parts are counted. `data` is base64, which costs 4
+  // bytes per 3 of source — decode the length back to source bytes so this
+  // total stays comparable to `video.buffer.length` below.
+  let committedVideoBytes = userParts.reduce((total, part) => {
+    if ("inlineData" in part) {
+      return total + Math.floor((part.inlineData.data.length * 3) / 4);
+    }
+    return total;
+  }, 0);
+  for (const video of videoFiles) {
+    // Split on both separators: a Windows-style name reaching a POSIX host
+    // would otherwise keep its whole path in the log line.
+    const base = video.filename.split(/[\\/]/).pop() ?? video.filename;
+    const decision = canDeliverVideoNatively(
+      providerName,
+      video,
+      committedVideoBytes,
+      model,
+    );
+    if (!decision.deliver) {
+      logger.warn(
+        `${logPrefix} Sending keyframes instead of the clip for ${base}: ` +
+          `${decision.reason}.`,
+      );
+      continue;
+    }
+    committedVideoBytes += video.buffer.length;
+    userParts.push({
+      inlineData: {
+        mimeType: video.mimeType,
+        data: video.buffer.toString("base64"),
+      },
+    });
+    logger.debug(
+      `${logPrefix} Added native video part for ${base} (${video.mimeType})`,
+    );
+  }
+}
+
+export async function buildUserPartsWithMultimodal(
+  input: GeminiMultimodalInput | undefined,
+  textOverride?: string,
+  logPrefix: string = "[GeminiNative]",
+  model?: string,
+): Promise<VertexNativePart[]> {
+  const text =
+    typeof textOverride === "string" ? textOverride : (input?.text ?? "");
+  const parts: VertexNativePart[] = [{ text }];
+
+  if (input?.pdfFiles && input.pdfFiles.length > 0) {
+    logger.debug(`${logPrefix} Processing ${input.pdfFiles.length} PDF(s)`);
+    for (const pdfFile of input.pdfFiles) {
+      let pdfBuffer: Buffer;
+      if (typeof pdfFile === "string") {
+        if (existsSync(pdfFile)) {
+          pdfBuffer = readFileSync(pdfFile);
+        } else {
+          // Treat as already-base64-encoded payload
+          pdfBuffer = Buffer.from(pdfFile, "base64");
+        }
+      } else {
+        pdfBuffer = pdfFile;
+      }
+      parts.push({
+        inlineData: {
+          mimeType: "application/pdf",
+          data: pdfBuffer.toString("base64"),
+        },
+      });
+    }
+  }
+
+  if (input?.images && input.images.length > 0) {
+    logger.debug(`${logPrefix} Processing ${input.images.length} image(s)`);
+    for (const rawImage of input.images) {
+      // `images` may carry plain Buffer/string values or `{ data, altText? }`
+      // objects. Normalise to the inner payload before format detection.
+      const image: Buffer | string =
+        rawImage && typeof rawImage === "object" && !Buffer.isBuffer(rawImage)
+          ? (rawImage as { data: Buffer | string }).data
+          : (rawImage as Buffer | string);
+      let imageBuffer: Buffer | undefined;
+      let mimeType = "image/jpeg";
+
+      if (typeof image === "string") {
+        if (existsSync(image)) {
+          imageBuffer = readFileSync(image);
+          const ext = extname(image).toLowerCase();
+          if (ext === ".png") {
+            mimeType = "image/png";
+          } else if (ext === ".gif") {
+            mimeType = "image/gif";
+          } else if (ext === ".webp") {
+            mimeType = "image/webp";
+          }
+        } else if (image.startsWith("data:")) {
+          const matches = image.match(/^data:([^;]+);base64,(.+)$/);
+          if (matches) {
+            mimeType = matches[1];
+            imageBuffer = Buffer.from(matches[2], "base64");
+          } else {
+            continue;
+          }
+        } else if (
+          image.startsWith("http://") ||
+          image.startsWith("https://")
+        ) {
+          try {
+            const response = await fetch(image);
+            if (!response.ok) {
+              logger.warn(
+                `${logPrefix} Image fetch failed: ${response.status} ${response.statusText}, skipping`,
+                { url: image },
+              );
+              continue;
+            }
+            const arrayBuffer = await response.arrayBuffer();
+            imageBuffer = Buffer.from(arrayBuffer);
+            const headerMime = response.headers.get("content-type");
+            if (headerMime && headerMime.startsWith("image/")) {
+              mimeType = headerMime.split(";")[0];
+            }
+          } catch (fetchError) {
+            logger.warn(
+              `${logPrefix} Image URL fetch threw, skipping: ${
+                fetchError instanceof Error
+                  ? fetchError.message
+                  : String(fetchError)
+              }`,
+              { url: image },
+            );
+            continue;
+          }
+        } else {
+          imageBuffer = Buffer.from(image, "base64");
+        }
+      } else {
+        imageBuffer = image;
+      }
+
+      if (!imageBuffer) {
+        continue;
+      }
+      parts.push({
+        inlineData: {
+          mimeType,
+          data: imageBuffer.toString("base64"),
+        },
+      });
+    }
+  }
+
+  // Audio last, and through the same helper the Vertex client uses. AI Studio
+  // never touches `buildMultimodalMessagesArray` — it overrides generate() and
+  // stream() and assembles its request here — so wiring audio only into the
+  // Vertex client left this front end advertising native audio via
+  // NATIVE_AUDIO_PROVIDERS and then dropping the bytes on the floor.
+  await appendNativeAudioParts(parts, input?.nativeAudioFiles, logPrefix);
+  // `google-ai-studio` rather than the caller's provider string: this helper
+  // is the AI Studio / Gemini 3 assembly path, and the capability table is
+  // keyed by provider name. Passing a name the table does not know would make
+  // every clip fall back to keyframes on the one front end that can watch it.
+  // `model` is threaded through for signature parity with the Vertex call
+  // site; AI Studio never hosts a Claude model, so it makes no delivery
+  // difference here, only in `canDeliverVideoNatively`'s Vertex branch.
+  await appendNativeVideoParts(
+    parts,
+    input?.nativeVideoFiles,
+    "google-ai-studio",
+    model,
+    logPrefix,
+  );
+
+  return parts;
+}

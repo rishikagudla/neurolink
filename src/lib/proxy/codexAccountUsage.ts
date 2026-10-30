@@ -1,0 +1,325 @@
+/**
+ * Codex account enumeration + usage/quota normalisation.
+ *
+ * Mirrors `accountUsage.ts` (Anthropic) for the Codex pool. Codex reports two
+ * rate-limit windows — `primary` (short) and `secondary` (weekly) — which we
+ * map onto the shared AccountQuota session/weekly fields so the same routing,
+ * cooldown, and display code works for both providers.
+ */
+
+import { tokenStore } from "../auth/tokenStore.js";
+import type { CodexProxyStatusAccountIdentity } from "../types/index.js";
+import { normalizeAnthropicAccountKey } from "./accountSelection.js";
+import {
+  CODEX_USAGE_URL,
+  CODEX_USER_AGENT,
+  decodeCodexAccessToken,
+  resolveCodexAccountId,
+} from "../auth/codexOAuth.js";
+import { logger } from "../utils/logger.js";
+import { fetchProxyAware } from "./proxyFetch.js";
+import type {
+  AccountQuota,
+  AccountQuotaWindow,
+  CodexRateLimitWindow,
+  CodexRateLimits,
+  CodexUsageFetchResult,
+  CodexUsageResponse,
+  ProxyPassthroughAccount,
+} from "../types/index.js";
+
+export const CODEX_ACCOUNT_PREFIX = "codex:";
+
+/**
+ * Native fallback legs (e.g. Claude-on-Vertex) key their usage rows as
+ * `vertex/<model>` rather than a provider-qualified `<provider>:<label>`
+ * pair — there is no OAuth account behind them, just a served model. They
+ * are not served by Codex, so without this prefix they fell through to the
+ * generic "other" branch below and lost both their identity and their live
+ * status in the CLI's proxy status output.
+ */
+const VERTEX_ACCOUNT_PREFIX = "vertex/";
+
+/** Keep an account label in the Codex namespace used by its token store. */
+export function normalizeCodexAccountKey(value: string): string {
+  const trimmed = value.trim();
+  return trimmed.startsWith(CODEX_ACCOUNT_PREFIX)
+    ? trimmed
+    : `${CODEX_ACCOUNT_PREFIX}${trimmed}`;
+}
+
+/** Resolve the provider-qualified key used to render a proxy status row. */
+export function resolveProxyStatusAccountIdentity(
+  label: string,
+  type: string,
+  persistedKey?: string,
+): CodexProxyStatusAccountIdentity {
+  // Current counter snapshots persist the provider-qualified key. Prefer it
+  // over the display type so a future type rename cannot move an account into
+  // the wrong cooldown/disabled namespace.
+  if (persistedKey?.toLowerCase().startsWith("anthropic:")) {
+    return {
+      provider: "anthropic",
+      key: normalizeAnthropicAccountKey(persistedKey),
+    };
+  }
+  if (persistedKey?.startsWith(CODEX_ACCOUNT_PREFIX)) {
+    return { provider: "codex", key: persistedKey };
+  }
+  if (persistedKey?.startsWith(VERTEX_ACCOUNT_PREFIX)) {
+    return { provider: "vertex", key: persistedKey };
+  }
+  if (type === "oauth" || type === "api_key") {
+    return { provider: "anthropic", key: normalizeAnthropicAccountKey(label) };
+  }
+  if (type === "codex-oauth") {
+    return { provider: "codex", key: normalizeCodexAccountKey(label) };
+  }
+  if (type === "vertex") {
+    return { provider: "vertex", key: persistedKey ?? label };
+  }
+  return { provider: "other", key: null };
+}
+
+/** Enumerate Codex OAuth accounts from the token store for usage refresh. */
+export async function listCodexAccountsForUsage(): Promise<
+  ProxyPassthroughAccount[]
+> {
+  const keys = await tokenStore.listByPrefix(CODEX_ACCOUNT_PREFIX);
+  const accounts: ProxyPassthroughAccount[] = [];
+  for (const key of keys) {
+    if (await tokenStore.isDisabled(key)) {
+      continue;
+    }
+    const tokens = await tokenStore.loadTokens(key);
+    if (!tokens) {
+      continue;
+    }
+    const label = key.slice(CODEX_ACCOUNT_PREFIX.length) || key;
+    accounts.push({
+      key,
+      label,
+      token: tokens.accessToken,
+      refreshToken: tokens.refreshToken,
+      expiresAt: tokens.expiresAt,
+      type: tokens.tokenType === "Bearer" ? "oauth" : "api_key",
+    });
+  }
+  return accounts;
+}
+
+function toFraction(percent: number | null | undefined): number {
+  if (typeof percent !== "number" || !Number.isFinite(percent)) {
+    return 0;
+  }
+  // Codex reports 0-100; clamp and normalise to 0-1.
+  return Math.min(1, Math.max(0, percent / 100));
+}
+
+/** Convert absolute or relative Codex window resets into epoch seconds. */
+function windowResetEpochSeconds(
+  window: CodexRateLimitWindow | null | undefined,
+  nowSeconds: number,
+): number {
+  if (!window) {
+    return 0;
+  }
+  if (
+    typeof window.resets_at === "number" &&
+    Number.isFinite(window.resets_at) &&
+    window.resets_at > 0
+  ) {
+    // Tolerate ms epochs (~year 2100 ceiling in seconds).
+    return window.resets_at > 4_102_444_800
+      ? Math.floor(window.resets_at / 1000)
+      : window.resets_at;
+  }
+  if (
+    typeof window.reset_at === "number" &&
+    Number.isFinite(window.reset_at) &&
+    window.reset_at > 0
+  ) {
+    return window.reset_at > 4_102_444_800
+      ? Math.floor(window.reset_at / 1000)
+      : window.reset_at;
+  }
+  const relative =
+    typeof window.resets_in_seconds === "number"
+      ? window.resets_in_seconds
+      : typeof window.reset_after_seconds === "number"
+        ? window.reset_after_seconds
+        : window.reset_after;
+  if (
+    typeof relative === "number" &&
+    Number.isFinite(relative) &&
+    relative > 0
+  ) {
+    return nowSeconds + Math.floor(relative);
+  }
+  return 0;
+}
+
+/** Classify only finite, nonnegative utilization; invalid measurements stay unknown. */
+function deriveWindowStatus(percent: number | null | undefined): string {
+  if (typeof percent !== "number" || !Number.isFinite(percent) || percent < 0) {
+    return "unknown";
+  }
+  return percent >= 100 ? "rejected" : "allowed";
+}
+
+/** Normalize a reported window while retaining uncertainty in its status. */
+function toQuotaWindow(
+  kind: string,
+  group: string,
+  window: CodexRateLimitWindow | null | undefined,
+  nowSeconds: number,
+): AccountQuotaWindow | null {
+  if (!window) {
+    return null;
+  }
+  const used = toFraction(window.used_percent);
+  return {
+    kind,
+    group,
+    used,
+    status: deriveWindowStatus(window.used_percent),
+    resetsAt: windowResetEpochSeconds(window, nowSeconds),
+    isActive: true,
+  };
+}
+
+/** Normalise a Codex rate-limit block into the shared AccountQuota shape. */
+export function codexRateLimitsToQuota(
+  rateLimits: CodexRateLimits | null | undefined,
+  now: number = Date.now(),
+): AccountQuota {
+  const nowSeconds = Math.floor(now / 1000);
+  const primary = rateLimits?.primary ?? null;
+  const secondary = rateLimits?.secondary ?? null;
+  const sessionUsed = toFraction(primary?.used_percent);
+  const weeklyUsed = toFraction(secondary?.used_percent);
+  const windows: AccountQuotaWindow[] = [];
+  const primaryWindow = toQuotaWindow(
+    "session",
+    "session",
+    primary,
+    nowSeconds,
+  );
+  const secondaryWindow = toQuotaWindow(
+    "weekly_all",
+    "weekly",
+    secondary,
+    nowSeconds,
+  );
+  if (primaryWindow) {
+    windows.push(primaryWindow);
+  }
+  if (secondaryWindow) {
+    windows.push(secondaryWindow);
+  }
+  return {
+    unifiedStatus:
+      rateLimits?.limit_reached === true || rateLimits?.allowed === false
+        ? "rejected"
+        : rateLimits?.allowed === true
+          ? "allowed"
+          : "unknown",
+    sessionUsed,
+    sessionStatus: deriveWindowStatus(primary?.used_percent),
+    sessionResetAt: windowResetEpochSeconds(primary, nowSeconds),
+    weeklyUsed,
+    weeklyStatus: deriveWindowStatus(secondary?.used_percent),
+    weeklyResetAt: windowResetEpochSeconds(secondary, nowSeconds),
+    // Codex has no overage/fallback concept; keep neutral defaults.
+    fallbackPercentage: 0,
+    overageStatus: "rejected",
+    lastUpdated: now,
+    windows: windows.length > 0 ? windows : undefined,
+    windowsUpdatedAt: windows.length > 0 ? now : undefined,
+    source: "usage-api",
+  };
+}
+
+/**
+ * Parse Codex rate-limit information from response headers. The ChatGPT backend
+ * returns a JSON rate-limit blob in `x-codex-ratelimit` / `x-codex-active-limit`
+ * on some responses; parse defensively and return null when absent.
+ */
+export function parseCodexRateLimitHeaders(
+  headers: Headers,
+  now: number = Date.now(),
+): AccountQuota | null {
+  const raw =
+    headers.get("x-codex-ratelimit") ??
+    headers.get("x-codex-active-limit") ??
+    null;
+  if (!raw) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as CodexRateLimits | CodexUsageResponse;
+    const rateLimits =
+      "rate_limits" in parsed && parsed.rate_limits
+        ? parsed.rate_limits
+        : (parsed as CodexRateLimits);
+    return { ...codexRateLimitsToQuota(rateLimits, now), source: "headers" };
+  } catch {
+    return null;
+  }
+}
+
+/** Fetch the usage/limits window for one Codex account. */
+export async function fetchCodexAccountUsage(
+  account: ProxyPassthroughAccount,
+  options: { timeoutMs?: number } = {},
+): Promise<CodexUsageFetchResult> {
+  if (account.type !== "oauth") {
+    return { ok: false, reason: "not_oauth" };
+  }
+  const accountId = resolveCodexAccountId(account.token);
+  try {
+    const response = await fetchProxyAware(CODEX_USAGE_URL, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${account.token}`,
+        ...(accountId ? { "chatgpt-account-id": accountId } : {}),
+        "User-Agent": CODEX_USER_AGENT,
+        Accept: "application/json",
+      },
+      signal: AbortSignal.timeout(options.timeoutMs ?? 10_000),
+    });
+    if (response.status === 401 || response.status === 403) {
+      return { ok: false, reason: "auth" };
+    }
+    if (response.status === 429) {
+      return { ok: false, reason: "rate_limited" };
+    }
+    if (!response.ok) {
+      return { ok: false, reason: "http" };
+    }
+    const usage = (await response.json()) as CodexUsageResponse;
+    const rateLimits = usage.rate_limit
+      ? {
+          allowed: usage.rate_limit.allowed,
+          limit_reached: usage.rate_limit.limit_reached,
+          primary: usage.rate_limit.primary_window,
+          secondary: usage.rate_limit.secondary_window,
+        }
+      : usage.rate_limits;
+    return { ok: true, quota: codexRateLimitsToQuota(rateLimits) };
+  } catch (error) {
+    logger.debug(
+      `Codex usage fetch failed for ${account.label}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    return { ok: false, reason: "network" };
+  }
+}
+
+/** Decode plan type from an account's access token (display convenience). */
+export function codexAccountPlanType(
+  account: ProxyPassthroughAccount,
+): string | undefined {
+  return decodeCodexAccessToken(account.token).planType;
+}

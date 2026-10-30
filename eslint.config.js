@@ -2,6 +2,10 @@
 import js from "@eslint/js";
 import tseslint from "@typescript-eslint/eslint-plugin";
 import tsparser from "@typescript-eslint/parser";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+const neurolink = require("./eslint-rules/index.cjs");
 
 export default [
   js.configs.recommended,
@@ -12,6 +16,7 @@ export default [
       sourceType: "module",
       globals: {
         // Node.js globals
+        structuredClone: "readonly",
         process: "readonly",
         Buffer: "readonly",
         __dirname: "readonly",
@@ -22,6 +27,12 @@ export default [
         clearTimeout: "readonly",
         setInterval: "readonly",
         clearInterval: "readonly",
+        URL: "readonly",
+        URLSearchParams: "readonly",
+        fetch: "readonly",
+        Headers: "readonly",
+        Request: "readonly",
+        Response: "readonly",
 
         // Browser globals
         window: "readonly",
@@ -62,8 +73,10 @@ export default [
     },
   },
   {
-    // TypeScript files in src/ directory (use project-based linting)
-    files: ["src/**/*.ts"],
+    // TypeScript files in src/ directory (use project-based linting). Includes
+    // .tsx so import-discipline (no-restricted-syntax) and the neurolink
+    // custom rules apply uniformly across React components.
+    files: ["src/**/*.ts", "src/**/*.tsx"],
     languageOptions: {
       parser: tsparser,
       parserOptions: {
@@ -74,8 +87,54 @@ export default [
     },
     plugins: {
       "@typescript-eslint": tseslint,
+      neurolink,
     },
     rules: {
+      // ======================================================================
+      // NeuroLink custom type-engineering rules (CLAUDE.md Critical Rules)
+      // All rules (7-13) enforced via ESLint — zero shell scripts.
+      // ======================================================================
+      "neurolink/format-provider-error-returns": "error", // Rule 6
+      "neurolink/no-interface": "error", // Rule 7
+      "neurolink/no-types-suffix-filename": "error", // Rule 8
+      "neurolink/unique-type-names": "error", // Rule 9
+      "neurolink/types-barrel-exports-only": "error", // Rule 10
+      "neurolink/no-local-types-folder": "error", // Rules 11 & 11b
+      "neurolink/no-type-export-outside-types": "error", // Rule 12
+      "neurolink/barrel-type-imports": "error", // Rule 13
+      "neurolink/no-local-type-alias": "error", // Rule 2 (strict)
+      "neurolink/no-inline-secret-regex": "error", // Review H04 — secret-redaction must go through logSanitize
+      "neurolink/provider-typed-errors": "error", // Review M08 — formatProviderError must return typed errors
+      "neurolink/provider-base-class": "error", // Issue #1177 — all providers must extend BaseProvider or OpenAIChatCompletionsProvider
+
+      // The Vercel AI SDK is gone: "ai" and "@ai-sdk/*" are banned outright by
+      // scripts/check-banned-deps.ts and are not installed, so there is no
+      // import of them left to route through a seam. The V3 protocol types are
+      // declared locally in src/lib/types/aiCompat.ts.
+      "no-restricted-syntax": [
+        "error",
+        // Critical Rule 14: no double type assertions through unknown/any.
+        // `x as unknown as T` defeats the compiler's structural-overlap check
+        // entirely — the value is trusted as T with zero validation. Fix the
+        // type at the source, use a runtime-validating type guard, or a single
+        // `as T` (still overlap-checked). Covers `as` and angle-bracket forms.
+        // (@typescript-eslint/no-unsafe-type-assertion is the stricter official
+        // alternative, but it bans ALL narrowing assertions — 2,790 hits as of
+        // 2026-07 — so the precise pattern is banned via selector instead.)
+        {
+          selector:
+            ":matches(TSAsExpression, TSTypeAssertion):matches([expression.type='TSAsExpression'], [expression.type='TSTypeAssertion'])[expression.typeAnnotation.type='TSUnknownKeyword']",
+          message:
+            "Unsafe double type assertion (`... as unknown as T`) defeats all compiler checking. Fix the type at the source, use a runtime-validating type guard, or a single `as T`. See CLAUDE.md Critical Rule 14.",
+        },
+        {
+          selector:
+            ":matches(TSAsExpression, TSTypeAssertion):matches([expression.type='TSAsExpression'], [expression.type='TSTypeAssertion'])[expression.typeAnnotation.type='TSAnyKeyword']",
+          message:
+            "Unsafe double type assertion (`... as any as T`) defeats all compiler checking. Fix the type at the source, use a runtime-validating type guard, or a single `as T`. See CLAUDE.md Critical Rule 14.",
+        },
+      ],
+
       // Disable base rules that are covered by TypeScript
       "no-unused-vars": "off",
       "no-undef": "off",
@@ -122,6 +181,108 @@ export default [
     },
   },
   {
+    // scripts/ and tools/ were invisible to ESLint in two separate ways, and
+    // removing them from `ignores` only fixed one. Nothing here matched a `.ts`
+    // file outside src/ and test/, so even un-ignored they parsed under no
+    // configuration at all and "passed" by never being read. Of 70 TypeScript
+    // files across the two directories, ESLint was reporting on zero.
+    //
+    // That is the blind spot tsconfig.ci-scripts.json was created for: the
+    // provider onboarding gate shipped asserting a field that does not exist,
+    // its catalog lookup silently produced {undefined}, and half a required
+    // check never ran — in tools/verify-provider-onboarding.ts, a file gating a
+    // required status check that nothing typechecked and nothing linted.
+    //
+    // No `project`, for the same reason test/**/*.ts has none: these files sit
+    // outside the root tsconfig, so type-aware rules cannot run on them. This
+    // is the syntactic tier — unused vars, undefined globals, empty catches —
+    // which is the tier that caught the real defects in this tree anyway.
+    files: ["scripts/**/*.ts", "tools/**/*.ts"],
+    languageOptions: {
+      parser: tsparser,
+      parserOptions: {
+        ecmaVersion: "latest",
+        sourceType: "module",
+      },
+      globals: {
+        process: "readonly",
+        Buffer: "readonly",
+        __dirname: "readonly",
+        __filename: "readonly",
+        global: "readonly",
+        console: "readonly",
+        fetch: "readonly",
+        structuredClone: "readonly",
+        setTimeout: "readonly",
+        clearTimeout: "readonly",
+        setInterval: "readonly",
+        clearInterval: "readonly",
+        URL: "readonly",
+        TextDecoder: "readonly",
+        TextEncoder: "readonly",
+        AbortController: "readonly",
+        AbortSignal: "readonly",
+        Response: "readonly",
+        ReadableStream: "readonly",
+        // Scripts that emit or drive browser code reference these in type
+        // positions and in generated snippets; they are not Node globals.
+        window: "readonly",
+        document: "readonly",
+        // The NodeJS namespace appears in type positions (NodeJS.Timeout).
+        NodeJS: "readonly",
+      },
+    },
+    plugins: {
+      "@typescript-eslint": tseslint,
+    },
+    rules: {
+      "no-unused-vars": "off",
+      // Mirrors the src/ options, plus caughtErrorsIgnorePattern. The tree
+      // already writes `catch (_error)` to mean "deliberately unused", but no
+      // block declared that pattern, so typescript-eslint's caughtErrors: "all"
+      // default flagged the very convention the code was following.
+      "@typescript-eslint/no-unused-vars": [
+        "error",
+        {
+          argsIgnorePattern: "^_",
+          varsIgnorePattern: "^_",
+          caughtErrorsIgnorePattern: "^_",
+          ignoreRestSiblings: true,
+          args: "after-used",
+          vars: "local",
+        },
+      ],
+      "no-undef": "error",
+      "no-empty": ["error", { allowEmptyCatch: true }],
+    },
+  },
+  {
+    // .cjs matched no configuration at all, so semantic-release-format-plugin.cjs
+    // — which runs in the release pipeline — was never linted. It needs its own
+    // block rather than joining the .js/.mjs one: that block declares
+    // sourceType "module", under which `require` and `module` are undefined.
+    files: ["**/*.cjs"],
+    languageOptions: {
+      ecmaVersion: "latest",
+      sourceType: "commonjs",
+      globals: {
+        process: "readonly",
+        Buffer: "readonly",
+        __dirname: "readonly",
+        __filename: "readonly",
+        console: "readonly",
+        require: "readonly",
+        module: "writable",
+        exports: "writable",
+        setTimeout: "readonly",
+        clearTimeout: "readonly",
+        setInterval: "readonly",
+        clearInterval: "readonly",
+        setImmediate: "readonly",
+      },
+    },
+  },
+  {
     // TypeScript files in test/ directory (no project-based linting due to path mismatch)
     files: ["test/**/*.ts"],
     languageOptions: {
@@ -164,8 +325,496 @@ export default [
     },
     plugins: {
       "@typescript-eslint": tseslint,
+      neurolink,
     },
     rules: {
+      // Rule 15 — tests drive the shipped surface, not src/lib. The `allow`
+      // list is the determinism exception: a suite may sit outside the rule
+      // only when it needs deterministic control a live call cannot give.
+      // Every entry states why in its own file header. Adding to this list is
+      // a review decision, not a way to silence the rule. The closed
+      // "Grandfathered" block near the end of the list is legacy debt with no
+      // per-file header; it may shrink, never grow.
+      "neurolink/e2e-tests-only": [
+        "error",
+        {
+          allow: [
+            // Which of convertZodToJsonSchema's two branches ran is visible
+            // only as a logger warning; the schema both branches return is
+            // valid, so a live generate() call cannot tell them apart. The
+            // regression also needs a Zod 3 shaped schema, and this repo
+            // installs only Zod 4.
+            "test/continuous-test-suite-zod3-schema-native-path.ts",
+            // resolveStepToolChoice (src/lib/core/nativeGenerateLoop.ts) is
+            // exported from no package entry point. Whether a forced choice
+            // for an undeclared tool is dropped, and that a warning said so,
+            // is visible through generate() only as "the turn did not 400",
+            // which needs a provider that rejects it; the declaredTools-absent
+            // branch is reached by no shipped call site at all. Its header
+            // states the exception in full.
+            "test/continuous-test-suite-forced-tool-declared.ts",
+            // The span content helpers are exported from no package entry
+            // point, and a live call cannot produce what is asserted: output
+            // byte-identical to the previous serializer across a thousand
+            // generated values, a value that throws when read, circular
+            // values and a __proto__ key, and the exact cut points at the
+            // size cap. The end-to-end half lives in the Vertex Claude
+            // characterization suite. Its header states the exception in full.
+            "test/continuous-test-suite-span-content-redaction.ts",
+            // The exporter pipeline is read from a local OTLP receiver that
+            // can refuse, hold or fail requests on demand, the OpenTelemetry
+            // SDK 1.x span shape is not installed and is reproduced as a
+            // fixture, and exact nanosecond times, a sampled-out span and an
+            // 80 KB adversarial string cannot come out of a model call. Its
+            // header states the exception in full.
+            "test/continuous-test-suite-observability-exporter-redaction.ts",
+            // More than 5,000 simultaneously open spans, an event stamped with
+            // an out-of-range time, a model call whose output has the wrong
+            // type, a response that names a different model than the request
+            // and a host provider torn down and rebuilt cannot come out of a
+            // live call; a global tracer provider with or without a context
+            // manager is set once per process, so each runs in a child. Its
+            // header states the exception in full.
+            "test/continuous-test-suite-observability-w2-extras-a.ts",
+            // The roots a direct provider call and a direct tool loop open for
+            // themselves come from the tracer wrappers, and the attributes are
+            // read from an in-memory exporter; a global tracer provider is set
+            // once per process and no generate() call exposes either. Its
+            // header states the exception in full.
+            "test/continuous-test-suite-observability-integration.ts",
+            // A voice call's recorder, binding verifier and realtime wiring
+            // have no path through generate()/stream(); what is asserted is
+            // stored message ids, metadata, ordering and the Redis key, plus
+            // out-of-order transcripts, duplicate deliveries, barge-in and a
+            // shutdown with about a second left, none of which a live model
+            // can be made to produce. Offline: Redis is an in-process fake and
+            // LiveKit is driven with synthetic events. Its header states the
+            // exception in full.
+            "test/continuous-test-suite-voice-turn-memory.ts",
+            // The window between a Redis SET (or SADD) and its separate
+            // EXPIRE is one round trip wide and closes by itself, so no live
+            // run observes it or dies inside it. What is asserted is a key's
+            // TTL read back after the connection is cut right behind the
+            // write, at internal write-backs (background title, summarization,
+            // agentic-loop report, the per-user session index) that no caller
+            // can aim at. Offline against an in-process stand-in that models
+            // TTL semantics; the real-server cases SKIP when nothing answers.
+            // Its header states the exception in full.
+            "test/continuous-test-suite-redis-atomic-expiry.ts",
+            // Chunk boundaries and reranker ordering are exact outcomes;
+            // generate({ rag }) only ever shows the model's answer.
+            "test/continuous-test-suite-rag.ts",
+            // Parser edge cases, outgoing wire format, proxy cooldown/quota.
+            "test/continuous-test-suite-bugfixes.ts",
+            // 429-cooldown planning and quota ordering across accounts, plus
+            // OpenCode client-config writing against a throwaway XDG dir —
+            // including the not-installed branch, which no live run reaches.
+            "test/continuous-test-suite-proxy.ts",
+            // ResearchWorker's branch, state-file and accept/revert behaviour
+            // is only reproducible by calling its tools with scripted inputs
+            // against a fixture repo; a live model cannot be made to emit
+            // them. Only those groups need the exception; the TaskManager
+            // group drives nl.tasks on a dist NeuroLink in an isolated child.
+            "test/continuous-test-suite-autoresearch.ts",
+            // MEDIA_HANDLER_CATALOG / providerChoicesFor / defaultProviderFor
+            // (src/lib/factories/mediaHandlerCatalog.ts) are never re-exported
+            // from src/lib/index.ts — no package entry point resolves them,
+            // so the catalog reads have no public surface. The suite's
+            // live-registration assertions (TTSProcessor.listProviders()
+            // etc.) still go through the real public surface via
+            // ../dist/index.js; only the catalog-internals reads need this
+            // exception.
+            "test/continuous-test-suite-media-registry-collisions.ts",
+            // resolveRequestKind() is internal dispatch plumbing consumed
+            // only by neurolink.ts/baseProvider.ts — never exported from any
+            // package entry point, no public surface at all.
+            "test/continuous-test-suite-resolve-request-kind.ts",
+            // Filter-dialect translation no live generate() could emit.
+            "test/continuous-test-suite-vector-chroma.ts",
+            "test/continuous-test-suite-vector-pinecone.ts",
+            // Synthetic rule tables, duck-typed error shapes no real SDK
+            // produces, and module-export-shape checks. Its header already
+            // states the exception and the all-src module graph.
+            "test/continuous-test-suite-error-classifier-contract.ts",
+            // Account ordering, 429 cooldown planning and refresh-failure
+            // classification, which would otherwise need a specific sequence
+            // of 429s and token-endpoint failures across several real ChatGPT
+            // accounts to provoke. Its header states the exception in full,
+            // including that `__testHooks` should shrink as the logic gains a
+            // real surface. Its last two cases drive the built CLI and are
+            // deliberately outside the exception.
+            "test/continuous-test-suite-codex.ts",
+            "test/continuous-test-suite-proxy-telemetry.ts",
+            // The Langfuse records the Claude and Codex proxy routes, the
+            // translated path and the LiveKit realtime wiring put on the wire
+            // (identity, bodies, usage and cost, one trace per turn, tool
+            // pairing, shutdown flush). A live provider cannot return a fixed
+            // usage, overlapping same-name tool calls, a stalled Langfuse
+            // endpoint or a worker reaped a second after shutdown. Its header
+            // states the exception in full.
+            "test/continuous-test-suite-observability-proxy-voice.ts",
+            // The wave-2 proxy and provider fixes hang on inputs a live call
+            // cannot produce: a Codex stream whose completed output is empty,
+            // a Claude stream whose message_start already counts a token, a
+            // tracer that starts before telemetry, a tool name that cannot be
+            // stringified, a SageMaker finish part out of spec and a provider
+            // result without a stream. Its header states the exception in full.
+            "test/continuous-test-suite-observability-w2-extras-b.ts",
+            // The three maintainer decisions on the follow-up: proxy bodies
+            // opt-in, a dropped Langfuse delivery as a signal without a
+            // breaker, and the dual-written gen_ai.* proxy keys. The real
+            // proxy routes run against recorded replies, and two local OTLP
+            // receivers (Langfuse, collector) decode what leaves the process.
+            // Its header states the exception in full.
+            "test/continuous-test-suite-observability-decisions.ts",
+            // The adversarial follow-up on the exporter: a local OTLP receiver
+            // that answers 200 with a null body or a malformed partialSuccess,
+            // 429 and 503 with Retry-After, or holds every request open; a
+            // GenAI span from another library and non-object metadata; 5,100
+            // spans ended between two ancestors and their descendant; a span
+            // that ends while shutdown() drains. None comes out of a live call.
+            // Its header states the exception in full.
+            "test/continuous-test-suite-observability-adv-exporter.ts",
+            // The defects an adversarial verifier reproduced in the proxy and
+            // realtime tracing: upstream error bodies that echo the prompt, a
+            // stream error event without a message, a stream with no content,
+            // secrets under unusual header names, a Codex item over the cap, a
+            // conversation store that never answers, and the label values a
+            // MeterProvider receives. Real routes and tracers run against local
+            // fakes and a decoding OTLP receiver. Its header states the
+            // exception in full.
+            "test/continuous-test-suite-observability-adv-proxy.ts",
+            // Exact isolated transport, cancellation, batching, budget and updater failures.
+            "test/continuous-test-suite-proxy-request-lifecycle.ts",
+            "test/continuous-test-suite-proxy-http-disconnect.ts",
+            "test/continuous-test-suite-proxy-route-accounting.ts",
+            "test/continuous-test-suite-proxy-capture-pipeline.ts",
+            // Exact logged token buckets and translated usage fields need fixed
+            // fixtures; live provider responses cannot guarantee cache hits.
+            "test/continuous-test-suite-proxy-usage-2049.ts",
+            "test/continuous-test-suite-proxy-update-staging.ts",
+            // Recorded package diffs and conflicting releases must be deterministic;
+            // the capture command is also exercised through the built CLI.
+            "test/continuous-test-suite-proxy-polyfills.ts",
+            "test/continuous-test-suite-proxy-pressure-recovery.ts",
+            "test/continuous-test-suite-proxy-token-budget.ts",
+            "test/fixtures/proxyTokenBudgetWorker.mts",
+            "test/continuous-test-suite-proxy-context-preflight.ts",
+            "test/continuous-test-suite-vertex-anthropic-fallback.ts",
+            "test/continuous-test-suite-proxy-telemetry-reconciliation.ts",
+            "test/continuous-test-suite-proxy-fallback-errors.ts",
+            "test/continuous-test-suite-proxy-fallback-parent.ts",
+            // Codex-outbound fallback (native Codex request -> Anthropic-pool
+            // loopback / Vertex): exact target selection, model-mapping
+            // overrides, the REQUEST_TOO_LARGE -> 413 mapping, and the
+            // reverse-direction loop-prevention filter are facts about
+            // config-gated dispatch order that no live Codex/Anthropic/Vertex
+            // call can deterministically reproduce (real Codex traffic is
+            // also quota-rejected in this environment). Drives the shipped
+            // `createProxyStartApp`-built app in process via `app.request()`
+            // with `globalThis.fetch` stubbed per upstream host, exactly as
+            // its sibling `continuous-test-suite-proxy-fallback-parent.ts`.
+            "test/continuous-test-suite-proxy-codex-outbound-fallback.ts",
+            // Pure IR shape and exhaustiveness invariants. The guarantee under
+            // test is that an unhandled union variant fails `tsc --noEmit`, which
+            // is a property of the type declarations and their shipped consumers,
+            // not of any dispatched request: a live call cannot observe it at all.
+            "test/continuous-test-suite-proxy-ir-codec.ts",
+            // Pure request-shape translation (Codex Responses -> ClaudeRequest)
+            // proven against fixed fixture bodies and constructed edge cases —
+            // malformed/duck-typed inputs, cache-breakpoint placement and
+            // tool-array ordering all need byte-identical repeated runs over
+            // the same input, which a live model cannot be made to reproduce
+            // turn-for-turn.
+            "test/continuous-test-suite-codex-outbound-translation.ts",
+            // Byte-exact SSE frame ordering, a truncated tool-call-argument
+            // sequence, and a randomized ordering-invariant sweep over the
+            // Anthropic -> Codex response/stream codec — none reproducible
+            // from a live provider call on demand.
+            "test/continuous-test-suite-codex-response-translation.ts",
+            // Exact tool_choice/disable_parallel_tool_use bijection table,
+            // byte-exact toolKindByName round-tripping for a custom-kind
+            // grammar tool through both response paths, and a specific
+            // circular-$ref/strict-flag degrade reason — none reproducible
+            // from a live provider call on demand.
+            "test/continuous-test-suite-codex-outbound-tool-fidelity.ts",
+            // parseRetryAfterMs, parseRetryAfterHeaderValue, parseRateLimitResetValue,
+            // and parseDurationMs need deterministic tests with synthetic header strings,
+            // mixed duration units, and clock-relative dates that live calls cannot provide.
+            "test/continuous-test-suite-retry-after-parsing.ts",
+
+            // Isolated rolling workers inject startup stalls and crashes while
+            // the built restart CLI and real streaming sockets are exercised.
+            "test/continuous-test-suite-proxy-restart.ts",
+            "test/fixtures/proxyRestartWorker.mjs",
+            // Synthetic Codex response streams, upstream transport failures,
+            // and provider-qualified persistence all need exact outcomes that
+            // a live request cannot safely or deterministically reproduce.
+            "test/codex-quota-observability.test.ts",
+            // A TCP connect that never completes (a SYN lost on a lossy
+            // uplink) cannot be induced through a live request, and the
+            // outcomes under test are exact attempt counts and the shape of
+            // the terminal 502. Drives the shipped /v1/messages handler in
+            // process with fetch stubbed to the captured error shape; the
+            // isolation helper blocks every provider host.
+            "test/continuous-test-suite-proxy-connect-retry.ts",
+            // Proxy selection and direct-fallback behavior need a synthetic
+            // hostname that cannot be reached except through a local proxy;
+            // the built CLI cannot target that endpoint without live credentials.
+            "test/continuous-test-suite-proxy-egress.ts",
+            // Internal agentic-loop-engine primitives (streamChannel,
+            // nativeToolFormat, loopEngine) have no exported surface: none of
+            // src/lib/core/{streamChannel,nativeToolFormat,loopEngine}.ts is
+            // reachable via package.json's `exports` map. The Anthropic,
+            // Bedrock, AI Studio and Vertex clients now run their turns on
+            // the engine, but exact push/close/error ordering, per-adapter
+            // retry-call counts against a hand-written fake adapter, and
+            // PostEmissionStepError's unwrap-in-both-directions behavior are
+            // facts about the primitives' own contracts that a fake adapter
+            // controls exactly and no live or mocked generate()/stream() call
+            // can be made to produce on demand. Its header states the
+            // exception in full.
+            "test/continuous-test-suite-loop-engine.ts",
+            // ToolsManager (src/lib/core/modules/ToolsManager.ts) is a
+            // `private readonly` field on BaseProvider with no getter, and
+            // generateToolOutputPreview / DEFAULT_MAX_PREVIEW_BYTES /
+            // RETRIEVE_CONTEXT_TOOL_NAME (src/lib/context/toolOutputLimits.ts)
+            // are not re-exported from any package entry point — no public
+            // surface at all. Which of two MCP envelope shapes (top-level vs.
+            // nested under `data`) is recognized and preserved rather than
+            // collapsed to the legacy `_truncated` sentinel, whether `isError`
+            // and non-text content items survive byte-for-byte, whether the
+            // omission notice names `retrieve_context` only when that tool is
+            // actually registered on the instance, and whether a configured
+            // `outputTruncationMaxBytes` moves the cut point, are all facts
+            // about this instance's own tool registry and truncation
+            // internals — not observable by inspecting a live model's output.
+            // Its header states the exception in full.
+            "test/continuous-test-suite-tools-manager-truncation.ts",
+            // manifestRegistry feeds four modules (contextWindows, pricing,
+            // modelRegistry, providerImageAdapter), and core/constants.ts
+            // derives PROVIDER_MAX_TOKENS from the same manifest files
+            // directly (it cannot import the aggregator without an import
+            // cycle). Only calculateCost/hasPricing are exported from
+            // dist/index.js; getContextWindowSize, MODEL_REGISTRY,
+            // ProviderImageAdapter and PROVIDER_MAX_TOKENS are not, so a
+            // per-model check that every consumer agrees with the manifest
+            // can only read the compiled tables directly. Its header states
+            // this in full.
+            "test/continuous-test-suite-model-manifests.ts",
+            // parseCatalogEntry and parseProviderCatalogJson are build-tool
+            // validators (codegen, the onboarding gate) that no generate(),
+            // stream() or CLI call reaches. Every case needs a fixed input, a
+            // real catalog file or one hand-mutated copy of an entry, so a
+            // rejection can be pinned to one rule. Its header states this.
+            "test/continuous-test-suite-decide-catalog-schema.ts",
+            // The decide catalog entries are read straight from the module
+            // graph: the descriptor table, the loader accessors, the registry
+            // loop and the generated index are not exported from dist/index.js,
+            // and the control that the 81 chat descriptors are unchanged is an
+            // exact-data comparison no generate() or CLI call can produce. The
+            // snapshot helper reads the same tables. Their headers say so.
+            "test/continuous-test-suite-decide-catalog.ts",
+            "test/helpers/descriptorSnapshot.ts",
+            // The decide engine modules (dist/providers/decide/*) and
+            // ConfiguredDecisionProvider are reachable from dist/index.js only
+            // through a configured provider's generate() call. Each module
+            // takes values a live endpoint cannot be made to produce on demand:
+            // a response body with a getter or a prototype-named key, an error
+            // body that holds the API key, a base URL that fails validation.
+            // Its header states this.
+            "test/continuous-test-suite-decide-engine.ts",
+            // The generic decide provider contract builds
+            // ConfiguredDecisionProvider from dist, which dist/index.js reaches
+            // only through a configured provider's generate() call. Its cases
+            // need what no live endpoint can be made to send on demand: a reply
+            // that echoes the API key, a blank key or base URL, a request count
+            // of exactly zero. Every request goes to a fetch mock, with fake
+            // credentials and .test hosts. Its header says so. The suite that
+            // checks the loop imports nothing from src/ or dist/ at run time
+            // itself, so it needs no entry.
+            "test/helpers/decideProviderContract.ts",
+            // Direct `synthesizeStream` access covers only the
+            // handler-synthesis seam: provider/default text caps,
+            // surrogate-safe splits, and final-chunk failure isolation.
+            // Sentence carry-over and flush behaviour drive the public
+            // `stream()` surface instead.
+            "test/continuous-test-suite-tts-unit.ts",
+            // Grant-gate arithmetic that no live call can stage: lease clock
+            // expiry against a fixed `now`, drift streaks that only pause on
+            // the Nth consecutive over-report, refill catch-up across a
+            // simulated clock jump, coin hold/settle under concurrent
+            // settlement, receipt sequence gaps, and reciprocal netting
+            // replays. Each is a decision the gate makes before any account is
+            // contacted, from state a real subscription would have to be
+            // driven for hours to reach. The suite's HTTP and CLI cases —
+            // handshake, /limits withholding, the gate-only share listener,
+            // coin notes over the wire — spawn the built CLI and drive the
+            // real endpoints, and are deliberately outside this exception. Its
+            // header states this in full.
+            "test/continuous-test-suite-proxy-sharing.ts",
+            // `resolveToolTimeoutMs` is a pure translation table: it maps the
+            // three shapes of `toolTimeoutMs` — absent, a number, and an
+            // explicit `null` — onto a bound or no bound at all. Two of those
+            // three are indistinguishable from outside. "No bound" and "the
+            // 300_000ms default" differ only for a tool that runs longer than
+            // 300s, and a case in that suite has 60s, so a live `stream()`
+            // call cannot tell an honoured opt-out from one that silently
+            // collapsed back to the default — which is exactly the regression
+            // the opt-out exists to prevent. Every other assertion in the file
+            // drives `new NeuroLink().stream()`; this one function is the
+            // exception, and the suite's header says so.
+            "test/continuous-test-suite-anthropic-execution-control.ts",
+            // `mapThinkingLevelToBudget` is a pure level->budget translation
+            // table (THINKING_LEVEL_FRACTIONS' 0/0.25/0.55/1 split). The
+            // live cases in this suite only observe it indirectly, through
+            // `reasoningTokens` ordering on a real Gemini 2.5 call — real
+            // signal, but unable to pin the exact fractions without live
+            // credentials. Every other case drives `new NeuroLink().generate()`;
+            // this one function is the exception, and the suite's header says
+            // so.
+            "test/continuous-test-suite-gemini-thinking-level.ts",
+            // `supportsNativeAudio` (adapters/audioFormatSupport.ts) and
+            // `buildMultimodalMessagesArray` (utils/messageBuilder.ts) are
+            // internal — neither is re-exported from src/lib/index.ts, so no
+            // public surface can observe them — and for the real Vertex
+            // provider the gate never reaches the wire request: `stream()`
+            // does run it (BaseProvider's early multimodal detection), but
+            // only to look for video frames before Vertex's own
+            // `executeStream()` rebuilds the request from `options.input`,
+            // and `generate()` is overridden outright. A live call therefore
+            // cannot distinguish the fixed decision from the pre-fix one.
+            // Asserts directly on the two functions' return values/output
+            // shape instead. Its header states the exception in full.
+            "test/continuous-test-suite-native-audio-model-aware.ts",
+            // The chunked streaming adapter's endpointer and LocalAgreement
+            // are pure functions of the PCM they are fed. Driving them with a
+            // generated 16 kHz signal (shaped noise bursts at known offsets)
+            // and a scripted engine pins utterance count, commit monotonicity,
+            // the never-shrink final, `silence` and the language takeover —
+            // sequences no live engine could be made to emit on demand.
+            // `chunkedTranscribeStream` / `runTranscribeStream` are not root
+            // exports, so the suite imports everything from `src`. Its header
+            // states the exception.
+            "test/continuous-test-suite-transcribe-stream.ts",
+
+            // Deterministic native HTTP, barriers/clock and captured policy state
+            // make concurrency/cache/backoff distinguishable without live secrets.
+            // Real public status/generate/stream remain on one shipped DIST graph.
+            "test/continuous-test-suite-ollama-diagnostics.ts",
+            // The documented ModelRouter decision seam selects retained Ollama
+            // branches when its configured model is absent; discovery, wire and
+            // returned public content stay real. No SDK/provider/fetch stubs.
+            "test/continuous-test-suite-orchestrated-provider-selection.ts",
+            // Fixed Gemini usage metadata (10,000 prompt tokens, 8,000 cached,
+            // 500 output, 300 thinking) whose per-step cost is hand-computed,
+            // a stream closed or thrown into before its first chunk, a direct
+            // provider loop with no ambient span, and a site-stamped decision
+            // call with no decision provider: interleavings and inputs no live
+            // call produces on demand. `createGeminiLoopAdapter` and
+            // `runAgenticLoop` are not root exports. Everything comes from
+            // `src`; loopback fakes only. Its header states the exception.
+            "test/continuous-test-suite-observability-core-providers.ts",
+            // Tool calls whose arguments carry a marker, a NeuroLink turn run
+            // from a direct loop's tool, finish reasons and thrown values in
+            // shapes no provider sends, Gemini usage with more cached than
+            // prompt tokens, a stream result dropped unread before a forced
+            // garbage collection, and a return() racing a pending next().
+            // Everything comes from `src`; loopback fakes only. Its header
+            // states the exception.
+            "test/continuous-test-suite-observability-adv-providers.ts",
+            // What every case asserts is an absence: a loopback server that
+            // received no request, a redirect hop never taken, a file outside
+            // the roots never opened, a temp directory created 0o700. A live
+            // call cannot show any of that, and the hosts the loaders refuse
+            // must not exist on a runner. NeuroLink runs against a loopback
+            // OpenAI-compatible endpoint that records what it was sent.
+            // Everything comes from `src`. Its header states the exception.
+            "test/continuous-test-suite-security-ingestion.ts",
+            // Tool-layer hardening suite: a scripted stand-in that calls
+            // writeFile / executeBashCommand with chosen arguments on demand,
+            // hostile JSON Schemas fed to the converter and to the external
+            // MCP tool builder (`ToolsManager`, exported from no entry point)
+            // over a fake server list, two fake servers offering one tool
+            // name, and fixed payloads through `coerceJsonToSchema` and
+            // `InMemoryVectorStore`. Everything comes from `src`; loopback
+            // stand-ins only. Its header states the exception.
+            "test/continuous-test-suite-security-tools.ts",
+            // Working-directory trust suite (the working directory is not a trust boundary):
+            // import-time and cwd-time side effects — whether importing the
+            // SDK reads `<cwd>/.env`, whether `new NeuroLink()` in a
+            // directory with a hostile `.mcp-config.json` spawns anything,
+            // whether the CLI entry refuses before any server starts — that
+            // only a fresh `tsx` child with a controlled cwd and a fake HOME
+            // can show, before `dist/` is rebuilt. Loopback HTTP stand-ins,
+            // a stdio child that dumps its environment, no network, no key.
+            // Everything comes from `src`. Its header states the exception.
+            "test/continuous-test-suite-security-cwd-trust.ts",
+            // Server hardening suite (the HTTP server fails closed on the network):
+            // fixed loopback source addresses (127.0.0.1 against 127.0.0.2)
+            // and a scripted X-Forwarded-For rotation for the rate-limiter
+            // key, an exact count of WebSocket upgrades against a cap, a
+            // scripted session-secret handshake, a request made to outlive a
+            // 300 ms timeout, and a provider failure made certain by a child
+            // started with no credentials — inputs no live call produces on
+            // demand, all before `dist/` is rebuilt. Loopback only, no key,
+            // no stub. Everything comes from `src`. Its header states the
+            // exception.
+            "test/continuous-test-suite-security-server.ts",
+            // Proxy hardening suite (proxy inbound trust and the token store): a
+            // scripted upstream — a 400 from chatgpt.com and a 500 from
+            // api.anthropic.com on demand, the exact bytes the proxy put on
+            // the wire, a snapshot file planted with prompt text, a borrower
+            // whose grant exists only in a temp HOME, a legacy-codec token
+            // file written by hand — none of which a live call can produce
+            // on request, and all before `dist/` is rebuilt. The proxy is the
+            // real Hono app `neurolink proxy start` serves; the bind-policy
+            // cases drive the CLI entry in a child. No network, no key.
+            // Everything comes from `src`. Its header states the exception.
+            "test/continuous-test-suite-security-proxy.ts",
+
+            // ---------------------------------------------------------------
+            // Grandfathered when this rule was extended to cover deep `dist/`
+            // paths as well as `src/`.
+            //
+            // These predate the extension. Rewriting an import from
+            // `../src/lib/x.js` to `../dist/lib/x.js` satisfied the old rule
+            // without changing what the suite proved, so the deep-dist form
+            // became the established local pattern — `provider-structure.ts`
+            // even greps the *source text* of providerRegistry.ts. That is
+            // the corpus the rule now encodes, not evasion of it.
+            //
+            // Listing them keeps the gate green while making the rule bite
+            // for every NEW suite, which is where the value is. This block is
+            // debt, not a clean bill of health: each entry should either gain
+            // a real public surface or be converted. Do not add to this block
+            // — a new suite belongs above, with its own stated reason.
+            // ---------------------------------------------------------------
+            "test/continuous-test-suite.ts",
+            "test/continuous-test-suite-auth.ts",
+            "test/continuous-test-suite-context.ts",
+            "test/continuous-test-suite-credentials.ts",
+            "test/continuous-test-suite-error-classification-e2e.ts",
+            "test/continuous-test-suite-memory.ts",
+            "test/continuous-test-suite-observability.ts",
+            "test/continuous-test-suite-ppt.ts",
+            "test/continuous-test-suite-provider-descriptors.ts",
+            "test/continuous-test-suite-provider-structure.ts",
+            "test/continuous-test-suite-provider-wiring.ts",
+            "test/continuous-test-suite-providers-mocked.ts",
+            "test/continuous-test-suite-providers.ts",
+            "test/continuous-test-suite-skills.ts",
+            "test/continuous-test-suite-tool-dedup.ts",
+            "test/continuous-test-suite-voice.ts",
+            // Matrix rows for catalog providers derive from the built
+            // catalog JSON — an exact-data enumeration no live call can
+            // produce; the deep dist import keeps the helper on the same
+            // module graph as the dist-importing suites that consume it.
+            "test/helpers/providerMatrix.ts",
+          ],
+        },
+      ],
+
       // Disable base rules that are covered by TypeScript
       "no-unused-vars": "off",
       "no-undef": "off",
@@ -207,6 +856,20 @@ export default [
     },
   },
   {
+    // This directory is excluded from tsconfig.json, so type-aware linting
+    // (project) is disabled here. The matched .ts file is the server-side
+    // package entry (re-exports only); no browser globals are needed.
+    files: ["src/lib/server/voice/public/**/*.ts"],
+    languageOptions: {
+      parser: tsparser,
+      parserOptions: {
+        ecmaVersion: "latest",
+        sourceType: "module",
+        project: null,
+      },
+    },
+  },
+  {
     // CommonJS files (e.g., Docusaurus config) - allow module.exports and require
     files: ["docs-site/**/*.js"],
     languageOptions: {
@@ -231,10 +894,13 @@ export default [
       "package/**",
       ".git/**",
       ".git_disabled/**",
+      // Claude Code local scratch worktrees (agent/workflow isolation copies) - not source
+      ".claude/worktrees/**",
+      // Vendored Whistle engine (emscripten output) and model, pinned from Hugging Face.
+      "models/whistle/**",
       "docs/cli-recordings/**",
       "docs/visual-content/**",
       "neurolink-demo/**",
-      "scripts/**",
       "memory-bank/**",
       "archive/**",
       "examples/**",
@@ -247,6 +913,8 @@ export default [
       "debug-output.txt",
       "demo-results.json",
       "batch-results.json",
+      // Scratch artifacts produced by the voice fix campaign — not source.
+      "test-results/**",
       "package-lock.json",
       "pnpm-lock.yaml",
       "*.tgz",
@@ -255,6 +923,20 @@ export default [
       // Exclude built documentation site and generated files
       "site/**",
       "_site/**",
+      // Exclude landing build outputs and Svelte files (handled by landing workspace)
+      "landing/.vercel/**",
+      "landing/.svelte-kit/**",
+      "landing/**/*.svelte",
+      // Exclude Docusaurus build output
+      "docs-site/.docusaurus/**",
+      "docs-site/build/**",
+      // Exclude compiled MCP server output files
+      "docs-site/mcp-server/**/*.js",
+      // Test scratch directories (suite-local temp files that come and go
+      // during runs; eslint racing them produces ENOENT errors)
+      "test/.tmp/**",
+      "test/.tmp-*/**",
+      ".tmp-tests/**",
     ],
   },
 ];

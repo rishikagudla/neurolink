@@ -3,13 +3,67 @@
  * Handles format conversion for different AI providers
  */
 
+import { basename } from "path";
+import { SUPPORTED_INPUT_IMAGE_MIME_TYPES } from "../adapters/imageFormatSupport.js";
 import { logger } from "./logger.js";
+import {
+  redactPathFromMessage,
+  redactUrlForError,
+  redactUrlsInText,
+  sanitizeErrorCause,
+} from "./logSanitize.js";
 import { urlDownloadRateLimiter } from "./rateLimiter.js";
 import { withRetry } from "./retryHandler.js";
 import { SYSTEM_LIMITS } from "../core/constants.js";
+import { SIZE_LIMITS_BYTES } from "../processors/config/sizeLimits.js";
 import { getImageCache } from "./imageCache.js";
-import type { ProcessedImage } from "../types/multimodal.js";
-import type { FileProcessingResult } from "../types/fileTypes.js";
+import { ErrorFactory, NeuroLinkError } from "./errorHandling.js";
+import { detectIsoBmffImageMimeType, hasFtypBoxSignature } from "./isoBmff.js";
+import type { ProcessedImage, FileProcessingResult } from "../types/index.js";
+
+/**
+ * Minimum bytes required just to detect an image format from magic bytes (#293).
+ */
+export const MIN_IMAGE_SIZE = 12;
+
+/**
+ * Minimum plausible byte size for a non-empty image of each format (#293). A
+ * buffer that carries a format's magic bytes but is smaller than this is
+ * truncated/corrupt and would fail (or render blank) downstream — reject early
+ * with a clear message instead.
+ *
+ * Each threshold approximates the smallest byte count that format's
+ * container can structurally be while still holding the mandatory
+ * header/chunk skeleton for a minimal (e.g. 1×1 pixel) image — not an exact
+ * spec minimum, but close enough that anything smaller is unambiguously
+ * truncated:
+ *  - **PNG (67)**: 8-byte signature + IHDR chunk (4 len + 4 type + 13 data +
+ *    4 CRC = 25) + a minimal IDAT chunk carrying one zlib-compressed
+ *    scanline (~22 bytes) + IEND chunk (4 len + 4 type + 0 data + 4 CRC =
+ *    12) — matches the commonly-cited size of the smallest possible valid
+ *    PNG (a 1×1 transparent pixel).
+ *  - **JPEG (125)**: SOI + APP0/JFIF marker (18) + at least one DQT
+ *    quantization table (~69 for one 8-bit luma table) + SOF0 + DHT + SOS
+ *    headers + a minimal entropy-coded scan + EOI — the smallest legal
+ *    baseline-JPEG skeleton for a 1×1 image.
+ *  - **GIF (43)**: 6-byte GIF87a/89a header + 7-byte Logical Screen
+ *    Descriptor + a 2-color (6-byte) color table + 10-byte Image
+ *    Descriptor + minimal LZW-coded image sub-blocks + 1-byte trailer.
+ *  - **WEBP (20)**: RIFF container header ("RIFF" + size + "WEBP" = 12
+ *    bytes) + the first chunk's fourCC + size (8 bytes) — enough to confirm
+ *    a well-formed RIFF/WEBP container and its first chunk, before any
+ *    actual VP8/VP8L bitstream payload.
+ *  - **AVIF (100)**: ISOBMFF `ftyp` box plus the mandatory `meta` box
+ *    skeleton (`hdlr`/`pitm`/`iloc`/`iinf` sub-boxes) — roughly the minimum
+ *    to hold AVIF's required box structure before any AV1 image item data.
+ */
+export const MIN_VALID_IMAGE_SIZE: Record<string, number> = {
+  "image/png": 67,
+  "image/jpeg": 125,
+  "image/gif": 43,
+  "image/webp": 20,
+  "image/avif": 100,
+};
 
 /**
  * Network error codes that should trigger a retry
@@ -21,6 +75,156 @@ const RETRYABLE_ERROR_CODES = new Set([
   "ETIMEDOUT",
   "ERR_NETWORK",
 ]);
+
+/**
+ * Bytes of prologue {@link hasSvgRoot} decodes and scans.
+ *
+ * A real SVG reaches its root within a few hundred bytes, so 4KB is generous.
+ * The cap exists because scanning the whole buffer made every unrecognized
+ * binary — and every BMP/TIFF/ICO/AVIF, whose checks run after this one — pay
+ * a full UTF-8 decode, and let a crafted unterminated doctype walk every byte
+ * (measured: 322ms on 32MB, 69ms to reject a 16MB BMP).
+ */
+const SVG_PROLOGUE_SCAN_BYTES = 4096;
+
+/**
+ * Find an SVG root after XML's permitted leading constructs.
+ *
+ * Deliberately a discriminator, not an XML parser. Raster magic is checked
+ * first; this only distinguishes text reaching an SVG root after a UTF-8 BOM,
+ * XML whitespace, processing instructions, comments, or a doctype. The doctype
+ * scanner tracks quotes, comments/PIs, and the internal subset so a `>` or
+ * `]` inside any of them cannot expose a later `<svg` early. The root itself
+ * may carry an XML namespace prefix (`<s:svg xmlns:s="...">`), which is
+ * accepted alongside the bare `<svg` form.
+ *
+ * Scanning a bounded window makes "unterminated" ambiguous, and the two cases
+ * must resolve OPPOSITE ways:
+ *
+ *  - the WINDOW ran out — the rest of the document is unreadable from here, so
+ *    fail CLOSED and answer SVG. This function gates a rejection, so answering
+ *    raster on an unterminated prologue would hand back the exact bypass it
+ *    exists to close: prepend filler past the window and sail through as
+ *    raster. A raster file never opens `<!--` or `<!doctype`, so the
+ *    false-positive cost is a skipped image; the other direction is the
+ *    vulnerability.
+ *  - the BUFFER ran out — the whole document was read and is malformed, so it
+ *    is genuinely not an SVG.
+ */
+function hasSvgRoot(input: Buffer): boolean {
+  const windowed = input.length > SVG_PROLOGUE_SCAN_BYTES;
+  const text = input
+    .subarray(0, Math.min(input.length, SVG_PROLOGUE_SCAN_BYTES))
+    .toString("utf8");
+  let position = text.charCodeAt(0) === 0xfeff ? 1 : 0;
+
+  const skipWhitespace = (): void => {
+    while (/\s/.test(text[position] ?? "")) {
+      position++;
+    }
+  };
+
+  const skipDoctype = (): boolean => {
+    let quote: '"' | "'" | undefined;
+    let subsetDepth = 0;
+    let index = position + 9;
+    while (index < text.length) {
+      const char = text[index];
+      if (quote) {
+        if (char === quote) {
+          quote = undefined;
+        }
+        index++;
+        continue;
+      }
+      // Comments and processing instructions are valid markup inside the
+      // internal subset (and, leniently, anywhere else in the declaration)
+      // and may themselves contain `]` or `>` — e.g. `<!-- ] > -->`. Skip
+      // them as opaque spans, the same way the outer scan does, so their
+      // contents can never be misread as the subset-close or doctype-end
+      // delimiter.
+      if (text.startsWith("<!--", index)) {
+        const end = text.indexOf("-->", index + 4);
+        if (end < 0) {
+          return false;
+        }
+        index = end + 3;
+        continue;
+      }
+      if (text.startsWith("<?", index)) {
+        const end = text.indexOf("?>", index + 2);
+        if (end < 0) {
+          return false;
+        }
+        index = end + 2;
+        continue;
+      }
+      if (char === '"' || char === "'") {
+        quote = char;
+      } else if (char === "[") {
+        subsetDepth++;
+      } else if (char === "]" && subsetDepth > 0) {
+        subsetDepth--;
+      } else if (char === ">" && subsetDepth === 0) {
+        position = index + 1;
+        return true;
+      }
+      index++;
+    }
+    return false;
+  };
+
+  skipWhitespace();
+  while (position < text.length) {
+    if (text.startsWith("<?", position)) {
+      const end = text.indexOf("?>", position + 2);
+      if (end < 0) {
+        return windowed;
+      }
+      position = end + 2;
+    } else if (text.startsWith("<!--", position)) {
+      const end = text.indexOf("-->", position + 4);
+      if (end < 0) {
+        return windowed;
+      }
+      position = end + 3;
+    } else if (
+      text.slice(position, position + 9).toLowerCase() === "<!doctype"
+    ) {
+      if (!skipDoctype()) {
+        return windowed;
+      }
+    } else {
+      break;
+    }
+    skipWhitespace();
+  }
+
+  const rest = text.slice(position);
+  // Accepts an optional XML namespace prefix ahead of the tag name — an
+  // NCName (letters/digits/`.`/`-`/`_`, not starting with a digit) followed
+  // by `:` — so `<s:svg xmlns:s="...">` matches the same way bare `<svg`
+  // does.
+  if (/^<(?:[A-Za-z_][\w.-]*:)?svg(?:[\s/>])/i.test(rest)) {
+    return true;
+  }
+  // A fixed "`<svg` plus its delimiter is 5 characters" cutoff only worked
+  // when the tag name was the literal `svg`. With a namespace prefix now
+  // accepted, the prefix is unbounded (any NCName), so no fixed length can
+  // bound "may still be mid-token" — `<s:svg` (6 chars) is just as
+  // truncatable as `<svg` (4) was. Instead, check whether `rest` could still
+  // be the START of a string this function would accept: an optional NCName
+  // prefix, optionally followed by `:` and however much of the literal
+  // `svg` has been seen so far, with nothing left over. Anything left over
+  // (a character that cannot continue the prefix, isn't `:`, or doesn't
+  // continue "svg") proves `rest` can never complete into a match, so it is
+  // safe to answer false even though the window is cut. An empty `rest` is
+  // the same ambiguity in the degenerate case (no root text observed yet).
+  const isUnresolvedPrefix =
+    rest.length === 0 ||
+    /^<(?:[A-Za-z_][\w.-]*)?(?::(?:s(?:v(?:g)?)?)?)?$/i.test(rest);
+  return windowed && isUnresolvedPrefix;
+}
 
 /**
  * Determines if an HTTP error is retryable based on status code
@@ -74,6 +278,28 @@ function isRetryableDownloadError(error: unknown): boolean {
 }
 
 /**
+ * Reject `detectImageType()`'s `application/octet-stream` sentinel — the
+ * honest "no known image signature (PNG/JPEG/GIF/WebP/BMP/TIFF/ICO/SVG/AVIF/HEIC/HEIF)
+ * matched" fallback (#261/#286). Packaging that sentinel into a data URI
+ * hands vision providers (OpenAI/Anthropic/Google) a MIME type they reject
+ * outright with an HTTP 400, so every public conversion path that turns
+ * unknown bytes into image output must fail loud here first instead of
+ * letting the sentinel slip through to a caller.
+ *
+ * @param mediaType - The MIME type returned by `detectImageType()`.
+ * @throws Error if `mediaType` is the octet-stream sentinel.
+ */
+function assertKnownImageType(mediaType: string): void {
+  if (mediaType === "application/octet-stream") {
+    logger.error("Unable to detect a supported image format from file content");
+    throw new Error(
+      "Unsupported or corrupted image: no known image signature " +
+        "(PNG/JPEG/GIF/WebP/BMP/TIFF/ICO/SVG/AVIF/HEIC/HEIF) was found in the file content.",
+    );
+  }
+}
+
+/**
  * Image processor class for handling provider-specific image formatting
  */
 export class ImageProcessor {
@@ -89,14 +315,18 @@ export class ImageProcessor {
     content: Buffer,
     _options?: unknown,
   ): Promise<FileProcessingResult> {
-    // Validate content is non-empty before processing
-    if (content.length === 0) {
-      logger.error("Empty buffer provided");
-      throw new Error("Invalid image processing: buffer is empty");
-    }
+    // #293: reject empty AND small/truncated buffers (not just 0 bytes) before
+    // processing; returns the detected media type.
+    const mediaType = this.validateBufferNotEmpty(content);
 
-    const mediaType = this.detectImageType(content);
-    const base64 = content.toString("base64");
+    // #261/#286 follow-up: fail loud instead of packaging the octet-stream
+    // sentinel as a "valid" image (see assertKnownImageType() above).
+    assertKnownImageType(mediaType);
+
+    const base64 = ImageProcessor.safeBase64Convert(
+      content,
+      "image processing",
+    );
     const dataUri = `data:${mediaType};base64,${base64}`;
 
     // Validate output before returning
@@ -111,6 +341,92 @@ export class ImageProcessor {
         size: content.length,
       },
     } satisfies FileProcessingResult;
+  }
+
+  /**
+   * Strict magic-byte match: does `content` actually begin with `mediaType`'s
+   * signature? `detectImageType` returns `image/jpeg` as a *fallback* for
+   * unrecognized data, so a per-format minimum must only be enforced when the
+   * bytes genuinely match — otherwise valid BMP/TIFF/unknown buffers would be
+   * wrongly rejected as "truncated jpeg" (#293 review).
+   */
+  private static hasStrictImageMagic(
+    content: Buffer,
+    mediaType: string,
+  ): boolean {
+    const b = content;
+    switch (mediaType) {
+      case "image/png":
+        return (
+          b.length >= 4 &&
+          b[0] === 0x89 &&
+          b[1] === 0x50 &&
+          b[2] === 0x4e &&
+          b[3] === 0x47
+        );
+      case "image/jpeg":
+        return b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff;
+      case "image/gif":
+        return b.length >= 3 && b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46;
+      case "image/webp":
+        return (
+          b.length >= 12 &&
+          b.subarray(0, 4).toString("latin1") === "RIFF" &&
+          b.subarray(8, 12).toString("latin1") === "WEBP"
+        );
+      case "image/avif":
+        return (
+          b.length >= 12 &&
+          b.subarray(4, 8).toString("latin1") === "ftyp" &&
+          b.subarray(8, 12).toString("latin1").startsWith("avif")
+        );
+      default:
+        return false;
+    }
+  }
+
+  /**
+   * Validate that a buffer is a plausibly-complete image (#293): non-empty and,
+   * for a strictly-identified raster format, at least the minimum plausible byte
+   * size. Returns the detected media type.
+   *
+   * @throws Error when the buffer is empty or a recognized format is truncated.
+   */
+  private static validateBufferNotEmpty(content: Buffer): string {
+    if (content.length === 0) {
+      logger.error("Empty buffer provided");
+      throw ErrorFactory.imageBufferInvalid(
+        "Invalid image processing: buffer is empty",
+      );
+    }
+    const mediaType = this.detectImageType(content);
+    // SVG is text and can be legitimately tiny (e.g. `<svg/>`), so the raster
+    // size floors don't apply to it (#293 review).
+    if (mediaType === "image/svg+xml") {
+      return mediaType;
+    }
+    // A buffer too small to carry any raster header is not a usable image.
+    if (content.length < MIN_IMAGE_SIZE) {
+      throw ErrorFactory.imageBufferInvalid(
+        `Invalid image processing: buffer too small (${content.length} bytes) — ` +
+          `a minimum of ${MIN_IMAGE_SIZE} bytes is required for a valid image.`,
+      );
+    }
+    // Only enforce a per-format minimum when the format was strictly identified
+    // from magic bytes (never from detectImageType's jpeg fallback), so valid
+    // BMP/TIFF/unknown buffers are not mis-rejected as "truncated jpeg".
+    const minForFormat = MIN_VALID_IMAGE_SIZE[mediaType];
+    if (
+      minForFormat !== undefined &&
+      content.length < minForFormat &&
+      this.hasStrictImageMagic(content, mediaType)
+    ) {
+      throw ErrorFactory.imageBufferInvalid(
+        `Invalid image processing: ${mediaType} buffer is truncated ` +
+          `(${content.length} bytes, minimum ${minForFormat} for a valid ${mediaType}).`,
+      );
+    }
+    return mediaType;
   }
 
   /**
@@ -172,12 +488,21 @@ export class ImageProcessor {
       }
 
       // Handle Buffer - convert to data URI
-      const base64 = image.toString("base64");
+      const base64 = ImageProcessor.safeBase64Convert(
+        image,
+        "OpenAI image input",
+      );
       return `data:image/jpeg;base64,${base64}`;
     } catch (error) {
+      // Preserve typed errors (e.g. IMAGE_TOO_LARGE) as-is — don't flatten
+      // them into a generic Error and lose the error `code` for callers.
+      if (error instanceof NeuroLinkError) {
+        throw error;
+      }
       logger.error("Failed to process image for OpenAI:", error);
       throw new Error(
         `Image processing failed for OpenAI: ${error instanceof Error ? error.message : "Unknown error"}`,
+        { cause: error },
       );
     }
   }
@@ -207,7 +532,10 @@ export class ImageProcessor {
           base64Data = image;
         }
       } else {
-        base64Data = image.toString("base64");
+        base64Data = ImageProcessor.safeBase64Convert(
+          image,
+          "provider image input",
+        );
       }
 
       return {
@@ -215,9 +543,15 @@ export class ImageProcessor {
         data: base64Data, // Google wants base64 WITHOUT data URI prefix
       };
     } catch (error) {
+      // Preserve typed errors (e.g. IMAGE_TOO_LARGE) as-is — don't flatten
+      // them into a generic Error and lose the error `code` for callers.
+      if (error instanceof NeuroLinkError) {
+        throw error;
+      }
       logger.error("Failed to process image for Google AI:", error);
       throw new Error(
         `Image processing failed for Google AI: ${error instanceof Error ? error.message : "Unknown error"}`,
+        { cause: error },
       );
     }
   }
@@ -247,7 +581,10 @@ export class ImageProcessor {
           base64Data = image;
         }
       } else {
-        base64Data = image.toString("base64");
+        base64Data = ImageProcessor.safeBase64Convert(
+          image,
+          "provider image input",
+        );
       }
 
       return {
@@ -255,9 +592,15 @@ export class ImageProcessor {
         data: base64Data, // Anthropic wants base64 WITHOUT data URI prefix
       };
     } catch (error) {
+      // Preserve typed errors (e.g. IMAGE_TOO_LARGE) as-is — don't flatten
+      // them into a generic Error and lose the error `code` for callers.
+      if (error instanceof NeuroLinkError) {
+        throw error;
+      }
       logger.error("Failed to process image for Anthropic:", error);
       throw new Error(
         `Image processing failed for Anthropic: ${error instanceof Error ? error.message : "Unknown error"}`,
+        { cause: error },
       );
     }
   }
@@ -282,9 +625,15 @@ export class ImageProcessor {
         return ImageProcessor.processImageForGoogle(image);
       }
     } catch (error) {
+      // Preserve typed errors bubbling up from processImageForGoogle/
+      // processImageForAnthropic (e.g. IMAGE_TOO_LARGE) as-is.
+      if (error instanceof NeuroLinkError) {
+        throw error;
+      }
       logger.error("Failed to process image for Vertex AI:", error);
       throw new Error(
         `Image processing failed for Vertex AI: ${error instanceof Error ? error.message : "Unknown error"}`,
+        { cause: error },
       );
     }
   }
@@ -356,65 +705,197 @@ export class ImageProcessor {
           }
         }
 
-        // SVG: check for "<svg" or "<?xml" at start (text-based)
-        if (input.length >= 4) {
-          const start = input.subarray(0, 4).toString();
-          if (start === "<svg" || start === "<?xm") {
-            return "image/svg+xml";
-          }
+        // SVG is text-based and may legally put a BOM, whitespace, an XML
+        // declaration, comments, or a doctype before its root element.
+        if (hasSvgRoot(input)) {
+          return "image/svg+xml";
         }
 
-        // AVIF: check for "ftypavif" signature at bytes 4-11
-        if (input.length >= 12) {
-          const ftyp = input.subarray(4, 8).toString();
-          const brand = input.subarray(8, 12).toString();
-          if (ftyp === "ftyp" && brand === "avif") {
-            return "image/avif";
-          }
+        // ISO-BMFF images: "ftyp" box at offset 4, major brand at offset 8.
+        // AVIF has codec-specific major brands. HEIC uses HEVC image/sequence
+        // brands, while generic HEIF structural brands (mif1/msf1) need a
+        // compatible codec brand to avoid mistaking AVIF or generic MP4 data
+        // for HEIF.
+        const isoBmffMimeType = detectIsoBmffImageMimeType(input);
+        if (isoBmffMimeType) {
+          return isoBmffMimeType;
+        }
+
+        // JPEG 2000, in both shapes it ships in. The JP2 container opens with
+        // the 12-byte signature box `00 00 00 0C 6A 50 20 20 0D 0A 87 0A`; a
+        // bare codestream (.j2k/.j2c) opens with the SOC+SIZ markers FF 4F FF
+        // 51. Checked BEFORE ICO because the container's first three bytes are
+        // 00 00 00, which is one byte away from ICO's 00 00 01 00 and shares
+        // its leading zeros — an ordering mistake here would classify every
+        // JPEG 2000 as an icon rather than merely failing to recognise it.
+        // All twelve bytes are checked, not just the length and brand: the
+        // trailing 0D 0A 87 0A is the signature's whole point. It is a
+        // line-ending probe — CR LF, a high byte, LF — that a transfer which
+        // mangles newlines or strips the eighth bit will visibly corrupt, so
+        // skipping it accepts exactly the damaged files it exists to reject.
+        if (
+          input.length >= 12 &&
+          input[0] === 0x00 &&
+          input[1] === 0x00 &&
+          input[2] === 0x00 &&
+          input[3] === 0x0c &&
+          input.subarray(4, 8).toString("latin1") === "jP  " &&
+          input[8] === 0x0d &&
+          input[9] === 0x0a &&
+          input[10] === 0x87 &&
+          input[11] === 0x0a
+        ) {
+          return "image/jp2";
+        }
+        if (
+          input.length >= 4 &&
+          input[0] === 0xff &&
+          input[1] === 0x4f &&
+          input[2] === 0xff &&
+          input[3] === 0x51
+        ) {
+          return "image/jp2";
+        }
+
+        // ICO: 00 00 01 00 (icon type=1)
+        if (
+          input[0] === 0x00 &&
+          input[1] === 0x00 &&
+          input[2] === 0x01 &&
+          input[3] === 0x00 &&
+          !hasFtypBoxSignature(input)
+        ) {
+          return "image/x-icon";
+        }
+
+        // BMP: "BM" magic (0x42 0x4D)
+        if (input[0] === 0x42 && input[1] === 0x4d) {
+          return "image/bmp";
+        }
+
+        // TIFF: little-endian "II*\0" or big-endian "MM\0*"
+        if (
+          (input[0] === 0x49 &&
+            input[1] === 0x49 &&
+            input[2] === 0x2a &&
+            input[3] === 0x00) ||
+          (input[0] === 0x4d &&
+            input[1] === 0x4d &&
+            input[2] === 0x00 &&
+            input[3] === 0x2a)
+        ) {
+          return "image/tiff";
         }
       }
 
-      return "image/jpeg"; // Default fallback
+      // No known image signature matched. Return a safe, honest sentinel
+      // rather than mislabeling arbitrary bytes as JPEG (#261): a wrong
+      // image/jpeg label silently corrupts the downstream provider request.
+      logger.warn(
+        "Could not detect image type from magic bytes; using application/octet-stream",
+      );
+      return "application/octet-stream";
     } catch (error) {
       logger.warn("Failed to detect image type, using default:", error);
-      return "image/jpeg";
+      return "application/octet-stream";
     }
   }
 
   /**
-   * Validate image size (default 10MB limit)
+   * Throwing size guard for a raw byte length. Prevents memory exhaustion by
+   * rejecting an oversized input BEFORE an unbounded read/allocation happens
+   * (#257) — callers that can get a size cheaply (e.g. `fs.stat`) should
+   * validate it before ever reading the bytes into memory. Default limit is
+   * the canonical `SIZE_LIMITS_BYTES.IMAGE_MAX` (10 MB); there is no public
+   * way to raise it — `maxSize` is an internal-only override for advanced
+   * callers (e.g. video image inputs use a higher limit).
+   *
+   * @param size - Byte length to validate
+   * @param context - Short label identifying the source (unused in the
+   *   thrown message today, kept for call-site readability and future use)
+   * @param maxSize - Max allowed size in bytes
+   * @throws NeuroLinkError (`INVALID_IMAGE_SIZE`) if `size` is not a finite,
+   *   non-negative number
+   * @throws NeuroLinkError (`IMAGE_TOO_LARGE`) if `size` exceeds `maxSize`
    */
-  static validateImageSize(
-    data: Buffer | string,
-    maxSize: number = 10 * 1024 * 1024,
-  ): boolean {
-    try {
-      const size =
-        typeof data === "string"
-          ? Buffer.byteLength(data, "base64")
-          : data.length;
-      return size <= maxSize;
-    } catch (error) {
-      logger.warn("Failed to validate image size:", error);
-      return false;
+  static validateSize(
+    size: number,
+    context: string,
+    maxSize: number = SIZE_LIMITS_BYTES.IMAGE_MAX,
+  ): void {
+    // Reject a malformed maxSize before it's ever compared: `size > NaN` and
+    // `size > Infinity` (for a negative maxSize) can both evaluate `false`,
+    // which would let a corrupted/negative limit bypass the guard entirely.
+    if (!Number.isFinite(maxSize) || maxSize < 0) {
+      throw ErrorFactory.invalidConfiguration(
+        "maxSize",
+        "must be a finite, non-negative byte count",
+        { maxSize, context },
+      );
     }
+    // Fail closed on malformed sizes first: `NaN > maxSize` and
+    // `-1 > maxSize` both evaluate to `false`, which would otherwise let a
+    // corrupted stat/header value silently skip the guard below.
+    if (!Number.isFinite(size) || size < 0) {
+      throw ErrorFactory.invalidImageSize(size);
+    }
+    if (size > maxSize) {
+      const mb = (size / (1024 * 1024)).toFixed(1);
+      const maxMb = (maxSize / (1024 * 1024)).toFixed(0);
+      throw ErrorFactory.imageTooLarge(mb, maxMb);
+    }
+  }
+
+  /**
+   * Throwing size guard for image buffers. Prevents memory exhaustion by
+   * rejecting oversized buffers with a descriptive error BEFORE an unbounded
+   * `Buffer.toString("base64")` allocation (#257). Delegates to
+   * `validateSize` so buffer-based and pre-read (stat-based) callers share
+   * one implementation.
+   *
+   * @param buffer - Image buffer to validate
+   * @param context - Short label identifying the source (see `validateSize`)
+   * @param maxSize - Max allowed size in bytes
+   * @throws NeuroLinkError (`IMAGE_TOO_LARGE`) if the buffer exceeds `maxSize`
+   */
+  static validateBufferSize(
+    buffer: Buffer,
+    context: string,
+    maxSize: number = SIZE_LIMITS_BYTES.IMAGE_MAX,
+  ): void {
+    ImageProcessor.validateSize(buffer.length, context, maxSize);
+  }
+
+  /**
+   * Size-guarded Buffer → base64. Use in place of `buffer.toString("base64")`
+   * on any path that converts a caller-supplied image buffer (#257).
+   */
+  static safeBase64Convert(
+    buffer: Buffer,
+    context: string,
+    maxSize: number = SIZE_LIMITS_BYTES.IMAGE_MAX,
+  ): string {
+    ImageProcessor.validateBufferSize(buffer, context, maxSize);
+    return buffer.toString("base64");
   }
 
   /**
    * Validate image format
    */
   static validateImageFormat(mediaType: string): boolean {
-    const supportedFormats = [
-      "image/jpeg",
-      "image/png",
-      "image/gif",
-      "image/webp",
-      "image/bmp",
-      "image/tiff",
-      "image/svg+xml",
-      "image/avif",
-    ];
-    return supportedFormats.includes(mediaType.toLowerCase());
+    // Derived from the canonical input set rather than hand-listed. The old
+    // literal omitted HEIC, HEIF, ICO and JPEG 2000, so an iPhone photo
+    // attached by path was rejected here — "Invalid MIME type: image/heic is
+    // not in allowed list" — before the transcode that exists to accept it
+    // could run. Intake has to allow every format we can convert, not just the
+    // ones providers take unchanged.
+    //
+    // Still excludes "application/octet-stream": that is detectImageType()'s
+    // honest sentinel for bytes matching no known image signature (#261), not
+    // a real format. Vision providers reject it with an HTTP 400, so process()
+    // must fail loud rather than package it as a valid image (see the
+    // octet-stream guard in process() below).
+    return SUPPORTED_INPUT_IMAGE_MIME_TYPES.has(mediaType.toLowerCase());
   }
 
   /**
@@ -434,11 +915,67 @@ export class ImageProcessor {
         return { width, height };
       }
 
-      // Basic JPEG dimension extraction (simplified)
+      // JPEG dimension extraction via SOF marker parsing
       if (buffer.length >= 4 && buffer[0] === 0xff && buffer[1] === 0xd8) {
-        // This is a very basic implementation
-        // For production, consider using a proper image library
-        return null;
+        // Search for SOF0 (0xFFC0) or SOF2 (0xFFC2) markers
+        let offset = 2;
+        while (offset < buffer.length - 1) {
+          // Find next marker (0xFF followed by non-zero, non-0xFF byte)
+          if (buffer[offset] !== 0xff) {
+            offset++;
+            continue;
+          }
+
+          // Skip any padding 0xFF bytes
+          while (offset < buffer.length && buffer[offset] === 0xff) {
+            offset++;
+          }
+
+          if (offset >= buffer.length) {
+            break;
+          }
+
+          const marker = buffer[offset];
+          offset++;
+
+          // Check for SOF0 (0xC0 - baseline DCT) and SOF2 (0xC2 - progressive DCT)
+          // These are the most common JPEG encoding modes
+          if (marker === 0xc0 || marker === 0xc2) {
+            // SOF marker found: length (2 bytes) + precision (1 byte) + height (2 bytes) + width (2 bytes)
+            if (offset + 7 > buffer.length) {
+              break; // Truncated file
+            }
+            const height = buffer.readUInt16BE(offset + 3);
+            const width = buffer.readUInt16BE(offset + 5);
+            return { width, height };
+          }
+
+          // Skip this marker's segment (except for markers without length)
+          if (
+            marker === 0xd0 ||
+            marker === 0xd1 ||
+            marker === 0xd2 ||
+            marker === 0xd3 ||
+            marker === 0xd4 ||
+            marker === 0xd5 ||
+            marker === 0xd6 ||
+            marker === 0xd7 ||
+            marker === 0xd8 ||
+            marker === 0xd9 ||
+            marker === 0x01
+          ) {
+            // RST0-RST7, SOI, EOI, TEM - no length field
+            continue;
+          }
+
+          if (offset + 2 > buffer.length) {
+            break; // Truncated file
+          }
+          const segmentLength = buffer.readUInt16BE(offset);
+          offset += segmentLength;
+        }
+
+        return null; // No SOF marker found
       }
 
       return null;
@@ -457,7 +994,19 @@ export class ImageProcessor {
     model?: string,
   ): ProcessedImage {
     try {
+      // #257: reject an oversized buffer before any format-detection or
+      // conversion work runs on it — mirrors the guard every
+      // `processImageForX()` branch below already applies via
+      // `safeBase64Convert()`, so the typed IMAGE_TOO_LARGE error surfaces
+      // here too instead of being pre-empted by the octet-stream check next.
+      if (Buffer.isBuffer(image)) {
+        ImageProcessor.validateBufferSize(image, "image processing");
+      }
       const mediaType = ImageProcessor.detectImageType(image);
+      // #261/#286 follow-up: reject the octet-stream sentinel here too — the
+      // returned ProcessedImage.mediaType is what callers use to build a
+      // data URI, so this is a separate public path that must not emit it.
+      assertKnownImageType(mediaType);
       const size =
         typeof image === "string"
           ? Buffer.byteLength(image, "base64")
@@ -505,7 +1054,7 @@ export class ImageProcessor {
               ? image.split(",")[1] || image
               : image;
           } else {
-            data = image.toString("base64");
+            data = ImageProcessor.safeBase64Convert(image, "image input");
           }
           format = "base64";
       }
@@ -517,13 +1066,45 @@ export class ImageProcessor {
         format,
       };
     } catch (error) {
+      // Preserve typed errors (e.g. IMAGE_TOO_LARGE) bubbling up from the
+      // provider-specific branches above as-is.
+      if (error instanceof NeuroLinkError) {
+        throw error;
+      }
       logger.error(`Failed to process image for ${provider}:`, error);
       throw new Error(
         `Image processing failed: ${error instanceof Error ? error.message : "Unknown error"}`,
+        { cause: error },
       );
     }
   }
 }
+
+/**
+ * Whitelist of valid image file extensions (lowercase, no dots).
+ * Used to validate file extensions against a known set of image formats.
+ */
+export const VALID_IMAGE_EXTENSIONS = [
+  "jpg",
+  "jpeg",
+  "png",
+  "gif",
+  "webp",
+  "bmp",
+  "tiff",
+  "tif",
+  "svg",
+  "avif",
+  "ico",
+  "heic",
+  "heif",
+];
+
+/**
+ * Set of valid image extensions for O(1) lookup.
+ * @internal
+ */
+const VALID_IMAGE_EXTENSIONS_SET = new Set<string>(VALID_IMAGE_EXTENSIONS);
 
 /**
  * Utility functions for image handling
@@ -558,11 +1139,54 @@ export const imageUtils = {
   isBase64: (str: string): boolean => imageUtils.isValidBase64(str),
 
   /**
-   * Extract file extension from filename or URL
+   * Extract file extension from filename or URL.
+   * Strips query strings and fragments before matching so that
+   * "image.jpg?v=1" correctly returns "jpg".
+   * Returns null if no extension is found or if the extension
+   * contains non-alphanumeric characters.
    */
   getFileExtension: (filename: string): string | null => {
-    const match = filename.match(/\.([^.]+)$/);
-    return match ? match[1].toLowerCase() : null;
+    const sanitized = filename.split(/[?#]/)[0];
+    const match = sanitized.match(/\.([^.]+)$/);
+    if (!match) {
+      return null;
+    }
+    const extension = match[1].toLowerCase();
+    if (!/^[a-z0-9]+$/.test(extension)) {
+      return null;
+    }
+    return extension;
+  },
+
+  /**
+   * Validate that an extension is a recognised image format.
+   * Case-insensitive; rejects extensions with special characters.
+   */
+  isValidImageExtension: (extension: string): boolean => {
+    if (!extension || typeof extension !== "string") {
+      return false;
+    }
+    const normalizedExt = extension.toLowerCase();
+    if (!/^[a-z0-9]+$/.test(normalizedExt)) {
+      return false;
+    }
+    return VALID_IMAGE_EXTENSIONS_SET.has(normalizedExt);
+  },
+
+  /**
+   * Extract and validate image file extension from a filename or URL.
+   * Returns null if the extension is missing or not a recognised image format.
+   *
+   * Security note: the last extension is used, so "malware.exe.jpg" returns
+   * "jpg". Callers should apply additional checks (e.g. content inspection)
+   * where double-extension attacks are a concern.
+   */
+  getValidatedImageExtension: (filename: string): string | null => {
+    const extension = imageUtils.getFileExtension(filename);
+    if (!extension) {
+      return null;
+    }
+    return imageUtils.isValidImageExtension(extension) ? extension : null;
   },
 
   /**
@@ -579,10 +1203,23 @@ export const imageUtils = {
   },
 
   /**
-   * Convert Buffer to base64 string
+   * Convert Buffer to base64 string. Guarded by the same #257 size limit as
+   * every other conversion site (default `SIZE_LIMITS_BYTES.IMAGE_MAX`);
+   * pass `maxBytes` to override for a caller with a legitimate need for a
+   * different ceiling rather than silently accepting an unbounded buffer.
+   * `imageUtils`/`ImageProcessor` are internal-only — not re-exported from
+   * `src/lib/index.ts` or the package's public `exports` map — so this
+   * default does not change behavior for any external SDK consumer.
    */
-  bufferToBase64: (buffer: Buffer): string => {
-    return buffer.toString("base64");
+  bufferToBase64: (
+    buffer: Buffer,
+    maxBytes: number = SIZE_LIMITS_BYTES.IMAGE_MAX,
+  ): string => {
+    return ImageProcessor.safeBase64Convert(
+      buffer,
+      "buffer-to-base64",
+      maxBytes,
+    );
   },
 
   /**
@@ -593,6 +1230,16 @@ export const imageUtils = {
     const cleanBase64 = base64.includes(",") ? base64.split(",")[1] : base64;
     return Buffer.from(cleanBase64, "base64");
   },
+
+  /**
+   * Redact `filePath` (both as given and its `path.resolve()`'d form) from
+   * an error message. Exposed directly (not just used internally by
+   * {@link fileToBase64DataUri}) so the resolved-path branch can be verified
+   * by a deterministic unit test — real `fs` errors only ever embed the
+   * literal path as passed, never a resolved variant, so that branch isn't
+   * otherwise observable through the async file-reading API.
+   */
+  redactPathFromMessage,
 
   /**
    * Convert file path to base64 data URI
@@ -624,12 +1271,41 @@ export const imageUtils = {
         ImageProcessor.detectImageType(buffer) ||
         ImageProcessor.detectImageType(filePath);
 
+      // #261/#286 follow-up: reject the octet-stream sentinel here too —
+      // this is a third public path (alongside process() and
+      // processImage()) that can otherwise package unknown bytes into a
+      // `data:application/octet-stream;base64,...` URI a vision provider
+      // rejects outright.
+      assertKnownImageType(mimeType);
+
       const base64 = buffer.toString("base64");
       return `data:${mimeType};base64,${base64}`;
     } catch (error) {
-      throw new Error(
-        `Failed to convert file to base64: ${error instanceof Error ? error.message : "Unknown error"}`,
+      // Full path stays in the debug log; the thrown (potentially
+      // client-facing) error only gets the basename. The underlying fs
+      // error's own message is scrubbed too — Node's ENOENT/EACCES text
+      // embeds the full path verbatim (e.g. "no such file or directory,
+      // stat '/full/path'"), which would otherwise leak the host's
+      // directory layout right back through the "reason" suffix. The raw
+      // `error` is never attached as `cause` either — that would leave the
+      // unredacted path reachable via `error.cause.message` for anything
+      // that walks the cause chain (cause-aware logging, telemetry); a
+      // sanitized copy (via the shared `sanitizeErrorCause`) is attached
+      // instead, mirroring `urlToBase64DataUri` below.
+      logger.debug("fileToBase64DataUri failed", { filePath, error });
+      const safeName = basename(filePath);
+      const cause = sanitizeErrorCause(error, { filePath });
+      const reason = error instanceof Error ? cause.message : "Unknown error";
+      // Assigned to a variable before throwing (rather than `throw new
+      // Error(...)` inline) so the sanitized `cause` — a deliberately NEW,
+      // redacted Error — isn't mistaken by tooling for a dropped/altered
+      // reference to the originally caught `error`; the raw error is never
+      // reachable from the thrown result at all, by design.
+      const wrapped = new Error(
+        `Failed to convert file to base64 (${safeName}): ${reason}`,
+        { cause },
       );
+      throw wrapped;
     }
   },
 
@@ -674,7 +1350,9 @@ export const imageUtils = {
     const cache = getImageCache();
     const cached = cache.get(url);
     if (cached) {
-      logger.debug("Using cached image for URL", { url: url.substring(0, 50) });
+      logger.debug("Using cached image for URL", {
+        url: redactUrlForError(url),
+      });
       return cached.dataUri;
     }
 
@@ -705,7 +1383,13 @@ export const imageUtils = {
           );
         }
 
-        const len = Number(response.headers.get("content-length") || 0);
+        const contentLengthHeader = response.headers.get("content-length");
+        const len = Number(contentLengthHeader || 0);
+
+        if (contentLengthHeader !== null && len === 0) {
+          throw new Error("Empty response: content-length is 0");
+        }
+
         if (len && len > maxBytes) {
           throw new Error(`Content too large: ${len} bytes`);
         }
@@ -738,18 +1422,37 @@ export const imageUtils = {
         maxDelay: SYSTEM_LIMITS.DEFAULT_MAX_DELAY,
         retryCondition: isRetryableDownloadError,
         onRetry: (attempt: number, error: unknown) => {
-          const message =
-            error instanceof Error ? error.message : String(error);
+          // Some fetch/DNS/TLS errors embed the full request URL (including
+          // a presigned query token) in `error.message` — redact that text
+          // too, not just the explicit `url` interpolation below. The
+          // non-Error branch is sanitized too: String(error) on a thrown
+          // non-Error value (e.g. a raw string or object) can just as
+          // easily carry the same signed URL.
+          const message = redactUrlsInText(
+            error instanceof Error ? error.message : String(error),
+          );
           const attemptsLeft = maxAttempts - attempt;
           logger.warn(
-            `⚠️ Image download attempt ${attempt} failed for ${url}: ${message}. ${attemptsLeft} ${attemptsLeft === 1 ? "attempt" : "attempts"} remaining...`,
+            `⚠️ Image download attempt ${attempt} failed for ${redactUrlForError(url)}: ${message}. ${attemptsLeft} ${attemptsLeft === 1 ? "attempt" : "attempts"} remaining...`,
           );
         },
       });
     } catch (error) {
-      throw new Error(
-        `Failed to download and convert URL to base64: ${error instanceof Error ? error.message : "Unknown error"}`,
+      // Query string / fragment stripped — a presigned S3/GCS URL or SAS
+      // token embedded there must not be echoed into a thrown error. The
+      // underlying error's own message is scrubbed too, since fetch/DNS/TLS
+      // errors often embed the full URL (query string and all) themselves.
+      // The raw `error` is never attached as `cause` — that would leave the
+      // unredacted URL reachable via `error.cause.message` for anything
+      // that walks the cause chain (cause-aware logging, telemetry); a
+      // sanitized copy is attached instead.
+      const sourceUrl = redactUrlForError(url);
+      const cause = sanitizeErrorCause(error);
+      const wrapped = new Error(
+        `Failed to download and convert URL to base64 (${sourceUrl}): ${cause.message}`,
+        { cause },
       );
+      throw wrapped;
     }
   },
 

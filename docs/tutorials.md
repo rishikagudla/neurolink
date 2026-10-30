@@ -1,3 +1,8 @@
+---
+title: Step-by-Step Integration Tutorials
+slug: tutorials/step-by-step
+---
+
 # 📚 Step-by-Step Integration Tutorials
 
 ## 🚀 Quick Start (15 minutes) {#quick-start-15-minutes}
@@ -115,7 +120,53 @@ npx @juspay/neurolink generate "Cinematic camera movement" \
 
 For complete documentation, see the [Video Generation Guide](features/video-generation.md).
 
-## �🌐 Web App Integration
+## 📊 PPT Generation Tutorial
+
+Generate professional PowerPoint presentations using the CLI:
+
+```bash
+# Basic presentation generation
+npx @juspay/neurolink generate "Create a 10-slide presentation about AI in healthcare" \
+  --outputMode ppt \
+  --pptOutput ./healthcare-ai.pptx
+
+# Full options with custom theme and AI images
+npx @juspay/neurolink generate "Create a sales deck for our SaaS product" \
+  --provider vertex \
+  --model gemini-2.5-pro \
+  --outputMode ppt \
+  --pptTheme corporate \
+  --pptPages 12 \
+  --pptOutput ./sales-deck.pptx
+```
+
+**SDK Usage:**
+
+```typescript
+import { NeuroLink } from "@juspay/neurolink";
+import { writeFile } from "fs/promises";
+
+const neurolink = new NeuroLink();
+
+const result = await neurolink.generate({
+  input: { text: "Create a product launch presentation" },
+  output: {
+    mode: "ppt",
+    ppt: {
+      theme: "modern",
+      pages: 10,
+      generateAIImages: true,
+      outputPath: "./launch-deck.pptx",
+    },
+  },
+});
+
+console.log(`Generated ${result.ppt?.totalSlides} slides`);
+```
+
+For complete documentation, see the [PPT Generation Guide](features/ppt-generation.md).
+
+## 🌐 Web App Integration
 
 ### Express.js API
 
@@ -339,13 +390,17 @@ NeuroLink can maintain a stateful conversation history, making it easy to build 
 
 ### Step 1: Enable Context Summarization
 
-To enable this feature, simply call the `enableContextSummarization()` method on your `NeuroLink` instance.
+To enable this feature, turn on conversation memory with summarization when you create your `NeuroLink` instance.
 
 ```javascript
 const { NeuroLink } = require("@juspay/neurolink");
 
-const neurolink = new NeuroLink();
-neurolink.enableContextSummarization();
+const neurolink = new NeuroLink({
+  conversationMemory: {
+    enabled: true,
+    enableSummarization: true,
+  },
+});
 
 console.log("Conversational agent ready. I will remember our conversation.");
 ```

@@ -1,8 +1,15 @@
+---
+description: The NeuroLink CLI provides a professional command-line interface for AI text generation, provider management, and workflow automation.
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
 # CLI Guide
 
 The NeuroLink CLI provides a professional command-line interface for AI text generation, provider management, and workflow automation.
 
-## 🎯 Overview
+## Overview
 
 The CLI is designed for:
 
@@ -11,99 +18,96 @@ The CLI is designed for:
 - **System administrators** who manage AI provider configurations
 - **Researchers** who experiment with different AI models and providers
 
-## 🚀 Quick Reference
+## Quick Reference
 
-=== "Basic Commands"
+<Tabs>
+<TabItem value="basic-commands" label="Basic Commands">
 
-    ```bash
-    # Text generation (primary commands)
-    neurolink generate "Your prompt here"
-    neurolink gen "Your prompt"           # Short form
+```bash
+# Text generation (primary commands)
+neurolink generate "Your prompt here"
+neurolink gen "Your prompt"           # Short form
 
-    # Real-time streaming
-    neurolink stream "Tell me a story"
+# Real-time streaming
+neurolink stream "Tell me a story"
 
-    # Provider management
-    neurolink status                      # Check all providers
-    neurolink provider status --verbose  # Detailed diagnostics
-    ```
+# Provider management
+neurolink status                      # Check all providers
+neurolink provider status --verbose  # Detailed diagnostics
+```
 
-=== "Advanced Usage"
+</TabItem>
+<TabItem value="advanced-usage" label="Advanced Usage">
 
-    ```bash
-    # With analytics and evaluation
-    neurolink generate "Write code" --enable-analytics --enable-evaluation
+```bash
+# With analytics and evaluation
+neurolink generate "Write code" --enable-analytics --enable-evaluation
 
-    # Custom provider and model
-    neurolink gen "Explain AI" --provider openai --model gpt-4
+# Custom provider and model
+neurolink gen "Explain AI" --provider openai --model gpt-4
 
-    # Batch processing
-    echo -e "Prompt 1\nPrompt 2" | neurolink batch prompts.txt
+# Batch processing from a file
+neurolink batch prompts.txt
 
-    # Output to file
-    neurolink generate "Documentation" --output result.md
-    ```
+# Output to file
+neurolink generate "Documentation" --output result.md
+```
 
-=== "MCP Tools"
+</TabItem>
+<TabItem value="mcp-tools" label="MCP Tools">
 
-    ```bash
-    # Built-in tools (working)
-    neurolink generate "What time is it?" --debug
+```bash
+# Built-in tools (working)
+neurolink generate "What time is it?" --debug
 
-    # Disable tools
-    neurolink generate "Pure text" --disable-tools
+# Disable tools
+neurolink generate "Pure text" --disable-tools
 
-    # MCP server management
-    neurolink mcp discover
-    neurolink mcp list
-    neurolink mcp install <server>
-    ```
+# MCP server management
+neurolink mcp discover
+neurolink mcp list
+neurolink mcp install <server>
+```
 
-=== "Server Management"
+</TabItem>
+<TabItem value="server-management" label="Server Management">
 
-    ```bash
-    # Start server in foreground
-    neurolink serve --port 3000 --framework hono
+```bash
+# Start server in foreground
+neurolink serve --port 3000 --framework hono
 
-    # Background server management
-    neurolink server start --port 8080
-    neurolink server status
-    neurolink server stop
+# Background server management
+neurolink server start --port 8080
+neurolink server status
+neurolink server stop
 
-    # View and manage routes
-    neurolink server routes
-    neurolink server routes --group agent --format json
+# Claude proxy + local telemetry
+neurolink proxy setup
+neurolink proxy status
+neurolink proxy telemetry setup
+neurolink proxy telemetry status
 
-    # Configuration management
-    neurolink server config
-    neurolink server config --set defaultPort=8080
-    ```
+# View and manage routes
+neurolink server routes
+neurolink server routes --group agent --format json
 
-## 📚 Documentation Sections
+# Configuration management
+neurolink server config
+neurolink server config --set defaultPort=8080
+```
 
-<div class="grid cards" markdown>
+</TabItem>
+</Tabs>
 
-- :material-book-open: **[Commands Reference](commands.md)**
+## Documentation Sections
 
-  ***
+- **[Commands Reference](commands.md)** — Complete reference for all CLI commands, options, and parameters with detailed explanations.
+- **[Examples](examples.md)** — Practical examples and common usage patterns for different scenarios and workflows.
+- **[Advanced Usage](advanced.md)** — Advanced features like batch processing, streaming, analytics, and custom configurations.
+- **[Claude Proxy](../features/claude-proxy.md)** — Multi-account Claude proxy setup, lifecycle commands, routing, and local service management.
+- **[Claude Proxy Observability](../features/claude-proxy-observability.md)** — Local OpenObserve stack setup, dashboard import, and how to read proxy logs, traces, and metrics.
 
-  Complete reference for all CLI commands, options, and parameters with detailed explanations.
-
-- :material-code-block-tags: **[Examples](examples.md)**
-
-  ***
-
-  Practical examples and common usage patterns for different scenarios and workflows.
-
-- :material-rocket: **[Advanced Usage](advanced.md)**
-
-  ***
-
-  Advanced features like batch processing, streaming, analytics, and custom configurations.
-
-</div>
-
-## 🔧 Installation
+## Installation
 
 The CLI requires no installation for basic usage:
 
@@ -116,7 +120,7 @@ npm install -g @juspay/neurolink
 neurolink generate "Hello, AI"
 ```
 
-## ⚙️ Configuration
+## Configuration
 
 The CLI automatically loads configuration from:
 
@@ -133,23 +137,23 @@ echo 'GOOGLE_AI_API_KEY="AIza-your-key"' >> .env
 neurolink status
 ```
 
-## 🎮 Interactive Features
+## Interactive Features
 
 The CLI includes several interactive and automation features:
 
-!!! tip "Auto-Provider Selection"
+:::tip[Auto-Provider Selection]
+NeuroLink automatically selects the best available provider based on configuration and performance.
+:::
 
-    NeuroLink automatically selects the best available provider based on configuration and performance.
+:::info[Built-in Tools]
+All commands include 6 built-in tools by default: time, file operations, math calculations, and more.
+:::
 
-!!! example "Built-in Tools"
+:::note[Streaming Support]
+Real-time streaming displays results as they're generated, perfect for long-form content.
+:::
 
-    All commands include 6 built-in tools by default: time, file operations, math calculations, and more.
-
-!!! note "Streaming Support"
-
-    Real-time streaming displays results as they're generated, perfect for long-form content.
-
-## 🔗 Integration
+## Integration
 
 The CLI works seamlessly with:
 
@@ -158,7 +162,7 @@ The CLI works seamlessly with:
 - **Git hooks** for documentation updates
 - **Cron jobs** for scheduled AI tasks
 
-## 🆘 Getting Help
+## Getting Help
 
 ```bash
 # General help

@@ -1,0 +1,78 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / CatalogModelSpec
+
+# Type Alias: CatalogModelSpec
+
+> **CatalogModelSpec** = `object`
+
+## Properties
+
+### contextWindow?
+
+> `optional` **contextWindow?**: `number`
+
+---
+
+### maxOutputTokens?
+
+> `optional` **maxOutputTokens?**: `number`
+
+The model's own output-token limit. Enforced at runtime: for a provider
+with no PROVIDER_MAX_TOKENS row, getSafeMaxTokens clamps a larger
+requested maxTokens to this value. Record only a number the vendor states
+as a hard limit; omit it when the source is a roster field that looks
+derived from the context window, because an omitted value leaves the
+model uncapped while a wrong one silently truncates callers.
+
+---
+
+### pricingPerMTok?
+
+> `optional` **pricingPerMTok?**: [`CatalogPricingPerMTok`](CatalogPricingPerMTok.md)
+
+---
+
+### vision
+
+> **vision**: `boolean`
+
+---
+
+### tools?
+
+> `optional` **tools?**: `boolean`
+
+Per-model override of the provider-level `capabilities.tools`, for a
+"model-dependent" provider whose vendor docs name which specific models
+accept tool definitions (e.g. Reka: its Models table has a Tools column,
+Yes for reka-edge-2603 and No for reka-flash-3). Absent means "inherit
+the provider-level answer", same as every model before this field
+existed. Only meaningful when `capabilities.tools` is
+`"model-dependent"` — a provider that already declares a plain
+`true`/`false` has no need for it, since that single value already
+applies to every model it serves.
+
+---
+
+### status
+
+> **status**: [`CatalogModelStatus`](CatalogModelStatus.md)
+
+---
+
+### description
+
+> **description**: `string`
+
+---
+
+### enumMember?
+
+> `optional` **enumMember?**: `string`
+
+Enum member name override. Default is the derived constant-case of the
+model id; REQUIRED where the derived name differs from a pre-existing
+exported member (public-surface compatibility).

@@ -1,3 +1,17 @@
+---
+title: "PDF File Support"
+description: Attach PDF documents directly to AI prompts for document analysis, information extraction, and content processing
+keywords:
+  [
+    pdf,
+    file-support,
+    multimodal,
+    document-analysis,
+    native-pdf,
+    document-processing,
+  ]
+---
+
 # PDF File Support
 
 NeuroLink provides seamless PDF file support as a **multimodal input type** - attach PDF documents directly to your AI prompts for document analysis, information extraction, and content processing.
@@ -51,7 +65,7 @@ const multimodal = await neurolink.generate({
 });
 
 // Streaming with PDF
-const stream = await neurolink.stream({
+const result = await neurolink.stream({
   input: {
     text: "Provide a detailed summary of this contract, highlighting key terms and obligations",
     pdfFiles: ["contract.pdf"],
@@ -59,8 +73,10 @@ const stream = await neurolink.stream({
   provider: "anthropic",
 });
 
-for await (const chunk of stream) {
-  process.stdout.write(chunk.content);
+for await (const chunk of result.stream) {
+  if ("content" in chunk) {
+    process.stdout.write(chunk.content);
+  }
 }
 ```
 
@@ -141,6 +157,115 @@ pdfFiles: [pdfBuffer];
 pdfFiles: ["invoice.pdf", pdfBuffer, "./report.pdf"];
 ```
 
+### Encrypted (Password-Protected) PDFs
+
+Providers without native PDF support fall back to rendering each page to an
+image. When the source PDF is encrypted, supply the open password so that
+image-conversion path can decrypt it. The password is only used locally
+during rendering — it is never sent to the model.
+
+```typescript
+// SDK — pass the password via pdfOptions
+const result = await neurolink.generate({
+  input: { text: "Summarise this statement", pdfFiles: ["./secured.pdf"] },
+  provider: "azure", // vision provider that renders PDF pages to images
+  pdfOptions: { password: "s3cret" },
+});
+```
+
+```bash
+# CLI — preferred: set NEUROLINK_PDF_PASSWORD so the password never appears
+# in shell history, `ps`/process listings, or CI logs.
+NEUROLINK_PDF_PASSWORD=s3cret neurolink generate "Summarise this statement" \
+  --pdf ./secured.pdf --provider azure
+
+# CLI — --pdf-password is still supported for convenience, but is visible in
+# shell history and process listings. Using it prints a one-line warning
+# recommending NEUROLINK_PDF_PASSWORD instead.
+neurolink generate "Summarise this statement" \
+  --pdf ./secured.pdf --provider azure --pdf-password s3cret
+```
+
+`--pdf-password` takes precedence when both are set. Both work for `generate`
+and `stream`.
+
+Error behaviour (both SDK and CLI):
+
+| Situation                        | Error code               | Message                                                              |
+| -------------------------------- | ------------------------ | -------------------------------------------------------------------- |
+| Encrypted PDF, no password given | `PDF_PASSWORD_REQUIRED`  | Prompts you to supply `pdfOptions: { password }` / `--pdf-password`. |
+| Wrong password supplied          | `PDF_INCORRECT_PASSWORD` | Tells you the supplied password is incorrect.                        |
+
+> Providers with **native** PDF support (Vertex, Anthropic, Bedrock, Google
+> AI Studio) forward the raw PDF bytes to the model and do not use the
+> image-conversion path, so `password` has no effect there — an encrypted
+> PDF must be decrypted upstream for those providers.
+
+### Memory Safety: Page Canvas Limits
+
+To prevent memory exhaustion on PDFs with very large page dimensions, the
+image-conversion path caps the rendered canvas at `maxCanvasPixels`
+(default 16,777,216 px ≈ 4096×4096). Oversized pages are automatically
+downscaled to fit the cap (a WARN is logged), so a malicious or malformed
+`/MediaBox` cannot force an unbounded allocation. Override the cap via
+`pdfOptions.maxCanvasPixels` when you need higher-resolution rendering:
+
+```typescript
+pdfOptions: {
+  maxCanvasPixels: 33_554_432, // 32 MP ceiling
+}
+```
+
+### Conversion Resilience & Limits
+
+The image-fallback path (providers without native PDF support) is hardened:
+
+- **Accurate page counts (#287).** Page-limit enforcement and the reported
+  `metadata.estimatedPages` use a real pdfjs parse (time-bounded), not a header
+  regex that miscounts compressed/object-stream PDFs. It degrades to the regex
+  estimate on timeout/failure.
+- **Per-page isolation (#294).** A single page that fails to render no longer
+  discards the whole conversion — the successful pages are returned and each
+  failure is reported in `result.errors` as `{ page, error }`.
+- **Default render scale 1.5 (#297).** Lowered from 2 to roughly halve per-page
+  canvas memory; the render scale is validated to the `0.1`–`10` range, and an
+  estimated-memory line is logged before conversion.
+- **Aggregate multi-PDF limits (#309).** When several PDFs are attached, their
+  combined page count and size are checked against the provider's ceiling — N
+  files each under the single-file limit can no longer exceed it together.
+- **URL pre-flight (#317).** A remote PDF's `Content-Length` is checked with a
+  `HEAD` request before any body is downloaded, so an oversized URL is rejected
+  up front (falling back to the streaming byte guard when the header is absent).
+
+### Streaming Conversion
+
+For large documents, `PDFProcessor.convertToImagesStream()` yields each page's
+image as soon as it renders (with an optional `onProgress` callback) instead of
+buffering the whole document (#302):
+
+```typescript
+import { PDFProcessor } from "@juspay/neurolink";
+
+for await (const page of PDFProcessor.convertToImagesStream(pdfBuffer, {
+  onProgress: ({ pagesConverted, totalPages, elapsedMs }) =>
+    console.log(`${pagesConverted}/${totalPages} in ${elapsedMs}ms`),
+})) {
+  if (page.error) {
+    console.warn(`page ${page.pageIndex} failed: ${page.error}`);
+  } else {
+    handlePng(page.image); // base64 PNG
+  }
+}
+```
+
+`convertToImages()` is **not** implemented as a wrapper over this stream — it's
+a separate, parallel implementation with its own page-render loop that
+happens to return the same per-page `errors` contract (an array of
+`{ page, error }` collected across the whole document instead of yielded
+per-page). Pick whichever fits the call site: `convertToImagesStream()` to
+start handling pages before the whole document finishes rendering,
+`convertToImages()` for a single buffered result.
+
 ## Provider Support
 
 ### Supported Providers
@@ -172,8 +297,10 @@ Current provider: azure-openai
 Options:
 1. Switch to a supported provider (--provider vertex or --provider openai)
 2. Convert your PDF to text manually
-3. Wait for future update (Azure OpenAI conversion coming soon)
+3. Wait for future update (Azure OpenAI conversion is planned)
 ```
+
+> **PDF-to-image page-size guard:** for providers reached via the image-conversion fallback, each page is rendered to a bounded canvas. A page whose dimensions × render scale would exceed the per-page pixel ceiling (`PDF_LIMITS.DEFAULT_MAX_CANVAS_PIXELS`, ~16.7M px ≈ 64 MB) is **uniformly downscaled** rather than allocating gigabytes of memory — so a large-format PDF (architectural drawing, map) is converted safely instead of exhausting memory. A warning is included in the conversion result when downscaling occurs.
 
 ### Provider-Specific Features
 
@@ -199,7 +326,7 @@ await neurolink.generate({
     pdfFiles: ["invoice.pdf"],
   },
   provider: "anthropic",
-  model: "claude-3-5-sonnet-20241022", // Latest model
+  model: "claude-sonnet-4-6", // Latest model
 });
 ```
 
@@ -410,7 +537,7 @@ try {
 
 ```typescript
 // For long documents, use streaming to get results faster
-const stream = await neurolink.stream({
+const result = await neurolink.stream({
   input: {
     text: "Provide a detailed analysis of this 50-page report",
     pdfFiles: ["long-report.pdf"],
@@ -419,8 +546,10 @@ const stream = await neurolink.stream({
   maxTokens: 8000,
 });
 
-for await (const chunk of stream) {
-  process.stdout.write(chunk.content);
+for await (const chunk of result.stream) {
+  if ("content" in chunk) {
+    process.stdout.write(chunk.content);
+  }
 }
 ```
 
@@ -720,7 +849,7 @@ See `examples/pdf-analysis.ts` for complete working examples:
    ↓
 5. Pass Buffer to messageBuilder
    ↓
-6. Format as Vercel AI SDK file type
+6. Format as the provider's native file/document part
    ↓
 7. Send to provider's native PDF API
    ↓
@@ -795,7 +924,6 @@ type FileProcessingResult = {
 
 Planned features for PDF support:
 
-- **OpenAI Support**: PDF-to-text conversion for GPT models
 - **OCR Integration**: Extract text from scanned PDFs
 - **Page Selection**: Analyze specific pages only
 - **PDF Generation**: Create PDFs from AI responses
@@ -814,7 +942,7 @@ Found a bug or have a feature request? Please:
 
 ## Changelog
 
-### Version 7.50.0 (Current)
+### Version 9.2.0 (Current)
 
 - ✅ Initial PDF support for Vertex AI, Anthropic, Bedrock, AI Studio
 - ✅ Auto-detection via `--file` flag

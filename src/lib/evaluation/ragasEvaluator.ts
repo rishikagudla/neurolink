@@ -2,10 +2,18 @@ import type {
   EnhancedEvaluationContext,
   EvaluationResult,
   GetPromptFunction,
-} from "../types/evaluationTypes.js";
+} from "../types/index.js";
 import { AIProviderFactory } from "../core/factory.js";
 import { PromptBuilder } from "./prompts.js";
 import { logger } from "../utils/logger.js";
+import {
+  SpanSerializer,
+  SpanType,
+  SpanStatus,
+  getMetricsAggregator,
+} from "../observability/index.js";
+import { withSpan } from "../telemetry/withSpan.js";
+import { tracers } from "../telemetry/tracers.js";
 
 /**
  * Implements a RAGAS-style evaluator that uses a "judge" LLM to score the
@@ -27,7 +35,7 @@ export class RAGASEvaluator {
     this.evaluationModel =
       evaluationModel ||
       process.env.NEUROLINK_RAGAS_EVALUATION_MODEL ||
-      "gemini-1.5-flash";
+      "gemini-2.5-flash";
     this.providerName =
       providerName ||
       process.env.NEUROLINK_RAGAS_EVALUATION_PROVIDER ||
@@ -47,39 +55,95 @@ export class RAGASEvaluator {
   public async evaluate(
     context: EnhancedEvaluationContext,
   ): Promise<EvaluationResult> {
-    const startTime = Date.now();
-    const prompt = this.promptBuilder.buildEvaluationPrompt(
-      context,
-      this.promptGenerator,
-    );
+    return withSpan(
+      {
+        name: "neurolink.evaluation.ragas",
+        tracer: tracers.sdk,
+        observationType: "span",
+        attributes: {
+          "evaluation.provider": this.providerName,
+          "evaluation.model": this.evaluationModel,
+        },
+      },
+      async (otelSpan) => {
+        const span = SpanSerializer.createSpan(
+          SpanType.EVALUATION,
+          "evaluation.ragas",
+          {
+            "evaluation.dimension": "relevance|accuracy|completeness",
+            "ai.provider": this.providerName,
+            "ai.model": this.evaluationModel,
+          },
+        );
+        const startTime = Date.now();
+        try {
+          const prompt = this.promptBuilder.buildEvaluationPrompt(
+            context,
+            this.promptGenerator,
+          );
 
-    const provider = await AIProviderFactory.createProvider(
-      this.providerName,
-      this.evaluationModel,
-    );
+          const provider = await AIProviderFactory.createProvider(
+            this.providerName,
+            this.evaluationModel,
+          );
 
-    const result = await provider.generate({
-      input: { text: prompt },
-    });
+          const result = await provider.generate({
+            input: { text: prompt },
+          });
 
-    if (!result) {
-      throw new Error("Evaluation generation failed to return a result.");
-    }
+          if (!result) {
+            throw new Error("Evaluation generation failed to return a result.");
+          }
 
-    const rawEvaluationResponse = result.content;
-    const parsedResult = this.parseEvaluationResponse(rawEvaluationResponse);
-    const evaluationTime = Date.now() - startTime;
+          const rawEvaluationResponse = result.content;
+          const parsedResult = this.parseEvaluationResponse(
+            rawEvaluationResponse,
+          );
+          const evaluationTime = Date.now() - startTime;
 
-    const finalResult: EvaluationResult = {
-      ...parsedResult,
-      isPassing: parsedResult.finalScore >= this.threshold, // This will be recalculated, but is needed for the type
-      evaluationModel: this.evaluationModel,
-      evaluationTime,
-      attemptNumber: context.attemptNumber,
-      rawEvaluationResponse,
-    };
+          const finalResult: EvaluationResult = {
+            ...parsedResult,
+            isPassing: parsedResult.finalScore >= this.threshold, // This will be recalculated, but is needed for the type
+            evaluationModel: this.evaluationModel,
+            evaluationTime,
+            attemptNumber: context.attemptNumber,
+            rawEvaluationResponse,
+          };
 
-    return finalResult;
+          // Write evaluation scores to OTel span for Langfuse visibility
+          otelSpan.setAttribute(
+            "evaluation.relevance_score",
+            finalResult.relevanceScore,
+          );
+          otelSpan.setAttribute(
+            "evaluation.accuracy_score",
+            finalResult.accuracyScore,
+          );
+          otelSpan.setAttribute(
+            "evaluation.completeness_score",
+            finalResult.completenessScore,
+          );
+          otelSpan.setAttribute(
+            "evaluation.final_score",
+            finalResult.finalScore,
+          );
+          otelSpan.setAttribute("evaluation.is_passing", finalResult.isPassing);
+
+          span.durationMs = Date.now() - startTime;
+          const endedSpan = SpanSerializer.endSpan(span, SpanStatus.OK);
+          getMetricsAggregator().recordSpan(endedSpan);
+
+          return finalResult;
+        } catch (error) {
+          span.durationMs = Date.now() - startTime;
+          const endedSpan = SpanSerializer.endSpan(span, SpanStatus.ERROR);
+          endedSpan.statusMessage =
+            error instanceof Error ? error.message : String(error);
+          getMetricsAggregator().recordSpan(endedSpan);
+          throw error;
+        }
+      },
+    ); // end withSpan
   }
 
   /**

@@ -10,17 +10,45 @@ Common questions and answers about NeuroLink usage, configuration, and troublesh
 
 ### Q: Which AI providers does NeuroLink support?
 
-**A:** NeuroLink supports 9+ AI providers:
+**A:** NeuroLink ships AI providers for text generation, streaming, and decision-making — plus separate provider systems for voice and media generation. The text and multimodal providers include:
 
-- **OpenAI** (GPT-4, GPT-4o, GPT-3.5-turbo)
-- **Google AI Studio** (Gemini models)
-- **Google Vertex AI** (Gemini, Claude via Vertex)
-- **Anthropic** (Claude 3.5 Sonnet, Haiku, Opus)
-- **AWS Bedrock** (Claude, Titan models)
+- **OpenAI** (GPT-4o, GPT-4.1, o3, o4-mini)
+- **Google AI Studio** (Gemini 3 Flash/Pro, Gemini 2.5 Pro/Flash)
+- **Google Vertex AI** (Gemini 3, Claude via Vertex)
+- **Anthropic** (Claude Opus 4.7, Sonnet 4.6, 4.5 Opus/Sonnet/Haiku)
+- **AWS Bedrock** (Claude, Titan, Nova models)
 - **Azure OpenAI** (GPT models)
 - **Hugging Face** (Open source models)
 - **Ollama** (Local AI models)
 - **Mistral AI** (Mistral models)
+- **LiteLLM** (100+ models via proxy)
+- **AWS SageMaker** (Custom endpoints)
+- **OpenAI-compatible** (Any OpenAI-API-compatible endpoint)
+- **OpenRouter** (300+ models via OpenRouter)
+- **DeepSeek** (DeepSeek V3, R1)
+- **NVIDIA NIM** (Llama 3.3 70B, 400+ catalog models)
+- **LM Studio** (Local models loaded in LM Studio)
+- **llama.cpp** (Local GGUF models via llama-server)
+- **Groq, Cerebras, SambaNova, Together AI, Fireworks AI, Perplexity, Cloudflare Workers AI, xAI, Baseten, GMI Cloud, Inception Labs, io.net Intelligence, Mancer, Upstage, API Route** (zero-quirk OpenAI-wire-compatible catalog providers)
+- **Cohere** (chat, plus `embed()` and reranking)
+- **Voyage AI**, **Jina AI** (embedding and/or reranking only — no chat completions)
+- **TypeSafe Jev**, **Laya**, **XOR**, **SubQ**, **Perplexity Decisions**, **Cloudflare Clef**, **OpenAI Decisions**, **ScaleDown** (decision-only — serve `decide()`, not `generate()`/`stream()`; tried in the order TypeSafe, Laya, XOR, SubQ, Perplexity, Cloudflare Clef, OpenAI Decisions, ScaleDown when several are configured; Clef is configured by the same `CLOUDFLARE_API_KEY` and `CLOUDFLARE_ACCOUNT_ID` as the Cloudflare Workers AI text provider, and OpenAI Decisions by the same `OPENAI_API_KEY` as the OpenAI chat provider, except that this key is not used by default while `OPENAI_BASE_URL`, `OPENAI_API_BASE` or `credentials.openai.baseURL` names a host other than `https://api.openai.com`, since it is then a gateway's; ScaleDown is configured by its own `SCALEDOWN_API_KEY`, which no other provider reads)
+
+See [Provider Setup](../getting-started/provider-setup.md) for the complete roster with setup guides.
+
+Voice providers (a separate system from the providers above):
+
+- **OpenAI TTS** (TTS-1, TTS-1-HD, GPT-4o Audio)
+- **ElevenLabs** (Multilingual v2, Turbo v2.5, Flash v2.5)
+- **Deepgram** (Nova-3, Nova-2, Enhanced — STT)
+- **Azure Speech** (Azure Cognitive Services TTS + STT)
+- **Google TTS / STT** (Google Cloud Speech)
+- **Whisper** (OpenAI Whisper — STT)
+- **Fish Audio** (TTS)
+- **Cartesia** (TTS)
+- **OpenAI Realtime** + **Gemini Live** (realtime voice APIs)
+
+Media generation providers (image / video / music / avatar) — Kling, Runway, Replicate, Beatoven, Lyria, D-ID, HeyGen. See [Media Generation](../features/index.md) for the full list.
 
 ### Q: Do I need to install anything?
 
@@ -257,11 +285,11 @@ npx @juspay/neurolink gen "What time is it?" --debug
 npx @juspay/neurolink stream "Tell me a story"
 
 # SDK streaming
-const stream = await neurolink.stream({
+const result = await neurolink.stream({
   input: { text: "Tell me a story" }
 });
 
-for await (const chunk of stream) {
+for await (const chunk of result.stream) {
   console.log(chunk.content);
 }
 ```

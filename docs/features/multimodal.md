@@ -12,7 +12,7 @@ NeuroLink provides comprehensive multimodal support, allowing you to combine tex
 
 **Supported Input Types:**
 
-- **Images** - JPEG, PNG, GIF, WebP, HEIC (vision-capable models)
+- **Images** - JPEG, PNG, GIF, WebP, AVIF, HEIC (vision-capable models)
 - **PDFs** - Document analysis and content extraction
 - **CSV/Spreadsheets** - Data analysis and tabular content processing
 - **Audio** - Transcription, analysis, and real-time voice input ([Audio Input Guide](audio-input.md))
@@ -75,11 +75,11 @@ Not all providers support all multimodal capabilities. Use this matrix to select
 
 ### CSV/Spreadsheet Data
 
-| Provider          | Supported | Max Rows | Format Options      | Notes                                 |
-| ----------------- | --------- | -------- | ------------------- | ------------------------------------- |
-| **All Providers** | ✅        | 10,000   | raw, json, markdown | Universal support - processed as text |
+| Provider                | Supported | Max Rows | Format Options      | Notes                             |
+| ----------------------- | --------- | -------- | ------------------- | --------------------------------- |
+| **Supported Providers** | ✅        | 10,000   | raw, json, markdown | Broad support - processed as text |
 
-CSV support works with **all providers** because files are converted to text before sending to the AI model. The file is parsed and formatted (raw CSV, JSON, or Markdown table) before inclusion in the prompt.
+CSV support works across **supported providers** because files are converted to text before sending to the AI model. The file is parsed and formatted (raw CSV, JSON, or Markdown table) before inclusion in the prompt.
 
 **Format Recommendations:**
 
@@ -103,7 +103,69 @@ For comprehensive audio documentation, see the [Audio Input Guide](audio-input.m
 
 ---
 
+### Video
+
+Two mechanisms, and which one a provider gets changes what it can answer.
+
+**Native (inline)** — the video file itself travels in the request. The model
+sees continuous motion and hears the audio track. Only Google's Gemini front
+ends accept this today.
+
+**Frame extraction** — ffmpeg pulls keyframes at intervals and they are
+attached as ordinary images, alongside a metadata summary in the prompt text.
+The model sees a handful of stills and hears nothing.
+
+| Provider                             | Mechanism        | Inline ceiling | Audio track | Default frame budget |
+| ------------------------------------ | ---------------- | -------------- | ----------- | -------------------- |
+| **Google AI Studio**                 | Native (inline)  | 14 MB          | ✅ heard    | 16 (fallback only)   |
+| **Google Vertex AI** (Gemini models) | Native (inline)  | 14 MB          | ✅ heard    | 16 (fallback only)   |
+| **OpenAI / Azure OpenAI**            | Frame extraction | –              | ❌          | 8                    |
+| **Anthropic / AWS Bedrock**          | Frame extraction | –              | ❌          | 8                    |
+| **Mistral**                          | Frame extraction | –              | ❌          | 8                    |
+| **LiteLLM / OpenRouter**             | Frame extraction | –              | ❌          | 8                    |
+| **Ollama / llama.cpp**               | Frame extraction | –              | ❌          | 4                    |
+
+The 14 MB ceiling is one **shared source-byte budget for the whole request**,
+not a separate per-clip limit. Before a clip ships natively, its bytes are
+added to the source bytes of every inline part already in the request, and
+the clip is delivered only if the total stays within 14 MB. Those parts
+include images (keyframes among them), PDFs, audio and any clip accepted
+earlier. With nothing else attached, that reduces to the clip's own size.
+The budget is in source bytes because inline data travels as base64 in a
+JSON body, which costs four bytes per three, and Gemini rejects a request
+over 20 MB. 14 MB of source encodes to ~18.7 MB, leaving headroom for the
+prompt and the request envelope. 15 MB would encode to exactly 20.0 MB, with
+nothing left over. A PDF that ends up sent as extracted text may still be
+counted, which errs toward an unnecessary keyframe fallback rather than an
+oversized request. Falling back is not an error: the clip goes as keyframes,
+and a line naming the reason is logged.
+
+Whichever mechanism applies, the metadata summary (duration, resolution,
+codec, frame rate) is always folded into the prompt text.
+
+> **ffmpeg is optional, and its absence is not symmetric.** Frame extraction
+> shells out to ffmpeg at runtime. Without it a video attached to a
+> frame-extraction provider yields the metadata summary and nothing visual —
+> no error, just an empty `keyframes` array. Native delivery needs no ffmpeg
+> at all, so on a machine without it Gemini still receives the whole clip.
+
+#### Supported containers
+
+`.mp4`, `.webm`, `.mov`, `.avi`, `.mkv`, `.mpeg`, `.flv`, `.wmv`, `.3gp` and
+the other formats in the detector's video registry are all accepted for frame
+extraction. Inline delivery is narrower — it is limited to the containers
+Gemini reads directly (mp4, mpeg, mov, avi, flv, webm, wmv, 3gpp) — and a
+container outside that set falls back to keyframes rather than being
+re-encoded. Transcoding a long recording mid-request costs minutes of CPU for
+a payload that would usually breach the inline ceiling anyway.
+
 ## Image Input
+
+> **Security:** an image or file given as a URL is fetched only over HTTPS from
+> a public host, with redirects re-checked per hop; one given as a path is read
+> from anywhere unless `attachments.allowedRoots` is set. Both are controlled
+> by the `attachments` constructor option — see
+> [Attachment Security](/docs/features/attachment-security).
 
 ### Quick Start
 
@@ -153,7 +215,11 @@ const result = await neurolink.generate({
 - PNG (`.png`)
 - GIF (`.gif`)
 - WebP (`.webp`)
-- HEIC (`.heic`, `.heif`) - iOS photos
+- AVIF (`.avif`) - detected from content (`avif`/`avis`/`avio` brands) as well as extension
+- BMP (`.bmp`), TIFF (`.tif`, `.tiff`) - detected from content
+- HEIC (`.heic`, `.heif`) - detected from HEIC/HEIF content brands as well as extension; unsupported provider formats still require PNG/JPEG conversion
+
+The MIME type is sniffed from the buffer's magic bytes, not assumed from the filename. A buffer whose bytes match no known image format is labeled `application/octet-stream` (with a warning) rather than silently mislabeled as JPEG.
 
 **Input methods:**
 
@@ -378,7 +444,131 @@ const result = await neurolink.generate({
 - **Use JSON format for structured processing** when AI needs to manipulate data
 - **Limit to 1000 rows by default** (configurable up to 10,000)
 - **Combine CSV with visualization images** for comprehensive analysis
-- **Works with ALL providers** (not just vision-capable models)
+- **Works across supported providers** (not just vision-capable models)
+
+---
+
+## Video Input
+
+### SDK usage
+
+```typescript
+// Auto-detect: the same `files` array used for every other format
+const result = await neurolink.generate({
+  input: {
+    text: "What happens in this clip, and what is said?",
+    files: ["./demo.mp4"],
+  },
+  provider: "google-ai",
+});
+
+// Explicit: `videoFiles` is folded into `files` before detection runs
+const result = await neurolink.generate({
+  input: {
+    text: "Summarise this recording",
+    videoFiles: ["./standup.mp4"],
+  },
+  provider: "vertex",
+});
+```
+
+### Frame-extraction options
+
+`frames`, `quality` and `format` control the keyframes and do not change a clip sent natively. `transcribeAudio` does not look at the provider: on Gemini it still adds a transcript next to the audio the model hears, so set it for frame-path providers only.
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "Describe each scene", files: ["./demo.mp4"] },
+  provider: "openai",
+  videoOptions: {
+    frames: 16, // Keyframe budget. Clamped to the processor ceiling of 100.
+    quality: 90, // Encoder quality 1-100. Default 80.
+    format: "jpeg", // "jpeg" | "png". Default jpeg.
+    // Transcribe the clip's speech and include it as text. Needs ffmpeg
+    // and a speech-to-text engine; see below.
+    transcribeAudio: true,
+  },
+});
+```
+
+Without an explicit `frames`, the interval is chosen from the clip's duration
+— roughly every second for clips under 10s, widening to one frame a minute
+for recordings over half an hour, always capped at 100 frames.
+
+### CLI usage
+
+```bash
+# Auto-detect
+neurolink generate "Describe this video" --file demo.mp4 --provider google-ai
+
+# Explicit flag
+neurolink generate "Summarise this" --video standup.mp4 --provider vertex
+
+# Frame-extraction knobs
+neurolink generate "Describe each scene" --file demo.mp4 \
+  --provider openai --video-frames 16 --video-quality 90 --video-format jpeg
+```
+
+`--transcribe-audio` (or `videoOptions.transcribeAudio`) gives a frame-path
+provider the clip's speech, which keyframes cannot carry. The audio track is
+extracted with ffmpeg, transcribed by the configured speech-to-text engine
+(the same selection as `neurolink.transcribe()`; see the
+[transcribe guide](../features/transcribe.md)), and sent alongside the keyframes under a
+`Spoken Audio (transcribed)` heading. Transcription is additive: when it cannot
+run — the clip has no audio track, the speech-to-text backend is not
+configured, the extracted audio is over the 25 MB limit, or extraction or the
+transcription request fails — the request still succeeds with the keyframes and
+metadata, and a `No transcript for <file>: <reason>` warning says which. A
+Gemini provider does not need it while the clip is delivered natively, since
+that includes the audio track; a clip that falls back to keyframes (over the
+inline ceiling) loses its speech unless `--transcribe-audio` is set.
+
+Embedded **subtitle tracks** are extracted separately and included whenever
+they exist, with or without `transcribeAudio`.
+
+### Asking which mechanism applies
+
+The capability table is exported, so a caller can ask before sending — useful
+for choosing a provider, or for budgeting.
+
+```typescript
+import {
+  estimateVideoTokens,
+  getVideoProviderConfig,
+  supportsNativeVideo,
+} from "@juspay/neurolink";
+
+supportsNativeVideo("google-ai"); // true
+supportsNativeVideo("openai"); // false
+getVideoProviderConfig("nope"); // null — not described, not "takes frames"
+
+// Duration drives the native price; frame count drives the other one.
+estimateVideoTokens({ provider: "google-ai", durationSec: 60 }); // ~15,600
+estimateVideoTokens({ provider: "openai", durationSec: 60, frameCount: 8 }); // ~2,000
+```
+
+### Best practices
+
+- **Ask an audio question of a Gemini provider only.** Nothing on the frame
+  path can hear the clip, so "what was said" has no answer there.
+- **Keep clips under 14 MB when you want native delivery.** Re-encoding a
+  screen recording at a lower bitrate usually gets a long clip under the
+  ceiling without losing anything a model would read.
+- **Raise `frames` rather than `quality` for detail over time.** Frames cost
+  roughly 250 tokens each regardless of quality; more of them is what buys
+  coverage of a clip where things change.
+- **Lower `frames` for local runtimes.** Ollama and llama.cpp hold every
+  frame in the same memory as the model; four is the practical default.
+
+### Troubleshooting
+
+| Symptom                                             | Cause                                                                                                                       | Fix                                                                    |
+| --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| Model describes the file but not its content        | No keyframes extracted — ffmpeg missing — and the provider takes frames                                                     | Install ffmpeg, or use a Gemini provider, which needs none             |
+| `Sending keyframes instead of the clip` in the logs | The clip failed the inline gate; the reason is on the same line                                                             | Shorten or re-encode it, or accept the frames                          |
+| Model cannot hear speech on a Gemini provider       | The clip exceeded the inline ceiling and fell back to frames                                                                | Get the source under 14 MB, or pass `--transcribe-audio`               |
+| `--transcribe-audio` produced no transcript         | The `No transcript for` warning names the reason: no audio track, no speech-to-text backend configured, or audio over 25 MB | Configure an engine (see the transcribe guide), or split the recording |
+| Only the first seconds of a long clip are described | The frame budget was hit before the end                                                                                     | Raise `frames`; the interval then spreads evenly across the whole clip |
 
 ---
 
@@ -419,6 +609,25 @@ for await (const chunk of stream) {
   process.stdout.write(chunk.text ?? "");
 }
 ```
+
+### Batch with Multimodal (CLI)
+
+The `batch` command supports `--image`, `--csv`, `--pdf`, and `--video`. The file(s) are attached **identically to every prompt** in the batch (a one-line notice is printed to **stderr**, unconditionally — it is not suppressed by `--quiet`, so it never corrupts `--format json` output written to stdout):
+
+```bash
+neurolink batch questions.txt --csv sales.csv --format json
+```
+
+> `--file` (auto-detect) is **not** available in `batch`, because it collides with the `<file>` positional (the prompts-list path). Use the explicit `--image` / `--csv` / `--pdf` / `--video` flags instead.
+
+### File validation & troubleshooting (CLI)
+
+Before any provider call, the CLI validates local file inputs across `generate`, `stream`, and `batch`:
+
+- A path that points at a **directory**, doesn't exist, or can't be read (e.g. a permissions error) is rejected up front with a clear error and troubleshooting hints — no cryptic `EISDIR`/`EACCES` deep in processing. This also applies to the `batch` `<file>` prompts-list positional itself.
+- A **large** file (images > 10 MB, CSV/PDF > 50 MB) prints a non-blocking warning to **stderr**. Like the batch attachment notice, this is unconditional — visible without `--debug` and regardless of `--quiet` — and never mixes into stdout, so `--format json` output stays valid JSON even when large-file warnings fire.
+
+This runs even under `--dry-run` and without API keys configured.
 
 ---
 
@@ -562,6 +771,7 @@ const result = await neurolink.generate({
 - [Audio Input](audio-input.md) - Transcription, analysis, and real-time voice
 - [TTS Integration](tts.md) - Text-to-Speech audio output
 - [Video Generation](video-generation.md) - AI-powered video creation
+- [PPT Generation](ppt-generation.md) - AI-powered PowerPoint presentations
 
 **Documentation:**
 

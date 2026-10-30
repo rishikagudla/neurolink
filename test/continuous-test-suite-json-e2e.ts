@@ -1,0 +1,942 @@
+#!/usr/bin/env tsx
+/**
+ * Continuous Test Suite: JSON validity — END-TO-END (live).
+ *
+ * The real verification of the JSON-validity + huge-text fix. It makes LIVE
+ * calls to actual models across providers, with TOOLS ACTIVE (the exact
+ * condition that used to disable structured output on Vertex+Claude and force
+ * fragile hand-parsed JSON), using complex Zod schemas — including:
+ *   - an escaping torture test (code with quotes, backslashes, newlines),
+ *   - deeply-nested config and array-heavy schemas,
+ *   - a HUGE-OUTPUT case (no maxTokens → relies on the model's real output
+ *     ceiling) that used to truncate at the legacy 4096 native-path default.
+ *
+ * For every (provider, model, schema) cell it asserts:
+ *   1. result.content parses as JSON                       (syntactic validity)
+ *   2. result.structuredData is present and == content     (parsed object exposed)
+ *   3. the parsed object satisfies the Zod schema          (shape — strict cells)
+ *   4. huge-output cells: result is NOT truncated          (the maxTokens fix)
+ *
+ * Plus two dedicated huge-text tests on the production cell (Vertex+Claude):
+ *   - complete: no maxTokens → large, valid, non-truncated structured output
+ *   - forced truncation: tiny maxTokens → still valid JSON AND jsonTruncated=true
+ *     (truncation is observable, never silent)
+ *
+ * Cells that fail for provider reasons (missing key, quota, unknown model,
+ * region) are SKIPPED, not failed — only a genuine JSON-validity break fails.
+ *
+ * Run:  npx tsx test/continuous-test-suite-json-e2e.ts
+ *       npx tsx test/continuous-test-suite-json-e2e.ts --only=vertex,openai
+ */
+// Drops `directAgentTools` only — it does NOT produce a tool-free run, and
+// nothing here should be read as covering the no-tools path. The repo's
+// tracked `.mcp-config.json` auto-registers a filesystem MCP server, so ~19
+// tools still reach the wire with this set (26 without it); only an explicit
+// `disableTools` gets to zero.
+//
+// That matters for what this suite can prove. Every provider except OpenAI and
+// Azure suppresses `response_format` whenever tools are present, so for those
+// providers these cells never send a schema to the provider at all — the JSON
+// they assert on comes from the fallback re-ask, not from provider-enforced
+// structured output. A model asked for JSON usually returns JSON either way,
+// so a reply-only assertion cannot tell the two apart.
+//
+// The `response_format` branch is covered deterministically instead, against a
+// local endpoint that records the request bytes: see
+// "a schema reaches the wire as response_format only when no tools are
+// attached" in continuous-test-suite-provider-wiring.ts.
+process.env.NEUROLINK_DISABLE_BUILTIN_TOOLS = "true";
+
+// ── Outbound request capture ────────────────────────────────────────────────
+// Installed BEFORE the `dist/` import below, so a provider that binds fetch at
+// module load still sees this wrapper. The real request is always forwarded —
+// this is instrumentation, never a mock.
+//
+// It exists for one assertion. Whether a model OMITS an optional property is a
+// statement about the MODEL, and no retry budget makes it reliable: the turn
+// either volunteers the field or it does not, so N attempts only move the flake
+// probability to p^N rather than removing it. What this SDK actually owns is
+// the JSON Schema it PUTS ON THE WIRE — an optional Zod property must never be
+// promoted into the schema's `required` list. That is deterministic, observable
+// once per request, and is the contract the test below is really about.
+let captureRequests = false;
+const capturedBodies: string[] = [];
+{
+  const realFetch = globalThis.fetch.bind(globalThis);
+  globalThis.fetch = (async (
+    input: Parameters<typeof realFetch>[0],
+    init?: Parameters<typeof realFetch>[1],
+  ) => {
+    if (captureRequests && typeof init?.body === "string") {
+      capturedBodies.push(init.body);
+    }
+    return realFetch(input, init);
+  }) as typeof globalThis.fetch;
+}
+
+/**
+ * Every `required` array anywhere inside a captured request body, regardless of
+ * where the vendor nests the schema (`response_format.json_schema.schema`,
+ * a tool's `parameters`, …). Walking for it keeps the assertion independent of
+ * one vendor's envelope shape.
+ */
+function requiredListsIn(body: string): string[][] {
+  const out: string[][] = [];
+  const walk = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      node.forEach(walk);
+      return;
+    }
+    if (!node || typeof node !== "object") {
+      return;
+    }
+    const rec = node as Record<string, unknown>;
+    if (
+      Array.isArray(rec.required) &&
+      rec.required.every((k) => typeof k === "string")
+    ) {
+      out.push(rec.required as string[]);
+    }
+    Object.values(rec).forEach(walk);
+  };
+  try {
+    walk(JSON.parse(body));
+  } catch {
+    // Not JSON (multipart upload, form post) — nothing to inspect.
+  }
+  return out;
+}
+/**
+ * How many captured request bodies carry BOTH a non-empty `tools` array and a
+ * `response_format` JSON schema. OpenAI and Azure are the two providers that do
+ * not suppress `response_format` when tools ride along, so this pair on one
+ * request is what proves their tools-plus-schema branch was the one taken —
+ * a turn that dropped the tools would still carry a schema and pass without it.
+ */
+function bodiesWithToolsAndSchema(bodies: readonly string[]): number {
+  return bodies.filter((body) => {
+    try {
+      const parsed = JSON.parse(body) as {
+        tools?: unknown;
+        response_format?: { json_schema?: unknown };
+      };
+      return (
+        Array.isArray(parsed.tools) &&
+        parsed.tools.length > 0 &&
+        parsed.response_format?.json_schema !== undefined
+      );
+    } catch {
+      return false;
+    }
+  }).length;
+}
+
+import "dotenv/config";
+import { z } from "zod";
+import { tool } from "../dist/index.js";
+import { NeuroLink } from "../dist/index.js";
+import { defineSuite, assert, Skip } from "./helpers/harness.js";
+
+import { assertDistFresh } from "./helpers/distFreshness.js";
+
+// Fail loudly rather than silently testing a stale build (see distFreshness.ts).
+assertDistFresh();
+
+const { test, runSuite } = defineSuite("JSON Validity E2E (live)");
+const nl = new NeuroLink();
+
+// Optional filter: --only=vertex,openai
+const onlyArg = process.argv.find((a) => a.startsWith("--only="));
+const onlyProviders = onlyArg
+  ? onlyArg
+      .slice("--only=".length)
+      .split(",")
+      .map((s) => s.trim())
+  : null;
+
+// A harmless tool that forces tools-active (triggers the tools↔schema gate)
+// without giving the model anything dangerous to call.
+const pingTool = {
+  ping: tool({
+    description:
+      "Health check. Returns 'pong'. Do not call unless explicitly asked.",
+    inputSchema: z.object({ value: z.string().describe("anything") }),
+    execute: async () => "pong",
+  }),
+};
+
+// The shape the SDK returns for a schema request (after this fix).
+type SchemaResult = {
+  content: string;
+  structuredData?: unknown;
+  finishReason?: string;
+  jsonTruncated?: boolean;
+  jsonRepaired?: boolean;
+};
+
+// ── Complex schemas ─────────────────────────────────────────────────────────
+
+// (A) TARA-like: free-form content field is the escaping danger zone.
+// All fields are required — OpenAI strict structured output rejects optional
+// keys. The escaping/size danger zone is `content`.
+const agentSchema = z.object({
+  summary: z.string().min(1).max(4000),
+  attachment: z
+    .object({
+      filename: z.string().min(1),
+      extension: z.string().min(1),
+      mimetype: z.string().min(1),
+      content: z.string().min(1),
+    })
+    .nullable(),
+});
+
+// (B) Deeply nested config with arrays, enums, numbers, nested objects.
+const nestedConfigSchema = z.object({
+  project: z.object({
+    name: z.string(),
+    version: z.string(),
+    private: z.boolean(),
+  }),
+  settings: z.object({
+    flags: z.array(z.string()),
+    limits: z.object({ min: z.number(), max: z.number() }),
+    mode: z.enum(["dev", "staging", "prod"]),
+  }),
+  tags: z.array(z.string()).min(1),
+});
+
+// (C) Array-of-objects with a total.
+const arrayHeavySchema = z.object({
+  items: z
+    .array(
+      z.object({
+        id: z.number(),
+        label: z.string(),
+        enabled: z.boolean(),
+      }),
+    )
+    .min(2),
+  total: z.number(),
+});
+
+// (D) A trivially small shape, for the case where the PROMPT says nothing about
+// the shape at all. Every other schema case above is driven by a prompt that
+// spells out the field names, which quietly does the schema's job for it: a
+// model answers those in JSON whether or not the SDK ever asked it to. This one
+// leaves the schema as the ONLY statement of the shape, which is what makes it
+// able to catch a turn where the schema never reached the model.
+const plainProseSchema = z.object({
+  colour: z.string(),
+  reason: z.string(),
+});
+
+// ── Prompts ─────────────────────────────────────────────────────────────────
+
+const STRESS_PROMPT = [
+  "Produce a structured response with a non-empty `summary` and an `attachment`.",
+  "The attachment must be a SHELL script (extension `sh`, mimetype `text/x-shellscript`, filename `probe`).",
+  "The script content MUST include, across multiple lines:",
+  '  - a line printing a double-quoted phrase: echo "hello world"',
+  "  - a Windows-style path with backslashes: C:\\Users\\test\\app",
+  '  - a grep with a backslash regex: grep -E "[0-9]\\\\d+" file.txt',
+  "  - at least 5 lines total.",
+  "Return the script verbatim inside attachment.content.",
+].join("\n");
+
+const NESTED_PROMPT =
+  "Return a project configuration object. project: name 'neurolink', version '9.69.3', private true. " +
+  "settings: flags ['a','b','c'], limits min 1 max 100, mode 'prod'. tags: ['sdk','ai','json'].";
+
+const ARRAY_PROMPT =
+  "Return an object with `items` (an array of at least 3 objects, each {id:number, label:string, enabled:boolean}) " +
+  "and `total` = the number of items. Use ids 1,2,3 and any labels.";
+
+// Forces a LARGE attachment.content — comfortably more than the legacy 4096
+// output-token default (which silently truncated this mid-JSON), yet well under
+// the model's real ceiling. With the fix, this returns complete, valid JSON.
+const HUGE_OUTPUT_PROMPT = [
+  "Produce a structured response.",
+  "summary: one sentence describing a deployment probe script.",
+  "attachment: filename 'probe', extension 'sh', mimetype 'text/x-shellscript'.",
+  "attachment.content MUST be a bash script with AT LEAST 200 numbered lines.",
+  "Each line must be a DISTINCT, descriptive echo, for example:",
+  '  echo "[step 7] validating service health for region ap-south-1 — retry budget remaining: 3"',
+  "Number the steps 1..200 with varied, realistic operational messages. No blank lines, no comments.",
+  "Return the FULL script verbatim in attachment.content — do not abbreviate, summarise, or use '...'.",
+].join("\n");
+
+// ── Matrix ──────────────────────────────────────────────────────────────────
+
+type SchemaCase = {
+  name: string;
+  schema: z.ZodTypeAny;
+  prompt: string;
+  /** Per-call output cap. Omit to rely on the SDK's provider default. */
+  maxTokens?: number;
+  /** Per-call timeout (ms). A genuinely large generation needs headroom; the
+   * Vertex native path uses a 5-min internal bound, so match it for fairness. */
+  timeout?: number;
+  /** When true, assert the result is NOT truncated (the huge-text fix). */
+  expectComplete?: boolean;
+  /** Soft, logged-only content checks (not hard assertions). */
+  soft?: (parsed: unknown) => string[];
+};
+
+const SCHEMA_CASES: SchemaCase[] = [
+  {
+    name: "agent/escaping-stress",
+    schema: agentSchema,
+    prompt: STRESS_PROMPT,
+    maxTokens: 2500,
+    soft: (p) => {
+      const obj = p as z.infer<typeof agentSchema>;
+      const c = obj.attachment?.content ?? "";
+      return [
+        `content length=${c.length}`,
+        `has double-quote=${c.includes('"')}`,
+        `preserves backslash=${c.includes("\\")}`,
+        `multiline=${c.includes("\n")}`,
+      ];
+    },
+  },
+  {
+    name: "nested-config",
+    schema: nestedConfigSchema,
+    prompt: NESTED_PROMPT,
+    maxTokens: 2500,
+  },
+  {
+    name: "array-heavy",
+    schema: arrayHeavySchema,
+    prompt: ARRAY_PROMPT,
+    maxTokens: 2500,
+  },
+  {
+    // Deliberately a PLAIN question: it names no field, no JSON, no shape.
+    // Regression guard for the tools-suppress-response_format defect — with
+    // tools attached, `response_format` is dropped on every provider that
+    // cannot combine the two, and nothing else was asking the model for JSON,
+    // so the turn came back as prose with `structuredData` unset. The other
+    // cases cannot catch that: their prompts name the fields, so the model
+    // emits JSON regardless of what the SDK sent.
+    name: "plain-prose-prompt",
+    schema: plainProseSchema,
+    prompt: "What colour is a clear daytime sky, and why?",
+    maxTokens: 500,
+  },
+  {
+    // No maxTokens → exercises the per-model default (64K for Sonnet 4.x, etc).
+    // Before the fix the Vertex+Claude native path defaulted to 4096 and
+    // truncated this mid-JSON.
+    name: "huge-output",
+    schema: agentSchema,
+    prompt: HUGE_OUTPUT_PROMPT,
+    timeout: 300_000, // 5 min — a 260-line generation needs real wall-clock time
+    expectComplete: true,
+    soft: (p) => {
+      const obj = p as z.infer<typeof agentSchema>;
+      const c = obj.attachment?.content ?? "";
+      const lines = c ? c.split("\n").length : 0;
+      return [`content length=${c.length}`, `lines=${lines}`];
+    },
+  },
+];
+
+type Cell = {
+  provider: string;
+  model?: string;
+  /** core cells run all schema cases; breadth cells run a subset. */
+  tier: "core" | "breadth";
+  /**
+   * When true, schema conformance is a HARD assertion (the provider enforces
+   * structured output). When false, conformance is logged but not asserted —
+   * weak models may emit valid-but-non-conforming JSON, which is a model
+   * limitation, not an SDK JSON-validity failure. Valid-JSON + structuredData
+   * consistency + non-truncation are always hard-asserted on core cells.
+   */
+  strictSchema: boolean;
+};
+
+const CELLS: Cell[] = [
+  // ── core: latest production-grade models, all schema cases, strict ──
+  // THE production cell (Vertex + Claude + tools).
+  {
+    provider: "vertex",
+    model: "claude-sonnet-4-6",
+    tier: "core",
+    strictSchema: true,
+  },
+  // Latest Claude on Vertex.
+  {
+    provider: "vertex",
+    model: "claude-opus-4-6",
+    tier: "core",
+    strictSchema: true,
+  },
+  // Gemini on Vertex (text-mode tools↔schema path).
+  {
+    provider: "vertex",
+    model: "gemini-2.5-pro",
+    tier: "core",
+    strictSchema: true,
+  },
+  // Latest Gemini on Vertex.
+  {
+    provider: "vertex",
+    model: "gemini-3-pro-preview",
+    tier: "core",
+    strictSchema: true,
+  },
+  // Direct Anthropic.
+  {
+    provider: "anthropic",
+    model: "claude-sonnet-4-6",
+    tier: "core",
+    strictSchema: true,
+  },
+  {
+    provider: "anthropic",
+    model: "claude-opus-4-6",
+    tier: "core",
+    strictSchema: true,
+  },
+  // Google AI Studio (text-mode).
+  {
+    provider: "google-ai",
+    model: "gemini-2.5-flash",
+    tier: "core",
+    strictSchema: true,
+  },
+  // OpenAI.
+  {
+    provider: "openai",
+    model: "gpt-4o-mini",
+    tier: "core",
+    strictSchema: true,
+  },
+
+  // ── breadth: valid-JSON + structuredData are hard-asserted; schema
+  // conformance is soft-logged (live model/infra variance under back-to-back
+  // load must not flake the SDK-guarantee verification). ──
+  {
+    provider: "vertex",
+    model: "gemini-2.5-flash",
+    tier: "breadth",
+    strictSchema: false,
+  },
+  {
+    provider: "google-ai",
+    model: "gemini-3-pro-preview",
+    tier: "breadth",
+    strictSchema: false,
+  },
+  {
+    provider: "mistral",
+    model: "mistral-large-latest",
+    tier: "breadth",
+    strictSchema: false,
+  },
+  { provider: "xai", model: "grok-3", tier: "breadth", strictSchema: false },
+  {
+    provider: "groq",
+    // llama-3.3-70b-versatile was decommissioned upstream — it now answers
+    // "does not exist or you do not have access to it", so this cell could
+    // only ever fail. gpt-oss-120b is groq's catalog default and was probed
+    // live for text and tool calling.
+    model: "openai/gpt-oss-120b",
+    tier: "breadth",
+    strictSchema: false,
+  },
+  // Cerebras: named alongside groq in the report that opened this defect, and a
+  // second vendor family for the tools-suppress-response_format path.
+  { provider: "cerebras", tier: "breadth", strictSchema: false },
+  {
+    provider: "deepseek",
+    model: "deepseek-chat",
+    tier: "breadth",
+    strictSchema: false,
+  },
+  {
+    provider: "openrouter",
+    model: "openai/gpt-4o-mini",
+    tier: "breadth",
+    strictSchema: false,
+  },
+  { provider: "bedrock", tier: "breadth", strictSchema: false }, // provider default model
+];
+
+// Provider/model/auth errors → SKIP (not a JSON-validity failure).
+// Deliberately narrow: only infra-shaped statuses (429/5xx) are skippable —
+// generic 4xx / "bad request" would mask real request-construction bugs.
+function isInfraError(message: string): boolean {
+  return /api key|apikey|credential|security token|unauthor|permission|quota|rate.?limit|too many requests|429|not found|unknown model|model.*not|timed[ -]?out|region|ENOTFOUND|ECONNREFUSED|ECONNRESET|socket hang|fetch failed|network|timeout|deadline|unavailable|overloaded|throttl|capacity|exhausted|billing|credits|insufficient|payment|402|access|forbidden|invalid.*model|does not exist|status (429|500|502|503|504)|internal server|service unavailable|max_tokens is too large|supports at most|completion tokens|maximum context|context length/i.test(
+    message,
+  );
+}
+
+async function runCell(cell: Cell, sc: SchemaCase): Promise<void> {
+  let res: SchemaResult;
+  try {
+    res = (await nl.generate({
+      input: { text: sc.prompt },
+      provider: cell.provider,
+      ...(cell.model ? { model: cell.model } : {}),
+      schema: sc.schema,
+      tools: pingTool,
+      disableTools: false,
+      temperature: 0,
+      ...(sc.maxTokens ? { maxTokens: sc.maxTokens } : {}),
+      ...(sc.timeout ? { timeout: sc.timeout } : {}),
+    })) as SchemaResult;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (isInfraError(msg)) {
+      throw new Skip(`${cell.provider}: ${msg.slice(0, 120)}`);
+    }
+    throw err;
+  }
+
+  // (1) content must be valid JSON — neurolink's core guarantee, HARD for all.
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(res.content);
+  } catch (e) {
+    // The head of the response is printed, NOT thrown. defineSuite classifies a
+    // thrown error as a SKIP when its message matches isExpectedProviderError(),
+    // and that match runs against the message text — so quoting live model prose
+    // into it lets the model's own wording decide whether a real failure is
+    // reported. A model that hedges with "I don't have access to real-time data"
+    // would turn this very assertion into a green skip.
+    console.log(
+      `      · ${cell.provider}/${sc.name}: non-JSON content head: ${JSON.stringify(
+        res.content.slice(0, 240),
+      )}`,
+    );
+    throw new Error(
+      `content is NOT valid JSON — parse failed at character ${
+        /position (\d+)/.exec((e as Error).message)?.[1] ?? "0"
+      } of ${res.content.length} (head printed above)`,
+      { cause: e },
+    );
+  }
+
+  // (2) structuredData present and == content — HARD for ALL cells (an SDK
+  // boundary guarantee, never model-dependent: the SDK exposes the parsed
+  // value for object, array, and scalar JSON roots alike).
+  const sdPresent =
+    res.structuredData !== undefined && res.structuredData !== null;
+  const sdConsistent =
+    sdPresent && JSON.stringify(res.structuredData) === JSON.stringify(parsed);
+  assert(
+    sdPresent,
+    "result.structuredData is missing (the parsed value was not exposed)",
+  );
+  assert(
+    sdConsistent,
+    "result.structuredData does not match content (inconsistent exposure)",
+  );
+
+  // (3) schema conformance — HARD only where the provider enforces structured
+  // output. Logged for weak breadth models (valid JSON is still guaranteed).
+  const sp = sc.schema.safeParse(parsed);
+  if (cell.strictSchema) {
+    assert(
+      sp.success,
+      `schema validation failed: ${JSON.stringify(
+        sp.success ? [] : sp.error.issues.slice(0, 3),
+      )}`,
+    );
+  } else if (!sp.success) {
+    console.log(
+      `      · ${cell.provider}/${sc.name}: valid JSON but NON-conforming shape (model limitation): ${JSON.stringify(
+        sp.error.issues.slice(0, 1),
+      )}`,
+    );
+  }
+
+  // (4) huge-output: with no maxTokens, the SDK default must NOT truncate —
+  // HARD on core cells (the maxTokens fix). On breadth, log only.
+  if (sc.expectComplete) {
+    const truncated =
+      res.finishReason === "length" || res.jsonTruncated === true;
+    if (cell.tier === "core") {
+      assert(
+        !truncated,
+        `huge output was TRUNCATED (finishReason=${res.finishReason}, jsonTruncated=${res.jsonTruncated}) — the maxTokens default did not protect a large response`,
+      );
+    } else if (truncated) {
+      console.log(
+        `      · ${cell.provider}/${sc.name}: truncated (finishReason=${res.finishReason}, jsonTruncated=${res.jsonTruncated})`,
+      );
+    }
+  }
+
+  // Soft, logged-only observations (e.g. backslash preservation, sizes).
+  if (sc.soft) {
+    const notes = sc.soft(parsed);
+    console.log(`      · ${cell.provider}/${sc.name}: ${notes.join("  ")}`);
+  }
+}
+
+// ── Register matrix tests ───────────────────────────────────────────────────
+for (const cell of CELLS) {
+  if (onlyProviders && !onlyProviders.includes(cell.provider)) {
+    continue;
+  }
+  // core runs all cases (incl. the slow huge-output); breadth runs the
+  // escaping-stress case plus the plain-prose case — breadth providers don't
+  // exercise the changed native-Claude cap path, and keeping the run tractable
+  // avoids load-flakes. plain-prose is on breadth deliberately: the
+  // tools-suppress-response_format defect it guards lives in the
+  // OpenAI-compatible native loop, which is exactly what the breadth cells are.
+  const BREADTH_CASES = ["agent/escaping-stress", "plain-prose-prompt"];
+  const cases =
+    cell.tier === "core"
+      ? SCHEMA_CASES
+      : SCHEMA_CASES.filter((c) => BREADTH_CASES.includes(c.name));
+  for (const sc of cases) {
+    const label = `${cell.provider}${cell.model ? `:${cell.model}` : ""} — ${sc.name}`;
+    await test(label, async () => {
+      await runCell(cell, sc);
+    });
+  }
+}
+
+// ── Dedicated huge-text tests on the production cell (Vertex+Claude) ─────────
+
+await test("vertex:claude-sonnet-4-6 — huge output is complete (no maxTokens)", async () => {
+  let res: SchemaResult;
+  try {
+    res = (await nl.generate({
+      input: { text: HUGE_OUTPUT_PROMPT },
+      provider: "vertex",
+      model: "claude-sonnet-4-6",
+      schema: agentSchema,
+      tools: pingTool,
+      disableTools: false,
+      temperature: 0,
+      timeout: 300_000, // 5 min — a complete 260-line script takes real time
+      // NO maxTokens — must default to the model ceiling, not the old 4096.
+    })) as SchemaResult;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (isInfraError(msg)) {
+      throw new Skip(`vertex: ${msg.slice(0, 120)}`);
+    }
+    throw err;
+  }
+  const parsed = JSON.parse(res.content) as z.infer<typeof agentSchema>;
+  assert(
+    res.structuredData !== undefined && res.structuredData !== null,
+    "structuredData missing",
+  );
+  assert(
+    res.finishReason !== "length" && res.jsonTruncated !== true,
+    `huge output truncated (finishReason=${res.finishReason}, jsonTruncated=${res.jsonTruncated})`,
+  );
+  const len = parsed.attachment?.content?.length ?? 0;
+  // The legacy 4096 cap truncated near ~12-16KB; a complete 260-line script is
+  // well beyond that. Assert a generous floor so model brevity doesn't flake.
+  assert(
+    len > 4000,
+    `expected a large complete script, got attachment.content length=${len}`,
+  );
+  console.log(`      · complete huge output: attachment.content length=${len}`);
+});
+
+await test("vertex:claude-sonnet-4-6 — forced truncation is observable, never silent", async () => {
+  let res: SchemaResult;
+  try {
+    res = (await nl.generate({
+      input: { text: HUGE_OUTPUT_PROMPT },
+      provider: "vertex",
+      model: "claude-sonnet-4-6",
+      schema: agentSchema,
+      tools: pingTool,
+      disableTools: false,
+      temperature: 0,
+      maxTokens: 200, // force a cut-off mid-JSON (260-line script won't fit)
+    })) as SchemaResult;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (isInfraError(msg)) {
+      throw new Skip(`vertex: ${msg.slice(0, 120)}`);
+    }
+    throw err;
+  }
+  // Even under forced truncation the SDK coerces to valid JSON (jsonrepair
+  // closes the cut-off span), so parsing is asserted UNCONDITIONALLY; and the
+  // truncation must be OBSERVABLE — flagged via jsonTruncated/finishReason,
+  // never silently returned as if complete.
+  JSON.parse(res.content); // must be valid JSON, truncated or not
+  assert(
+    res.jsonTruncated === true || res.finishReason === "length",
+    `truncation was not surfaced (jsonTruncated=${res.jsonTruncated}, finishReason=${res.finishReason})`,
+  );
+  console.log(
+    `      · forced truncation flagged: jsonTruncated=${res.jsonTruncated}, finishReason=${res.finishReason}`,
+  );
+});
+
+// The exact regression behind #1156 lived on the DIRECT Anthropic path: a
+// max_tokens cut left `structuredData` as a STRING (the raw completion) where
+// the schema required an object. Force the same cut here and assert the
+// contract — structuredData is a plain object (never a string), and
+// jsonTruncated === true tells a caller the object is partial.
+await test("anthropic:claude-sonnet-4-6 — forced truncation yields a partial object, never a string", async () => {
+  let res: SchemaResult;
+  try {
+    res = (await nl.generate({
+      input: { text: HUGE_OUTPUT_PROMPT },
+      provider: "anthropic",
+      model: "claude-sonnet-4-6",
+      schema: agentSchema,
+      tools: pingTool,
+      disableTools: false,
+      temperature: 0,
+      maxTokens: 200, // force a cut-off mid-JSON (260-line script won't fit)
+    })) as SchemaResult;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (isInfraError(msg)) {
+      throw new Skip(`anthropic: ${msg.slice(0, 120)}`);
+    }
+    throw err;
+  }
+  JSON.parse(res.content); // must be valid JSON, truncated or not
+  const isObject =
+    res.structuredData !== undefined &&
+    res.structuredData !== null &&
+    typeof res.structuredData === "object" &&
+    !Array.isArray(res.structuredData);
+  assert(isObject, "structuredData must be a plain object, never a string");
+  assert(
+    res.jsonTruncated === true,
+    `truncation must be flagged jsonTruncated=true (jsonTruncated=${res.jsonTruncated}, finishReason=${res.finishReason})`,
+  );
+  console.log(
+    `      · direct-Anthropic forced truncation: plain object + jsonTruncated=true`,
+  );
+});
+
+// A Zod schema with ANY optional field converts to `required` missing that
+// property while `additionalProperties: false` is already present — a shape
+// OpenAI's strict mode rejects outright with "'required' is required to be
+// supplied". So `generate({ schema })` failed with a 400, not a degraded
+// answer, for the most ordinary optional field there is.
+//
+// Forcing every property into `required` would satisfy strict mode but would
+// silently make the caller's optional fields mandatory. The request must drop
+// to non-strict instead, which OpenAI accepts and which honours optionality.
+//
+// The absence assertion is the point: without it, an implementation that
+// regressed to forcing `required` would still pass, because the model would
+// return both fields and every other assertion would hold.
+await test("openai:gpt-4o-mini — an optional Zod field stays optional, and is absent when unset", async () => {
+  // Two different contracts are checked here, and only one of them is this
+  // SDK's to keep.
+  //
+  // The SDK's: an optional Zod property must not be promoted into the JSON
+  // Schema's `required` list on the way to the provider. That is asserted from
+  // the captured request body, so it is deterministic — it does not depend on
+  // what the model chose to answer.
+  //
+  // The model's: whether gpt-4o-mini honours "do not include a population
+  // figure". That is genuinely outside our control, so it is reported, not
+  // asserted. An earlier revision asserted it and was intermittently red; a
+  // retry budget only moves that flake to p^N instead of removing it.
+  capturedBodies.length = 0;
+  captureRequests = true;
+  let res: SchemaResult;
+  try {
+    res = (await nl.generate({
+      input: {
+        text: "Name the capital of France. Do not include a population figure.",
+      },
+      provider: "openai",
+      model: "gpt-4o-mini",
+      maxTokens: 200,
+      // Explicit, so the tools-plus-schema branch is the one under test rather
+      // than whichever the ambient MCP config happens to produce.
+      tools: pingTool,
+      disableTools: false,
+      schema: z.object({
+        capital: z.string(),
+        population: z.number().optional(),
+      }),
+    })) as SchemaResult;
+  } catch (e) {
+    if (isInfraError(String((e as Error)?.message ?? e))) {
+      throw new Skip("openai unavailable for provider reasons");
+    }
+    throw new Error(
+      "a schema with an optional property was rejected outright",
+      { cause: e },
+    );
+  } finally {
+    captureRequests = false;
+  }
+
+  // Precondition: the assertion below is about a schema that actually reached
+  // the wire, so prove one did. Without this, a turn served from anywhere but
+  // an HTTP request would make the `required` check vacuously true.
+  const schemaRequireds = capturedBodies
+    .flatMap(requiredListsIn)
+    .filter((req) => req.includes("capital"));
+  assert(
+    schemaRequireds.length > 0,
+    "no outbound request carried the declared schema — nothing to assert against",
+  );
+  // THE contract: `population` is optional, so it must appear in no `required`
+  // list the SDK emitted. Forcing it in is the defect this test exists for, and
+  // it is visible here whatever the model later chooses to answer.
+  const forced = schemaRequireds.filter((req) => req.includes("population"));
+  assert(
+    forced.length === 0,
+    `the optional property was promoted into the schema's required list (${forced.length} of ${schemaRequireds.length} schema(s) on the wire)`,
+  );
+  // OpenAI keeps `response_format` when tools are present, so the schema and
+  // the tools must arrive on the same request. If the tools were dropped, or
+  // the schema suppressed as it is for every other family member, this fails.
+  assert(
+    bodiesWithToolsAndSchema(capturedBodies) > 0,
+    "no outbound request carried both tools and a response_format json_schema",
+  );
+
+  const data = res.structuredData as Record<string, unknown> | undefined;
+  assert(
+    !!data && typeof data === "object" && !Array.isArray(data),
+    "structuredData must be a plain object",
+  );
+  assert(
+    typeof data?.capital === "string" && (data.capital as string).length > 0,
+    "the required property must be present and non-empty",
+  );
+  // When the model DOES volunteer it, it must still be schema-correct — a null
+  // or a string there would mean the property was injected rather than
+  // answered, which is the same defect wearing a disguise.
+  if (data && "population" in data) {
+    assert(
+      typeof data.population === "number",
+      "the optional property, when present, must match its declared type",
+    );
+  }
+  console.log(
+    `      · optional Zod field absent from the wire schema's required list; model ${
+      data && "population" in data ? "volunteered" : "omitted"
+    } it`,
+  );
+});
+
+// The same shared path carries the whole OpenAI-compatible family, so pin a
+// second member of it. Azure is the right second cell here: it is the other
+// provider that opts OUT of suppressing response_format with tools, so it
+// actually exercises the `json_schema` + strict decision this change makes,
+// rather than a provider whose format is downgraded or suppressed before the
+// decision matters.
+await test("azure — an optional field survives on a second family member", async () => {
+  const azureModel = process.env.AZURE_OPENAI_MODEL ?? process.env.AZURE_MODEL;
+  if (!azureModel) {
+    throw new Skip("no azure deployment configured");
+  }
+  capturedBodies.length = 0;
+  captureRequests = true;
+  let res: SchemaResult;
+  try {
+    res = (await nl.generate({
+      input: {
+        text: "Name the capital of France. Do not include a population figure.",
+      },
+      provider: "azure",
+      model: azureModel,
+      maxTokens: 200,
+      tools: pingTool,
+      disableTools: false,
+      schema: z.object({
+        capital: z.string(),
+        population: z.number().optional(),
+      }),
+    })) as SchemaResult;
+  } catch (e) {
+    if (isInfraError(String((e as Error)?.message ?? e))) {
+      throw new Skip("azure unavailable for provider reasons");
+    }
+    throw new Error("optional-field schema failed on a second provider", {
+      cause: e,
+    });
+  } finally {
+    captureRequests = false;
+  }
+  assert(
+    bodiesWithToolsAndSchema(capturedBodies) > 0,
+    "no outbound request carried both tools and a response_format json_schema",
+  );
+  const data = res.structuredData as Record<string, unknown> | undefined;
+  assert(
+    !!data && typeof data === "object",
+    "structuredData must be produced on the shared family path too",
+  );
+  console.log("      · optional field honoured on a second family member");
+});
+
+// This suite sets NEUROLINK_DISABLE_BUILTIN_TOOLS at the top, so the case below
+// spells its tool out explicitly: every OpenAI-compatible provider except
+// OpenAI and Azure suppresses `response_format` when the request carries tools,
+// and the caller's schema then never reaches the wire at all. That suppressed
+// turn used to come back as prose with `structuredData` undefined, silently
+// breaking the documented generate({ schema }) contract.
+//
+// Cohere, and only cohere, because the defect was never provider-specific: it
+// lives in the shared native generate loop the whole OpenAI-compatible family
+// rides. deepseek is already a breadth cell in CELLS above and runs the same
+// path through `plain-prose-prompt`, so repeating it here would buy a second
+// live call and no extra signal. Cohere is in no cell of that matrix, and it is
+// a separate vendor family: CohereProvider extends the same
+// OpenAIChatCompletionsProvider base and does not override
+// suppressResponseFormatWithTools, so it takes the suppressing default.
+await test("cohere:command-r-plus-08-2024 — a schema survives a request that also carries tools", async () => {
+  let res: SchemaResult;
+  try {
+    res = (await nl.generate({
+      input: { text: "Capital of France and its population." },
+      provider: "cohere",
+      model: "command-r-plus-08-2024",
+      maxTokens: 300,
+      tools: pingTool,
+      // Explicit, as in every other tools-bearing call in this file. The tool
+      // has to actually ride along for the suppression path to be reached; a
+      // turn that quietly dropped it would take the ordinary response_format
+      // route and pass while testing nothing.
+      disableTools: false,
+      schema: z.object({ capital: z.string(), population: z.number() }),
+    })) as SchemaResult;
+  } catch (e) {
+    if (isInfraError(String((e as Error)?.message ?? e))) {
+      throw new Skip("cohere unavailable for provider reasons");
+    }
+    throw new Error("schema request with tools present failed outright", {
+      cause: e,
+    });
+  }
+  const data = res.structuredData as Record<string, unknown> | undefined;
+  assert(
+    !!data && typeof data === "object" && !Array.isArray(data),
+    "structuredData must be produced even when tools suppress response_format",
+  );
+  // Assert the WHOLE declared schema, not just one field. The recovery path
+  // can publish a syntactically valid object that still fails the schema, so
+  // checking only `capital` would let a half-restored contract pass — the
+  // schema declares both properties required.
+  assert(
+    typeof data?.capital === "string" &&
+      (data.capital as string).length > 0 &&
+      typeof data?.population === "number",
+    "both required schema properties must be present and correctly typed",
+  );
+  console.log(
+    "      · schema honoured on a tools-bearing request (prompt fallback)",
+  );
+});
+
+await runSuite();

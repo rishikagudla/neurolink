@@ -4,17 +4,122 @@ NeuroLink supports multiple AI providers with flexible authentication methods. T
 
 ## Supported Providers
 
+This guide walks through full environment-variable setup for the providers below; the complete roster — including the newer catalog providers and the embedding/media/decision-only providers — is indexed with setup guides at [Provider Guides](providers/index.md).
+
+### Providers configured in this guide
+
 - **OpenAI** - GPT-4o, GPT-4o-mini, GPT-4-turbo
 - **Amazon Bedrock** - Claude 3.7 Sonnet, Claude 3.5 Sonnet, Claude 3 Haiku
 - **Amazon SageMaker** - Custom models deployed on SageMaker endpoints
 - **Google Vertex AI** - Gemini 3 Flash/Pro (preview), Gemini 2.5 Flash, Claude 4.0 Sonnet
 - **Google AI Studio** - Gemini 1.5 Pro, Gemini 2.0 Flash, Gemini 1.5 Flash
-- **Anthropic** - Claude 3.5 Sonnet, Claude 3 Opus, Claude 3 Haiku
+- **Anthropic** - Claude 4.5 Opus/Sonnet/Haiku, Claude 4.0 Opus/Sonnet, Claude 3.7 Sonnet
 - **Azure OpenAI** - GPT-4, GPT-3.5-Turbo
-- **LiteLLM** - 100+ models from all providers via proxy server
-- **Hugging Face** - 100,000+ open source models including DialoGPT, GPT-2, GPT-Neo
+- **LiteLLM** - 100+ models across a broad range of providers via proxy server
+- **Hugging Face** - open models served by the unified router (Llama 3.x, Qwen 2.5, DeepSeek, Mistral)
 - **Ollama** - Local AI models including Llama 2, Code Llama, Mistral, Vicuna
+- **OpenRouter** - 300+ models from every major lab via one aggregator endpoint
 - **Mistral AI** - Mistral Tiny, Small, Medium, and Large models
+- **DeepSeek** - deepseek-chat (V3) and deepseek-reasoner (R1)
+- **NVIDIA NIM** - Llama 3.3 70B and 400+ catalog models via NVIDIA hosted or self-hosted NIM
+- **LM Studio** - Any model loaded in LM Studio desktop app (local, no API key required)
+- **llama.cpp** - Any GGUF model served by llama-server (local, no API key required)
+
+### Other providers (setup guides in the Provider Guides index)
+
+Onboarded via the zero-quirk OpenAI-wire-compatible catalog (Tier 2) — each has its own setup guide under [`providers/`](providers/):
+
+- **[Groq](providers/groq.md)** - LPU-accelerated inference; default `openai/gpt-oss-120b`
+- **[Cerebras](providers/cerebras.md)** - Wafer-scale inference; default `gpt-oss-120b`
+- **[SambaNova](providers/sambanova.md)** - default `Meta-Llama-3.3-70B-Instruct`
+- **[Together AI](providers/together-ai.md)** - default `meta-llama/Llama-3.3-70B-Instruct-Turbo`
+- **[Fireworks AI](providers/fireworks.md)** - default `accounts/fireworks/models/kimi-k3`
+- **[Perplexity](providers/perplexity.md)** - search-augmented models; default `sonar`
+- **[Cloudflare Workers AI](providers/cloudflare.md)** - edge inference
+- **[xAI](providers/xai.md)** - Grok models; default `grok-4.6`
+- **[Baseten](providers/baseten.md)** - default `zai-org/GLM-5.3-Flash` (`BASETEN_API_KEY`)
+- **[GMI Cloud](providers/gmicloud.md)** - default `MiniMaxAI/MiniMax-M3` (`GMICLOUD_API_KEY`)
+- **[Inception Labs](providers/inception-labs.md)** - diffusion LLMs; default `mercury-2` (`INCEPTION_LABS_API_KEY`)
+- **[io.net Intelligence](providers/io-intelligence.md)** - decentralized GPU inference; default `meta-llama/Llama-3.3-70B-Instruct` (`IO_INTELLIGENCE_API_KEY`)
+- **[Mancer](providers/mancer.md)** - default `deepseek-v4-flash` (`MANCER_API_KEY`); **no tool calling**
+- **[Upstage](providers/upstage.md)** - Solar models; default `solar-pro4` (`UPSTAGE_API_KEY`)
+- **[API Route](providers/api-route.md)** - OpenAI-compatible passthrough; default `claude-sonnet-4-6` (`API_ROUTE_API_KEY`)
+- **[DeepInfra](providers/deepinfra.md)** - default `deepseek-ai/DeepSeek-V4-Flash-0731` (`DEEPINFRA_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[Featherless AI](providers/featherless-ai.md)** - default `unsloth/Llama-3.3-70B-Instruct` (`FEATHERLESS_AI_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[Chutes](providers/chutes.md)** - default `moonshotai/Kimi-K2.6-TEE` (`CHUTES_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[OVHcloud AI Endpoints](providers/ovhcloud.md)** - default `gpt-oss-120b` (`OVH_AI_ENDPOINTS_ACCESS_TOKEN`); docs- and roster-verified, not yet live-verified
+- **[Sarvam AI](providers/sarvam.md)** - default `sarvam-105b` (`SARVAM_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[Synthetic](providers/synthetic.md)** - default `syn:large:text` (`SYNTHETIC_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[Ambient](providers/ambient.md)** - default `ambient/large` (`AMBIENT_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[Inference.net](providers/inference-net.md)** - default `glm-5.2` (`INFERENCE_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[EmpirioLabs AI](providers/empiriolabs.md)** - default `glm-5-3` (`EMPIRIOLABS_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[above.dev](providers/above-dev.md)** - default `deepseek-v4.1-flash` (`ABOVE_DEV_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[ai&](providers/aiand.md)** - default `openai/gpt-oss-120b` (`AIAND_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[Bee by HEOSSI](providers/bee-heossi.md)** - default `bee-cell` (`BEE_HEOSSI_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[Charm Hyper](providers/charm-hyper.md)** - default `deepseek-v4-pro` (`CHARM_HYPER_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[Inco](providers/inco.md)** - default `glm-5.3` (`INCO_API_KEY`); **no tool calling**; docs- and roster-verified, not yet live-verified
+- **[Kosmik Compute](providers/koscompute.md)** - default `qwen/qwen3.8-27b` (`KOSCOMPUTE_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[Lilac](providers/lilac.md)** - default `moonshotai/kimi-k2.6` (`LILAC_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[LLM Tech](providers/llmtech.md)** - default `nvidia/Qwen3.8-27B-NVFP4` (`LLMTECH_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[Moark](providers/moark.md)** - default `Qwen3-8B` (`MOARK_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[Neuralwatt](providers/neuralwatt.md)** - default `glm-5.3` (`NEURALWATT_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[Pareto Inference](providers/pareto-inference.md)** - default `z-ai/glm-5.3-flash` (`PARETO_INFERENCE_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[Aion Labs](providers/aionlabs.md)** - default `aion-labs/aion-3.5` (`AIONLABS_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[Atlas Cloud](providers/atlas-cloud.md)** - default `deepseek-ai/deepseek-v3.2` (`ATLAS_CLOUD_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[Avian](providers/avian-io.md)** - default `deepseek/deepseek-v4-pro-0813` (`AVIAN_IO_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[Prime Intellect](providers/prime-intellect.md)** - default `openai/gpt-4.1-mini` (`PRIME_INTELLECT_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[Subconscious](providers/subconscious.md)** - default `subconscious/glm-5.3-marathon` (`SUBCONSCIOUS_API_KEY`); **no tool calling**; docs- and roster-verified, not yet live-verified
+- **[Tinfoil](providers/tinfoil.md)** - default `kimi-k3` (`TINFOIL_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[Umans AI](providers/umans-ai.md)** - default `umans-coder` (`UMANS_AI_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[Vultr Inference](providers/vultr-inference.md)** - default `glm-5.2` (`VULTR_INFERENCE_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[Wafer](providers/wafer.md)** - default `GLM-5.3` (`WAFER_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[Venice AI](providers/venice-ai.md)** - default `zai-org-glm-5-2` (`VENICE_AI_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[AI21 Labs](providers/ai21.md)** - default `jamba-large` (`AI21_API_KEY`); docs-verified only (the roster needs a key), not yet live-verified
+- **[Nebius Token Factory](providers/nebius.md)** - default `Qwen/Qwen3-235B-A22B-Instruct-2507` (`NEBIUS_API_KEY`); docs-verified only (the roster needs a key), not yet live-verified
+- **[Moonshot AI (Kimi)](providers/moonshot-ai.md)** - default `kimi-k3` (`MOONSHOT_AI_API_KEY`); docs-verified only (the roster needs a key), not yet live-verified
+- **[MiniMax](providers/minimax.md)** - default `MiniMax-M3` (`MINIMAX_API_KEY`); docs-verified only (the roster needs a key), not yet live-verified
+- **[Z.AI](providers/z-ai.md)** - default `glm-5.3` (`Z_AI_API_KEY`); docs-verified only (the roster needs a key), not yet live-verified
+- **[StepFun](providers/stepfun.md)** - default `step-5-preview` (`STEPFUN_API_KEY`); docs-verified only (the roster needs a key), not yet live-verified
+- **[SiliconFlow](providers/siliconflow.md)** - default `deepseek-ai/DeepSeek-V4-Pro` (`SILICONFLOW_API_KEY`); docs-verified only (the roster needs a key), not yet live-verified
+- **[Scaleway](providers/scaleway.md)** - default `mistral-small-3.2-24b-instruct-2506` (`SCALEWAY_API_KEY`); docs-verified only (the roster needs a key), not yet live-verified
+- **[Crusoe](providers/crusoe.md)** - default `deepseek-ai/DeepSeek-V4-Flash` (`CRUSOE_API_KEY`); docs-verified only (the roster needs a key), not yet live-verified
+- **[W&B Inference](providers/wandb-inference.md)** - default `openai/gpt-oss-120b` (`WANDB_INFERENCE_API_KEY`); docs-verified only (the roster needs a key), not yet live-verified
+- **[Inceptron](providers/inceptron.md)** - default `zai-org/GLM-5.3` (`INCEPTRON_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[BytePlus ModelArk](providers/byteplus-modelark.md)** - default `seed-2-0-pro-260328` (`BYTEPLUS_MODELARK_API_KEY`); docs-verified only (the roster needs a key), not yet live-verified
+- **[GradientAI (DigitalOcean)](providers/gradientai.md)** - default `llama-4-maverick` (`GRADIENTAI_API_KEY`); docs-verified only (the roster needs a key), not yet live-verified
+- **[Parasail](providers/parasail.md)** - default `parasail-llama-33-70b-fp8` (`PARASAIL_API_KEY`); docs-verified only (the roster needs a key), not yet live-verified
+- **[Baidu Qianfan](providers/baidu-qianfan.md)** - default `ernie-5.1` (`BAIDU_QIANFAN_API_KEY`); docs-verified only (the roster needs a key), not yet live-verified
+- **[Arcee](providers/arcee.md)** - default `trinity-large-thinking` (`ARCEE_API_KEY`); docs-verified only (the roster needs a key), not yet live-verified
+- **[Telnyx](providers/telnyx.md)** - default `zai-org/GLM-5.3-Flash` (`TELNYX_API_KEY`); docs-verified only (the roster needs a key), not yet live-verified
+- **[Reka AI](providers/reka.md)** - default `reka-flash` (`REKA_API_KEY`); docs-verified only (the roster needs a key), not yet live-verified
+- **[Thinking Machines](providers/thinking-machines.md)** - default `moonshotai/Kimi-K2.6` (`THINKING_MACHINES_API_KEY`); **no tool calling**; docs-verified only (the roster needs a key), not yet live-verified
+- **[Alibaba Cloud Model Studio (DashScope)](providers/dashscope.md)** - default `qwen3.8-max` (`DASHSCOPE_API_KEY`); docs-verified only (the roster needs a key), not yet live-verified
+- **[Vispark](providers/vispark.md)** - default `vispark/vision-large` (`VISPARK_API_KEY`); docs- and roster-verified, not yet live-verified
+- **[Sakana AI](providers/sakana-ai.md)** - default `fugu` (`SAKANA_AI_API_KEY`); docs-verified only (the roster needs a key), not yet live-verified
+- **[Poolside](providers/poolside.md)** - default `poolside/laguna-s-2.1` (`POOLSIDE_API_KEY`); docs-verified only (the roster needs a key), not yet live-verified
+- **[Lemonfox AI](providers/lemonfox-ai.md)** - default `deepseek-v4-flash` (`LEMONFOX_AI_API_KEY`); **no tool calling**; docs-verified only (the roster needs a key), not yet live-verified
+- **[ModelScope](providers/modelscope.md)** - default `Qwen/Qwen3.5-35B-A3B` (`MODELSCOPE_API_KEY`); **no tool calling**; docs- and roster-verified, not yet live-verified
+- **[Hetzner Inference](providers/hetzner-inference.md)** - default `Qwen/Qwen3.6-35B-A3B-FP8` (`HETZNER_INFERENCE_API_KEY`); **no tool calling**; docs-verified only (the roster needs a key), not yet live-verified
+- **[Meta Model API](providers/meta-model-api.md)** - default `muse-spark-1.3` (`META_MODEL_API_API_KEY`); docs-verified only (the roster needs a key), not yet live-verified
+- **[STACKIT](providers/stackit.md)** - default `Qwen/Qwen3-VL-235B-A22B-Instruct-FP8` (`STACKIT_API_KEY`); docs-verified only (the roster needs a key), not yet live-verified
+- **[Bytez](providers/bytez.md)** - default `Qwen/Qwen3-4B` (`BYTEZ_API_KEY`); **no tool calling**; docs-verified only (the roster needs a key), not yet live-verified
+
+Embedding, media-generation, and decision-only providers — not part of `generate()`/`stream()` provider selection in the same way, but each has a setup guide:
+
+- **[Cohere](providers/cohere.md)** - chat + `embed-english-v3.0` embeddings + reranking
+- **[Voyage AI](providers/voyage.md)** - embedding-only; default `voyage-3.5`
+- **[Jina AI](providers/jina.md)** - embeddings + reranking; default `jina-embeddings-v3`
+- **[Replicate](providers/replicate.md)**, **[Stability AI](providers/stability.md)**, **[Ideogram](providers/ideogram.md)**, **[Recraft](providers/recraft.md)** - direct image generation
+- **[TypeSafe Jev](providers/typesafe.md)** - decision-only; serves `decide()`, not `generate()`/`stream()`. Set `TYPESAFE_API_KEY` (or `AI_GATEWAY_API_KEY` for the gateway transport)
+- **[Laya](providers/laya.md)** - decision-only, open-weights; serves `decide()` on a Laya server or LiteLLM proxy route you configure. Set `LAYA_API_KEY` + `LAYA_BASE_URL`; used when TypeSafe isn't configured
+- **[XOR](providers/xor.md)** - decision-only, open-weights XOR (`xor-latest` for text, `xor-omni` for an image, audio or `value` questions); serves `decide()`. Set `XOR_API_KEY` + `XOR_BASE_URL` (`XOR_MODEL` is optional, default `xor-latest`); used when neither TypeSafe nor Laya is configured
+- **[SubQ](providers/subq.md)** - decision-only; serves `decide()` with `subq-snap-preview` (public preview) at `https://api.subq.ai`. Set `SUBQ_API_KEY` alone (`SUBQ_MODEL` and `SUBQ_BASE_URL` are optional); the key comes from console.subq.ai and is shown once. NeuroLink does not send it images or video; used when none of TypeSafe, Laya or XOR is configured, ahead of Perplexity and Cloudflare Clef (its key is shared with no other provider)
+- **[Perplexity Decisions](providers/perplexity-decider.md)** - decision-only; serves `decide()` with `pplx-decider-v1-27b` and takes images (no video). Set `PERPLEXITY_API_KEY` alone (`PERPLEXITY_DECIDER_MODEL` and `PERPLEXITY_DECIDER_BASE_URL` are optional); used when none of TypeSafe, Laya, XOR or SubQ is configured. The key is shared with the Perplexity text provider, so a key set for Sonar also configures it
+- **[Cloudflare Clef](providers/cloudflare-clef.md)** - decision-only; serves `decide()` with `clef` (27B, the default) or `clef-flash` (9B) and takes up to 4 images (no video). Set `CLOUDFLARE_API_KEY` (Workers AI permission) **and** `CLOUDFLARE_ACCOUNT_ID`, both required (`CLOUDFLARE_CLEF_MODEL` and `CLOUDFLARE_CLEF_BASE_URL` are optional); used when none of TypeSafe, Laya, XOR, SubQ or Perplexity is configured (OpenAI Decisions and ScaleDown come after it). The two variables are shared with the Cloudflare Workers AI text provider, so a token and account id set for it also configure Clef. The Workers AI state window changed in October 2026 (about 2,048 tokens until 2026-10-04, far more on 2026-10-07; hosted service or model: unknown), and NeuroLink refuses a state it estimates over 16,000 tokens
+- **[OpenAI Decisions](providers/openai-decisions.md)** - decision-only; serves `decide()` with `gpt-6-luna` (OpenAI's Decisions API, a public beta) and takes up to 8 images (no video). Set `OPENAI_API_KEY` alone (`OPENAI_DECISIONS_MODEL` and `OPENAI_DECISIONS_BASE_URL` are optional); used when none of TypeSafe, Laya, XOR, SubQ, Perplexity or Cloudflare Clef is configured (ScaleDown alone comes after it). The key is shared with the OpenAI chat provider, so a key set for chat also configures it, and built-in features then make paid decision calls, unless `OPENAI_BASE_URL`, `OPENAI_API_BASE` or `credentials.openai.baseURL` names a host other than `https://api.openai.com` (a gateway's key is not used by default); limits and behaviour of the endpoint are largely not established, see the guide
+- **[ScaleDown](providers/scaledown.md)** - decision-only; serves `decide()` with `classify-1` (the default) or `classify` at `https://api.scaledown.xyz`. Set `SCALEDOWN_API_KEY` alone (`SCALEDOWN_MODEL` and `SCALEDOWN_BASE_URL` are optional); the key is sent in an `x-api-key` header and no other provider reads it. Text only (no images or video). Used last, when none of TypeSafe, Laya, XOR, SubQ, Perplexity, Cloudflare Clef or OpenAI Decisions is configured. Its context size, latency and rate limits are not measured, see the guide
+
+Voice providers (TTS/STT/Realtime) are configured further down in this guide — see [OpenAI TTS](#openai-tts) onward.
 
 ## 💰 Model Availability & Cost Considerations
 
@@ -35,7 +140,7 @@ NeuroLink supports multiple AI providers with flexible authentication methods. T
 
 ## 🏢 Enterprise Proxy Support
 
-**All providers support corporate proxy environments automatically.** Simply set environment variables:
+**Providers support corporate proxy environments automatically.** Simply set environment variables:
 
 ```bash
 export HTTPS_PROXY=http://your-corporate-proxy:port
@@ -57,14 +162,21 @@ export OPENAI_API_KEY="sk-your-openai-api-key"
 ### Optional Configuration
 
 ```bash
-export OPENAI_MODEL="gpt-4o"  # Default model to use
+# Optional: override the default model (default: gpt-4o-mini)
+export OPENAI_MODEL="gpt-5.4"
 ```
 
 ### Supported Models
 
-- `gpt-4o` (default) - Latest multimodal model
-- `gpt-4o-mini` - Cost-effective variant
+Examples, not the full list. The [OpenAI guide](providers/openai.md) lists every model the SDK names, including the GPT-6 and `gpt-5.4-nano` models.
+
+- `gpt-5.4` - GPT-5.4 model
+- `gpt-5.4-mini` - Cost-effective GPT-5.4 variant
+- `gpt-4o-mini` (default) - Cost-effective variant
+- `gpt-4o` - Previous generation multimodal model
 - `gpt-4-turbo` - High-performance model
+
+See the [environment variables guide](environment-variables.md) for the order in which the model is chosen when none is set.
 
 ### Usage Example
 
@@ -343,15 +455,14 @@ export SAGEMAKER_TIMEOUT="60000"  # 60 seconds for large models
 
 ### 📖 Complete SageMaker Guide
 
-For comprehensive SageMaker setup, advanced features, and production deployment:
-**[📖 Complete SageMaker Integration Guide](../sagemaker-integration.md)** - Includes:
+For endpoint setup, permissions and production deployment:
+**[📖 Amazon SageMaker Provider Guide](providers/sagemaker.md)** - Includes:
 
-- Model deployment examples
-- Cost optimization strategies
-- Enterprise security patterns
-- Multi-model endpoint management
-- Performance testing and monitoring
-- Troubleshooting and debugging
+- Model endpoint deployment
+- Environment and client configuration
+- IAM policies and VPC connectivity
+- Feature support (streaming, embeddings, tools, structured output)
+- Troubleshooting
 
 ## Google Vertex AI Configuration {#vertex}
 
@@ -480,6 +591,8 @@ const result = await neurolink.generate({
 - `veo-3.1` / `veo-3.1-generate-001` - Video generation from image + text prompt (8-second videos with audio)
 
 > **Video Generation:** Use `output.mode: "video"` with Veo 3.1 to generate videos. See [Video Generation Guide](../features/video-generation.md).
+
+> **PPT Generation:** Use `output.mode: "ppt"` with supported providers (Vertex AI, Google AI, OpenAI, Anthropic, Azure OpenAI, or Bedrock) and compatible text models to generate PowerPoint presentations. See [PPT Generation Guide](../features/ppt-generation.md).
 
 ### Gemini 3 Extended Thinking Configuration
 
@@ -733,7 +846,7 @@ try {
 
 ## LiteLLM Configuration
 
-LiteLLM provides access to 100+ models through a unified proxy server, allowing you to use any AI provider through a single interface.
+LiteLLM provides access to 100+ models through a unified proxy server, allowing you to use supported AI providers through a single interface.
 
 ### Prerequisites
 
@@ -856,7 +969,7 @@ export HUGGINGFACE_API_KEY="hf_your_token_here"
 ### Optional Configuration
 
 ```bash
-export HUGGINGFACE_MODEL="microsoft/DialoGPT-medium"  # Default model
+export HUGGINGFACE_MODEL="Qwen/Qwen2.5-72B-Instruct"  # Default model
 ```
 
 ### Model Selection Strategy
@@ -899,11 +1012,12 @@ const result = await neurolink.generate({
 
 ### Popular Models
 
-- `microsoft/DialoGPT-medium` (default) - Conversational AI
-- `gpt2` - Classic GPT-2
-- `distilgpt2` - Lightweight GPT-2
-- `EleutherAI/gpt-neo-2.7B` - Large open model
-- `bigscience/bloom-560m` - Multilingual model
+- `Qwen/Qwen2.5-72B-Instruct` (default) - tool-capable, strong multilingual
+- `meta-llama/Llama-3.1-8B-Instruct` - fastest of the served set, tool-capable
+- `meta-llama/Llama-3.3-70B-Instruct` - stronger general reasoning
+- `deepseek-ai/DeepSeek-V3` - highest quality of the served set
+- `Qwen/Qwen2.5-Coder-32B-Instruct` - code-focused
+- Any id listed by `GET https://router.huggingface.co/v1/models`
 
 ### Getting Started with Hugging Face
 
@@ -1141,12 +1255,16 @@ Mistral models excel at multilingual tasks:
 
 ## Anthropic Configuration {#anthropic}
 
-Direct access to Anthropic's Claude models without going through AWS Bedrock.
+Direct access to Anthropic's Claude models. Supports both API key and OAuth (Claude subscription) authentication.
 
 ### Basic Setup
 
 ```bash
+# Option 1: API key authentication
 export ANTHROPIC_API_KEY="sk-ant-api03-your-key-here"
+
+# Option 2: OAuth authentication (Claude Pro/Max subscribers)
+neurolink auth login anthropic
 ```
 
 ### Optional Configuration
@@ -1157,10 +1275,13 @@ export ANTHROPIC_MODEL="claude-3-5-sonnet-20241022"  # Default model
 
 ### Supported Models
 
-- `claude-3-7-sonnet-20250219` - Latest Claude 3.7 Sonnet
-- `claude-3-5-sonnet-20241022` (default) - Claude 3.5 Sonnet v2
-- `claude-3-opus-20240229` - Most capable model
-- `claude-3-haiku-20240307` - Fastest, most cost-effective
+- `claude-opus-4-5-20251101` - Claude 4.5 Opus (most capable)
+- `claude-sonnet-4-5-20250929` - Claude 4.5 Sonnet
+- `claude-haiku-4-5-20251001` - Claude 4.5 Haiku (fastest)
+- `claude-opus-4-1-20250805` - Claude 4.1 Opus
+- `claude-opus-4-20250514` - Claude 4.0 Opus
+- `claude-sonnet-4-20250514` - Claude 4.0 Sonnet
+- `claude-3-7-sonnet-20250219` - Claude 3.7 Sonnet
 
 ### Usage Example
 
@@ -1187,10 +1308,12 @@ const result = await neurolink.generate({
 
 ### Getting Started with Anthropic
 
-1. **Create Account**: Visit [anthropic.com](https://www.anthropic.com)
-2. **Get API Key**: Navigate to API Keys section
-3. **Generate Key**: Create new API key
-4. **Set Environment**: Export key as `ANTHROPIC_API_KEY`
+1. **API Key**: Visit [console.anthropic.com](https://console.anthropic.com), navigate to API Keys, and export as `ANTHROPIC_API_KEY`
+2. **OAuth (Subscription)**: Run `neurolink auth login anthropic` to authenticate with your Claude Pro/Max subscription
+
+### Complete Guide
+
+For comprehensive Anthropic setup including OAuth configuration, subscription tiers, and advanced options, see the [Detailed Anthropic Provider Guide](providers/anthropic.md) and the [Claude Subscription Guide](../features/claude-subscription.md).
 
 ## Azure OpenAI Configuration {#azure}
 
@@ -1312,6 +1435,340 @@ export OPENAI_COMPATIBLE_API_KEY="your-api-key-if-needed"
 # Optional: Default model name
 export OPENAI_COMPATIBLE_MODEL="your-model-name"
 ```
+
+## DeepSeek Configuration {#deepseek}
+
+DeepSeek provides cost-effective access to its own frontier models: the general-purpose V3 chat model and the R1 reasoning model.
+
+### Basic Setup
+
+```bash
+export DEEPSEEK_API_KEY="sk-your-deepseek-api-key"
+```
+
+### Optional Configuration
+
+```bash
+export DEEPSEEK_MODEL="deepseek-chat"               # Default: deepseek-chat
+export DEEPSEEK_BASE_URL="https://api.deepseek.com" # Default base URL (override for compatible proxies)
+```
+
+### Supported Models
+
+- `deepseek-chat` (default) - DeepSeek V3, high-quality general chat at low cost
+- `deepseek-reasoner` - DeepSeek R1, extended chain-of-thought reasoning (thinking mode)
+
+### Usage Example
+
+```typescript
+import { NeuroLink } from "@juspay/neurolink";
+
+const neurolink = new NeuroLink();
+
+// General chat with DeepSeek V3
+const result = await neurolink.generate({
+  input: { text: "Explain transformers in simple terms" },
+  provider: "deepseek",
+  model: "deepseek-chat",
+  temperature: 0.7,
+  maxTokens: 1000,
+});
+
+// Extended reasoning with DeepSeek R1
+const reasoned = await neurolink.generate({
+  input: { text: "Solve step by step: ..." },
+  provider: "deepseek",
+  model: "deepseek-reasoner",
+  thinkingLevel: "high",
+});
+```
+
+### CLI Usage
+
+```bash
+# Use DeepSeek V3
+npx @juspay/neurolink generate "Explain quantum computing" --provider deepseek
+
+# Use DeepSeek R1 with alias
+npx @juspay/neurolink generate "Solve this math problem" --provider ds --model deepseek-reasoner
+```
+
+### Getting Started with DeepSeek
+
+1. **Create Account**: Visit [platform.deepseek.com](https://platform.deepseek.com)
+2. **Generate Key**: Navigate to **API Keys** and create a new key
+3. **Add Billing**: Top up your account balance at [platform.deepseek.com/usage](https://platform.deepseek.com/usage)
+4. **Set Environment**: Export `DEEPSEEK_API_KEY`
+
+### Environment Variables Reference
+
+| Variable            | Required | Default                    | Description                                             |
+| ------------------- | -------- | -------------------------- | ------------------------------------------------------- |
+| `DEEPSEEK_API_KEY`  | ✅       | -                          | DeepSeek API key                                        |
+| `DEEPSEEK_MODEL`    | ❌       | `deepseek-chat`            | Model: `deepseek-chat` (V3) or `deepseek-reasoner` (R1) |
+| `DEEPSEEK_BASE_URL` | ❌       | `https://api.deepseek.com` | Override for proxies or alternative endpoints           |
+
+### Provider ID and Aliases
+
+- **Provider ID**: `deepseek`
+- **Aliases**: `ds`
+
+---
+
+## NVIDIA NIM Configuration {#nvidia-nim}
+
+NVIDIA NIM provides access to 400+ optimized models through NVIDIA's hosted cloud inference API, and also supports self-hosted NIM deployments.
+
+### Basic Setup
+
+```bash
+export NVIDIA_NIM_API_KEY="nvapi-your-nvidia-api-key"
+```
+
+### Optional Configuration
+
+```bash
+export NVIDIA_NIM_MODEL="openai/gpt-oss-20b"                         # Default model
+export NVIDIA_NIM_BASE_URL="https://integrate.api.nvidia.com/v1"   # Default; override for self-hosted NIM
+```
+
+### NIM-Specific Extras (Advanced)
+
+These environment variables pass NIM-specific request body extensions. Leave them unset unless you have a specific need:
+
+```bash
+export NVIDIA_NIM_TOP_K=""                  # Integer; -1 or unset = disabled
+export NVIDIA_NIM_MIN_P=""                  # Float; 0 or unset = disabled
+export NVIDIA_NIM_REPETITION_PENALTY=""     # Float; 1.0 or unset = disabled
+export NVIDIA_NIM_MIN_TOKENS=""             # Integer; 0 or unset = disabled
+export NVIDIA_NIM_CHAT_TEMPLATE=""          # Override model chat template (advanced)
+```
+
+### Supported Models
+
+- `openai/gpt-oss-20b` (default) - OpenAI gpt-oss 20B, 128K context, tool calling
+- Any model from the [NVIDIA NIM catalog](https://build.nvidia.com/models)
+
+### Usage Example
+
+```typescript
+import { NeuroLink } from "@juspay/neurolink";
+
+const neurolink = new NeuroLink();
+
+const result = await neurolink.generate({
+  input: { text: "Explain GPU architecture" },
+  provider: "nvidia-nim",
+  model: "openai/gpt-oss-20b",
+  temperature: 0.7,
+  maxTokens: 1000,
+});
+```
+
+### CLI Usage
+
+```bash
+# Use NVIDIA NIM with default model
+npx @juspay/neurolink generate "Explain GPU architecture" --provider nvidia-nim
+
+# Use nim alias
+npx @juspay/neurolink generate "Hello" --provider nim --model "mistralai/mistral-7b-instruct-v0.3"
+```
+
+### Self-Hosted NIM Endpoints
+
+Override the base URL to point at your own NIM deployment:
+
+```bash
+export NVIDIA_NIM_BASE_URL="http://your-nim-server:8000/v1"
+```
+
+### Getting Started with NVIDIA NIM
+
+1. **Create Account**: Visit [build.nvidia.com](https://build.nvidia.com/)
+2. **Open Settings**: Navigate to **Settings → API Keys**
+3. **Generate Key**: Create a new Bearer token API key
+4. **Browse Models**: Explore the catalog at [build.nvidia.com/models](https://build.nvidia.com/models)
+5. **Set Environment**: Export `NVIDIA_NIM_API_KEY`
+
+### Environment Variables Reference
+
+| Variable                        | Required | Default                               | Description                             |
+| ------------------------------- | -------- | ------------------------------------- | --------------------------------------- |
+| `NVIDIA_NIM_API_KEY`            | ✅       | -                                     | NVIDIA NIM API key (Bearer token)       |
+| `NVIDIA_NIM_MODEL`              | ❌       | `openai/gpt-oss-20b`                  | Default model                           |
+| `NVIDIA_NIM_BASE_URL`           | ❌       | `https://integrate.api.nvidia.com/v1` | Override for self-hosted NIM            |
+| `NVIDIA_NIM_TOP_K`              | ❌       | -                                     | Top-K sampling parameter                |
+| `NVIDIA_NIM_MIN_P`              | ❌       | -                                     | Min-P sampling parameter                |
+| `NVIDIA_NIM_REPETITION_PENALTY` | ❌       | -                                     | Repetition penalty                      |
+| `NVIDIA_NIM_MIN_TOKENS`         | ❌       | -                                     | Minimum tokens to generate              |
+| `NVIDIA_NIM_CHAT_TEMPLATE`      | ❌       | -                                     | Override model chat template (advanced) |
+
+### Provider ID and Aliases
+
+- **Provider ID**: `nvidia-nim`
+- **Aliases**: `nim`, `nvidia`
+
+---
+
+## LM Studio Configuration {#lm-studio}
+
+LM Studio is a local AI provider — it runs models entirely on your machine with no data sent to any external service. No API key is required for standard (non-proxied) installations.
+
+### Prerequisites
+
+1. Install LM Studio from [lmstudio.ai](https://lmstudio.ai/)
+2. Open LM Studio and download a model from the **Discover** tab
+3. Go to **Local Server** and click **Start Server**
+
+The server starts at `http://localhost:1234/v1` by default. NeuroLink auto-discovers the currently loaded model via `/v1/models` — you do not need to specify a model name.
+
+### Optional Configuration
+
+```bash
+export LM_STUDIO_BASE_URL="http://localhost:1234/v1"   # Default; override if server is on a different host/port
+export LM_STUDIO_MODEL=""                              # Blank = auto-discover; set to force a specific model ID
+# export LM_STUDIO_API_KEY="your-key"                 # Only needed behind an auth-proxying reverse-proxy
+```
+
+### Usage Example
+
+```typescript
+import { NeuroLink } from "@juspay/neurolink";
+
+const neurolink = new NeuroLink();
+
+// Model is auto-discovered from LM Studio
+const result = await neurolink.generate({
+  input: { text: "Explain machine learning" },
+  provider: "lm-studio",
+  temperature: 0.7,
+  maxTokens: 500,
+});
+
+// Or specify a model explicitly (must be loaded in LM Studio)
+const result2 = await neurolink.generate({
+  input: { text: "Write a poem" },
+  provider: "lm-studio",
+  model: "lmstudio-community/Meta-Llama-3.1-8B-Instruct-GGUF",
+});
+```
+
+### CLI Usage
+
+```bash
+# Auto-discover loaded model
+npx @juspay/neurolink generate "Hello from LM Studio" --provider lm-studio
+
+# Use alias
+npx @juspay/neurolink generate "Hello" --provider lmstudio
+```
+
+### Notes
+
+- **API key**: Not required for vanilla LM Studio installs. Set `LM_STUDIO_API_KEY` only when running LM Studio behind an authenticating reverse-proxy.
+- **Model auto-discovery**: If the server is not running or has no model loaded, NeuroLink logs a warning and falls back gracefully. Start LM Studio and load a model, then retry.
+
+### Timeout Configuration
+
+- **Default Timeout**: 5 minutes (longer for local CPU/GPU inference)
+- **Environment Variable**: `LM_STUDIO_TIMEOUT='10m'` (optional)
+
+### Environment Variables Reference
+
+| Variable             | Required | Default                    | Description                                           |
+| -------------------- | -------- | -------------------------- | ----------------------------------------------------- |
+| `LM_STUDIO_BASE_URL` | ❌       | `http://localhost:1234/v1` | LM Studio server URL                                  |
+| `LM_STUDIO_MODEL`    | ❌       | _(auto-discovered)_        | Force a specific model ID; blank = use loaded model   |
+| `LM_STUDIO_API_KEY`  | ❌       | -                          | API key — only for reverse-proxy authenticated setups |
+
+### Provider ID and Aliases
+
+- **Provider ID**: `lm-studio`
+- **Aliases**: `lmstudio`, `lms`
+
+---
+
+## llama.cpp Configuration {#llamacpp}
+
+llama.cpp's `llama-server` is a local AI provider — it runs GGUF models entirely on your machine. No API key is required for standard (non-proxied) installations.
+
+### Prerequisites
+
+1. Build llama.cpp: follow the [build instructions](https://github.com/ggerganov/llama.cpp#build)
+2. Download a GGUF model file (e.g., from [Hugging Face](https://huggingface.co/models?library=gguf))
+3. Start the server:
+
+   ```bash
+   # Basic usage
+   ./llama-server -m model.gguf --port 8080
+
+   # With tool/function-call support (required for MCP tools)
+   ./llama-server -m model.gguf --port 8080 --jinja
+   ```
+
+The server starts at `http://localhost:8080/v1` by default. NeuroLink auto-discovers the loaded model via `/v1/models`.
+
+### Optional Configuration
+
+```bash
+export LLAMACPP_BASE_URL="http://localhost:8080/v1"    # Default; override if server is on a different host/port
+export LLAMACPP_MODEL=""                               # Blank = auto-discover; set to force a specific model ID
+# export LLAMACPP_API_KEY="your-key"                  # Only needed behind an auth-proxying reverse-proxy
+```
+
+### Usage Example
+
+```typescript
+import { NeuroLink } from "@juspay/neurolink";
+
+const neurolink = new NeuroLink();
+
+// Model is auto-discovered from llama-server
+const result = await neurolink.generate({
+  input: { text: "Explain machine learning" },
+  provider: "llamacpp",
+  temperature: 0.7,
+  maxTokens: 500,
+});
+```
+
+### CLI Usage
+
+```bash
+# Auto-discover loaded model
+npx @juspay/neurolink generate "Hello from llama.cpp" --provider llamacpp
+
+# Use alias
+npx @juspay/neurolink generate "Hello" --provider "llama.cpp"
+```
+
+### Notes
+
+- **API key**: Not required for vanilla llama-server installs. Set `LLAMACPP_API_KEY` only when running behind an authenticating reverse-proxy.
+- **Tool support**: llama-server must be started with the `--jinja` flag to enable tool/function-call support. Without it, tool calls return a 400 error.
+- **Model auto-discovery**: llama-server hosts one model at a time. NeuroLink reads it from `/v1/models` automatically.
+- **Health check**: NeuroLink validates connectivity via the `/health` endpoint with up to 3 retries.
+
+### Timeout Configuration
+
+- **Default Timeout**: 5 minutes (longer for local CPU/GPU inference)
+- **Environment Variable**: `LLAMACPP_TIMEOUT='10m'` (optional)
+
+### Environment Variables Reference
+
+| Variable            | Required | Default                    | Description                                           |
+| ------------------- | -------- | -------------------------- | ----------------------------------------------------- |
+| `LLAMACPP_BASE_URL` | ❌       | `http://localhost:8080/v1` | llama-server URL                                      |
+| `LLAMACPP_MODEL`    | ❌       | _(auto-discovered)_        | Force a specific model ID; blank = use loaded model   |
+| `LLAMACPP_API_KEY`  | ❌       | -                          | API key — only for reverse-proxy authenticated setups |
+
+### Provider ID and Aliases
+
+- **Provider ID**: `llamacpp`
+- **Aliases**: `llama.cpp`
+
+---
 
 ## Redis Configuration {#redis}
 
@@ -1452,7 +1909,7 @@ AZURE_OPENAI_DEPLOYMENT_ID=your-deployment-name
 
 # Hugging Face
 HUGGINGFACE_API_KEY=hf_your_token_here
-HUGGINGFACE_MODEL=microsoft/DialoGPT-medium  # Optional
+HUGGINGFACE_MODEL=Qwen/Qwen2.5-72B-Instruct  # Optional
 
 # Ollama (Local AI)
 OLLAMA_BASE_URL=http://localhost:11434  # Optional
@@ -1461,6 +1918,20 @@ OLLAMA_MODEL=llama2  # Optional
 # Mistral AI
 MISTRAL_API_KEY=your_mistral_api_key
 MISTRAL_MODEL=mistral-small  # Optional
+
+# DeepSeek
+DEEPSEEK_API_KEY=sk-your-deepseek-key
+DEEPSEEK_MODEL=deepseek-chat  # Optional (deepseek-chat or deepseek-reasoner)
+
+# NVIDIA NIM
+NVIDIA_NIM_API_KEY=nvapi-your-nvidia-key
+NVIDIA_NIM_MODEL=openai/gpt-oss-20b  # Optional
+
+# LM Studio (local — no API key required)
+LM_STUDIO_BASE_URL=http://localhost:1234/v1  # Optional
+
+# llama.cpp (local — no API key required)
+LLAMACPP_BASE_URL=http://localhost:8080/v1  # Optional
 
 # Application Settings
 DEFAULT_PROVIDER=auto
@@ -1654,6 +2125,530 @@ Authentication failed
 - Implement rate limiting in your applications
 - Monitor usage and costs
 - Use HTTPS for all API communications
+
+---
+
+## OpenAI TTS Configuration {#openai-tts}
+
+OpenAI TTS provides text-to-speech synthesis using the same API key as the OpenAI LLM provider. No additional credentials are required.
+
+### Basic Setup
+
+```bash
+export OPENAI_API_KEY="sk-your-openai-api-key"
+```
+
+**Note:** `OPENAI_API_KEY` is shared with the OpenAI LLM provider. No separate key is needed.
+
+### Supported Models
+
+- `tts-1` (default) - Optimized for speed, lower latency
+- `tts-1-hd` - Optimized for quality, higher fidelity audio
+
+### Supported Voices
+
+`alloy`, `echo`, `fable`, `onyx`, `nova`, `shimmer`
+
+### Supported Output Formats
+
+`mp3` (default), `opus`, `wav`, `ogg`
+
+### Usage Example
+
+```typescript
+import { NeuroLink } from "@juspay/neurolink";
+
+const neurolink = new NeuroLink();
+
+const result = await neurolink.generate({
+  input: { text: "Hello, world!" },
+  tts: {
+    enabled: true,
+    provider: "openai-tts",
+    voice: "alloy",
+    format: "mp3",
+  },
+});
+```
+
+### CLI Usage
+
+```bash
+npx @juspay/neurolink generate "Hello, world!" --tts --tts-provider openai-tts
+```
+
+### Environment Variables Reference
+
+| Variable         | Required | Default | Description                         |
+| ---------------- | -------- | ------- | ----------------------------------- |
+| `OPENAI_API_KEY` | ✅       | -       | Shared with the OpenAI LLM provider |
+
+### Provider ID and Aliases
+
+- **Provider ID**: `openai-tts`
+
+---
+
+## ElevenLabs Configuration {#elevenlabs}
+
+ElevenLabs provides high-quality, multilingual text-to-speech synthesis with a wide selection of voices and voice cloning support.
+
+### Basic Setup
+
+```bash
+export ELEVENLABS_API_KEY="your-elevenlabs-api-key"
+```
+
+### How to Get ElevenLabs API Key
+
+1. Visit [ElevenLabs](https://elevenlabs.io)
+2. Sign up or log in to your account
+3. Navigate to **Profile → API Key**
+4. Copy the key
+
+### Supported Models
+
+- `eleven_multilingual_v2` (default) - Best quality, 29 languages
+- `eleven_turbo_v2_5` - Low-latency streaming, 32 languages
+- `eleven_flash_v2_5` - Fastest, suitable for real-time applications
+
+### Usage Example
+
+```typescript
+import { NeuroLink } from "@juspay/neurolink";
+
+const neurolink = new NeuroLink();
+
+const result = await neurolink.generate({
+  input: { text: "Bonjour le monde!" },
+  tts: {
+    enabled: true,
+    provider: "elevenlabs",
+    voice: "Rachel",
+    model: "eleven_multilingual_v2",
+  },
+});
+```
+
+### CLI Usage
+
+```bash
+npx @juspay/neurolink generate "Hello, world!" --tts --tts-provider elevenlabs
+```
+
+### Notes
+
+- **Multilingual support**: ElevenLabs models support up to 32 languages with natural prosody
+- **Voice cloning**: ElevenLabs supports custom voice IDs from your ElevenLabs account
+
+### Environment Variables Reference
+
+| Variable             | Required | Default | Description        |
+| -------------------- | -------- | ------- | ------------------ |
+| `ELEVENLABS_API_KEY` | ✅       | -       | ElevenLabs API key |
+
+### Provider ID and Aliases
+
+- **Provider ID**: `elevenlabs`
+
+---
+
+## Deepgram STT Configuration {#deepgram}
+
+Deepgram provides fast, accurate speech-to-text transcription with support for real-time streaming and pre-recorded audio.
+
+### Basic Setup
+
+```bash
+export DEEPGRAM_API_KEY="your-deepgram-api-key"
+```
+
+### How to Get Deepgram API Key
+
+1. Visit [Deepgram Console](https://console.deepgram.com)
+2. Sign up or log in to your account
+3. Navigate to **API Keys**
+4. Click **Create a New API Key**
+5. Copy the key
+
+### Supported Models
+
+- `nova-3` (default) - Latest, highest accuracy
+- `nova-2` - High accuracy, broad language support
+- `base` - Balanced accuracy and speed
+
+### Usage Example
+
+```typescript
+import { NeuroLink } from "@juspay/neurolink";
+import { readFileSync } from "fs";
+
+const neurolink = new NeuroLink();
+const audioBuffer = readFileSync("audio.wav");
+
+const result = await neurolink.generate({
+  input: { text: "Respond to what was said" },
+  stt: {
+    enabled: true,
+    provider: "deepgram",
+    audio: audioBuffer,
+    model: "nova-3",
+    language: "en",
+  },
+});
+```
+
+### CLI Usage
+
+```bash
+npx @juspay/neurolink generate "Respond to this" --stt --stt-provider deepgram --input-audio file.wav
+```
+
+### Notes
+
+- **Streaming transcription**: Deepgram supports real-time audio streaming for live transcription
+- **Language support**: Deepgram nova models support 30+ languages
+
+### Environment Variables Reference
+
+| Variable           | Required | Default | Description      |
+| ------------------ | -------- | ------- | ---------------- |
+| `DEEPGRAM_API_KEY` | ✅       | -       | Deepgram API key |
+
+### Provider ID and Aliases
+
+- **Provider ID**: `deepgram` (STT only — Deepgram's TTS product is not wired today)
+
+---
+
+## Whisper Configuration {#whisper}
+
+Whisper is OpenAI's speech-to-text model — registered as the provider id `whisper`.
+It accepts MP3, WAV, M4A, and FLAC inputs up to 25 MB.
+
+```bash
+# Required environment variable
+OPENAI_API_KEY=sk-...
+```
+
+Get your API key from: **OpenAI Platform** > **API Keys**.
+
+### Usage
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "Repeat what was said" },
+  provider: "openai",
+  stt: {
+    enabled: true,
+    provider: "whisper",
+    audio: audioBuffer,
+    format: "mp3",
+  },
+});
+console.log(result.transcription?.text);
+```
+
+### CLI
+
+```bash
+neurolink generate "Repeat what was said" \
+  --provider openai \
+  --stt --stt-provider whisper --input-audio ./audio.mp3
+```
+
+### Provider ID
+
+- **Provider ID**: `whisper`
+
+---
+
+## Azure Speech Configuration {#azure-speech}
+
+Azure Cognitive Services Speech provides both TTS (`azure-tts`) and STT (`azure-stt`).
+
+```bash
+# Required environment variables
+AZURE_SPEECH_KEY=your-speech-key
+AZURE_SPEECH_REGION=eastus
+```
+
+Get credentials from: **Azure Portal** > **Cognitive Services** > **Speech** > **Keys and Endpoint**.
+
+### TTS Usage
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "Hello world" },
+  tts: {
+    enabled: true,
+    provider: "azure-tts",
+    voice: "en-US-JennyNeural",
+    format: "mp3",
+  },
+});
+```
+
+### STT Usage
+
+> **MP3 not supported** — Azure's short-audio REST endpoint only decodes WAV
+> PCM and Ogg/Opus. Passing `format: "mp3"` to `azure-stt` throws
+> `STT_INVALID_AUDIO_FORMAT` early. Convert with
+> `ffmpeg -i in.mp3 -ar 16000 -ac 1 out.wav` first.
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "" },
+  provider: "openai",
+  stt: {
+    enabled: true,
+    provider: "azure-stt",
+    audio: wavBuffer,
+    format: "wav",
+    language: "en-US",
+  },
+});
+```
+
+### Provider IDs
+
+- **TTS**: `azure-tts`
+- **STT**: `azure-stt`
+
+---
+
+## Fish Audio TTS Configuration {#fish-audio}
+
+Low-cost TTS provider focused on voice cloning. Wrapped as a TTSHandler so it
+slots into the same `generate({ tts: { provider: "fish-audio" } })` flow as
+OpenAI / ElevenLabs / Azure / Google AI TTS.
+
+```bash
+# Required
+FISH_AUDIO_API_KEY=your-fish-audio-api-key
+
+# Optional: default voice (any reference_id from the Fish library)
+# FISH_AUDIO_VOICE_ID=...
+
+# Optional: base URL override
+# FISH_AUDIO_BASE_URL=https://api.fish.audio
+```
+
+Get an API key from [fish.audio](https://fish.audio/) → dashboard.
+
+### Usage
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "Hello world from Fish Audio" },
+  provider: "openai",
+  tts: {
+    enabled: true,
+    provider: "fish-audio",
+    format: "mp3",
+  },
+});
+```
+
+- **Provider ID**: `fish-audio`
+- **Default model**: `s1` (override via `tts.model`: `speech-1.5`, `speech-1.6`, `s1`)
+- **Max text length**: 5000 characters
+- **Output formats**: `mp3` (default, 44.1 kHz), `wav` (44.1 kHz), `pcm16` (raw, 44.1 kHz)
+- **Languages**: 14 (English, Mandarin, Cantonese, Japanese, Korean, French, German, Spanish, Italian, Portuguese, Russian, Arabic, Hindi, Indonesian)
+- **Voice cloning**: 15 s of reference audio → custom `reference_id`
+
+Full guide: [Fish Audio TTS Provider](./providers/fish-audio.md).
+
+---
+
+## Cartesia TTS Configuration {#cartesia}
+
+Low-latency TTS provider running Cartesia's Sonic models. The synchronous
+`/tts/bytes` endpoint is wrapped as a TTSHandler; the realtime WebSocket flow
+is exposed separately as `CartesiaStream` for the voice server.
+
+```bash
+# Required
+CARTESIA_API_KEY=sk_car_...
+
+# Optional: default voice id (any voice from your Cartesia library)
+# CARTESIA_VOICE_ID=...
+
+# Optional: model override (default sonic-3.6)
+# CARTESIA_MODEL=sonic-3.6
+
+# Optional: API version header (default 2025-04-16)
+# CARTESIA_API_VERSION=2025-04-16
+
+# Optional: base URL override
+# CARTESIA_BASE_URL=https://api.cartesia.ai
+```
+
+Get an API key from [play.cartesia.ai/keys](https://play.cartesia.ai/keys).
+
+### Usage
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "Hello world from Cartesia Sonic" },
+  provider: "openai",
+  tts: {
+    enabled: true,
+    provider: "cartesia",
+    format: "mp3",
+  },
+});
+```
+
+- **Provider ID**: `cartesia`
+- **Default model**: `sonic-3.6`
+- **Default voice**: `694f9389-aac1-45b6-b726-9d9369183238` ("Bright Female", English)
+- **Max text length**: 5000 characters
+- **Output formats**: `mp3` (default, 44.1 kHz), `wav` (PCM s16le @ 44.1 kHz), `pcm16` (raw, 24 kHz)
+- **Streaming**: synchronous via this handler; WebSocket via `CartesiaStream` adapter
+
+Full guide: [Cartesia TTS Provider](./providers/cartesia.md).
+
+---
+
+## Google Speech Configuration {#google-speech}
+
+Covers both Google Cloud TTS (`google-tts` / via `google-ai`) and Google Cloud
+Speech-to-Text (`google-stt`). Both share the same service-account credentials.
+
+```bash
+# Required environment variable
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
+
+# OR (for TTS only) an API key
+GOOGLE_API_KEY=AIza...
+```
+
+> **Speech-to-Text API must be enabled** in your Google Cloud project for
+> `google-stt` to work. Enable it at
+> [console.cloud.google.com/apis/library/speech.googleapis.com](https://console.cloud.google.com/apis/library/speech.googleapis.com).
+
+### TTS Usage
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "Hello world" },
+  tts: {
+    enabled: true,
+    provider: "google-ai",
+    voice: "en-US-Neural2-A",
+    format: "mp3",
+  },
+});
+```
+
+### STT Usage
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "" },
+  provider: "openai",
+  stt: {
+    enabled: true,
+    provider: "google-stt",
+    audio: audioBuffer,
+    format: "mp3",
+  },
+});
+```
+
+### Provider IDs
+
+- **TTS**: `google-ai` (or `google-tts` alias)
+- **STT**: `google-stt`
+
+---
+
+## OpenAI Realtime Configuration {#openai-realtime}
+
+Real-time voice via the OpenAI Realtime WebSocket API. Provider id
+`openai-realtime` is registered for future use; the typical pattern is to
+launch the integrated voice server (`neurolink serve voice`) which wires
+this through Soniox/Cartesia.
+
+```bash
+OPENAI_API_KEY=sk-...
+```
+
+### Provider ID
+
+- **Provider ID**: `openai-realtime`
+- **Audio chunk format**: `pcm16` — raw 16-bit PCM at 24 kHz, **NOT**
+  WAV-headered. Do not pass these chunks to a WAV duration parser.
+
+---
+
+## Gemini Live Configuration {#gemini-live}
+
+Real-time voice via Google's Gemini Live WebSocket API. Provider id
+`gemini-live` is registered for future use.
+
+```bash
+GOOGLE_API_KEY=AIza...
+# OR
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
+```
+
+### Provider ID
+
+- **Provider ID**: `gemini-live`
+
+---
+
+## Streaming + Voice Patterns {#streaming-voice}
+
+### `stream()` + STT (transcribe before stream)
+
+```typescript
+const audio = readFileSync("./recording.mp3");
+const r = await neurolink.stream({
+  input: { text: "" },
+  provider: "openai",
+  stt: { enabled: true, provider: "whisper", audio, format: "mp3" },
+});
+
+console.log("transcription:", r.transcription?.text); // available before iterating
+for await (const chunk of r.stream) {
+  if ("content" in chunk) process.stdout.write(chunk.content);
+}
+```
+
+### `stream()` + TTS Mode 2 (synthesise the streamed reply)
+
+Two ergonomic options — both deliver byte-identical audio:
+
+```typescript
+const r = await neurolink.stream({
+  input: { text: "Tell me a fact." },
+  provider: "openai",
+  tts: {
+    enabled: true,
+    useAiResponse: true,
+    provider: "openai-tts",
+    format: "mp3",
+  },
+});
+
+// --- Option A: collect inline while iterating ---
+const audioBufs: Buffer[] = [];
+for await (const c of r.stream) {
+  if ("content" in c) process.stdout.write(c.content);
+  else if (c.type === "audio") audioBufs.push(c.audio.data);
+}
+writeFileSync("./out.mp3", Buffer.concat(audioBufs));
+
+// --- Option B: ergonomic Promise — read after the stream completes ---
+const tts = await r.audio; // resolves to TTSResult or undefined
+if (tts) writeFileSync("./out.mp3", tts.buffer);
+```
+
+When `tts.useAiResponse` is `false` (Mode 1) or TTS is not enabled,
+`r.audio` resolves to `undefined` rather than hanging.
 
 ---
 

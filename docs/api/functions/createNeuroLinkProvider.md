@@ -1,0 +1,37 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / createNeuroLinkProvider
+
+# Function: createNeuroLinkProvider()
+
+> **createNeuroLinkProvider**(`options`): [`NeuroLinkAIProvider`](../classes/NeuroLinkAIProvider.md) & (`modelId?`, `modelOptions?`) => [`NeuroLinkLanguageModel`](../classes/NeuroLinkLanguageModel.md)
+
+Create a NeuroLink provider for Vercel AI SDK
+
+## Parameters
+
+### options
+
+[`NeuroLinkProviderOptions`](../type-aliases/NeuroLinkProviderOptions.md)
+
+## Returns
+
+[`NeuroLinkAIProvider`](../classes/NeuroLinkAIProvider.md) & (`modelId?`, `modelOptions?`) => [`NeuroLinkLanguageModel`](../classes/NeuroLinkLanguageModel.md)
+
+## Example
+
+```typescript
+import { createNeuroLinkProvider, generateText } from "@neurolink/ai-sdk";
+
+const neurolink = createNeuroLinkProvider({
+  baseUrl: "https://api.neurolink.example.com",
+  apiKey: process.env.NEUROLINK_API_KEY,
+});
+
+const result = await generateText({
+  model: neurolink("gpt-4o"),
+  prompt: "Hello!",
+});
+```

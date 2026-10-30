@@ -3,15 +3,11 @@ import chalk from "chalk";
 import ora from "ora";
 import inquirer from "inquirer";
 import { logger } from "../../lib/utils/logger.js";
+import type { SetupHuggingFaceArgs } from "../../lib/types/index.js";
 import {
   updateEnvFile as writeEnvFile,
   displayEnvUpdateSummary,
 } from "../utils/envManager.js";
-
-interface SetupHuggingFaceArgs {
-  check?: boolean;
-  "non-interactive"?: boolean;
-}
 
 /**
  * Validates Hugging Face API key format
@@ -137,29 +133,37 @@ export const handleHuggingFaceSetup = async (
     // Step 2: Model Selection
     const { modelChoice } = await inquirer.prompt([
       {
-        type: "list",
+        type: "select",
         name: "modelChoice",
         message: "Select a Hugging Face model:",
+        // Router-served ids only. The previous five options
+        // (DialoGPT-large/medium/small, blenderbot-400M-distill) are all
+        // absent from the router catalogue and answer 400 on every request,
+        // so this wizard wrote a dead model into the user's .env.
         choices: [
           {
-            name: "Skip - use default (microsoft/DialoGPT-large)",
+            name: "Skip - use default (Qwen/Qwen2.5-72B-Instruct)",
             value: "default",
           },
           {
-            name: "microsoft/DialoGPT-large (Conversational AI - Recommended)",
-            value: "microsoft/DialoGPT-large",
+            name: "Qwen/Qwen2.5-72B-Instruct (Recommended - tool-capable)",
+            value: "Qwen/Qwen2.5-72B-Instruct",
           },
           {
-            name: "microsoft/DialoGPT-medium (Faster, smaller)",
-            value: "microsoft/DialoGPT-medium",
+            name: "meta-llama/Llama-3.1-8B-Instruct (Fastest)",
+            value: "meta-llama/Llama-3.1-8B-Instruct",
           },
           {
-            name: "facebook/blenderbot-400M-distill (General purpose)",
-            value: "facebook/blenderbot-400M-distill",
+            name: "meta-llama/Llama-3.3-70B-Instruct (Stronger reasoning)",
+            value: "meta-llama/Llama-3.3-70B-Instruct",
           },
           {
-            name: "microsoft/DialoGPT-small (Fastest)",
-            value: "microsoft/DialoGPT-small",
+            name: "deepseek-ai/DeepSeek-V3 (Highest quality)",
+            value: "deepseek-ai/DeepSeek-V3",
+          },
+          {
+            name: "Qwen/Qwen2.5-Coder-32B-Instruct (Code-focused)",
+            value: "Qwen/Qwen2.5-Coder-32B-Instruct",
           },
           {
             name: "Custom model name",
@@ -183,7 +187,7 @@ export const handleHuggingFaceSetup = async (
               return "Model name is required";
             }
             if (!trimmed.includes("/")) {
-              return "Model name should include organization (e.g., 'microsoft/DialoGPT-large')";
+              return "Model name should include organization (e.g., 'Qwen/Qwen2.5-72B-Instruct')";
             }
             return true;
           },
@@ -221,6 +225,7 @@ export const handleHuggingFaceSetup = async (
       spinner.stop();
       throw new Error(
         `Failed to save configuration: ${envError instanceof Error ? envError.message : String(envError)}`,
+        { cause: envError },
       );
     }
     logger.always(chalk.blue("\n📖 Usage examples:"));
@@ -243,7 +248,7 @@ export const handleHuggingFaceSetup = async (
       );
       logger.always(
         chalk.gray(
-          '   neurolink generate "Explain AI" --provider huggingface --model microsoft/DialoGPT-medium',
+          '   neurolink generate "Explain AI" --provider huggingface --model Qwen/Qwen2.5-72B-Instruct',
         ),
       );
     }

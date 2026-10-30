@@ -17,29 +17,19 @@ import chalk from "chalk";
 import ora from "ora";
 import { logger } from "../../lib/utils/logger.js";
 import { getTopModelChoices } from "../../lib/utils/modelChoices.js";
-import { AIProviderName } from "../../lib/types/index.js";
-
-interface AnthropicSetupOptions {
-  checkOnly?: boolean;
-  interactive?: boolean;
-}
-
-interface AnthropicSetupArgv {
-  check?: boolean;
-  nonInteractive?: boolean;
-}
-
-interface AnthropicConfig {
-  apiKey?: string;
-  model?: string;
-  isReconfiguring?: boolean;
-}
+import {
+  AIProviderName,
+  type ProviderSetupArgv,
+  type ProviderSetupConfig,
+  type ProviderSetupOptions,
+} from "../../lib/types/index.js";
+import { maskCredential } from "../utils/maskCredential.js";
 
 export async function handleAnthropicSetup(
-  argv: AnthropicSetupArgv,
+  argv: ProviderSetupArgv,
 ): Promise<void> {
   try {
-    const options: AnthropicSetupOptions = {
+    const options: ProviderSetupOptions = {
       checkOnly: argv.check || false,
       interactive: !argv.nonInteractive,
     };
@@ -64,7 +54,7 @@ export async function handleAnthropicSetup(
         if (hasModel) {
           logger.always(`   Model: ${process.env.ANTHROPIC_MODEL}`);
         } else {
-          logger.always("   Model: claude-3-5-sonnet-20241022 (default)");
+          logger.always("   Model: claude-sonnet-4-6 (default)");
         }
       } else {
         logger.always(chalk.yellow("⚠️  Anthropic setup incomplete"));
@@ -72,7 +62,7 @@ export async function handleAnthropicSetup(
       return;
     }
 
-    const config: AnthropicConfig = {};
+    const config: ProviderSetupConfig = {};
 
     // Step 2: Handle existing configuration
     if (hasApiKey) {
@@ -84,7 +74,7 @@ export async function handleAnthropicSetup(
       if (hasModel) {
         logger.always(`   Model: ${process.env.ANTHROPIC_MODEL}`);
       } else {
-        logger.always("   Model: claude-3-5-sonnet-20241022 (default)");
+        logger.always("   Model: claude-sonnet-4-6 (default)");
       }
 
       if (options.interactive) {
@@ -288,7 +278,7 @@ function displayCurrentStatus(hasApiKey: boolean, hasModel: boolean): void {
   } else {
     logger.always(
       chalk.yellow(
-        "⚠ ANTHROPIC_MODEL not set (will use claude-3-5-sonnet-20241022 default)",
+        "⚠ ANTHROPIC_MODEL not set (will use claude-sonnet-4-6 default)",
       ),
     );
   }
@@ -326,7 +316,7 @@ function validateApiKey(input: string): boolean | string {
 async function promptForModel(): Promise<string> {
   const { modelChoice } = await inquirer.prompt([
     {
-      type: "list",
+      type: "select",
       name: "modelChoice",
       message: "Select an Anthropic Claude model:",
       choices: getTopModelChoices(AIProviderName.ANTHROPIC, 5),
@@ -361,7 +351,7 @@ async function promptForModel(): Promise<string> {
 /**
  * Update .env file with Anthropic configuration
  */
-async function updateEnvFile(config: AnthropicConfig): Promise<void> {
+async function updateEnvFile(config: ProviderSetupConfig): Promise<void> {
   const envPath = path.join(process.cwd(), ".env");
   const spinner = ora("💾 Updating .env file...").start();
 
@@ -445,22 +435,6 @@ async function updateEnvFile(config: AnthropicConfig): Promise<void> {
     );
     throw error;
   }
-}
-
-/**
- * Mask API key for display
- */
-function maskCredential(credential: string): string {
-  if (!credential || credential.length < 8) {
-    return "****";
-  }
-  const knownPrefixes = ["sk-ant-"];
-  const prefix =
-    knownPrefixes.find((p) => credential.startsWith(p)) ??
-    credential.slice(0, 3);
-  const end = credential.slice(-4);
-  const stars = "*".repeat(Math.max(4, credential.length - prefix.length - 4));
-  return `${prefix}${stars}${end}`;
 }
 
 /**

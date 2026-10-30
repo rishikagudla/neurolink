@@ -36,23 +36,47 @@
  * ```
  */
 
-import { type CellValue, Workbook } from "exceljs";
-
 import { BaseFileProcessor } from "../base/BaseFileProcessor.js";
 import type {
+  CellValue,
+  ExcelJSCell,
+  ExcelJSRow,
+  ExcelJSWorkbook,
+  ExcelJSWorksheet,
+  ExcelWorksheet,
   FileInfo,
-  FileProcessingResult,
+  OfficeProcessorOptions,
   ProcessOptions,
-} from "../base/types.js";
+  ProcessedExcel,
+  ProcessorFileProcessingResult,
+} from "../../types/index.js";
 import { SIZE_LIMITS } from "../config/index.js";
 import { FileErrorCode } from "../errors/index.js";
+import { tryImport } from "../../utils/tryImport.js";
+import { dedupeColumnNames } from "../../utils/csvProcessor.js";
+
+let _exceljs: typeof import("exceljs") | null = null;
+async function loadExcelJS() {
+  if (_exceljs) {
+    return _exceljs;
+  }
+  const mod = await tryImport("exceljs", "Excel file processing");
+  // exceljs is a CommonJS module. Under Node ESM (and some bundlers) the
+  // `Workbook` constructor is exposed at runtime on the namespace's `default`
+  // export rather than on the namespace itself — so a bare
+  // `new ExcelJS.Workbook()` throws "ExcelJS.Workbook is not a constructor"
+  // (TS still types it as present via esModuleInterop, masking the bug).
+  // Normalise here so the constructor is reachable regardless of interop style.
+  const ns = mod as { Workbook?: unknown; default?: unknown };
+  _exceljs = (
+    ns.Workbook ? ns : (ns.default ?? ns)
+  ) as typeof import("exceljs");
+  return _exceljs;
+}
 
 // Re-export for consumers who import from this module
-export type { ExcelWorksheet, ProcessedExcel } from "../base/types.js";
 
 // Import for local use
-import type { ExcelWorksheet, ProcessedExcel } from "../base/types.js";
-
 // =============================================================================
 // CONSTANTS
 // =============================================================================
@@ -188,7 +212,7 @@ export class ExcelProcessor extends BaseFileProcessor<ProcessedExcel> {
   override async processFile(
     fileInfo: FileInfo,
     options?: ProcessOptions,
-  ): Promise<FileProcessingResult<ProcessedExcel>> {
+  ): Promise<ProcessorFileProcessingResult<ProcessedExcel>> {
     try {
       // Step 1: Validate file type and size
       const validationResult = this.validateFileWithResult(fileInfo);
@@ -300,8 +324,13 @@ export class ExcelProcessor extends BaseFileProcessor<ProcessedExcel> {
    * @param buffer - Excel file content
    * @returns Parsed ExcelJS Workbook
    */
-  private async parseWorkbook(buffer: Buffer): Promise<Workbook> {
-    const workbook = new Workbook();
+  private async parseWorkbook(buffer: Buffer): Promise<ExcelJSWorkbook> {
+    const ExcelJS = await loadExcelJS();
+    // The exceljs constructor comes from a normalised CJS/ESM interop
+    // namespace (see loadExcelJS); probe the instance as `unknown` and
+    // narrow to the structural subset this processor uses.
+    const workbookInstance: unknown = new ExcelJS.Workbook();
+    const workbook = workbookInstance as ExcelJSWorkbook;
     // ExcelJS load() types expect Buffer but Node 22+ Buffer<ArrayBufferLike>
     // is not directly assignable. Extract a clean ArrayBuffer for the exact
     // byte range via slice, then cast for type compatibility.
@@ -320,7 +349,7 @@ export class ExcelProcessor extends BaseFileProcessor<ProcessedExcel> {
    * @param workbook - Parsed ExcelJS Workbook
    * @returns Extracted worksheets with truncation metadata
    */
-  private extractWorksheets(workbook: Workbook): {
+  private extractWorksheets(workbook: ExcelJSWorkbook): {
     worksheets: ExcelWorksheet[];
     truncated: boolean;
     truncatedSheets: string[];
@@ -346,7 +375,7 @@ export class ExcelProcessor extends BaseFileProcessor<ProcessedExcel> {
       let rowIndex = 0;
       let hitLimit = false;
 
-      worksheet.eachRow((row, rowNumber) => {
+      worksheet.eachRow((row: ExcelJSRow, rowNumber: number) => {
         if (hitLimit) {
           return;
         }
@@ -491,6 +520,253 @@ export class ExcelProcessor extends BaseFileProcessor<ProcessedExcel> {
       })
       .join("");
   }
+
+  // ===========================================================================
+  // TARGETED EXTRACTION API
+  // ===========================================================================
+
+  /**
+   * Extract a specific range from a spreadsheet.
+   *
+   * Called by the `extract_file_content` tool for targeted data access.
+   * Returns TSV-formatted text for the specified sheet, row range, and columns.
+   *
+   * @param buffer - Excel file buffer
+   * @param sheet - Sheet name or 0-based index (default: first sheet)
+   * @param rowStart - Starting row (1-indexed, default: 1)
+   * @param rowEnd - Ending row (1-indexed, default: all rows)
+   * @param columns - Specific column letters to include (e.g., ["A", "B", "D"])
+   * @returns TSV-formatted string with the extracted data
+   */
+  async extractSheetRange(
+    buffer: Buffer,
+    sheet?: string | number,
+    rowStart: number = 1,
+    rowEnd?: number,
+    columns?: string[],
+  ): Promise<string> {
+    const workbook = await this.parseWorkbook(buffer);
+
+    // Resolve the target worksheet
+    let worksheet: ExcelJSWorksheet | undefined;
+    if (typeof sheet === "number") {
+      // exceljs worksheets are 1-indexed
+      worksheet = workbook.worksheets[sheet];
+    } else if (typeof sheet === "string") {
+      worksheet = workbook.getWorksheet(sheet);
+    } else {
+      worksheet = workbook.worksheets[0];
+    }
+
+    if (!worksheet) {
+      const sheetNames = workbook.worksheets
+        .map((ws: ExcelJSWorksheet) => ws.name)
+        .join(", ");
+      return `Sheet not found. Available sheets: ${sheetNames}`;
+    }
+
+    // Convert column letters to 1-based column indices if specified
+    const columnIndices: number[] | undefined = columns?.map((col) => {
+      let index = 0;
+      for (let i = 0; i < col.length; i++) {
+        index = index * 26 + col.toUpperCase().charCodeAt(i) - 64;
+      }
+      return index;
+    });
+
+    const lines: string[] = [];
+    lines.push(`## Sheet: ${worksheet.name}`);
+
+    const actualRowEnd = rowEnd ?? worksheet.rowCount;
+    let rowCount = 0;
+
+    worksheet.eachRow(
+      { includeEmpty: false },
+      (row: ExcelJSRow, rowNumber: number) => {
+        if (rowNumber < rowStart || rowNumber > actualRowEnd) {
+          return;
+        }
+        rowCount++;
+
+        const values: string[] = [];
+        row.eachCell(
+          { includeEmpty: true },
+          (cell: ExcelJSCell, colNumber: number) => {
+            if (columnIndices && !columnIndices.includes(colNumber)) {
+              return;
+            }
+            const val = this.getCellValue(cell.value as CellValue);
+            values.push(val === null ? "" : String(val));
+          },
+        );
+
+        // Add row number prefix for easy reference
+        lines.push(`${rowNumber}\t${values.join("\t")}`);
+      },
+    );
+
+    if (rowCount === 0) {
+      lines.push(`(No data in rows ${rowStart}-${actualRowEnd})`);
+    } else {
+      lines.push(`\n(${rowCount} rows, range ${rowStart}-${actualRowEnd})`);
+    }
+
+    return lines.join("\n");
+  }
+}
+
+// =============================================================================
+// PROMPT FORMATTING
+// =============================================================================
+
+/** Rows beyond this per sheet are summarised rather than listed. */
+const PROMPT_PREVIEW_ROWS = 20;
+
+/** RFC 4180: quote a field that contains a comma, quote or newline. */
+function csvEscape(value: string): string {
+  return /[",\r\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
+}
+
+/** A pipe inside a cell would otherwise split it into two columns. */
+function markdownEscape(value: string): string {
+  return value
+    .replace(/\\/g, "\\\\")
+    .replace(/\|/g, "\\|")
+    .replace(/\r?\n/g, " ");
+}
+
+function cellText(value: string | number | boolean | null): string {
+  return String(value ?? "");
+}
+
+function formatSheetRows(
+  sheet: ExcelWorksheet,
+  formatStyle: NonNullable<OfficeProcessorOptions["formatStyle"]>,
+): string {
+  const previewRows = sheet.rows.slice(0, PROMPT_PREVIEW_ROWS);
+  if (previewRows.length === 0) {
+    return "";
+  }
+
+  switch (formatStyle) {
+    case "markdown": {
+      // `rows[0]` IS the header row (that is where `headers` came from), so
+      // the body always starts at index 1 — emitting row 0 again would
+      // duplicate the header underneath the separator.
+      const header =
+        sheet.headers.length > 0 ? sheet.headers : previewRows[0].map(cellText);
+      const body = previewRows.slice(1);
+      const columnCount = Math.max(
+        header.length,
+        ...body.map((row) => row.length),
+        1,
+      );
+      const pad = (cells: string[]): string[] =>
+        Array.from({ length: columnCount }, (_, i) =>
+          markdownEscape(cells[i] ?? ""),
+        );
+      return [
+        `| ${pad(header).join(" | ")} |`,
+        `| ${Array.from({ length: columnCount }, () => "---").join(" | ")} |`,
+        ...body.map((row) => `| ${pad(row.map(cellText)).join(" | ")} |`),
+      ].join("\n");
+    }
+    case "csv":
+      return previewRows
+        .map((row) => row.map((cell) => csvEscape(cellText(cell))).join(","))
+        .join("\n");
+    case "json": {
+      const rawHeader =
+        sheet.headers.length > 0 ? sheet.headers : previewRows[0].map(cellText);
+      const body = previewRows.slice(1);
+      // A data row's own populated-cell count can exceed the header's — row
+      // extraction sizes each row on its own last populated cell, not a
+      // workbook-wide column count, so a header truncated by a merged cell
+      // (or a value landing in a column the header left blank) is a normal
+      // spreadsheet shape. "markdown" already sizes on the widest row for
+      // exactly this reason; do the same here instead of zipping strictly to
+      // header.length, which silently dropped every cell past it.
+      const columnCount = Math.max(
+        rawHeader.length,
+        ...body.map((row) => row.length),
+        1,
+      );
+      const extendedHeader = Array.from(
+        { length: columnCount },
+        (_, i) => rawHeader[i] ?? `Column ${i + 1}`,
+      );
+      // Object.fromEntries silently drops a column when two header cells are
+      // literally the same string (a copy-pasted header, a merged-and-split
+      // sheet) — the later column's value overwrites the earlier one under
+      // the shared key. Dedupe first so every column keeps its own key.
+      const header = dedupeColumnNames(extendedHeader);
+      const objects = body.map((row) =>
+        Object.fromEntries(header.map((key, i) => [key, row[i] ?? null])),
+      );
+      return JSON.stringify(objects, null, 2);
+    }
+    case "raw":
+    default:
+      // Bug-for-bug with the pre-option behaviour: the header line is printed
+      // and then `rows` is printed in full, so row 1 appears twice. Callers
+      // that want a clean table ask for "markdown" or "csv".
+      return [
+        sheet.headers.join("\t"),
+        ...previewRows.map((row) => row.map(cellText).join("\t")),
+      ].join("\n");
+  }
+}
+
+/**
+ * Render processed worksheets into the text handed to the model.
+ *
+ * @param worksheets - Worksheets extracted from the workbook
+ * @param totalRows - Total row count across all extracted worksheets
+ * @param options - Office options; `sheetName` selects a single sheet and
+ *   `formatStyle` chooses the rendering (default `raw`, the tab-separated
+ *   preview that predates the option)
+ * @returns Prompt-ready text, or a message naming the available sheets when
+ *   `sheetName` matches none of them
+ */
+export function formatWorksheetsForPrompt(
+  worksheets: ExcelWorksheet[],
+  totalRows: number,
+  options?: OfficeProcessorOptions,
+): string {
+  const requested = options?.sheetName;
+  let selected = worksheets;
+
+  if (requested !== undefined) {
+    selected = worksheets.filter((sheet) => sheet.name === requested);
+    if (selected.length === 0) {
+      const available = worksheets.map((sheet) => sheet.name).join(", ");
+      return `Sheet "${requested}" not found. Available sheets: ${available || "(none)"}`;
+    }
+  }
+
+  const formatStyle = options?.formatStyle ?? "raw";
+  const selectedRows = selected.reduce((sum, sheet) => sum + sheet.rowCount, 0);
+  const scope =
+    requested !== undefined
+      ? `Spreadsheet: sheet "${requested}" of ${worksheets.length}, ${selectedRows} rows`
+      : `Spreadsheet: ${worksheets.length} sheet(s), ${totalRows} total rows`;
+
+  let text = `${scope}\n`;
+  for (const sheet of selected) {
+    text += `\n### Sheet: ${sheet.name}\n`;
+    text += `Columns (${sheet.columnCount}): ${sheet.headers.join(", ")}\n`;
+    text += `Rows: ${sheet.rowCount}\n`;
+    const rendered = formatSheetRows(sheet, formatStyle);
+    if (!rendered) {
+      continue;
+    }
+    text += `\nData:\n${rendered}\n`;
+    const remaining = sheet.rowCount - PROMPT_PREVIEW_ROWS;
+    if (remaining > 0) {
+      text += `... (${remaining} more rows)\n`;
+    }
+  }
+  return text;
 }
 
 // =============================================================================
@@ -587,7 +863,7 @@ export function validateExcelSize(sizeBytes: number): boolean {
 export async function processExcel(
   fileInfo: FileInfo,
   options?: ProcessOptions,
-): Promise<FileProcessingResult<ProcessedExcel>> {
+): Promise<ProcessorFileProcessingResult<ProcessedExcel>> {
   return excelProcessor.processFile(fileInfo, options);
 }
 

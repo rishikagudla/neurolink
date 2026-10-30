@@ -1,0 +1,993 @@
+/**
+ * File detection and processing types for unified file handling
+ */
+
+import type { ImageWithAltText } from "./multimodal.js";
+import type { AttachmentPolicy } from "./attachments.js";
+
+/**
+ * Supported file types for multimodal input
+ */
+export type FileType =
+  | "csv"
+  | "image"
+  | "pdf"
+  | "audio"
+  | "video"
+  | "archive"
+  | "text"
+  | "svg"
+  | "docx"
+  | "pptx"
+  | "xlsx"
+  | "unknown";
+
+/**
+ * Office document types
+ */
+export type OfficeDocumentType = "docx" | "pptx" | "xlsx";
+
+/**
+ * Transcode target for a vision-incompatible image (`adapters/imageFormatSupport.ts`).
+ *
+ * Defaults to `"png"` everywhere a caller does not pick one: sources routed
+ * through that module are frequently lossless (TIFF, BMP, ICO) or already
+ * carry alpha, and a lossy re-encode of an image the model is about to read
+ * closely is the wrong default. `"jpeg"` is available for callers who know
+ * their source has no alpha and prefer the smaller payload.
+ */
+export type VisionImageOutputFormat = "png" | "jpeg";
+
+/**
+ * Outcome of a vision-compatibility pass over one image.
+ *
+ * See `adapters/imageFormatSupport.ts` — `converted` is false both when the
+ * source format was already universally accepted and when no decoder could
+ * read it, so callers must not treat it as a success flag.
+ */
+export type VisionImageConversion = {
+  readonly buffer: Buffer;
+  readonly mimeType: string;
+  /** True when the bytes were re-encoded; false when they were left alone. */
+  readonly converted: boolean;
+};
+
+/**
+ * Knobs for one vision-compatibility pass.
+ *
+ * `autoOrient` exists so a caller that also wants EXIF orientation applied
+ * gets it inside the same decode. Rotating first and transcoding second means
+ * two full decode/re-encode cycles, and for the lossy formats in both sets
+ * (TIFF, which sharp writes JPEG-compressed by default) the intermediate
+ * re-encode costs a generation of image quality that the model then reads.
+ *
+ * `outputFormat` picks the transcode target; see {@link VisionImageOutputFormat}
+ * for the default and why it stays PNG unless a caller opts into JPEG.
+ */
+export type VisionTranscodeOptions = {
+  readonly autoOrient?: boolean;
+  readonly outputFormat?: VisionImageOutputFormat;
+};
+
+/**
+ * What a bounded header probe could establish about an image's EXIF
+ * orientation tag, without decoding the image or reading all of its bytes.
+ *
+ * `"inconclusive"` is not a failure — it is the honest answer whenever the
+ * prefix ran out before the parse reached a verdict, or the container is one
+ * this probe does not parse. Callers must treat it as "find out the expensive
+ * way", never as "no tag".
+ */
+export type ExifOrientationProbe = "absent" | "present" | "inconclusive";
+
+/**
+ * Outcome of an EXIF-orientation pass over one image.
+ *
+ * See `adapters/imageFormatSupport.ts` — `normalized` is false both when the
+ * image carried no orientation tag (or an already-upright `1`) and when the
+ * pass could not run (sharp unavailable, decode failure), so callers must not
+ * treat it as a success flag; either way `buffer` is safe to send as-is.
+ */
+export type ImageOrientationNormalization = {
+  readonly buffer: Buffer;
+  /** True when the bytes were re-encoded to apply and strip EXIF orientation. */
+  readonly normalized: boolean;
+};
+
+/**
+ * Outcome of an audio-compatibility pass over one file.
+ *
+ * See `adapters/audioFormatSupport.ts`. As with images, `converted` is false
+ * both when the container was already acceptable and when nothing could
+ * re-encode it, so it is not a success flag — the caller decides what to do
+ * from the resulting `mimeType`.
+ */
+export type AudioConversionResult = {
+  readonly buffer: Buffer;
+  readonly mimeType: string;
+  /** True when the bytes were re-encoded; false when they were left alone. */
+  readonly converted: boolean;
+};
+
+/**
+ * One audio file destined for native delivery to a provider.
+ *
+ * Carries the bytes rather than a path because the decision to send audio is
+ * made per provider, after detection has already read the file — re-reading it
+ * from disk at dispatch time would be a second read of something already in
+ * memory.
+ */
+export type MultimodalAudioEntry = {
+  /** Raw audio bytes, as detected. */
+  buffer: Buffer;
+  /** Display name; may be a full path, so log only its basename. */
+  filename: string;
+  /** Detected MIME type of `buffer`. */
+  mimeType: string;
+};
+
+/**
+ * One video file destined for native delivery to a provider.
+ *
+ * Mirrors {@link MultimodalAudioEntry}: the bytes travel rather than the path,
+ * because whether a video is sent at all is decided per provider, after
+ * detection has already read the file.
+ *
+ * `durationSec` rides along because the native-delivery gate is expressed in
+ * seconds as well as bytes, and re-probing the container at dispatch time
+ * would mean a second ffprobe run for something the processor already
+ * measured. It is optional: probing can fail (no ffmpeg, an exotic container),
+ * and an unknown duration must not by itself disqualify a clip that is
+ * comfortably under the size ceiling.
+ */
+export type MultimodalVideoEntry = {
+  /** Raw video bytes, as detected. */
+  buffer: Buffer;
+  /** Display name; may be a full path, so log only its basename. */
+  filename: string;
+  /** Detected MIME type of `buffer`. */
+  mimeType: string;
+  /** Clip length in seconds, when the processor was able to measure it. */
+  durationSec?: number;
+};
+
+/**
+ * How one provider handles an attached video.
+ *
+ * The table lives in `adapters/videoFormatSupport.ts`; this is its row shape.
+ * `apiType` names the mechanism that is actually implemented, not the one a
+ * provider theoretically offers — Gemini also exposes a resumable Files API
+ * for clips beyond the inline ceiling, and until that is wired up calling this
+ * row "files-api" would misdescribe what happens to a 200 MB upload.
+ */
+export type VideoProviderConfig = {
+  /** Whether raw video bytes can be handed to this provider at all. */
+  readonly supportsNativeVideo: boolean;
+  /** How the video reaches the model. */
+  readonly apiType: "inline" | "frame-extraction";
+  /**
+   * Inline source-byte budget for the whole request, in MB. A clip is
+   * delivered natively only while its bytes plus every inline part already in
+   * the request stay within it; otherwise it falls back to keyframes.
+   * Meaningless when `supportsNativeVideo` is false, and set to 0 there rather
+   * than to a number that reads like a real limit.
+   */
+  readonly maxSizeMB: number;
+  /** Longest clip accepted natively, in seconds. 0 when not applicable. */
+  readonly maxDurationSec: number;
+  /** Whether the provider hears the video's audio track as well as seeing it. */
+  readonly supportsAudio: boolean;
+  /**
+   * Keyframe budget to aim for when this provider gets frames instead of the
+   * video. Advisory: an explicit `videoOptions.frames` always wins.
+   */
+  readonly recommendedFrameCount: number;
+};
+
+/**
+ * Media collected during file detection that a provider may be able to
+ * consume directly, rather than as a text summary.
+ *
+ * Grouped rather than passed as two more positional parameters: the message
+ * converters already take text, images, PDFs, provider and model, and each
+ * new modality added one more argument to a call nobody could read. A bag
+ * also means the next modality is a field, not another signature change at
+ * every call site.
+ */
+export type NativeMediaAttachments = {
+  readonly audio?: MultimodalAudioEntry[];
+  readonly video?: MultimodalVideoEntry[];
+  /**
+   * Transcode target for an incompatible image (see
+   * `GenerateOptions.imageOptions`). Not itself a native attachment, but
+   * bundled here for the same reason audio and video are: it is one more
+   * per-request option the message converters need at the same call sites.
+   */
+  readonly outputFormat?: VisionImageOutputFormat;
+};
+
+/**
+ * Outcome of asking whether one video may be handed to one provider as bytes.
+ *
+ * A plain boolean collapsed "this provider never watches video" with "this
+ * provider would have, but the clip is 400 MB" — and the two want different
+ * log lines and different advice. `reason` is populated exactly when
+ * `deliver` is false, and is phrased for a user to read.
+ *
+ * The accepting arm declares `reason?: undefined` rather than omitting the
+ * field. Not decoration: `build:react-hooks` type-checks this graph without
+ * `--strict`, and there a negated boolean-literal discriminant does not
+ * narrow, so `decision.reason` inside `if (!decision.deliver)` fails to
+ * compile unless the property exists on both arms. Declaring it keeps the
+ * union exact under strict and compilable under both.
+ */
+export type VideoDeliveryDecision =
+  | { readonly deliver: true; readonly reason?: undefined }
+  | { readonly deliver: false; readonly reason: string };
+
+/**
+ * Broad category a file format belongs to, as a human would name it.
+ *
+ * Distinct from {@link FileType}, which is the *routing* type the detector
+ * emits. The two deliberately differ where one processor handles several
+ * formats: an .odt has `modality: "document"` but `fileType: "docx"`, and a
+ * .svg has `modality: "image"` but `fileType: "svg"` because it is sanitised as
+ * markup rather than sent to a vision API.
+ */
+export type FileModality =
+  | "image"
+  | "audio"
+  | "video"
+  | "document"
+  | "data"
+  | "archive";
+
+/**
+ * One format in the canonical file-type registry.
+ *
+ * `extensions[0]` and `mimeTypes[0]` are canonical; the remaining entries are
+ * aliases accepted on input. See `processors/config/fileTypeRegistry.ts`.
+ */
+export type FileFormatEntry = {
+  /** Human-readable format name, used in registry-conflict errors. */
+  readonly label: string;
+  /** Extensions with leading dots, lowercase; first is canonical. */
+  readonly extensions: readonly string[];
+  /** MIME types, lowercase; first is canonical. */
+  readonly mimeTypes: readonly string[];
+  /** Routing type the detector emits for this format. */
+  readonly fileType: FileType;
+  /** Category a human would put this format in. */
+  readonly modality: FileModality;
+};
+
+/**
+ * File with metadata — allows callers to pass filename alongside a Buffer.
+ *
+ * This is the recommended way for applications (e.g. Slack bots) to pass
+ * files that were downloaded as Buffers but still have original filenames.
+ *
+ * @example
+ * ```typescript
+ * files: [
+ *   { buffer: pdfBuffer, filename: "quarterly-report.pdf" },
+ *   { buffer: videoBuffer, filename: "meeting-recording.mov", mimetype: "video/quicktime" }
+ * ]
+ * ```
+ */
+export type FileWithMetadata = {
+  buffer: Buffer;
+  filename: string;
+  mimetype?: string;
+};
+
+/**
+ * File input can be Buffer, string (path/URL/data URI), or an object with metadata.
+ */
+export type FileInput = Buffer | string | FileWithMetadata;
+
+/**
+ * File source type for tracking input origin
+ */
+export type FileSource = "url" | "path" | "buffer" | "datauri";
+
+/**
+ * File detection result with confidence scoring
+ */
+export type FileDetectionResult = {
+  type: FileType;
+  mimeType: string;
+  extension: string | null;
+  source: FileSource;
+  metadata: {
+    size?: number;
+    filename?: string;
+    confidence: number; // 0-100
+  };
+};
+
+/**
+ * File processing result after detection and conversion
+ */
+export type FileProcessingResult = {
+  type: FileType;
+  content: string | Buffer;
+  mimeType: string;
+  /**
+   * Additional images extracted from the file (e.g., video keyframes, audio
+   * cover art).
+   *
+   * An entry may carry alt text, which is how a video keyframe states the
+   * timestamp it was sampled at. Bare bytes still work — the field was
+   * widened, not changed.
+   */
+  images?: Array<Buffer | string | ImageWithAltText>;
+  metadata: {
+    confidence: number;
+    size?: number;
+    filename?: string;
+    extension?: string | null; // Original file extension (e.g., 'csv', 'tsv', 'txt')
+    // CSV-specific metadata
+    rowCount?: number;
+    totalLines?: number;
+    columnCount?: number;
+    columnNames?: string[];
+    sampleData?: string | unknown[];
+    hasEmptyColumns?: boolean;
+    /** Enhanced column metadata with type detection and statistics */
+    columnMetadata?: CSVColumnMetadata[];
+    /** Data quality warnings */
+    dataQualityWarnings?: CSVDataQualityWarning[];
+    /** Overall data quality score (0-100) */
+    dataQualityScore?: number;
+    /** Whether headers were detected */
+    hasHeaders?: boolean;
+    /** Detected delimiter */
+    detectedDelimiter?: string;
+    /** Detected (or overridden) character encoding used to decode the CSV (#362) */
+    detectedEncoding?: string;
+    /** Confidence (0-100) of the detected encoding (#362) */
+    encodingConfidence?: number;
+    /** Original→sanitized column-name mapping when sanitizeColumnNames is on (#378) */
+    columnNameMapping?: Array<{ original: string; sanitized: string }>;
+    /** True when the parse hit its time budget and returned partial rows (#379) */
+    parseTimedOut?: boolean;
+    // PDF-specific metadata
+    version?: string;
+    estimatedPages?: number | null;
+    provider?: string;
+    apiType?: PDFAPIType;
+    /** Provider's citations requirement for visual PDF analysis (#349). */
+    requiresCitations?: boolean | "auto";
+    // Office-specific metadata
+    officeFormat?: OfficeDocumentType;
+    pageCount?: number;
+    slideCount?: number;
+    sheetCount?: number;
+    sheetNames?: string[];
+    author?: string;
+    createdDate?: string;
+    modifiedDate?: string;
+    hasFormulas?: boolean;
+    hasImages?: boolean;
+    // Video-specific metadata
+    frameCount?: number;
+    hasKeyframes?: boolean;
+    /**
+     * Clip length in seconds, when the processor could measure it.
+     *
+     * Surfaced here so the native-delivery gate does not have to re-probe a
+     * container the processor has already opened. Absent when probing failed
+     * — an unknown duration, not a zero-length clip.
+     */
+    durationSec?: number;
+    // Audio-specific metadata (#409)
+    /**
+     * Media duration in seconds, read from the container header.
+     *
+     * Sourced from the demuxed stream rather than from the transcription
+     * backend, so it is present for every audio file — including one that was
+     * never transcribed because no provider was configured.
+     */
+    duration?: number;
+    /**
+     * Language of the transcript, as reported by the transcription provider
+     * (BCP-47 or ISO-639-1 depending on the backend), or the language the
+     * caller pinned via `AudioProcessorOptions.language`.
+     *
+     * Absent when the file was not transcribed — its absence therefore means
+     * "unknown", never "not speech".
+     */
+    language?: string;
+    /**
+     * Character count of the transcript.
+     *
+     * `0` is a meaningful value distinct from `undefined`: it means a provider
+     * ran and returned an empty transcript (silence, music, no speech), where
+     * `undefined` means no transcription was attempted at all.
+     */
+    transcriptionLength?: number;
+    /** Which backend produced the transcript, e.g. "openai-whisper". */
+    transcriptionProvider?: string;
+  };
+};
+
+/**
+ * Sample data format options for CSV metadata
+ * - 'json': JSON string representation (default, backward compatible)
+ * - 'object': Structured array of row objects (best for programmatic use)
+ * - 'csv': CSV formatted string preview
+ * - 'markdown': Markdown table format
+ */
+export type SampleDataFormat = "object" | "json" | "csv" | "markdown";
+
+/**
+ * Detected data type for a CSV column
+ */
+export type CSVColumnDataType =
+  | "string"
+  | "number"
+  | "integer"
+  | "float"
+  | "boolean"
+  | "date"
+  | "datetime"
+  | "email"
+  | "url"
+  | "empty"
+  | "mixed";
+
+/**
+ * Data quality warning for CSV columns
+ */
+export type CSVDataQualityWarning = {
+  column: string;
+  type:
+    | "empty_values"
+    | "invalid_name"
+    | "mixed_types"
+    | "high_null_rate"
+    | "duplicates"
+    | "inconsistent_format";
+  message: string;
+  severity: "info" | "warning" | "error";
+  affectedRows?: number;
+};
+
+/**
+ * Rich metadata for a single CSV column
+ */
+export type CSVColumnMetadata = {
+  name: string;
+  /** Original header text before sanitization, when sanitizeColumnNames rewrote it (#378) */
+  originalName?: string;
+  index: number;
+  detectedType: CSVColumnDataType;
+  /** Confidence of type detection (0-100) */
+  typeConfidence: number;
+  /** Count of null/empty values */
+  nullCount: number;
+  /** Count of unique values */
+  uniqueCount: number;
+  /** Sample values from this column (up to 5) */
+  sampleValues: string[];
+  /** For numeric columns: min value */
+  minValue?: number;
+  /** For numeric columns: max value */
+  maxValue?: number;
+  /** For numeric columns: average value */
+  avgValue?: number;
+  /** For date columns: detected format (e.g., 'YYYY-MM-DD', 'MM/DD/YYYY') */
+  dateFormat?: string;
+  /** Column name validation issues */
+  nameIssues?: string[];
+};
+
+/** A parsed CSV row: string-keyed with string (or missing) cell values (#384). */
+export type CSVRow = Record<string, string | undefined>;
+
+/**
+ * How `CSVProcessor.parseCSVFile` opens the file.
+ *
+ * `followSymlinks: false` opens with O_NOFOLLOW, so a symlink at the final
+ * path component is refused (ELOOP) rather than followed. The sandboxed
+ * analyzeCSV tool passes it after containment has resolved the real path,
+ * closing the window between that check and the open. Defaults to `true`; on
+ * Windows, where O_NOFOLLOW does not exist, the option has no effect.
+ */
+export type CSVFileOpenOptions = {
+  followSymlinks?: boolean;
+};
+
+/** Result of decoding a buffer with encoding detection (#362). */
+export type DecodedBuffer = {
+  /** Decoded text with any BOM removed. */
+  text: string;
+  /** iconv-lite label actually used to decode. */
+  encoding: string;
+  /** Detection confidence 0-100 (100 for BOM/override, 0 for the UTF-8 fallback). */
+  confidence: number;
+};
+
+/**
+ * CSV processor options
+ */
+export type CSVProcessorOptions = {
+  maxRows?: number;
+  formatStyle?: "raw" | "markdown" | "json";
+  includeHeaders?: boolean;
+  sampleDataFormat?: SampleDataFormat;
+  extension?: string | null;
+  /**
+   * Character encoding override (#362). When omitted, the encoding is detected
+   * from a BOM then `chardet`, falling back to UTF-8. Accepts any label
+   * `iconv-lite` supports (e.g. "utf-8", "utf-16le", "windows-1252", "latin1").
+   */
+  encoding?: string;
+  /**
+   * Rewrite column headers into valid identifiers (#378). Opt-in; default false
+   * preserves the raw header strings as object keys.
+   */
+  sanitizeColumnNames?: boolean;
+  /** Case style used when `sanitizeColumnNames` is on (#378). Default "snake_case". */
+  columnNameCase?: "camelCase" | "snake_case";
+  /**
+   * Wall-clock cap for the streaming parse in milliseconds (#379). On timeout the
+   * parse returns the rows collected so far and flags `metadata.parseTimedOut`,
+   * rather than hanging forever. Defaults: 30s for strings, 5min for files.
+   */
+  parseTimeoutMs?: number;
+  /**
+   * Skip blank / whitespace-only data rows (#373). Default `true`: blank lines
+   * are excluded from the returned content (including raw CSV text) and from
+   * `metadata.rowCount`. Set to `false` to preserve empty lines literally.
+   */
+  skipEmptyLines?: boolean;
+};
+
+/**
+ * PDF API types for different providers
+ */
+export type PDFAPIType = "document" | "files-api" | "unsupported";
+
+/**
+ * PDF provider configuration
+ */
+export type PDFProviderConfig = {
+  maxSizeMB: number;
+  maxPages: number;
+  supportsNative: boolean;
+  /**
+   * Whether this provider needs source citations enabled for visual PDF
+   * analysis (#349). `"auto"` = enable when the request requires visual
+   * grounding (currently Bedrock's Converse document blocks); `false` = the
+   * provider handles PDFs without an explicit citations flag. Surfaced on
+   * `FileProcessingResult.metadata.requiresCitations` so downstream provider
+   * adapters can act on it instead of the value being dead config.
+   */
+  requiresCitations: boolean | "auto";
+  apiType: PDFAPIType;
+};
+
+/**
+ * PDF processor options
+ */
+export type PDFProcessorOptions = {
+  provider?: string;
+  model?: string;
+  maxSizeMB?: number;
+  bedrockApiMode?: "converse" | "invokeModel";
+  /**
+   * Whether to enforce page limits by throwing an error (default: true)
+   * Set to false to bypass limit enforcement (logs warning instead)
+   */
+  enforceLimits?: boolean;
+  /** Password for an encrypted PDF (used on the image-conversion path) (#258). */
+  password?: string;
+};
+
+/**
+ * Audio provider configuration for transcription services
+ *
+ * Describes the capabilities and limitations of each audio transcription provider
+ * (e.g., OpenAI Whisper, Google Speech-to-Text, Azure Speech Services).
+ *
+ * @example OpenAI Whisper configuration
+ * ```typescript
+ * const openaiConfig: AudioProviderConfig = {
+ *   maxSizeMB: 25,
+ *   maxDurationSeconds: 600,
+ *   supportedFormats: ['mp3', 'mp4', 'm4a', 'wav', 'webm'],
+ *   supportsLanguageDetection: true,
+ *   requiresApiKey: true,
+ *   costPer60s: 0.006  // $0.006 per minute
+ * };
+ * ```
+ *
+ * @example Google Speech-to-Text configuration
+ * ```typescript
+ * const googleConfig: AudioProviderConfig = {
+ *   maxSizeMB: 10,
+ *   maxDurationSeconds: 480,
+ *   supportedFormats: ['flac', 'wav', 'mp3', 'ogg'],
+ *   supportsLanguageDetection: true,
+ *   requiresApiKey: true,
+ *   costPer15s: 0.004  // $0.016 per minute ($0.004 per 15 seconds)
+ * };
+ * ```
+ */
+export type AudioProviderConfig = {
+  /** Maximum audio file size in megabytes */
+  maxSizeMB: number;
+  /** Maximum audio duration in seconds */
+  maxDurationSeconds: number;
+  /** Supported audio formats (e.g., 'mp3', 'wav', 'm4a', 'flac', 'ogg') */
+  supportedFormats: string[];
+  /** Whether the provider supports automatic language detection */
+  supportsLanguageDetection: boolean;
+  /** Whether the provider requires an API key for authentication */
+  requiresApiKey: boolean;
+  /** Optional: Cost per 60 seconds of audio in USD */
+  costPer60s?: number;
+  /** Optional: Cost per 15 seconds of audio in USD */
+  costPer15s?: number;
+};
+
+/**
+ * A transcription backend `AudioProcessor` can drive (#413).
+ *
+ * Deliberately narrower than `AudioProcessorOptions.provider`, which stays a
+ * free-form `string` on the public surface for backward compatibility: a
+ * caller's spelling is normalised onto this union (accepting aliases such as
+ * "whisper" for "openai") and an unrecognised one is reported rather than
+ * silently ignored.
+ */
+export type AudioTranscriptionProvider = "openai" | "google" | "azure";
+
+/**
+ * Outcome of choosing a transcription backend (#413).
+ *
+ * A union rather than a nullable provider so the "nothing usable" case is
+ * forced to carry the reason — the failure mode this replaces was every
+ * unavailable backend collapsing into an indistinguishable empty result.
+ */
+export type AudioTranscriptionSelection =
+  | { provider: AudioTranscriptionProvider; label: string; reason?: undefined }
+  | { provider?: undefined; label?: undefined; reason: string };
+
+/**
+ * What a transcription attempt produced (#409/#416).
+ *
+ * `transcriptionSkippedReason` is present on exactly the attempts that yielded
+ * no transcript, so a caller can tell "no speech in this audio" from "no
+ * backend was reachable".
+ */
+export type AudioTranscriptionOutcome = {
+  transcript: string | undefined;
+  hasTranscript: boolean;
+  transcriptionProvider: string | undefined;
+  transcriptionLanguage: string | undefined;
+  transcriptionDuration: number | undefined;
+  transcriptionSkippedReason: string | undefined;
+};
+
+/**
+ * Audio processor options
+ */
+export type AudioProcessorOptions = {
+  /** AI provider to use for transcription (e.g., 'openai', 'google', 'azure') */
+  provider?: string;
+  /** Transcription model to use (e.g., 'whisper-1', 'chirp-3') */
+  transcriptionModel?: string;
+  /** Language code for transcription (e.g., 'en', 'es', 'fr') */
+  language?: string;
+  /** OpenAI/Whisper-only context prompt to guide transcription accuracy; ignored by Google and Azure */
+  prompt?: string;
+  /** Maximum audio duration in seconds (default: 600) */
+  maxDurationSeconds?: number;
+  /** Maximum file size in megabytes */
+  maxSizeMB?: number;
+};
+
+/**
+ * Keyframe-extraction knobs for an attached video (#478).
+ *
+ * These back the `--video-frames` / `--video-quality` / `--video-format` CLI
+ * flags and `GenerateOptions.videoOptions`. Each is clamped to the processor's
+ * own ceiling — a caller cannot raise `frames` above VIDEO_CONFIG.MAX_FRAMES.
+ */
+export type VideoProcessorOptions = {
+  /** Max keyframes to extract. Clamped to the processor's MAX_FRAMES ceiling. */
+  frames?: number;
+  /** Encoder quality 1-100 for the extracted frames. */
+  quality?: number;
+  /** Frame encoding. Defaults to jpeg. */
+  format?: "jpeg" | "png";
+  /**
+   * Transcribe the clip's spoken audio (#433). Off by default: it costs an
+   * ffmpeg pass plus a Whisper call, and most attached video is silent
+   * screen capture.
+   *
+   * Best-effort — a clip with no audio track, no `OPENAI_API_KEY`, or a
+   * failed call still processes, and the reason lands in
+   * `ProcessedVideo.transcriptionSkippedReason`.
+   */
+  transcribeAudio?: boolean;
+};
+
+/**
+ * Office processor options for Word, PowerPoint, and Excel documents
+ *
+ * @example Word document processing (docx)
+ * ```typescript
+ * const options: OfficeProcessorOptions = {
+ *   format: "docx",
+ *   extractTextOnly: false,
+ *   includeMetadata: true
+ * };
+ * ```
+ *
+ * @example PowerPoint processing (pptx)
+ * ```typescript
+ * const options: OfficeProcessorOptions = {
+ *   format: "pptx",
+ *   includeSlideNotes: true,  // pptx-specific
+ *   includeMetadata: true
+ * };
+ * ```
+ *
+ * @example Excel processing (xlsx)
+ * ```typescript
+ * const options: OfficeProcessorOptions = {
+ *   format: "xlsx",
+ *   processAllSheets: true,   // xlsx-specific
+ *   includeMetadata: true
+ * };
+ * ```
+ */
+export type OfficeProcessorOptions = {
+  /** Office document format type */
+  format?: OfficeDocumentType;
+  /** Whether to extract text only (true) or preserve formatting (false). Applies to: docx, pptx, xlsx */
+  extractTextOnly?: boolean;
+  /** Maximum file size in megabytes. Applies to: docx, pptx, xlsx */
+  maxSizeMB?: number;
+  /** Whether to include metadata (author, created date, etc.). Applies to: docx, pptx, xlsx */
+  includeMetadata?: boolean;
+  /** For spreadsheets (xlsx only): whether to process all sheets or just the first */
+  processAllSheets?: boolean;
+  /** For presentations (pptx only): whether to include slide notes */
+  includeSlideNotes?: boolean;
+  /**
+   * For spreadsheets (xlsx only): restrict processing to the named sheet.
+   * When the workbook has no sheet by that name the result says so and lists
+   * the names it does have, rather than silently falling back to every sheet.
+   * Omit to process every sheet (the default).
+   */
+  sheetName?: string;
+  /**
+   * For spreadsheets (xlsx only): how sheet data is rendered into the prompt.
+   * - `raw` (default): tab-separated preview — the long-standing behaviour
+   * - `csv`: comma-separated values with RFC 4180 quoting
+   * - `markdown`: a markdown table per sheet
+   * - `json`: an array of row objects keyed by the header row
+   */
+  formatStyle?: "raw" | "markdown" | "json" | "csv";
+};
+
+/**
+ * File detector options
+ */
+export type FileDetectorOptions = {
+  maxSize?: number;
+  timeout?: number;
+  allowedTypes?: FileType[];
+  /**
+   * When set, local file paths must resolve inside this base directory;
+   * anything that escapes it (absolute path, `../` traversal, or a symlink
+   * pointing outside) is rejected. Containment is enforced on the real,
+   * symlink-resolved path of both the base dir and the target, so a symlink
+   * inside the base cannot be used to reach a file outside it. Servers that
+   * accept file paths from untrusted callers should set this to sandbox
+   * filesystem access; SDK callers loading their own files can omit it.
+   */
+  allowedBaseDir?: string;
+  /**
+   * Instance attachment policy: `allowedRoots` containment (when
+   * `allowedBaseDir` is not set), the URL rules (HTTPS-only, public hosts,
+   * re-validated redirects) and the global size cap. The environment-derived
+   * default applies when absent.
+   */
+  attachmentPolicy?: AttachmentPolicy;
+  audioOptions?: AudioProcessorOptions;
+  csvOptions?: CSVProcessorOptions;
+  officeOptions?: OfficeProcessorOptions;
+  videoOptions?: VideoProcessorOptions;
+  confidenceThreshold?: number;
+  provider?: string;
+  /** Maximum number of retry attempts for network requests (default: 3) */
+  maxRetries?: number;
+  /** Initial retry delay in milliseconds with exponential backoff (default: 1000) */
+  retryDelay?: number;
+  /**
+   * Caller-provided MIME type hint (e.g. "text/plain", "application/json").
+   * Used when the filename has no extension and magic-byte detection cannot
+   * identify the content — the common Slack/Curator extension-less-buffer
+   * case. When set to a trustworthy mimetype (not "application/octet-stream"),
+   * it short-circuits the detection strategy loop with a high-confidence
+   * result so small files on the eager file-processing path still honor the
+   * hint (the lazy FileReferenceRegistry path has its own hint-handling).
+   */
+  mimetypeHint?: string;
+  /**
+   * Caller-provided filename hint, the companion to {@link mimetypeHint}.
+   *
+   * The unified file path unwraps a `FileWithMetadata` to its `buffer` before
+   * detection runs, so the object's `filename` is gone by the time extension
+   * resolution looks for one — and TAR in particular cannot be identified any
+   * other way, because its "ustar" marker sits at byte 257 rather than at
+   * offset 0. Passing the name alongside the bytes keeps `.odp`, `.rtf` and
+   * `.tar` routed to the processors that can actually read them.
+   */
+  filenameHint?: string;
+};
+
+/**
+ * Google AI Studio Files API types
+ */
+export type GoogleFilesAPIUploadResult = {
+  file: {
+    name: string;
+    displayName: string;
+    mimeType: string;
+    sizeBytes: string;
+    createTime: string;
+    updateTime: string;
+    expirationTime: string;
+    sha256Hash: string;
+    uri: string;
+  };
+};
+
+// =============================================================================
+// PDF PROCESSOR TYPES (moved from utils/pdfProcessor.ts)
+// =============================================================================
+
+/** Options for converting PDF pages to images. */
+export type PDFImageConversionOptions = {
+  /** Scale factor for image quality (1-4, default: 2) */
+  scale?: number;
+  /** Maximum number of pages to convert (default: 20 from PDF_LIMITS.DEFAULT_MAX_PAGES) */
+  maxPages?: number;
+  /** Output format (default: png). Only PNG is currently implemented by PDFProcessor. */
+  format?: "png";
+  /**
+   * Per-page pixel ceiling (#260). Any page whose width×height×scale² would
+   * exceed this is uniformly downscaled to stay under it, preventing a huge
+   * page from allocating gigabytes of canvas. Default: PDF_LIMITS.DEFAULT_MAX_CANVAS_PIXELS.
+   */
+  maxCanvasPixels?: number;
+  /** Password for an encrypted PDF (passed to the underlying renderer) (#258). */
+  password?: string;
+  /** Per-page progress callback invoked as each page is rendered (#302). */
+  onProgress?: (progress: PDFImageConversionProgress) => void | Promise<void>;
+};
+
+/** Progress reported per page during streaming conversion (#302). */
+export type PDFImageConversionProgress = {
+  /** Number of pages successfully converted so far. */
+  pagesConverted: number;
+  /** Total pages in the document (known up-front from the renderer). */
+  totalPages: number;
+  /** Elapsed time since conversion started, in milliseconds. */
+  elapsedMs: number;
+};
+
+/** A single streamed page result (#302). `error` is set when that page failed. */
+export type PDFImagePage = {
+  /** 1-based page index. */
+  pageIndex: number;
+  /** Base64-encoded PNG for the page (empty string when `error` is set). */
+  image: string;
+  /** Byte size of the rendered PNG (0 when `error` is set). */
+  imageSizeBytes: number;
+  /** Populated when this page failed to render (#294). */
+  error?: string;
+};
+
+/**
+ * A PDF opened for page rendering. Rendering goes through pdf-parse so the
+ * process loads exactly one pdfjs-dist copy — a second copy fails pdfjs's
+ * API-vs-Worker version check for whichever library loads second.
+ */
+export type PDFRenderDocument = {
+  /** Total pages in the document. */
+  length: number;
+  /** Render a 1-based page to a PNG buffer. */
+  getPage: (pageNumber: number) => Promise<Buffer>;
+  /** Release pdfjs resources held by the document. */
+  destroy: () => Promise<void>;
+};
+
+/**
+ * A single PDF queued for multimodal message building, normalised from either
+ * submission surface — `input.pdfFiles` or `input.content` with `type: "pdf"`
+ * — so both can share the aggregate page/size guard (#309).
+ */
+export type MultimodalPdfEntry = {
+  /** Raw PDF bytes. */
+  buffer: Buffer;
+  /** Display name; may be a full path, so log only its basename. */
+  filename: string;
+  /**
+   * Page count when known. Null/undefined on the `input.content` path whenever
+   * the caller omitted `metadata.pages`; the aggregate guard resolves those
+   * from `buffer` rather than treating them as zero.
+   */
+  pageCount?: number | null;
+  /** Password for an encrypted PDF (#258). */
+  password?: string;
+  /** Per-page pixel ceiling for the image fallback (#260). */
+  maxCanvasPixels?: number;
+  /** Render scale for the image fallback (#297). */
+  scale?: number;
+  /** Max pages converted by the image fallback (#297). */
+  maxPages?: number;
+};
+
+/** Result of PDF to image conversion. */
+export type PDFImageConversionResult = {
+  /** Array of base64-encoded PNG images (one per successfully converted page) */
+  images: string[];
+  /** Number of pages converted */
+  pageCount: number;
+  /** Total conversion time in milliseconds */
+  conversionTimeMs: number;
+  /** Any warnings during conversion */
+  warnings?: string[];
+  /** Per-page failures — present only when some pages failed to render (#294). */
+  errors?: Array<{ page: number; error: string }>;
+};
+
+// =============================================================================
+// FILENAME SANITIZER TYPES (moved from utils/sanitizers/filename.ts)
+// =============================================================================
+
+/** Options for filename sanitization. */
+export type SanitizeFileNameOptions = {
+  /** Maximum length for the filename (default: 255) */
+  maxLength?: number;
+  /** Replacement character for invalid chars (default: '_') */
+  replacement?: string;
+  /** Whether to block dangerous extensions (default: true) */
+  blockDangerousExtensions?: boolean;
+  /** Whether to allow hidden files starting with dot (default: false) */
+  allowHiddenFiles?: boolean;
+};
+
+/** Options for display name sanitization. */
+export type SanitizeDisplayNameOptions = {
+  /** Maximum length for the name (default: 100) */
+  maxLength?: number;
+  /** Whether to allow unicode characters (default: true) */
+  allowUnicode?: boolean;
+};
+
+// =============================================================================
+// SVG SANITIZER TYPES (moved from utils/sanitizers/svg.ts)
+// =============================================================================
+
+/** Result of SVG sanitization. */
+export type SvgSanitizationResult = {
+  /** Sanitized SVG content */
+  content: string;
+  /** Items that were removed during sanitization */
+  removedItems: string[];
+  /** Whether any content was modified */
+  wasModified: boolean;
+};
+
+/** Contract implemented by each file-detection strategy. */
+export type DetectionStrategy = {
+  detect(input: FileInput): Promise<FileDetectionResult>;
+};

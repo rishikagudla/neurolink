@@ -5,19 +5,30 @@
  * Supports multiple time formats: milliseconds, seconds, minutes, hours.
  */
 
-import type { TimeoutConfig, TimeoutResult } from "../types/utilities.js";
+import type { TimeoutConfig, TimeoutResult } from "../types/index.js";
+import { TimeoutError as BaseTimeoutError } from "./async/withTimeout.js";
 
 /**
- * Custom error class for timeout operations
+ * Custom error class for timeout operations.
+ *
+ * Extends the base {@link BaseTimeoutError} (from `./async/withTimeout.js`)
+ * rather than `Error` directly, merging what were two independent internal
+ * `TimeoutError` classes onto one prototype chain — an `instanceof` check
+ * against either module's `TimeoutError` now recognizes errors thrown by
+ * this class. Constructor signature, `.name`, and the extra
+ * `timeout`/`provider`/`operation` fields are unchanged so all 15 existing
+ * `instanceof TimeoutError` call sites keep working exactly as before;
+ * `super(message, timeout)` additionally populates the base class's
+ * `timeoutMs` field (equal to `timeout`) as a byproduct.
  */
-export class TimeoutError extends Error {
+export class TimeoutError extends BaseTimeoutError {
   constructor(
     message: string,
     public readonly timeout: number,
     public readonly provider?: string,
     public readonly operation?: "generate" | "stream",
   ) {
-    super(message);
+    super(message, timeout);
     this.name = "TimeoutError";
     // Maintains proper stack trace for where error was thrown
     if (typeof Error.captureStackTrace === "function") {
@@ -102,6 +113,7 @@ export const DEFAULT_TIMEOUTS = {
     huggingface: "2m", // Open source models vary significantly
     ollama: "5m", // Local models need more time, especially large ones
     mistral: "45s", // Mistral AI moderate speed
+    litellm: "5m", // Self-hosted proxy over arbitrary backends, same variable-latency profile as ollama
   },
   tools: {
     default: "10s", // Default timeout for MCP tool execution
@@ -352,8 +364,16 @@ export async function withTimeout<T>(
     return promise;
   }
 
+  // The handle is captured, unref'd and cleared — the same shape
+  // `createTimeoutPromise` above already uses. `Promise.race` settles on the
+  // first outcome but cancels nothing, so an uncaptured timer stayed pending
+  // for its full duration after the wrapped promise had already resolved: one
+  // live timer per call, each holding the event loop open until it fired. The
+  // `finally` clears it the moment the race is decided, which is what makes
+  // this safe to wrap around something invoked once per tool call.
+  let timeoutHandle: NodeJS.Timeout | number | undefined;
   const timeoutPromise = new Promise<never>((_, reject) => {
-    setTimeout(() => {
+    const timer = setTimeout(() => {
       reject(
         new TimeoutError(
           `${provider} ${operation} operation timed out after ${timeoutMs}ms`,
@@ -363,9 +383,26 @@ export async function withTimeout<T>(
         ),
       );
     }, timeoutMs);
+    timeoutHandle = timer;
+
+    // Unref the timer so it doesn't keep the process alive (Node.js only)
+    if (
+      typeof timer === "object" &&
+      timer &&
+      "unref" in timer &&
+      typeof timer.unref === "function"
+    ) {
+      (timer as NodeJS.Timeout).unref();
+    }
   });
 
-  return Promise.race([promise, timeoutPromise]);
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeoutHandle !== undefined) {
+      clearTimeout(timeoutHandle as NodeJS.Timeout);
+    }
+  }
 }
 
 /**
@@ -430,6 +467,13 @@ export function createTimeoutController(
 ): {
   controller: AbortController;
   cleanup: () => void;
+  /**
+   * Re-arm the timeout window from now. Streaming consumers call this on
+   * every chunk so the timeout bounds *idle* time rather than total
+   * duration — a slow-but-alive upstream is not killed mid-generation.
+   * No-op once the controller has already aborted.
+   */
+  reset: () => void;
   timeoutMs: number;
 } | null {
   const timeoutMs = parseTimeout(timeout);
@@ -440,7 +484,15 @@ export function createTimeoutController(
 
   const controller = new AbortController();
 
-  const timer = setTimeout(() => {
+  const fire = () => {
+    // NOTE: we cannot stamp the AI SDK's ai.streamText/ai.generateText span
+    // from here — the setTimeout callback runs in the async context captured
+    // at schedule time, which is BEFORE the AI SDK span exists. Instead we
+    // rely on the AI SDK propagating the TimeoutError through its recordSpan
+    // wrapper, which sets span.status = ERROR + message. NeuroLink's own
+    // spans the error passes through (withGeneration, withSpan) record it
+    // in markFailure as level=ERROR + status_message, and
+    // ExporterSpanProcessor exports them.
     controller.abort(
       new TimeoutError(
         `${provider} ${operation} operation timed out after ${timeout}`,
@@ -449,17 +501,104 @@ export function createTimeoutController(
         operation,
       ),
     );
-  }, timeoutMs);
+  };
+
+  let timer = setTimeout(fire, timeoutMs);
 
   const cleanup = () => {
     clearTimeout(timer);
   };
 
-  return { controller, cleanup, timeoutMs };
+  const reset = () => {
+    if (controller.signal.aborted) {
+      return;
+    }
+    clearTimeout(timer);
+    timer = setTimeout(fire, timeoutMs);
+  };
+
+  return { controller, cleanup, reset, timeoutMs };
+}
+
+/**
+ * Compose an external abort signal with a timeout controller's signal.
+ * Returns a single AbortSignal that fires when either signal aborts.
+ * If only one signal is present, returns it directly without wrapping.
+ *
+ * @param externalSignal - User-provided AbortSignal (e.g., from options.abortSignal)
+ * @param timeoutSignal - Timeout controller's signal
+ * @returns Combined AbortSignal, or undefined if neither is present
+ */
+export function composeAbortSignals(
+  externalSignal?: AbortSignal,
+  timeoutSignal?: AbortSignal,
+): AbortSignal | undefined {
+  if (externalSignal && timeoutSignal) {
+    return AbortSignal.any([externalSignal, timeoutSignal]);
+  }
+  return externalSignal ?? timeoutSignal;
+}
+
+/**
+ * Scoped variant of {@link composeAbortSignals} for per-step / per-request
+ * composition against a LONG-LIVED external signal (e.g. the generate-call
+ * signal inside a multi-step agent loop). `AbortSignal.any` keeps its source
+ * registration alive until the derived signal is GC'd, so composing per step
+ * accumulates listeners on the outer signal for the whole turn
+ * (MaxListenersExceededWarning at 10+ steps). This helper registers plain
+ * listeners instead and returns a `dispose()` that removes them the moment
+ * the step settles.
+ */
+export function composeAbortSignalsScoped(
+  externalSignal?: AbortSignal,
+  timeoutSignal?: AbortSignal,
+): { signal: AbortSignal | undefined; dispose: () => void } {
+  if (!externalSignal || !timeoutSignal) {
+    return { signal: externalSignal ?? timeoutSignal, dispose: () => {} };
+  }
+  const controller = new AbortController();
+  const sources = [externalSignal, timeoutSignal];
+  const listeners: Array<{ source: AbortSignal; listener: () => void }> = [];
+  const dispose = () => {
+    for (const { source, listener } of listeners) {
+      source.removeEventListener("abort", listener);
+    }
+    listeners.length = 0;
+  };
+  const onAbort = (source: AbortSignal) => {
+    if (!controller.signal.aborted) {
+      controller.abort(source.reason);
+    }
+    // Self-clean on abort: once the composed signal fired, no source
+    // listener has any work left — detach from the OTHER source too (the
+    // firing one auto-removed via `once`), so callers that only observe
+    // `signal.aborted` and never reach their dispose() leave nothing behind.
+    dispose();
+  };
+  for (const source of sources) {
+    const listener = () => onAbort(source);
+    source.addEventListener("abort", listener, { once: true });
+    listeners.push({ source, listener });
+  }
+  for (const source of sources) {
+    if (source.aborted) {
+      onAbort(source);
+      break;
+    }
+  }
+  return { signal: controller.signal, dispose };
 }
 
 /**
  * Merge abort signals (for combining user abort with timeout)
+ *
+ * Implemented via `AbortSignal.any` with a single once-listener forward, so
+ * no per-source listeners are left behind on long-lived input signals once
+ * the merged controller becomes unreachable (registrations are released with
+ * the derived signal). The previous implementation attached one permanent
+ * listener per source per call — repeated stream calls sharing one caller
+ * signal accumulated listeners for the life of that signal.
+ *
  * @param signals - Array of abort signals to merge
  * @returns Combined abort controller
  */
@@ -467,21 +606,33 @@ export function mergeAbortSignals(
   signals: (AbortSignal | undefined)[],
 ): AbortController {
   const controller = new AbortController();
+  const active = signals.filter((s): s is AbortSignal => s !== undefined);
 
-  for (const signal of signals) {
-    if (signal && !signal.aborted) {
-      signal.addEventListener("abort", () => {
-        if (!controller.signal.aborted) {
-          controller.abort(signal.reason);
-        }
-      });
-    }
-
-    if (signal?.aborted) {
-      controller.abort(signal.reason);
-      break;
-    }
+  const aborted = active.find((s) => s.aborted);
+  if (aborted) {
+    controller.abort(aborted.reason);
+    return controller;
   }
+  if (active.length === 0) {
+    return controller;
+  }
+
+  const merged = AbortSignal.any(active);
+  merged.addEventListener(
+    "abort",
+    () => {
+      if (!controller.signal.aborted) {
+        controller.abort(merged.reason);
+      }
+    },
+    { once: true },
+  );
+  // Pin the derived signal to the returned controller: sources hold only
+  // weak refs to `any()` dependents, so without this strong ref the derived
+  // signal (and the forward listener with it) could be GC'd before firing.
+  (
+    controller as AbortController & { __nlMergedSignal?: AbortSignal }
+  ).__nlMergedSignal = merged;
 
   return controller;
 }

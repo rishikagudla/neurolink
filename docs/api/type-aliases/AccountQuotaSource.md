@@ -1,0 +1,16 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / AccountQuotaSource
+
+# Type Alias: AccountQuotaSource
+
+> **AccountQuotaSource** = `"headers"` \| `"usage-api"`
+
+Where an AccountQuota snapshot came from.
+
+- "headers" : passive capture of anthropic-ratelimit-unified-\* response
+  headers on a routed request (the automatic path).
+- "usage-api" : an explicit refresh against Anthropic's OAuth usage
+  endpoint (manual refetch path).

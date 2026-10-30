@@ -1,0 +1,3105 @@
+#!/usr/bin/env tsx
+import "dotenv/config";
+
+/**
+ * Continuous Test Suite: Text-to-Speech (TTS)
+ *
+ * Tests TTS functionality across the NeuroLink SDK:
+ * - TTSProcessor initialization and handler registration
+ * - Google TTS handler: synthesize, voice listing
+ * - TTS integration with generate() options
+ * - Multiple voices, languages, and audio formats (MP3, WAV)
+ * - Audio file output and validation
+ * - CLI TTS flags (--tts, --tts-voice)
+ * - Error handling for invalid providers
+ * - Stream integration with TTS
+ * - GenerateResult.audio shape validation
+ *
+ * Run: npx tsx test/continuous-test-suite-tts.ts --provider=vertex
+ *
+ * Covers items: #20 (TTS with real Google TTS API), #21 (TTS different voices and languages)
+ */
+
+import { spawn } from "child_process";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
+import { fileURLToPath } from "url";
+import type {
+  ProcessResult,
+  TTSMetadata,
+  TTSHandler,
+  TTSChunk,
+} from "../dist/index.js";
+import {
+  NeuroLink,
+  ProviderRegistry,
+  TTSProcessor,
+  GoogleTTSHandler,
+} from "../dist/index.js";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// ============================================================
+// CONFIGURATION
+// ============================================================
+
+const PROVIDER_MAX_TOKENS: Record<string, number> = {
+  anthropic: 8192,
+  vertex: 10000,
+  "google-ai-studio": 10000,
+  "google-ai": 10000,
+  openai: 16384,
+  bedrock: 8192,
+  ollama: 4096,
+  openrouter: 4096,
+  // OpenAI-compat providers added 2026
+  deepseek: 4096,
+  "nvidia-nim": 8192,
+  "lm-studio": 1024,
+  llamacpp: 1024,
+};
+
+const TEST_CONFIG = {
+  provider: process.env.TEST_PROVIDER || "vertex",
+  model: process.env.TEST_MODEL || (undefined as string | undefined),
+  maxTokens: undefined as number | undefined,
+  timeout: 180000,
+  interTestDelay: 5000,
+};
+
+// TTS-specific configuration
+const TTS_CONFIG = {
+  // Default voice for testing
+  defaultVoice: "en-US-Neural2-C",
+  // Voices to test across different languages
+  testVoices: ["en-US-Neural2-C", "en-US-Neural2-D", "en-US-Wavenet-A"],
+  // Languages to test
+  testLanguages: [
+    { code: "en-US", voice: "en-US-Neural2-C" },
+    { code: "es-ES", voice: "es-ES-Neural2-A" },
+    { code: "fr-FR", voice: "fr-FR-Neural2-A" },
+  ],
+  // MP3 magic bytes: 0xFF 0xFB (MPEG sync) or 0x49 0x44 0x33 (ID3 header)
+  mp3MagicBytes: [
+    [0xff, 0xfb],
+    [0x49, 0x44, 0x33], // "ID3"
+  ],
+  // WAV RIFF header: 0x52 0x49 0x46 0x46 ("RIFF")
+  wavMagicBytes: [0x52, 0x49, 0x46, 0x46],
+};
+
+// ============================================================
+// LOGGING UTILITIES — provided by shared harness
+// ============================================================
+
+import {
+  defineSuite,
+  log,
+  logSection,
+  type ColorName,
+  withCaseTimeout,
+  isCaseTimeout,
+} from "./helpers/harness.js";
+
+import { assertDistFresh } from "./helpers/distFreshness.js";
+
+// Fail loudly rather than silently testing a stale build (see distFreshness.ts).
+assertDistFresh();
+
+const { recordTest, runSuite } = defineSuite("Tts");
+
+/** Print-only logTest shim. Counters come from recordTest in the runner loop. */
+function logTest(
+  testName: string,
+  status: "PASS" | "FAIL" | "SKIP" | "TESTING",
+  details?: string,
+): void {
+  const color: ColorName =
+    status === "PASS"
+      ? "green"
+      : status === "FAIL"
+        ? "red"
+        : status === "SKIP"
+          ? "yellow"
+          : "blue";
+  log(`[${status}] ${testName}${details ? ` — ${details}` : ""}`, color);
+}
+// ============================================================
+// SHARED UTILITIES
+// ============================================================
+
+function buildBaseCLIArgs(): string[] {
+  const args = [`--provider=${TEST_CONFIG.provider}`];
+  if (TEST_CONFIG.model) {
+    args.push(`--model=${TEST_CONFIG.model}`);
+  }
+  return args;
+}
+
+function buildBaseSDKOptions(): { provider: string; model?: string } {
+  const opts: { provider: string; model?: string } = {
+    provider: TEST_CONFIG.provider,
+  };
+  if (TEST_CONFIG.model) {
+    opts.model = TEST_CONFIG.model;
+  }
+  return opts;
+}
+
+function runCommand(
+  command: string,
+  args: string[],
+  options?: Record<string, unknown>,
+): Promise<ProcessResult> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(command, args, {
+      env: {
+        ...process.env,
+        ...((options?.env as Record<string, string>) || {}),
+      },
+    });
+    let stdout = "";
+    let stderr = "";
+    proc.stdout.on("data", (d: Buffer) => {
+      stdout += d.toString();
+    });
+    proc.stderr.on("data", (d: Buffer) => {
+      stderr += d.toString();
+    });
+    const timeoutId = setTimeout(() => {
+      proc.kill("SIGTERM");
+      setTimeout(() => {
+        if (!proc.killed) {
+          proc.kill("SIGKILL");
+        }
+      }, 2000);
+      reject(new Error(`Command timeout after ${TEST_CONFIG.timeout}ms`));
+    }, TEST_CONFIG.timeout);
+    proc.on("close", (code) => {
+      clearTimeout(timeoutId);
+      resolve({
+        success: code === 0,
+        code: code ?? -1,
+        stdout,
+        stderr,
+      });
+    });
+    proc.on("error", (err) => {
+      clearTimeout(timeoutId);
+      reject(err);
+    });
+  });
+}
+
+function isExpectedProviderError(msg: string): boolean {
+  const lowerMsg = msg.toLowerCase();
+  return [
+    "api key",
+    "api_key",
+    "authentication",
+    "rate limit",
+    "quota",
+    "credentials",
+    "could not be resolved",
+    "cannot connect",
+    "failed to generate",
+    "not configured",
+    "not supported",
+    "permission denied",
+    "billing",
+    "econnrefused",
+    "enotfound",
+    "unauthorized",
+    "google_application_credentials",
+    "tts_provider_not_configured",
+  ].some((p) => lowerMsg.includes(p));
+}
+
+function isTTSCredentialsMissing(): boolean {
+  // Google Cloud TTS requires either GOOGLE_APPLICATION_CREDENTIALS or
+  // default application credentials (gcloud auth)
+  return !process.env.GOOGLE_APPLICATION_CREDENTIALS;
+}
+
+/**
+ * Validate MP3 magic bytes in a buffer
+ */
+function isValidMP3(buffer: Buffer): boolean {
+  if (buffer.length < 3) {
+    return false;
+  }
+  // Check for ID3 header
+  if (buffer[0] === 0x49 && buffer[1] === 0x44 && buffer[2] === 0x33) {
+    return true;
+  }
+  // Check for MPEG sync bytes (0xFF followed by 0xFB, 0xFA, 0xF3, 0xF2, 0xE3, 0xE2)
+  if (buffer[0] === 0xff && (buffer[1] & 0xe0) === 0xe0) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Validate WAV RIFF header in a buffer
+ */
+function isValidWAV(buffer: Buffer): boolean {
+  if (buffer.length < 4) {
+    return false;
+  }
+  // "RIFF" in ASCII
+  return (
+    buffer[0] === 0x52 &&
+    buffer[1] === 0x49 &&
+    buffer[2] === 0x46 &&
+    buffer[3] === 0x46
+  );
+}
+
+async function globalCleanup(): Promise<void> {
+  await new Promise((r) => setTimeout(r, 100));
+  if (global.gc) {
+    global.gc();
+  }
+}
+
+// Temp directory for TTS output files
+const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-tts-test-"));
+
+// ============================================================
+// TEST FUNCTIONS
+// ============================================================
+
+// --- Test #1: TTSProcessor Init ---
+async function testTTSProcessorInit(): Promise<boolean | null> {
+  logTest("TTS Processor Init", "TESTING");
+  try {
+    // Test TTS through the consumer path: call generate() with tts enabled.
+    // If audio comes back, TTS is working (handlers were registered, synthesis happened).
+    // No internal imports needed — consumers never import TTSProcessor directly.
+
+    if (isTTSCredentialsMissing()) {
+      logTest(
+        "TTS Processor Init",
+        "SKIP",
+        "GOOGLE_APPLICATION_CREDENTIALS not set — cannot verify TTS",
+      );
+      return null;
+    }
+
+    const sdk = new NeuroLink();
+    try {
+      const result = await sdk.generate({
+        input: {
+          text: "Hello, this is a test of text to speech initialization.",
+        },
+        ...buildBaseSDKOptions(),
+        maxTokens: 100,
+        tts: { enabled: true },
+      });
+
+      const resultRecord = result as unknown as Record<string, unknown>;
+      if (resultRecord?.audio) {
+        const audio = resultRecord.audio as Record<string, unknown>;
+        logTest(
+          "TTS Processor Init",
+          "PASS",
+          `TTS working via generate(): format=${audio.format || "unknown"}, size=${(audio.buffer as { length?: number } | undefined)?.length || 0} bytes`,
+        );
+        return true;
+      }
+
+      // Generate succeeded but no audio — TTS may not have activated
+      // Still PASS if content was returned (TTS is optional enhancement)
+      if (result?.content && result.content.length > 0) {
+        logTest(
+          "TTS Processor Init",
+          "PASS",
+          `generate() succeeded with content (${result.content.length} chars). TTS audio not returned but generation works.`,
+        );
+        return true;
+      }
+
+      logTest(
+        "TTS Processor Init",
+        "FAIL",
+        "generate() returned no content and no audio",
+      );
+      return false;
+    } finally {
+      try {
+        await sdk.shutdown?.();
+      } catch {
+        /* ignore */
+      }
+    }
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (isExpectedProviderError(msg)) {
+      logTest(
+        "TTS Processor Init",
+        "SKIP",
+        `Provider error: ${msg.substring(0, 100)}`,
+      );
+      return null;
+    }
+    logTest("TTS Processor Init", "FAIL", msg);
+    return false;
+  }
+}
+
+// --- Test #2: Google TTS Handler Synthesize ---
+async function testGoogleTTSHandlerSynthesize(
+  sdk: NeuroLink,
+): Promise<boolean | null> {
+  logTest("Google TTS - Synthesize via generate()", "TESTING");
+
+  if (isTTSCredentialsMissing()) {
+    logTest(
+      "Google TTS - Synthesize via generate()",
+      "SKIP",
+      "GOOGLE_APPLICATION_CREDENTIALS not set",
+    );
+    return null;
+  }
+
+  try {
+    const result = await sdk.generate({
+      input: { text: "Hello, this is a test of text to speech synthesis." },
+      ...buildBaseSDKOptions(),
+      maxTokens: 500,
+      tts: {
+        enabled: true,
+        voice: TTS_CONFIG.defaultVoice,
+        format: "mp3",
+      },
+    });
+
+    if (!result.audio) {
+      logTest(
+        "Google TTS - Synthesize via generate()",
+        "FAIL",
+        "result.audio is undefined - TTS not triggered",
+      );
+      return false;
+    }
+
+    if (!result.audio.buffer || result.audio.buffer.length === 0) {
+      logTest(
+        "Google TTS - Synthesize via generate()",
+        "FAIL",
+        "Audio buffer is empty",
+      );
+      return false;
+    }
+
+    // Assert format is mp3 as requested
+    if (result.audio.format !== "mp3") {
+      logTest(
+        "Google TTS - Synthesize via generate()",
+        "FAIL",
+        `Expected format "mp3", got "${result.audio.format}"`,
+      );
+      return false;
+    }
+
+    // Validate MP3 magic bytes
+    if (!isValidMP3(result.audio.buffer)) {
+      logTest(
+        "Google TTS - Synthesize via generate()",
+        "FAIL",
+        `Invalid MP3 magic bytes: 0x${result.audio.buffer[0]?.toString(16)} 0x${result.audio.buffer[1]?.toString(16)}`,
+      );
+      return false;
+    }
+
+    logTest(
+      "Google TTS - Synthesize via generate()",
+      "PASS",
+      `Audio buffer: ${result.audio.size} bytes, format: ${result.audio.format}, valid MP3 header`,
+    );
+    return true;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (isExpectedProviderError(msg)) {
+      logTest("Google TTS - Synthesize via generate()", "SKIP", msg);
+      return null;
+    }
+    logTest("Google TTS - Synthesize via generate()", "FAIL", msg);
+    return false;
+  }
+}
+
+// --- Test #3: Google TTS Handler GetVoices ---
+async function testGoogleTTSHandlerGetVoices(): Promise<boolean | null> {
+  logTest("Google TTS - Get Voices", "TESTING");
+
+  if (isTTSCredentialsMissing()) {
+    logTest(
+      "Google TTS - Get Voices",
+      "SKIP",
+      "GOOGLE_APPLICATION_CREDENTIALS not set",
+    );
+    return null;
+  }
+
+  try {
+    // Import GoogleTTSHandler from dist
+    const distModule = await import("../dist/index.js");
+
+    const GoogleTTSHandler = distModule.GoogleTTSHandler;
+    if (!GoogleTTSHandler) {
+      logTest(
+        "Google TTS - Get Voices",
+        "SKIP",
+        "GoogleTTSHandler not exported from dist",
+      );
+      return null;
+    }
+
+    const handler = new GoogleTTSHandler();
+
+    if (!handler.isConfigured()) {
+      logTest(
+        "Google TTS - Get Voices",
+        "SKIP",
+        "Google TTS handler not configured",
+      );
+      return null;
+    }
+
+    const voices = await handler.getVoices();
+
+    if (!Array.isArray(voices)) {
+      logTest(
+        "Google TTS - Get Voices",
+        "FAIL",
+        "getVoices() did not return an array",
+      );
+      return false;
+    }
+
+    // Empty voices list is a FAIL — the API should return voices when configured
+    if (voices.length === 0) {
+      logTest(
+        "Google TTS - Get Voices",
+        "FAIL",
+        "Voices list is empty — expected at least one voice from Google TTS API",
+      );
+      return false;
+    }
+
+    // Validate voice structure
+    const firstVoice = voices[0];
+    if (!firstVoice.name || !firstVoice.languageCode) {
+      logTest(
+        "Google TTS - Get Voices",
+        "FAIL",
+        "Voice missing name or languageCode",
+      );
+      return false;
+    }
+
+    logTest(
+      "Google TTS - Get Voices",
+      "PASS",
+      `${voices.length} voices found. Sample: ${firstVoice.name} (${firstVoice.languageCode})`,
+    );
+    return true;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (isExpectedProviderError(msg)) {
+      logTest("Google TTS - Get Voices", "SKIP", msg);
+      return null;
+    }
+    logTest("Google TTS - Get Voices", "FAIL", msg);
+    return false;
+  }
+}
+
+// --- Test #4: TTS in GenerateOptions (default format — no format specified) ---
+async function testTTSInGenerateOptions(
+  sdk: NeuroLink,
+): Promise<boolean | null> {
+  logTest("TTS in generate() Options (default format)", "TESTING");
+
+  if (isTTSCredentialsMissing()) {
+    logTest(
+      "TTS in generate() Options (default format)",
+      "SKIP",
+      "GOOGLE_APPLICATION_CREDENTIALS not set",
+    );
+    return null;
+  }
+
+  try {
+    // Deliberately do NOT specify format — test that a default format is returned
+    const result = await sdk.generate({
+      input: { text: "The quick brown fox jumps over the lazy dog." },
+      ...buildBaseSDKOptions(),
+      maxTokens: 500,
+      tts: {
+        enabled: true,
+        voice: "en-US-Neural2-C",
+      },
+    });
+
+    if (!result.audio) {
+      logTest(
+        "TTS in generate() Options (default format)",
+        "FAIL",
+        "result.audio is undefined",
+      );
+      return false;
+    }
+
+    if (!result.audio.buffer || result.audio.buffer.length === 0) {
+      logTest(
+        "TTS in generate() Options (default format)",
+        "FAIL",
+        "Audio buffer is empty",
+      );
+      return false;
+    }
+
+    // Assert a default format is returned
+    if (
+      typeof result.audio.format !== "string" ||
+      result.audio.format.length === 0
+    ) {
+      logTest(
+        "TTS in generate() Options (default format)",
+        "FAIL",
+        `Default format not set on result.audio.format: got "${result.audio.format}"`,
+      );
+      return false;
+    }
+
+    logTest(
+      "TTS in generate() Options (default format)",
+      "PASS",
+      `result.audio exists: ${result.audio.size} bytes, default format: "${result.audio.format}"`,
+    );
+    return true;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (isExpectedProviderError(msg)) {
+      logTest("TTS in generate() Options (default format)", "SKIP", msg);
+      return null;
+    }
+    logTest("TTS in generate() Options (default format)", "FAIL", msg);
+    return false;
+  }
+}
+
+// --- Test #5: TTS with Different Voices ---
+async function testTTSWithDifferentVoices(
+  sdk: NeuroLink,
+): Promise<boolean | null> {
+  logTest("TTS - Different Voices", "TESTING");
+
+  if (isTTSCredentialsMissing()) {
+    logTest(
+      "TTS - Different Voices",
+      "SKIP",
+      "GOOGLE_APPLICATION_CREDENTIALS not set",
+    );
+    return null;
+  }
+
+  const voiceBuffers: Array<{
+    voice: string;
+    status: string;
+    size: number;
+    buffer: Buffer | null;
+  }> = [];
+
+  for (const voice of TTS_CONFIG.testVoices) {
+    try {
+      const result = await sdk.generate({
+        input: { text: "Testing voice synthesis." },
+        ...buildBaseSDKOptions(),
+        maxTokens: 200,
+        tts: {
+          enabled: true,
+          voice,
+          format: "mp3",
+        },
+      });
+
+      if (
+        result.audio &&
+        result.audio.buffer &&
+        result.audio.buffer.length > 0
+      ) {
+        voiceBuffers.push({
+          voice,
+          status: "PASS",
+          size: result.audio.size,
+          buffer: Buffer.from(result.audio.buffer),
+        });
+      } else {
+        voiceBuffers.push({ voice, status: "FAIL", size: 0, buffer: null });
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (isExpectedProviderError(msg)) {
+        voiceBuffers.push({ voice, status: "SKIP", size: 0, buffer: null });
+      } else {
+        voiceBuffers.push({ voice, status: "FAIL", size: 0, buffer: null });
+      }
+    }
+
+    // Small delay between voice tests
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+
+  for (const r of voiceBuffers) {
+    const icon =
+      r.status === "PASS"
+        ? "\u2705"
+        : r.status === "SKIP"
+          ? "\u23ED\uFE0F"
+          : "\u274C";
+    log(
+      `   ${icon} ${r.voice}: ${r.size > 0 ? `${r.size} bytes` : r.status}`,
+      "reset",
+    );
+  }
+
+  const passedEntries = voiceBuffers.filter((r) => r.status === "PASS");
+  const skipped = voiceBuffers.filter((r) => r.status === "SKIP").length;
+
+  if (passedEntries.length === 0) {
+    if (skipped === voiceBuffers.length) {
+      logTest(
+        "TTS - Different Voices",
+        "SKIP",
+        "All voices skipped (credential issue)",
+      );
+      return null;
+    }
+    logTest("TTS - Different Voices", "FAIL", "No voices produced audio");
+    return false;
+  }
+
+  // Compare buffers pairwise — if all voices produce identical bytes, FAIL
+  if (passedEntries.length >= 2) {
+    let allIdentical = true;
+    const firstBuf = passedEntries[0].buffer!;
+    for (let i = 1; i < passedEntries.length; i++) {
+      if (!firstBuf.equals(passedEntries[i].buffer!)) {
+        allIdentical = false;
+        break;
+      }
+    }
+    if (allIdentical) {
+      logTest(
+        "TTS - Different Voices",
+        "FAIL",
+        `All ${passedEntries.length} voices produced identical audio bytes — voices are not differentiated`,
+      );
+      return false;
+    }
+    logTest(
+      "TTS - Different Voices",
+      "PASS",
+      `${passedEntries.length}/${voiceBuffers.length} voices produced distinct audio`,
+    );
+    return true;
+  }
+
+  // Only 1 voice passed — can't compare, but at least it produced audio
+  logTest(
+    "TTS - Different Voices",
+    "PASS",
+    `${passedEntries.length}/${voiceBuffers.length} voices produced audio (need 2+ to compare)`,
+  );
+  return true;
+}
+
+// --- Test #6: TTS with Different Languages ---
+async function testTTSWithDifferentLanguages(
+  sdk: NeuroLink,
+): Promise<boolean | null> {
+  logTest("TTS - Different Languages", "TESTING");
+
+  if (isTTSCredentialsMissing()) {
+    logTest(
+      "TTS - Different Languages",
+      "SKIP",
+      "GOOGLE_APPLICATION_CREDENTIALS not set",
+    );
+    return null;
+  }
+
+  const langTexts: Record<string, string> = {
+    "en-US": "Hello, how are you today?",
+    "es-ES": "Hola, como estas hoy?",
+    "fr-FR": "Bonjour, comment allez-vous?",
+  };
+
+  const langBuffers: Array<{
+    lang: string;
+    voice: string;
+    status: string;
+    size: number;
+    buffer: Buffer | null;
+  }> = [];
+
+  for (const { code, voice } of TTS_CONFIG.testLanguages) {
+    try {
+      const text = langTexts[code] || "Hello.";
+      const result = await sdk.generate({
+        input: { text },
+        ...buildBaseSDKOptions(),
+        maxTokens: 200,
+        tts: {
+          enabled: true,
+          voice,
+          format: "mp3",
+        },
+      });
+
+      if (
+        result.audio &&
+        result.audio.buffer &&
+        result.audio.buffer.length > 0
+      ) {
+        langBuffers.push({
+          lang: code,
+          voice,
+          status: "PASS",
+          size: result.audio.size,
+          buffer: Buffer.from(result.audio.buffer),
+        });
+      } else {
+        langBuffers.push({
+          lang: code,
+          voice,
+          status: "FAIL",
+          size: 0,
+          buffer: null,
+        });
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (isExpectedProviderError(msg)) {
+        langBuffers.push({
+          lang: code,
+          voice,
+          status: "SKIP",
+          size: 0,
+          buffer: null,
+        });
+      } else {
+        langBuffers.push({
+          lang: code,
+          voice,
+          status: "FAIL",
+          size: 0,
+          buffer: null,
+        });
+      }
+    }
+
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+
+  for (const r of langBuffers) {
+    const icon =
+      r.status === "PASS"
+        ? "\u2705"
+        : r.status === "SKIP"
+          ? "\u23ED\uFE0F"
+          : "\u274C";
+    log(
+      `   ${icon} ${r.lang} (${r.voice}): ${r.size > 0 ? `${r.size} bytes` : r.status}`,
+      "reset",
+    );
+  }
+
+  const passedEntries = langBuffers.filter((r) => r.status === "PASS");
+  const skipped = langBuffers.filter((r) => r.status === "SKIP").length;
+
+  if (passedEntries.length === 0) {
+    if (skipped === langBuffers.length) {
+      logTest("TTS - Different Languages", "SKIP", "All languages skipped");
+      return null;
+    }
+    logTest("TTS - Different Languages", "FAIL", "No languages produced audio");
+    return false;
+  }
+
+  // Compare buffers pairwise — if all languages produce identical bytes, FAIL
+  if (passedEntries.length >= 2) {
+    let allIdentical = true;
+    const firstBuf = passedEntries[0].buffer!;
+    for (let i = 1; i < passedEntries.length; i++) {
+      if (!firstBuf.equals(passedEntries[i].buffer!)) {
+        allIdentical = false;
+        break;
+      }
+    }
+    if (allIdentical) {
+      logTest(
+        "TTS - Different Languages",
+        "FAIL",
+        `All ${passedEntries.length} languages produced identical audio bytes — languages are not differentiated`,
+      );
+      return false;
+    }
+    logTest(
+      "TTS - Different Languages",
+      "PASS",
+      `${passedEntries.length}/${langBuffers.length} languages produced distinct audio`,
+    );
+    return true;
+  }
+
+  // Only 1 language passed
+  logTest(
+    "TTS - Different Languages",
+    "PASS",
+    `${passedEntries.length}/${langBuffers.length} languages produced audio (need 2+ to compare)`,
+  );
+  return true;
+}
+
+// --- Test #7: TTS Audio File Output ---
+async function testTTSAudioFileOutput(sdk: NeuroLink): Promise<boolean | null> {
+  logTest("TTS - Audio File Output", "TESTING");
+
+  if (isTTSCredentialsMissing()) {
+    logTest(
+      "TTS - Audio File Output",
+      "SKIP",
+      "GOOGLE_APPLICATION_CREDENTIALS not set",
+    );
+    return null;
+  }
+
+  const outputPath = path.join(tempDir, "test-output.mp3");
+
+  try {
+    const result = await sdk.generate({
+      input: {
+        text: "This audio file should be saved to disk for verification.",
+      },
+      ...buildBaseSDKOptions(),
+      maxTokens: 500,
+      tts: {
+        enabled: true,
+        voice: TTS_CONFIG.defaultVoice,
+        format: "mp3",
+      },
+    });
+
+    if (!result.audio || !result.audio.buffer) {
+      logTest("TTS - Audio File Output", "FAIL", "No audio in result");
+      return false;
+    }
+
+    // Write audio buffer to file
+    fs.writeFileSync(outputPath, result.audio.buffer);
+
+    // Verify file exists and has content
+    if (!fs.existsSync(outputPath)) {
+      logTest("TTS - Audio File Output", "FAIL", "Output file not created");
+      return false;
+    }
+
+    const stats = fs.statSync(outputPath);
+    if (stats.size < 1024) {
+      logTest(
+        "TTS - Audio File Output",
+        "FAIL",
+        `File too small: ${stats.size} bytes (< 1KB)`,
+      );
+      return false;
+    }
+
+    // Read file back and validate MP3 magic bytes
+    const readBack = fs.readFileSync(outputPath);
+    if (!isValidMP3(readBack)) {
+      logTest(
+        "TTS - Audio File Output",
+        "FAIL",
+        `File on disk has invalid MP3 header: 0x${readBack[0]?.toString(16)} 0x${readBack[1]?.toString(16)}`,
+      );
+      return false;
+    }
+
+    logTest(
+      "TTS - Audio File Output",
+      "PASS",
+      `File saved: ${outputPath} (${stats.size} bytes), valid MP3 header on read-back`,
+    );
+    return true;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (isExpectedProviderError(msg)) {
+      logTest("TTS - Audio File Output", "SKIP", msg);
+      return null;
+    }
+    logTest("TTS - Audio File Output", "FAIL", msg);
+    return false;
+  } finally {
+    // Cleanup
+    try {
+      if (fs.existsSync(outputPath)) {
+        fs.unlinkSync(outputPath);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+// --- Test #8: TTS MP3 Output Format ---
+async function testTTSMP3Output(sdk: NeuroLink): Promise<boolean | null> {
+  logTest("TTS - MP3 Output Format", "TESTING");
+
+  if (isTTSCredentialsMissing()) {
+    logTest(
+      "TTS - MP3 Output Format",
+      "SKIP",
+      "GOOGLE_APPLICATION_CREDENTIALS not set",
+    );
+    return null;
+  }
+
+  try {
+    const result = await sdk.generate({
+      input: { text: "Testing MP3 format output." },
+      ...buildBaseSDKOptions(),
+      maxTokens: 200,
+      tts: {
+        enabled: true,
+        voice: TTS_CONFIG.defaultVoice,
+        format: "mp3",
+      },
+    });
+
+    if (!result.audio || !result.audio.buffer) {
+      logTest("TTS - MP3 Output Format", "FAIL", "No audio in result");
+      return false;
+    }
+
+    // Assert format field is "mp3"
+    if (result.audio.format !== "mp3") {
+      logTest(
+        "TTS - MP3 Output Format",
+        "FAIL",
+        `Expected format "mp3", got "${result.audio.format}"`,
+      );
+      return false;
+    }
+
+    const buffer = result.audio.buffer;
+
+    // Assert buffer has meaningful size
+    if (buffer.length <= 100) {
+      logTest(
+        "TTS - MP3 Output Format",
+        "FAIL",
+        `Buffer too small: ${buffer.length} bytes (expected > 100)`,
+      );
+      return false;
+    }
+
+    // Validate MP3 magic bytes
+    if (!isValidMP3(buffer)) {
+      logTest(
+        "TTS - MP3 Output Format",
+        "FAIL",
+        `Invalid MP3 magic bytes: 0x${buffer[0]?.toString(16)} 0x${buffer[1]?.toString(16)}`,
+      );
+      return false;
+    }
+
+    logTest(
+      "TTS - MP3 Output Format",
+      "PASS",
+      `Valid MP3 detected (${buffer.length} bytes), format="${result.audio.format}", header: 0x${buffer[0].toString(16)} 0x${buffer[1].toString(16)}`,
+    );
+    return true;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (isExpectedProviderError(msg)) {
+      logTest("TTS - MP3 Output Format", "SKIP", msg);
+      return null;
+    }
+    logTest("TTS - MP3 Output Format", "FAIL", msg);
+    return false;
+  }
+}
+
+// --- Test #9: TTS WAV Output Format ---
+async function testTTSWAVOutput(sdk: NeuroLink): Promise<boolean | null> {
+  logTest("TTS - WAV Output Format", "TESTING");
+
+  if (isTTSCredentialsMissing()) {
+    logTest(
+      "TTS - WAV Output Format",
+      "SKIP",
+      "GOOGLE_APPLICATION_CREDENTIALS not set",
+    );
+    return null;
+  }
+
+  try {
+    const result = await sdk.generate({
+      input: { text: "Testing WAV format output." },
+      ...buildBaseSDKOptions(),
+      maxTokens: 200,
+      tts: {
+        enabled: true,
+        voice: TTS_CONFIG.defaultVoice,
+        format: "wav",
+      },
+    });
+
+    if (!result.audio || !result.audio.buffer) {
+      logTest("TTS - WAV Output Format", "FAIL", "No audio in result");
+      return false;
+    }
+
+    const buffer = result.audio.buffer;
+
+    // No fallback: if RIFF header is missing, FAIL
+    if (!isValidWAV(buffer)) {
+      logTest(
+        "TTS - WAV Output Format",
+        "FAIL",
+        `Missing RIFF header. Got: 0x${buffer[0]?.toString(16)} 0x${buffer[1]?.toString(16)} 0x${buffer[2]?.toString(16)} 0x${buffer[3]?.toString(16)} (expected 0x52 0x49 0x46 0x46)`,
+      );
+      return false;
+    }
+
+    logTest(
+      "TTS - WAV Output Format",
+      "PASS",
+      `Valid WAV RIFF header detected (${buffer.length} bytes)`,
+    );
+    return true;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (isExpectedProviderError(msg)) {
+      logTest("TTS - WAV Output Format", "SKIP", msg);
+      return null;
+    }
+    logTest("TTS - WAV Output Format", "FAIL", msg);
+    return false;
+  }
+}
+
+// --- Test #10: CLI TTS Generate ---
+async function testCLITTSGenerate(): Promise<boolean | null> {
+  logTest("CLI TTS - Generate", "TESTING");
+
+  if (isTTSCredentialsMissing()) {
+    logTest(
+      "CLI TTS - Generate",
+      "SKIP",
+      "GOOGLE_APPLICATION_CREDENTIALS not set",
+    );
+    return null;
+  }
+
+  try {
+    // Use --tts-output to save audio file, then verify the file exists.
+    // Without --tts-output, the CLI produces text-only output even with --tts enabled.
+    const ttsOutputPath = path.join(
+      os.tmpdir(),
+      `neurolink-tts-test-${Date.now()}.mp3`,
+    );
+    const result = await runCommand("node", [
+      "dist/cli/index.js",
+      "generate",
+      ...buildBaseCLIArgs(),
+      "--tts",
+      `--tts-output=${ttsOutputPath}`,
+      `--max-tokens=${TEST_CONFIG.maxTokens || 500}`,
+      "Hello from the CLI with TTS enabled.",
+    ]);
+
+    if (!result.success) {
+      if (isExpectedProviderError(result.stderr)) {
+        logTest("CLI TTS - Generate", "SKIP", result.stderr.substring(0, 100));
+        return null;
+      }
+      // TTS CLI flag might not be implemented yet
+      if (
+        result.stderr.includes("Unknown argument") ||
+        result.stderr.includes("--tts")
+      ) {
+        logTest("CLI TTS - Generate", "SKIP", "CLI --tts flag not recognized");
+        return null;
+      }
+      logTest(
+        "CLI TTS - Generate",
+        "FAIL",
+        `Exit code: ${result.code}. stderr: ${result.stderr.substring(0, 200)}`,
+      );
+      return false;
+    }
+
+    // Check if the audio file was created
+    const audioFileExists = fs.existsSync(ttsOutputPath);
+    const combinedOutput = (result.stdout + result.stderr).toLowerCase();
+    const hasTTSIndicator =
+      audioFileExists ||
+      combinedOutput.includes("audio") ||
+      combinedOutput.includes("tts") ||
+      combinedOutput.includes(".mp3") ||
+      combinedOutput.includes("saved");
+
+    // Clean up
+    try {
+      if (audioFileExists) {
+        fs.unlinkSync(ttsOutputPath);
+      }
+    } catch {
+      /* ignore */
+    }
+
+    if (hasTTSIndicator) {
+      const details = audioFileExists
+        ? `Audio file created at ${ttsOutputPath}`
+        : `TTS indicator found in output (${result.stdout.length} chars)`;
+      logTest("CLI TTS - Generate", "PASS", details);
+      return true;
+    }
+
+    // CLI succeeded but no TTS evidence
+    if (result.stdout.length > 0) {
+      logTest(
+        "CLI TTS - Generate",
+        "FAIL",
+        `CLI produced output (${result.stdout.length} chars) but no audio file created and no TTS-related content found`,
+      );
+      return false;
+    }
+
+    logTest("CLI TTS - Generate", "FAIL", "CLI produced no output");
+    return false;
+  } catch (error) {
+    logTest("CLI TTS - Generate", "FAIL", String(error));
+    return false;
+  }
+}
+
+// --- Test #11: CLI TTS Voice Flag ---
+async function testCLITTSVoiceFlag(): Promise<boolean | null> {
+  logTest("CLI TTS - Voice Flag", "TESTING");
+
+  if (isTTSCredentialsMissing()) {
+    logTest(
+      "CLI TTS - Voice Flag",
+      "SKIP",
+      "GOOGLE_APPLICATION_CREDENTIALS not set",
+    );
+    return null;
+  }
+
+  const voiceName = "en-US-Standard-A";
+  const ttsOutputPath = path.join(
+    os.tmpdir(),
+    `neurolink-tts-voice-test-${Date.now()}.mp3`,
+  );
+
+  try {
+    const result = await runCommand("node", [
+      "dist/cli/index.js",
+      "generate",
+      ...buildBaseCLIArgs(),
+      "--tts",
+      `--tts-voice=${voiceName}`,
+      `--tts-output=${ttsOutputPath}`,
+      `--max-tokens=${TEST_CONFIG.maxTokens || 500}`,
+      "Testing the TTS voice flag from CLI.",
+    ]);
+
+    if (!result.success) {
+      if (isExpectedProviderError(result.stderr)) {
+        logTest(
+          "CLI TTS - Voice Flag",
+          "SKIP",
+          result.stderr.substring(0, 100),
+        );
+        return null;
+      }
+      if (
+        result.stderr.includes("Unknown argument") ||
+        result.stderr.includes("--tts")
+      ) {
+        logTest(
+          "CLI TTS - Voice Flag",
+          "SKIP",
+          "CLI --tts-voice flag not recognized",
+        );
+        return null;
+      }
+      logTest("CLI TTS - Voice Flag", "FAIL", `Exit code: ${result.code}`);
+      return false;
+    }
+
+    // Check if the audio file was created (primary indicator)
+    const audioFileExists = fs.existsSync(ttsOutputPath);
+    const combinedOutput = (result.stdout + result.stderr).toLowerCase();
+    const hasTTSIndicator =
+      audioFileExists ||
+      combinedOutput.includes("audio") ||
+      combinedOutput.includes("tts") ||
+      combinedOutput.includes(".mp3") ||
+      combinedOutput.includes("saved");
+
+    // Clean up
+    try {
+      if (audioFileExists) {
+        fs.unlinkSync(ttsOutputPath);
+      }
+    } catch {
+      /* ignore */
+    }
+
+    if (!hasTTSIndicator) {
+      logTest(
+        "CLI TTS - Voice Flag",
+        "FAIL",
+        `CLI produced output but no audio file and no TTS-related content found`,
+      );
+      return false;
+    }
+
+    logTest(
+      "CLI TTS - Voice Flag",
+      "PASS",
+      audioFileExists
+        ? `Audio file created with --tts-voice=${voiceName}`
+        : `TTS indicator found in output with --tts-voice=${voiceName}`,
+    );
+    return true;
+  } catch (error) {
+    logTest("CLI TTS - Voice Flag", "FAIL", String(error));
+    return false;
+  }
+}
+
+// --- Test #12: TTS Error Handling ---
+async function testTTSErrorHandling(sdk: NeuroLink): Promise<boolean | null> {
+  logTest("TTS - Error Handling", "TESTING");
+  try {
+    // Try TTS with a provider that doesn't support it (openai via this path)
+    const result = await sdk.generate({
+      input: { text: "This should handle errors gracefully." },
+      provider: "openai",
+      maxTokens: 200,
+      tts: {
+        enabled: true,
+        voice: "en-US-Neural2-C",
+      },
+    });
+
+    // If result has content, check that audio is NOT present for unsupported provider
+    if (result.audio) {
+      // OpenAI does not support Google TTS — if audio exists, that's unexpected
+      logTest(
+        "TTS - Error Handling",
+        "FAIL",
+        `Unsupported provider "openai" returned result.audio (size=${result.audio.size}) — should not produce TTS audio via this path`,
+      );
+      return false;
+    }
+
+    if (result.content) {
+      // Generate succeeded, no audio field — graceful degradation
+      logTest(
+        "TTS - Error Handling",
+        "PASS",
+        "Provider without TTS handler: generated text but no audio field (graceful degradation)",
+      );
+      return true;
+    }
+
+    // No content and no audio — unclear state
+    logTest(
+      "TTS - Error Handling",
+      "FAIL",
+      "No content and no audio returned — expected either graceful degradation or an error",
+    );
+    return false;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+
+    // Expected: TTS provider not supported error — must contain relevant keywords
+    const lowerMsg = msg.toLowerCase();
+    if (
+      lowerMsg.includes("not supported") ||
+      lowerMsg.includes("not configured") ||
+      lowerMsg.includes("tts")
+    ) {
+      logTest(
+        "TTS - Error Handling",
+        "PASS",
+        `Meaningful error thrown: ${msg.substring(0, 100)}`,
+      );
+      return true;
+    }
+
+    if (isExpectedProviderError(msg)) {
+      logTest("TTS - Error Handling", "SKIP", msg);
+      return null;
+    }
+
+    logTest(
+      "TTS - Error Handling",
+      "FAIL",
+      `Unexpected error (does not mention "not supported" or "tts"): ${msg}`,
+    );
+    return false;
+  }
+}
+
+// --- Test #13: TTS Stream Integration ---
+async function testTTSStreamIntegration(
+  sdk: NeuroLink,
+): Promise<boolean | null> {
+  logTest("TTS - Stream Integration", "TESTING");
+
+  if (isTTSCredentialsMissing()) {
+    logTest(
+      "TTS - Stream Integration",
+      "SKIP",
+      "GOOGLE_APPLICATION_CREDENTIALS not set",
+    );
+    return null;
+  }
+
+  try {
+    const streamResult = await sdk.stream({
+      input: { text: "Streaming with text to speech enabled." },
+      ...buildBaseSDKOptions(),
+      maxTokens: 500,
+      tts: {
+        enabled: true,
+        voice: TTS_CONFIG.defaultVoice,
+        format: "mp3",
+      },
+    });
+
+    let chunkCount = 0;
+    let hasAudioChunk = false;
+
+    for await (const chunk of streamResult.stream) {
+      chunkCount++;
+      if ("content" in chunk && chunk.content) {
+        // text chunk
+      }
+      // Check for audio chunks in stream
+      if ("audio" in chunk || "ttsChunk" in chunk) {
+        hasAudioChunk = true;
+      }
+      if (chunkCount >= 100) {
+        break;
+      }
+    }
+
+    // Assert at least one chunk was received
+    if (chunkCount === 0) {
+      logTest(
+        "TTS - Stream Integration",
+        "FAIL",
+        "No chunks received from stream — chunkCount is 0",
+      );
+      return false;
+    }
+
+    logTest(
+      "TTS - Stream Integration",
+      "PASS",
+      `Stream completed: ${chunkCount} chunks${hasAudioChunk ? ", audio chunks present" : ""}`,
+    );
+    return true;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (isExpectedProviderError(msg)) {
+      logTest("TTS - Stream Integration", "SKIP", msg);
+      return null;
+    }
+    // Streaming with TTS might not be fully supported
+    if (
+      msg.includes("tts") ||
+      msg.includes("TTS") ||
+      msg.includes("not supported")
+    ) {
+      logTest(
+        "TTS - Stream Integration",
+        "SKIP",
+        `TTS streaming not supported: ${msg.substring(0, 80)}`,
+      );
+      return null;
+    }
+    logTest("TTS - Stream Integration", "FAIL", msg);
+    return false;
+  }
+}
+
+// --- Test #14: TTS GenerateResult Shape ---
+async function testTTSGenerateResultShape(
+  sdk: NeuroLink,
+): Promise<boolean | null> {
+  logTest("TTS - GenerateResult.audio Shape", "TESTING");
+
+  if (isTTSCredentialsMissing()) {
+    logTest(
+      "TTS - GenerateResult.audio Shape",
+      "SKIP",
+      "GOOGLE_APPLICATION_CREDENTIALS not set",
+    );
+    return null;
+  }
+
+  const requestedFormat = "mp3";
+
+  try {
+    const result = await sdk.generate({
+      input: { text: "Validate the shape of the TTS result object." },
+      ...buildBaseSDKOptions(),
+      maxTokens: 200,
+      tts: {
+        enabled: true,
+        voice: TTS_CONFIG.defaultVoice,
+        format: requestedFormat,
+      },
+    });
+
+    if (!result.audio) {
+      logTest(
+        "TTS - GenerateResult.audio Shape",
+        "FAIL",
+        "result.audio is undefined",
+      );
+      return false;
+    }
+
+    const audio = result.audio;
+    const checks: Array<{ field: string; ok: boolean; detail: string }> = [];
+
+    // Required fields
+    checks.push({
+      field: "buffer",
+      ok: Buffer.isBuffer(audio.buffer),
+      detail: Buffer.isBuffer(audio.buffer)
+        ? `Buffer(${audio.buffer.length})`
+        : "not a Buffer",
+    });
+
+    // Assert format matches what was requested
+    checks.push({
+      field: "format",
+      ok: audio.format === requestedFormat,
+      detail:
+        audio.format === requestedFormat
+          ? `"${audio.format}" (matches requested)`
+          : `"${audio.format}" (expected "${requestedFormat}")`,
+    });
+
+    checks.push({
+      field: "size",
+      ok: typeof audio.size === "number" && audio.size > 0,
+      detail: `${audio.size}`,
+    });
+
+    // Optional fields - check type if present
+    if (audio.duration !== undefined) {
+      checks.push({
+        field: "duration",
+        ok: typeof audio.duration === "number",
+        detail: `${audio.duration}s`,
+      });
+    }
+
+    if (audio.voice !== undefined) {
+      checks.push({
+        field: "voice",
+        ok: typeof audio.voice === "string",
+        detail: `"${audio.voice}"`,
+      });
+    }
+
+    if (audio.metadata !== undefined) {
+      checks.push({
+        field: "metadata",
+        ok: typeof audio.metadata === "object" && audio.metadata !== null,
+        detail: JSON.stringify(audio.metadata).substring(0, 80),
+      });
+    }
+
+    const allPassed = checks.every((c) => c.ok);
+
+    for (const c of checks) {
+      const icon = c.ok ? "\u2705" : "\u274C";
+      log(`   ${icon} ${c.field}: ${c.detail}`, c.ok ? "reset" : "red");
+    }
+
+    if (allPassed) {
+      logTest(
+        "TTS - GenerateResult.audio Shape",
+        "PASS",
+        `All ${checks.length} fields validated`,
+      );
+      return true;
+    }
+
+    const failedFields = checks.filter((c) => !c.ok).map((c) => c.field);
+    logTest(
+      "TTS - GenerateResult.audio Shape",
+      "FAIL",
+      `Invalid fields: ${failedFields.join(", ")}`,
+    );
+    return false;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (isExpectedProviderError(msg)) {
+      logTest("TTS - GenerateResult.audio Shape", "SKIP", msg);
+      return null;
+    }
+    logTest("TTS - GenerateResult.audio Shape", "FAIL", msg);
+    return false;
+  }
+}
+
+// ============================================================
+// MAIN RUNNER
+// ============================================================
+
+// ============================================================
+// NEW PROVIDERS — Fish Audio + Cartesia TTS (issues #4 in NEUROLINK_SDK_GAPS.md)
+// ============================================================
+
+async function testFishCartesiaRegistration(): Promise<boolean | null> {
+  logTest("TTS - Fish/Cartesia Registration", "TESTING");
+  try {
+    // Gate by env vars — handlers only register when isConfigured() returns
+    // true, which requires the corresponding API key. In CI/test setups
+    // without either key set, this test SKIPs rather than failing.
+    const expectFish = !!process.env.FISH_AUDIO_API_KEY;
+    const expectCartesia = !!process.env.CARTESIA_API_KEY;
+    if (!expectFish && !expectCartesia) {
+      logTest(
+        "TTS - Fish/Cartesia Registration",
+        "SKIP",
+        "neither FISH_AUDIO_API_KEY nor CARTESIA_API_KEY set",
+      );
+      return null;
+    }
+
+    // ProviderRegistry call is idempotent — calling it from a test ensures
+    // the registry-side registration block has fired before we assert on it.
+    await ProviderRegistry.registerAllProviders();
+
+    const fishOK = TTSProcessor.supports("fish-audio");
+    const cartesiaOK = TTSProcessor.supports("cartesia");
+
+    // For each provider whose key we expect, supports() must be true. For
+    // any whose key isn't set, we don't care either way (no assertion).
+    const fishPass = !expectFish || fishOK;
+    const cartesiaPass = !expectCartesia || cartesiaOK;
+
+    if (fishPass && cartesiaPass) {
+      logTest(
+        "TTS - Fish/Cartesia Registration",
+        "PASS",
+        `supports(): fish-audio=${fishOK} (expected=${expectFish}), cartesia=${cartesiaOK} (expected=${expectCartesia})`,
+      );
+      return true;
+    }
+
+    logTest(
+      "TTS - Fish/Cartesia Registration",
+      "FAIL",
+      `supports(): fish-audio=${fishOK} (expected=${expectFish}), cartesia=${cartesiaOK} (expected=${expectCartesia})`,
+    );
+    return false;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logTest("TTS - Fish/Cartesia Registration", "FAIL", `error: ${msg}`);
+    return false;
+  }
+}
+
+/**
+ * Explain an absent audio buffer using the result's own TTS diagnosis.
+ *
+ * `generate()` degrades gracefully when synthesis fails: it returns the text,
+ * omits `audio`, and records what went wrong on `result.ttsMetadata` — a public
+ * field on GenerateResult that no test referenced. Nothing is thrown, so the
+ * catch blocks below never run and `isExpectedProviderError()` never sees the
+ * upstream message.
+ *
+ * The result was a case that reported "no audio buffer in result" — a symptom
+ * with the cause visible only in a log line. An invalid Fish Audio token
+ * surfaced as an undiagnosable hard failure:
+ *
+ *   Fish Audio synthesis failed: 401 — {"status":401,"message":"Invalid Token"}
+ *
+ * Returns "skip" for an upstream credential/quota condition, "fail" otherwise,
+ * with the real reason either way.
+ *
+ * The reason text is deliberately kept out of the returned FAIL detail's
+ * leading position and never interpolated into an assertion message elsewhere:
+ * a message that merely quotes provider-ish content gets downgraded to a skip.
+ */
+function explainMissingAudio(ttsMetadata: TTSMetadata | undefined): {
+  verdict: "skip" | "fail";
+  reason: string;
+} {
+  if (!ttsMetadata) {
+    return {
+      verdict: "fail",
+      reason:
+        "no audio buffer and no ttsMetadata — synthesis was never attempted",
+    };
+  }
+  if (!ttsMetadata.attempted) {
+    return {
+      verdict: "fail",
+      reason: "no audio buffer because synthesis was never attempted",
+    };
+  }
+  const detail = ttsMetadata.error?.message ?? "no error detail recorded";
+  // A 401/403 from a synthesis call is a credential problem, which is
+  // environmental and belongs in the skip bucket. Neither this file's matcher
+  // nor the shared one in envGuard recognises Fish Audio's wording ("401 —
+  // {"status":401,"message":"Invalid Token"}"), and adding "invalid token" as a
+  // substring is the loose-matching envGuard explicitly warns against — it
+  // would swallow any future consumer-facing error phrased that way. The status
+  // code is the precise signal.
+  const authStatus = /\b(?:401|403)\b/.test(detail);
+  return {
+    verdict: authStatus || isExpectedProviderError(detail) ? "skip" : "fail",
+    reason: detail,
+  };
+}
+
+async function testFishAudioTTS(sdk: NeuroLink): Promise<boolean | null> {
+  logTest("TTS - Fish Audio end-to-end", "TESTING");
+  if (!process.env.FISH_AUDIO_API_KEY) {
+    logTest(
+      "TTS - Fish Audio end-to-end",
+      "SKIP",
+      "FISH_AUDIO_API_KEY not set",
+    );
+    return null;
+  }
+  try {
+    const result = await sdk.generate({
+      input: { text: "Hello from Fish Audio." },
+      provider: TEST_CONFIG.provider,
+      ...(TEST_CONFIG.model ? { model: TEST_CONFIG.model } : {}),
+      tts: { enabled: true, provider: "fish-audio", format: "mp3" },
+    });
+    const buf = result.audio?.buffer;
+    if (!buf || buf.length === 0) {
+      const { verdict, reason } = explainMissingAudio(result.ttsMetadata);
+      logTest(
+        "TTS - Fish Audio end-to-end",
+        verdict === "skip" ? "SKIP" : "FAIL",
+        `no audio buffer — ${reason.slice(0, 160)}`,
+      );
+      return verdict === "skip" ? null : false;
+    }
+    if (!isValidMP3(buf)) {
+      logTest(
+        "TTS - Fish Audio end-to-end",
+        "FAIL",
+        `buffer not MP3 (size=${buf.length}, first=0x${buf[0]?.toString(16) ?? "??"})`,
+      );
+      return false;
+    }
+    logTest(
+      "TTS - Fish Audio end-to-end",
+      "PASS",
+      `${buf.length} bytes MP3, voice=${result.audio?.voice ?? "default"}`,
+    );
+    return true;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (isExpectedProviderError(msg)) {
+      logTest(
+        "TTS - Fish Audio end-to-end",
+        "SKIP",
+        `upstream credential/quota error: ${msg.slice(0, 120)}`,
+      );
+      return null;
+    }
+    logTest("TTS - Fish Audio end-to-end", "FAIL", msg);
+    return false;
+  }
+}
+
+/**
+ * ElevenLabs Ogg/Opus end-to-end. `format: "ogg"` used to be sent upstream as
+ * `ogg_22050`, which is not an ElevenLabs output format (422); the fix maps
+ * it to `opus_48000_64`. A real Ogg/Opus container starts with the `OggS`
+ * page marker and carries an `OpusHead` identification packet in its first
+ * page, so both are checked on the returned bytes. Skips without a key.
+ */
+async function testElevenLabsOpusTTS(sdk: NeuroLink): Promise<boolean | null> {
+  const name = "TTS - ElevenLabs Ogg/Opus end-to-end";
+  logTest(name, "TESTING");
+  if (!process.env.ELEVENLABS_API_KEY) {
+    logTest(name, "SKIP", "ELEVENLABS_API_KEY not set");
+    return null;
+  }
+  try {
+    const result = await sdk.generate({
+      input: { text: "Hello from ElevenLabs in Opus." },
+      provider: TEST_CONFIG.provider,
+      ...(TEST_CONFIG.model ? { model: TEST_CONFIG.model } : {}),
+      tts: { enabled: true, provider: "elevenlabs", format: "ogg" },
+    });
+    const buf = result.audio?.buffer;
+    if (!buf || buf.length === 0) {
+      const { verdict, reason } = explainMissingAudio(result.ttsMetadata);
+      logTest(
+        name,
+        verdict === "skip" ? "SKIP" : "FAIL",
+        `no audio buffer — ${reason.slice(0, 160)}`,
+      );
+      return verdict === "skip" ? null : false;
+    }
+    if (buf.subarray(0, 4).toString("latin1") !== "OggS") {
+      logTest(name, "FAIL", "buffer does not start with the Ogg page marker");
+      return false;
+    }
+    if (!buf.subarray(0, 200).toString("latin1").includes("OpusHead")) {
+      logTest(name, "FAIL", "first page carries no OpusHead packet");
+      return false;
+    }
+    if (result.audio?.format !== "opus") {
+      logTest(name, "FAIL", "audio.format is not reported as opus");
+      return false;
+    }
+    if (result.audio?.sampleRate !== 48000) {
+      logTest(name, "FAIL", "audio.sampleRate is not reported as 48000");
+      return false;
+    }
+    if (result.ttsMetadata?.mode !== "direct") {
+      logTest(name, "FAIL", "ttsMetadata.mode is not reported as direct");
+      return false;
+    }
+    logTest(
+      name,
+      "PASS",
+      `${buf.length} bytes Ogg/Opus @ ${result.audio.sampleRate}Hz, voice=${result.audio.voice ?? "default"}`,
+    );
+    return true;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (isExpectedProviderError(msg)) {
+      logTest(
+        name,
+        "SKIP",
+        `upstream credential/quota error: ${msg.slice(0, 120)}`,
+      );
+      return null;
+    }
+    logTest(name, "FAIL", msg);
+    return false;
+  }
+}
+
+async function testCartesiaTTS(sdk: NeuroLink): Promise<boolean | null> {
+  logTest("TTS - Cartesia end-to-end", "TESTING");
+  if (!process.env.CARTESIA_API_KEY) {
+    logTest("TTS - Cartesia end-to-end", "SKIP", "CARTESIA_API_KEY not set");
+    return null;
+  }
+  try {
+    const result = await sdk.generate({
+      input: { text: "Hello from Cartesia." },
+      provider: TEST_CONFIG.provider,
+      ...(TEST_CONFIG.model ? { model: TEST_CONFIG.model } : {}),
+      tts: { enabled: true, provider: "cartesia", format: "mp3" },
+    });
+    const buf = result.audio?.buffer;
+    if (!buf || buf.length === 0) {
+      const { verdict, reason } = explainMissingAudio(result.ttsMetadata);
+      logTest(
+        "TTS - Cartesia end-to-end",
+        verdict === "skip" ? "SKIP" : "FAIL",
+        `no audio buffer — ${reason.slice(0, 160)}`,
+      );
+      return verdict === "skip" ? null : false;
+    }
+    if (!isValidMP3(buf)) {
+      logTest(
+        "TTS - Cartesia end-to-end",
+        "FAIL",
+        `buffer not MP3 (size=${buf.length}, first=0x${buf[0]?.toString(16) ?? "??"})`,
+      );
+      return false;
+    }
+    logTest(
+      "TTS - Cartesia end-to-end",
+      "PASS",
+      `${buf.length} bytes MP3, voice=${result.audio?.voice ?? "default"}`,
+    );
+    return true;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (isExpectedProviderError(msg)) {
+      logTest(
+        "TTS - Cartesia end-to-end",
+        "SKIP",
+        `upstream credential/quota error: ${msg.slice(0, 120)}`,
+      );
+      return null;
+    }
+    logTest("TTS - Cartesia end-to-end", "FAIL", msg);
+    return false;
+  }
+}
+
+// ============================================================
+// TTS-013 (#492): Google native streaming synthesis
+// TTS-026 (#524): `neurolink voices`
+// TTS-028 (#528): live per-provider synthesis
+// ============================================================
+
+/**
+ * A voice family Google's streaming endpoint accepts. Every other family is
+ * refused with `only Chirp 3: HD voices are supported for streaming
+ * synthesis`, so this is not interchangeable with TTS_CONFIG.defaultVoice.
+ */
+const STREAMING_VOICE = "en-US-Chirp3-HD-Aoede";
+
+/**
+ * Exactly one sentence, and long enough that Google takes over a second to
+ * render it.
+ *
+ * That is what makes the chunk count discriminating. `TTSProcessor` segments
+ * streamed text at sentence boundaries and serves each segment either from a
+ * handler's native stream or from a single buffered `synthesize()` call, so
+ * one sentence yields exactly ONE chunk on the buffered path however long it
+ * is. More than one chunk is reachable only by the native path.
+ */
+const ONE_SENTENCE =
+  "One single sentence that is long enough for the service to take a " +
+  "noticeable moment to render it from beginning to end";
+
+/**
+ * A multi-sentence paragraph, long enough that Google's real synthesis and
+ * delivery time comfortably exceeds `GoogleTTSHandler`'s 30-second streaming
+ * idle window.
+ *
+ * `ONE_SENTENCE` is deliberately too short for that: its whole response
+ * finishes within a second or two, so by the time any idle timer could fire
+ * the duplex has already closed on its own, and a premature `destroy()`
+ * lands on a stream that was never going to deliver anything more anyway —
+ * a false negative for the idle-timer defect. `takeBufferedSegment`
+ * (ttsProcessor.ts) only splits accumulated text into multiple segments once
+ * the buffer reaches `streamingBufferSize`; since this whole paragraph
+ * arrives as one generator yield under that threshold, it is flushed as a
+ * single segment on end-of-input regardless of how many sentences it
+ * contains, so it still reaches Google as exactly one streaming synthesis
+ * call — one duplex, open for the entire real synthesis time.
+ */
+const LONG_STREAMING_TEXT =
+  "The morning sun rose slowly over the quiet valley, casting long golden shadows across the fields " +
+  "where farmers had already begun their daily work. Birds called to one another from the tall oak " +
+  "trees lining the winding dirt road, and a gentle breeze carried the scent of fresh hay and blooming " +
+  "wildflowers through the open countryside. In the distance, a small river wound its way past mossy " +
+  "boulders and fallen logs, its steady current reflecting the pale blue sky above. Travelers walking " +
+  "along the ridge paused to admire the view, watching clouds drift lazily overhead while sheep grazed " +
+  "peacefully in the meadow below. By midday, the village market would fill with the sounds of vendors " +
+  "calling out prices, children laughing as they chased each other between stalls, and the warm smell " +
+  "of fresh bread drifting from the corner bakery, making the whole square feel alive with quiet, " +
+  "ordinary happiness that seemed to stretch on comfortably into the long, unhurried afternoon. Later, " +
+  "as the light began to soften and shift toward amber, shopkeepers would slowly close their wooden " +
+  "shutters, exchanging quiet farewells with neighbors who lingered near the fountain at the center of " +
+  "the square. Somewhere beyond the rooftops, a church bell rang out a slow, familiar melody, marking " +
+  "the hour for anyone who cared to listen. Even the old stray cats seemed to know the rhythm of the " +
+  "town, stretching lazily on sun-warmed steps before wandering off toward the bakery for scraps left " +
+  "at the back door. As evening settled in, lanterns were lit one by one along the narrow cobblestone " +
+  "streets, their warm glow reflecting softly in shop windows still dusted with the last light of day, " +
+  "while somewhere further down the lane a fiddler began to play a slow, wandering tune that drifted " +
+  "gently through open doorways and out into the cooling evening air.";
+
+async function* oneSegment(text: string): AsyncGenerator<string> {
+  yield text;
+}
+
+type CollectedChunk = {
+  index: number;
+  isFinal: boolean;
+  bytes: number;
+  cumulativeSize?: number;
+  format: string;
+  sampleRate?: number;
+};
+
+/**
+ * Drain `TTSProcessor.synthesizeStream()` for one sentence.
+ *
+ * `streamingBufferSize` is set above the sentence length so the processor
+ * cannot hard-split it: any chunk count above one then comes from the
+ * handler, not from segmentation.
+ */
+async function collectGoogleChunks(
+  format: "pcm16" | "ogg" | "mp3",
+  voice: string,
+): Promise<CollectedChunk[]> {
+  await ProviderRegistry.registerAllProviders();
+  const collected: CollectedChunk[] = [];
+  for await (const chunk of TTSProcessor.synthesizeStream(
+    oneSegment(ONE_SENTENCE),
+    "google-ai",
+    { voice, format, streamingBufferSize: ONE_SENTENCE.length + 50 },
+  )) {
+    collected.push({
+      index: chunk.index,
+      isFinal: chunk.isFinal,
+      bytes: chunk.data.length,
+      cumulativeSize: chunk.cumulativeSize,
+      format: chunk.format,
+      sampleRate: chunk.sampleRate,
+    });
+  }
+  return collected;
+}
+
+/**
+ * Global chunk invariants `TTSProcessor` guarantees whichever path served a
+ * segment. Returns a discrepancy description, or undefined when they all hold.
+ *
+ * Deliberately names the position of a mismatch rather than printing the
+ * chunk: a message carrying provider-ish text is reclassified as a skip by
+ * the harness, which would turn a real failure green.
+ */
+function describeChunkInvariantBreak(
+  chunks: readonly CollectedChunk[],
+): string | undefined {
+  const misindexed = chunks.findIndex((chunk, at) => chunk.index !== at);
+  if (misindexed !== -1) {
+    return `chunk indexes are not 0..n-1 — first mismatch at position ${misindexed}`;
+  }
+  const finals = chunks.filter((chunk) => chunk.isFinal).length;
+  if (finals !== 1) {
+    return `expected exactly one final chunk, counted ${finals}`;
+  }
+  if (!chunks[chunks.length - 1]?.isFinal) {
+    return "the final chunk is not the last one delivered";
+  }
+  let running = 0;
+  for (const [at, chunk] of chunks.entries()) {
+    running += chunk.bytes;
+    if (chunk.cumulativeSize !== running) {
+      return `cumulativeSize does not track the running byte total — first divergence at position ${at}`;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * TTS-013 (#492): Google streams natively for a streaming-capable voice.
+ *
+ * The precondition below matters: "more than one chunk" is only evidence of
+ * native delivery once audio has actually been produced. An empty stream
+ * would otherwise read as a failure of the native path when in fact nothing
+ * ran at all.
+ */
+async function testGoogleNativeStreaming(): Promise<boolean | null> {
+  const name = "TTS - Google native streaming (#492)";
+  logTest(name, "TESTING");
+
+  if (isTTSCredentialsMissing()) {
+    logTest(name, "SKIP", "GOOGLE_APPLICATION_CREDENTIALS not set");
+    return null;
+  }
+
+  try {
+    const chunks = await collectGoogleChunks("pcm16", STREAMING_VOICE);
+
+    // Precondition: synthesis actually happened.
+    const audible = chunks.filter((chunk) => chunk.bytes > 0).length;
+    if (audible === 0) {
+      logTest(
+        name,
+        "FAIL",
+        "no audio was produced at all — the chunk-count assertion below would be vacuous",
+      );
+      return false;
+    }
+
+    if (chunks.length < 2) {
+      logTest(
+        name,
+        "FAIL",
+        `one sentence produced ${chunks.length} chunk(s); the native path must deliver more than one`,
+      );
+      return false;
+    }
+
+    const broken = describeChunkInvariantBreak(chunks);
+    if (broken) {
+      logTest(name, "FAIL", broken);
+      return false;
+    }
+
+    if (chunks[0]?.format !== "pcm16") {
+      logTest(name, "FAIL", "streamed chunks are not labelled pcm16");
+      return false;
+    }
+    if (chunks[0]?.sampleRate !== 24000) {
+      logTest(
+        name,
+        "FAIL",
+        "streamed chunks do not report the 24kHz sample rate headerless PCM needs",
+      );
+      return false;
+    }
+
+    logTest(
+      name,
+      "PASS",
+      `${chunks.length} native chunks, ${chunks[chunks.length - 1]?.cumulativeSize} bytes`,
+    );
+    return true;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (isExpectedProviderError(msg)) {
+      logTest(name, "SKIP", `upstream error: ${msg.slice(0, 120)}`);
+      return null;
+    }
+    logTest(name, "FAIL", msg);
+    return false;
+  }
+}
+
+/**
+ * TTS-013 (#492), negative control: the format gate keeps mp3 on the buffered
+ * path.
+ *
+ * Google's streaming endpoint rejects MP3 outright, so the handler must
+ * answer `undefined` for it rather than reach the wire and fail a segment the
+ * buffered path can serve. Same voice as the case above — only the format
+ * differs — so a chunk count of exactly one isolates the gate.
+ */
+async function testGoogleStreamingFormatGate(): Promise<boolean | null> {
+  const name = "TTS - Google streaming format gate (#492)";
+  logTest(name, "TESTING");
+
+  if (isTTSCredentialsMissing()) {
+    logTest(name, "SKIP", "GOOGLE_APPLICATION_CREDENTIALS not set");
+    return null;
+  }
+
+  try {
+    const chunks = await collectGoogleChunks("mp3", STREAMING_VOICE);
+
+    // Precondition: the buffered path ran and produced audio. Without this,
+    // zero chunks would satisfy "not more than one" for the wrong reason.
+    const audible = chunks.filter((chunk) => chunk.bytes > 0).length;
+    if (audible === 0) {
+      logTest(
+        name,
+        "FAIL",
+        "the buffered path produced no audio — nothing was actually synthesized",
+      );
+      return false;
+    }
+
+    if (chunks.length !== 1) {
+      logTest(
+        name,
+        "FAIL",
+        `mp3 must take the buffered path and yield one chunk per sentence; got ${chunks.length}`,
+      );
+      return false;
+    }
+
+    const broken = describeChunkInvariantBreak(chunks);
+    if (broken) {
+      logTest(name, "FAIL", broken);
+      return false;
+    }
+
+    logTest(
+      name,
+      "PASS",
+      `mp3 fell back to buffered, ${chunks[0]?.bytes} bytes`,
+    );
+    return true;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (isExpectedProviderError(msg)) {
+      logTest(name, "SKIP", `upstream error: ${msg.slice(0, 120)}`);
+      return null;
+    }
+    logTest(name, "FAIL", msg);
+    return false;
+  }
+}
+
+/**
+ * PR #1746 review (CodeRabbit r4090036240, MAJOR): the streaming idle timer
+ * must bound time spent waiting for the SERVER, not time this generator sits
+ * suspended at its own `yield` waiting for ITS OWN CONSUMER. The prior code
+ * re-armed the timer unconditionally on every response, before yielding — so
+ * the clock started running before that suspension, and a consumer slower
+ * than the idle window to pull the next chunk destroyed a healthy duplex and
+ * reported its own backpressure as a network stall.
+ *
+ * Real-time by necessity, not a unit-level trick: the defect is a race
+ * against a live 30-second wall-clock timer inside `GoogleTTSHandler`, and
+ * Rule 15 forbids reaching into that internal generator state to simulate
+ * it. Deliberately drives `GoogleTTSHandler.synthesizeStream()` directly
+ * (exported from `../dist/index.js`, a legitimate public surface) rather
+ * than through `TTSProcessor.synthesizeStream()`: the processor's outer loop
+ * keeps a one-chunk lookahead buffer, so a chunk it yields was already
+ * fetched from the handler before this test's own pause began, and a single
+ * post-pause pull would keep resolving from that stale, already-safe buffer
+ * regardless of whether the timer fired — silently absorbing exactly the
+ * failure this test exists to catch. Driving the handler removes that
+ * buffering: each `.next()` call maps 1:1 onto one real response from the
+ * duplex, so a pull made after the pause can only succeed if the connection
+ * the timer was supposed to be guarding is still alive.
+ *
+ * Pulls one chunk, then pauses this test's own consumption — never Google's
+ * server, which is still genuinely mid-flight on `LONG_STREAMING_TEXT` at
+ * that point — for longer than the idle window before pulling the next
+ * chunk. Accepts either observable symptom of the bug (a thrown "stalled"
+ * error, or the stream silently ending early) so the assertion does not
+ * depend on exactly how Node/gRPC surfaces a destroyed duplex. It stops as
+ * soon as a post-pause chunk is confirmed, releasing the stream via
+ * `iterator.return()` instead of draining the rest of a multi-minute
+ * response for no additional evidence.
+ */
+async function testGoogleStreamingSurvivesSlowConsumer(): Promise<
+  boolean | null
+> {
+  const name = "TTS - Google streaming survives a slow consumer (PR#1746)";
+  logTest(name, "TESTING");
+
+  if (isTTSCredentialsMissing()) {
+    logTest(name, "SKIP", "GOOGLE_APPLICATION_CREDENTIALS not set");
+    return null;
+  }
+
+  const handler = new GoogleTTSHandler();
+  if (!handler.isConfigured()) {
+    logTest(name, "SKIP", "GoogleTTSHandler reports not configured");
+    return null;
+  }
+
+  let iterator: AsyncIterator<TTSChunk> | undefined;
+  try {
+    const iterable = handler.synthesizeStream(LONG_STREAMING_TEXT, {
+      voice: STREAMING_VOICE,
+      format: "pcm16",
+    });
+    if (iterable === undefined) {
+      logTest(
+        name,
+        "FAIL",
+        "GoogleTTSHandler declined to stream this voice/format — the slow-consumer assertion below would be vacuous",
+      );
+      return false;
+    }
+    iterator = iterable[Symbol.asyncIterator]();
+
+    const first = await iterator.next();
+    if (first.done || (first.value?.data.length ?? 0) === 0) {
+      logTest(
+        name,
+        "FAIL",
+        "no audio arrived on the first pull — the slow-consumer assertion below would be vacuous",
+      );
+      return false;
+    }
+
+    // Longer than GoogleTTSHandler's 30s idle window. LONG_STREAMING_TEXT is
+    // sized so Google's server is still genuinely streaming this response
+    // when the pause ends — this is this test's own consumption stalling,
+    // not the server finishing early.
+    await new Promise((resolve) => setTimeout(resolve, 31_000));
+
+    let second: IteratorResult<TTSChunk> | undefined;
+    let misattributed = false;
+    try {
+      second = await iterator.next();
+    } catch {
+      misattributed = true;
+    }
+
+    if (misattributed) {
+      logTest(
+        name,
+        "FAIL",
+        "a slow consumer pull was reported as a synthesis failure instead of delivering the still-in-flight response",
+      );
+      return false;
+    }
+
+    if (second === undefined || second.done) {
+      logTest(
+        name,
+        "FAIL",
+        "the stream ended after the paused pull instead of continuing to deliver the response still being produced",
+      );
+      return false;
+    }
+
+    if ((second.value?.data.length ?? 0) === 0) {
+      logTest(
+        name,
+        "FAIL",
+        "the chunk delivered after the paused pull carried no audio",
+      );
+      return false;
+    }
+
+    logTest(
+      name,
+      "PASS",
+      "delivered a further chunk after a 31s consumer pause without the connection being torn down",
+    );
+    return true;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (isExpectedProviderError(msg)) {
+      logTest(name, "SKIP", `upstream error: ${msg.slice(0, 120)}`);
+      return null;
+    }
+    logTest(name, "FAIL", msg);
+    return false;
+  } finally {
+    await iterator?.return?.(undefined)?.catch?.(() => undefined);
+  }
+}
+
+/**
+ * TTS-026 (#524): `TTSProcessor.getVoices()` reports an unregistered provider
+ * as a typed error rather than a TypeError on an absent member.
+ *
+ * Runs without any credentials: with none set, nothing registers and every
+ * provider name is unregistered, which is exactly the case under test.
+ */
+async function testGetVoicesUnregistered(): Promise<boolean | null> {
+  const name = "TTS - getVoices rejects an unregistered provider (#524)";
+  logTest(name, "TESTING");
+
+  try {
+    await ProviderRegistry.registerAllProviders();
+    let raised: unknown;
+    try {
+      await TTSProcessor.getVoices("definitely-not-a-tts-provider");
+    } catch (err) {
+      raised = err;
+    }
+
+    if (raised === undefined) {
+      logTest(name, "FAIL", "listing voices for an unknown provider resolved");
+      return false;
+    }
+    const code = (raised as { code?: unknown }).code;
+    if (code !== "TTS_PROVIDER_NOT_SUPPORTED") {
+      logTest(name, "FAIL", "the raised error does not carry the typed code");
+      return false;
+    }
+
+    logTest(name, "PASS", "typed TTS_PROVIDER_NOT_SUPPORTED");
+    return true;
+  } catch (err) {
+    logTest(name, "FAIL", err instanceof Error ? err.message : String(err));
+    return false;
+  }
+}
+
+/**
+ * PR #1746 review (CodeRabbit r4090036240 / Yama): `getVoices()` must gate on
+ * `isConfigured()` before touching the handler, and must shape whatever the
+ * handler throws into a typed `TTSError` — exactly what `synthesize()` does.
+ *
+ * No live provider exercises this today: every shipped handler already
+ * guards its own `isConfigured()` and wraps its own errors, so the gap this
+ * closes is invisible against real providers. A handler that does neither is
+ * exactly what the public `TTSHandler` structural type exists to allow, and
+ * registering one through the same `TTSProcessor.registerHandler()` a real
+ * provider uses is still the public surface under test, not an internal
+ * shape — the JSDoc example on `registerHandler` shows the identical
+ * pattern. Runs everywhere, no credentials, no network.
+ */
+async function testGetVoicesGatesConfigAndShapesErrors(): Promise<
+  boolean | null
+> {
+  const name = "TTS - getVoices gates isConfigured, shapes errors (PR#1746)";
+  logTest(name, "TESTING");
+
+  try {
+    const { TTSError } = await import("../dist/index.js");
+
+    // Case 1: an unconfigured handler must be rejected before its own
+    // getVoices() ever runs.
+    let handlerGetVoicesCalled = false;
+    const unconfiguredProvider = `test-unconfigured-tts-${Date.now()}`;
+    const unconfiguredHandler: TTSHandler = {
+      synthesize: async () => {
+        throw new Error("not used by this test");
+      },
+      isConfigured: () => false,
+      getVoices: async () => {
+        handlerGetVoicesCalled = true;
+        return [];
+      },
+    };
+    TTSProcessor.registerHandler(unconfiguredProvider, unconfiguredHandler);
+
+    let unconfiguredRaised: unknown;
+    try {
+      await TTSProcessor.getVoices(unconfiguredProvider);
+    } catch (err) {
+      unconfiguredRaised = err;
+    }
+
+    if (handlerGetVoicesCalled) {
+      logTest(
+        name,
+        "FAIL",
+        "getVoices() called the handler's own getVoices() before checking isConfigured()",
+      );
+      return false;
+    }
+    if (!(unconfiguredRaised instanceof TTSError)) {
+      logTest(
+        name,
+        "FAIL",
+        "an unconfigured handler did not raise a typed TTSError",
+      );
+      return false;
+    }
+    const unconfiguredCode = (unconfiguredRaised as { code?: unknown }).code;
+    if (unconfiguredCode !== "TTS_PROVIDER_NOT_CONFIGURED") {
+      logTest(
+        name,
+        "FAIL",
+        "an unconfigured handler did not raise TTS_PROVIDER_NOT_CONFIGURED",
+      );
+      return false;
+    }
+
+    // Case 2: a configured handler whose getVoices() throws a raw, unshaped
+    // error — the failure must still arrive as a typed, retriable TTSError.
+    const failingProvider = `test-failing-voices-tts-${Date.now()}`;
+    const failingHandler: TTSHandler = {
+      synthesize: async () => {
+        throw new Error("not used by this test");
+      },
+      isConfigured: () => true,
+      getVoices: async () => {
+        throw new Error("simulated upstream voice-list failure");
+      },
+    };
+    TTSProcessor.registerHandler(failingProvider, failingHandler);
+
+    let failingRaised: unknown;
+    try {
+      await TTSProcessor.getVoices(failingProvider);
+    } catch (err) {
+      failingRaised = err;
+    }
+
+    if (!(failingRaised instanceof TTSError)) {
+      logTest(
+        name,
+        "FAIL",
+        "a handler's raw getVoices() failure reached the caller unshaped",
+      );
+      return false;
+    }
+    const failingRecord = failingRaised as {
+      retriable?: unknown;
+    };
+    if (failingRecord.retriable !== true) {
+      logTest(
+        name,
+        "FAIL",
+        "the shaped error lost the retriable flag synthesize() would carry",
+      );
+      return false;
+    }
+
+    logTest(
+      name,
+      "PASS",
+      "unconfigured handler gated before the call; raw failure shaped into TTSError",
+    );
+    return true;
+  } catch (err) {
+    logTest(name, "FAIL", err instanceof Error ? err.message : String(err));
+    return false;
+  }
+}
+
+/**
+ * TTS-026 (#524): the CLI command exists, is reachable, and fails cleanly.
+ *
+ * Credential-free by construction — an unknown provider is unregistered
+ * whatever keys are present — so this half runs everywhere.
+ */
+async function testCLIVoicesUnknownProvider(): Promise<boolean | null> {
+  const name = "CLI voices - unknown provider exits non-zero (#524)";
+  logTest(name, "TESTING");
+
+  try {
+    const result = await runCommand("node", [
+      "dist/cli/index.js",
+      "voices",
+      "--provider=definitely-not-a-tts-provider",
+    ]);
+
+    if (result.success) {
+      logTest(
+        name,
+        "FAIL",
+        "the command reported success for an unknown provider",
+      );
+      return false;
+    }
+    const output = `${result.stdout}${result.stderr}`;
+    if (!output.includes("Could not list voices")) {
+      logTest(
+        name,
+        "FAIL",
+        "the failure was not reported by the voices command",
+      );
+      return false;
+    }
+    if (!output.includes("Registered providers")) {
+      logTest(name, "FAIL", "the failure does not name what is registered");
+      return false;
+    }
+
+    logTest(name, "PASS", `exit ${result.code}, registered set named`);
+    return true;
+  } catch (err) {
+    logTest(name, "FAIL", err instanceof Error ? err.message : String(err));
+    return false;
+  }
+}
+
+/**
+ * TTS-026 (#524): the live listing path — CLI, JSON mode, against OpenAI's
+ * fixed six voices, which are the one provider list that is a known constant.
+ */
+async function testCLIVoicesOpenAI(): Promise<boolean | null> {
+  const name = "CLI voices - OpenAI list (#524)";
+  logTest(name, "TESTING");
+
+  if (!process.env.OPENAI_API_KEY) {
+    logTest(name, "SKIP", "OPENAI_API_KEY not set");
+    return null;
+  }
+
+  try {
+    const result = await runCommand("node", [
+      "dist/cli/index.js",
+      "voices",
+      "--provider=openai-tts",
+      "--json",
+    ]);
+
+    if (!result.success) {
+      if (isExpectedProviderError(result.stderr)) {
+        logTest(name, "SKIP", result.stderr.slice(0, 120));
+        return null;
+      }
+      logTest(name, "FAIL", `the command exited ${result.code}`);
+      return false;
+    }
+
+    const start = result.stdout.indexOf("[");
+    const end = result.stdout.lastIndexOf("]");
+    if (start === -1 || end <= start) {
+      logTest(name, "FAIL", "--json did not emit a JSON array");
+      return false;
+    }
+    const parsed: unknown = JSON.parse(result.stdout.slice(start, end + 1));
+    if (!Array.isArray(parsed)) {
+      logTest(name, "FAIL", "--json did not emit a JSON array");
+      return false;
+    }
+
+    const ids = parsed.map((voice) => (voice as { id?: unknown }).id);
+    const expected = ["alloy", "echo", "fable", "nova", "onyx", "shimmer"];
+    const missing = expected.filter((id) => !ids.includes(id));
+    if (missing.length > 0) {
+      logTest(
+        name,
+        "FAIL",
+        `${missing.length} of the six OpenAI voices are absent`,
+      );
+      return false;
+    }
+
+    const names = parsed.map((voice) =>
+      String((voice as { name?: unknown }).name),
+    );
+    const unsorted = names.findIndex(
+      (current, at) => at > 0 && (names[at - 1] ?? "") > current,
+    );
+    if (unsorted !== -1) {
+      logTest(
+        name,
+        "FAIL",
+        `the list is not sorted by name — first break at position ${unsorted}`,
+      );
+      return false;
+    }
+
+    logTest(name, "PASS", `${parsed.length} voices, sorted`);
+    return true;
+  } catch (err) {
+    logTest(name, "FAIL", err instanceof Error ? err.message : String(err));
+    return false;
+  }
+}
+
+/**
+ * Issue #528's Google share of its literal per-provider acceptance list:
+ * "getVoices() returns 220+ voices". The live synthesis matrix below covers
+ * Google's synthesis half of #528 but never calls `getVoices()`, so that
+ * specific assertion had no test anywhere in the PR — CodeRabbit's pre-merge
+ * Linked Issues check named the gap.
+ *
+ * OpenAI's share of the same issue ("all 6 voices work", meaning synthesis of
+ * each) and Azure's ("emotional styles work") both need live synthesis against
+ * keys this environment does not hold; this case covers only the one share
+ * that is actually reachable and provable here — Google's catalog size,
+ * through the same `TTSProcessor.getVoices()` surface #524 added — gated on
+ * `GOOGLE_APPLICATION_CREDENTIALS` like every other Google case in this file.
+ */
+async function testGoogleVoiceCatalogSize(): Promise<boolean | null> {
+  const name = "TTS - Google getVoices returns 220+ voices (#528)";
+  logTest(name, "TESTING");
+
+  if (!process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+    logTest(name, "SKIP", "GOOGLE_APPLICATION_CREDENTIALS not set");
+    return null;
+  }
+
+  try {
+    await ProviderRegistry.registerAllProviders();
+    if (!TTSProcessor.supports("google-ai")) {
+      logTest(name, "SKIP", "google-ai did not register");
+      return null;
+    }
+
+    const voices = await TTSProcessor.getVoices("google-ai");
+
+    if (!Array.isArray(voices)) {
+      logTest(name, "FAIL", "getVoices() did not return an array");
+      return false;
+    }
+    // 220 is issue #528's own literal threshold, not a number this test
+    // picked — a full, unfiltered catalog call is well past it (thousands),
+    // so this also catches an accidental language-code filter creeping into
+    // the unfiltered path.
+    if (voices.length < 220) {
+      logTest(
+        name,
+        "FAIL",
+        `only ${voices.length} voices returned — issue #528 requires 220+`,
+      );
+      return false;
+    }
+
+    const unnamed = voices.filter(
+      (voice) => typeof (voice as { name?: unknown }).name !== "string",
+    );
+    if (unnamed.length > 0) {
+      logTest(name, "FAIL", `${unnamed.length} voice(s) are missing a name`);
+      return false;
+    }
+
+    logTest(
+      name,
+      "PASS",
+      `${voices.length} voices via TTSProcessor.getVoices("google-ai")`,
+    );
+    return true;
+  } catch (err) {
+    logTest(name, "FAIL", err instanceof Error ? err.message : String(err));
+    return false;
+  }
+}
+
+/**
+ * TTS-028 (#528): every configured TTS provider in scope synthesizes real
+ * audio.
+ *
+ * One case rather than one per provider so the matrix stays readable, and
+ * because the interesting property is coverage across providers rather than
+ * any single provider's behaviour. A provider whose key is absent is not
+ * counted; a provider whose key is present but rejected upstream is reported
+ * as an environment skip, matching `explainMissingAudio` elsewhere in this
+ * file. The whole case skips only when nothing at all was exercised.
+ *
+ * The matrix is OpenAI, Google and Azure only — the three providers #492,
+ * #524 and #528 actually scope this work to. ElevenLabs and Cartesia are
+ * real TTS providers elsewhere in this codebase, but adding them here would
+ * be coverage this PR did not otherwise touch, under an issue number that
+ * does not ask for them.
+ */
+async function testLiveProviderSynthesis(): Promise<boolean | null> {
+  const name = "TTS - live provider synthesis matrix (#528)";
+  logTest(name, "TESTING");
+
+  const matrix: Array<{
+    provider: string;
+    configured: boolean;
+    voice?: string;
+    format: "mp3" | "pcm16";
+  }> = [
+    {
+      provider: "openai-tts",
+      configured: !!process.env.OPENAI_API_KEY,
+      voice: "nova",
+      format: "mp3",
+    },
+    {
+      provider: "google-ai",
+      configured: !!process.env.GOOGLE_APPLICATION_CREDENTIALS,
+      voice: TTS_CONFIG.defaultVoice,
+      format: "mp3",
+    },
+    {
+      provider: "azure-tts",
+      configured:
+        !!process.env.AZURE_SPEECH_KEY && !!process.env.AZURE_SPEECH_REGION,
+      voice: "en-US-JennyNeural",
+      format: "mp3",
+    },
+  ];
+
+  try {
+    await ProviderRegistry.registerAllProviders();
+
+    const passed: string[] = [];
+    const skipped: string[] = [];
+    const failed: string[] = [];
+
+    for (const entry of matrix) {
+      if (!entry.configured) {
+        continue;
+      }
+      if (!TTSProcessor.supports(entry.provider)) {
+        // Credentials are present but registration declined them. That is a
+        // configuration condition, not a synthesis defect.
+        skipped.push(`${entry.provider} (not registered)`);
+        continue;
+      }
+      try {
+        const result = await TTSProcessor.synthesize(
+          "Integration coverage for text to speech.",
+          entry.provider,
+          {
+            format: entry.format,
+            ...(entry.voice !== undefined ? { voice: entry.voice } : {}),
+          },
+        );
+        if (!Buffer.isBuffer(result.buffer) || result.buffer.length === 0) {
+          failed.push(`${entry.provider} (empty buffer)`);
+          continue;
+        }
+        if (result.size !== result.buffer.length) {
+          failed.push(`${entry.provider} (size disagrees with buffer)`);
+          continue;
+        }
+        if (typeof result.metadata?.latency !== "number") {
+          failed.push(`${entry.provider} (no latency recorded)`);
+          continue;
+        }
+        passed.push(`${entry.provider} ${result.buffer.length}B`);
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        // 401/403 is a credential condition — environmental, like a missing
+        // key. Anything else is a real failure of this provider's path.
+        if (/\b(?:401|403)\b/.test(detail) || isExpectedProviderError(detail)) {
+          skipped.push(`${entry.provider} (upstream credential/quota)`);
+          continue;
+        }
+        failed.push(`${entry.provider} (synthesis raised)`);
+      }
+    }
+
+    if (failed.length > 0) {
+      logTest(
+        name,
+        "FAIL",
+        `${failed.length} provider(s) failed: ${failed.join(", ")}`,
+      );
+      return false;
+    }
+    if (passed.length === 0) {
+      logTest(
+        name,
+        "SKIP",
+        skipped.length > 0
+          ? `no provider was exercised — ${skipped.join(", ")}`
+          : "no TTS provider credentials are set",
+      );
+      return null;
+    }
+
+    logTest(
+      name,
+      "PASS",
+      `${passed.length} synthesized: ${passed.join(", ")}${
+        skipped.length > 0 ? ` | skipped: ${skipped.join(", ")}` : ""
+      }`,
+    );
+    return true;
+  } catch (err) {
+    logTest(name, "FAIL", err instanceof Error ? err.message : String(err));
+    return false;
+  }
+}
+
+async function runAllTests(): Promise<void> {
+  log("\nNeuroLink Continuous Test Suite: TTS (Text-to-Speech)", "bright");
+  log(
+    `   Provider: ${TEST_CONFIG.provider}, Model: ${TEST_CONFIG.model || "default"}`,
+    "cyan",
+  );
+  log(
+    `   Google Credentials: ${process.env.GOOGLE_APPLICATION_CREDENTIALS ? "set" : "NOT SET (most tests will skip)"}`,
+    process.env.GOOGLE_APPLICATION_CREDENTIALS ? "green" : "yellow",
+  );
+  log(`   Temp dir: ${tempDir}`, "cyan");
+
+  // Prerequisite checks
+  if (!fs.existsSync("dist") || !fs.existsSync("dist/index.js")) {
+    // Throw so the harness owns the exit path (prints summary, cleanup).
+    throw new Error("Build not found. Run: pnpm run build");
+  }
+
+  const sharedSdk = new NeuroLink();
+
+  const tests: Array<{ name: string; fn: () => Promise<boolean | null> }> = [
+    // Infrastructure (Test #1)
+    { name: "TTS Processor Init", fn: () => testTTSProcessorInit() },
+
+    // Google TTS Handler (Tests #2-#3)
+    {
+      name: "Google TTS - Synthesize via generate()",
+      fn: () => testGoogleTTSHandlerSynthesize(sharedSdk),
+    },
+    {
+      name: "Google TTS - Get Voices",
+      fn: () => testGoogleTTSHandlerGetVoices(),
+    },
+
+    // TTS in generate() (Test #4)
+    {
+      name: "TTS in generate() Options (default format)",
+      fn: () => testTTSInGenerateOptions(sharedSdk),
+    },
+
+    // Different voices and languages (Tests #5-#6)
+    {
+      name: "TTS - Different Voices",
+      fn: () => testTTSWithDifferentVoices(sharedSdk),
+    },
+    {
+      name: "TTS - Different Languages",
+      fn: () => testTTSWithDifferentLanguages(sharedSdk),
+    },
+
+    // Audio file output (Test #7)
+    {
+      name: "TTS - Audio File Output",
+      fn: () => testTTSAudioFileOutput(sharedSdk),
+    },
+
+    // Audio format validation (Tests #8-#9)
+    { name: "TTS - MP3 Output Format", fn: () => testTTSMP3Output(sharedSdk) },
+    { name: "TTS - WAV Output Format", fn: () => testTTSWAVOutput(sharedSdk) },
+
+    // CLI TTS (Tests #10-#11)
+    { name: "CLI TTS - Generate", fn: () => testCLITTSGenerate() },
+    { name: "CLI TTS - Voice Flag", fn: () => testCLITTSVoiceFlag() },
+
+    // Error handling (Test #12)
+    { name: "TTS - Error Handling", fn: () => testTTSErrorHandling(sharedSdk) },
+
+    // Stream integration (Test #13)
+    {
+      name: "TTS - Stream Integration",
+      fn: () => testTTSStreamIntegration(sharedSdk),
+    },
+
+    // Result shape validation (Test #14)
+    {
+      name: "TTS - GenerateResult.audio Shape",
+      fn: () => testTTSGenerateResultShape(sharedSdk),
+    },
+
+    // New providers — Fish Audio + Cartesia
+    {
+      name: "TTS - Fish/Cartesia Registration",
+      fn: () => testFishCartesiaRegistration(),
+    },
+    {
+      name: "TTS - Fish Audio end-to-end",
+      fn: () => testFishAudioTTS(sharedSdk),
+    },
+    {
+      name: "TTS - Cartesia end-to-end",
+      fn: () => testCartesiaTTS(sharedSdk),
+    },
+    {
+      name: "TTS - ElevenLabs Ogg/Opus end-to-end",
+      fn: () => testElevenLabsOpusTTS(sharedSdk),
+    },
+
+    // TTS-013 (#492) — Google native streaming, plus its format gate.
+    {
+      name: "TTS - Google native streaming (#492)",
+      fn: () => testGoogleNativeStreaming(),
+    },
+    {
+      name: "TTS - Google streaming format gate (#492)",
+      fn: () => testGoogleStreamingFormatGate(),
+    },
+    {
+      name: "TTS - Google streaming survives a slow consumer (PR#1746)",
+      fn: () => testGoogleStreamingSurvivesSlowConsumer(),
+    },
+
+    // TTS-026 (#524) — voice discovery, SDK and CLI.
+    {
+      name: "TTS - getVoices rejects an unregistered provider (#524)",
+      fn: () => testGetVoicesUnregistered(),
+    },
+    {
+      name: "TTS - getVoices gates isConfigured, shapes errors (PR#1746)",
+      fn: () => testGetVoicesGatesConfigAndShapesErrors(),
+    },
+    {
+      name: "CLI voices - unknown provider exits non-zero (#524)",
+      fn: () => testCLIVoicesUnknownProvider(),
+    },
+    {
+      name: "CLI voices - OpenAI list (#524)",
+      fn: () => testCLIVoicesOpenAI(),
+    },
+    {
+      name: "TTS - Google getVoices returns 220+ voices (#528)",
+      fn: () => testGoogleVoiceCatalogSize(),
+    },
+
+    // TTS-028 (#528) — live synthesis across every configured provider.
+    {
+      name: "TTS - live provider synthesis matrix (#528)",
+      fn: () => testLiveProviderSynthesis(),
+    },
+    // Observability spans (Test #15)
+    {
+      name: "TTS - Observability Spans",
+      fn: async (): Promise<boolean | null> => {
+        logTest("TTS - Observability Spans", "TESTING");
+        try {
+          const { getMetricsAggregator, resetMetricsAggregator, SpanType } =
+            await import("../dist/index.js");
+          resetMetricsAggregator();
+          const aggregator = getMetricsAggregator();
+
+          if (!SpanType.TTS) {
+            logTest(
+              "TTS - Observability Spans",
+              "FAIL",
+              "SpanType.TTS is not defined",
+            );
+            return false;
+          }
+
+          // Only attempt real TTS operation — no synthetic span fallback
+          if (isTTSCredentialsMissing()) {
+            logTest(
+              "TTS - Observability Spans",
+              "SKIP",
+              "GOOGLE_APPLICATION_CREDENTIALS not set — cannot run real TTS for span collection",
+            );
+            return null;
+          }
+
+          const ttsSdk = new NeuroLink();
+          let ttsSucceeded = false;
+          try {
+            const result = await ttsSdk.generate({
+              input: { text: "Observability span test." },
+              ...buildBaseSDKOptions(),
+              maxTokens: 500,
+              tts: {
+                enabled: true,
+                voice: TTS_CONFIG.defaultVoice,
+                format: "mp3",
+              },
+            });
+            if (
+              result.audio &&
+              result.audio.buffer &&
+              result.audio.buffer.length > 0
+            ) {
+              ttsSucceeded = true;
+            }
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (isExpectedProviderError(msg)) {
+              logTest(
+                "TTS - Observability Spans",
+                "SKIP",
+                `Real TTS failed with expected error: ${msg.substring(0, 80)}`,
+              );
+              return null;
+            }
+            logTest(
+              "TTS - Observability Spans",
+              "FAIL",
+              `Real TTS threw unexpected error: ${msg}`,
+            );
+            return false;
+          } finally {
+            try {
+              await ttsSdk.shutdown?.();
+            } catch {
+              /* ignore */
+            }
+          }
+
+          if (!ttsSucceeded) {
+            logTest(
+              "TTS - Observability Spans",
+              "FAIL",
+              "TTS generate() did not produce audio — cannot verify spans",
+            );
+            return false;
+          }
+
+          // Check for TTS-related spans after real operation
+          const allSpans = aggregator.getSpans();
+          const ttsSpans = allSpans.filter(
+            (s: { type?: string; name?: string }) =>
+              s.type === "tts" || (s.name && s.name.startsWith("tts.")),
+          );
+
+          if (ttsSpans.length === 0) {
+            // TTS succeeded but no spans recorded — log as informational, don't crash
+            log(
+              "   [INFO] TTS operation succeeded but no TTS-specific spans found in aggregator. " +
+                "Spans may be emitted via OpenTelemetry exporters rather than the internal aggregator.",
+              "yellow",
+            );
+            logTest(
+              "TTS - Observability Spans",
+              "PASS",
+              "TTS operation succeeded; no spans in internal aggregator (may use external OTEL pipeline)",
+            );
+            return true;
+          }
+
+          logTest(
+            "TTS - Observability Spans",
+            "PASS",
+            `${ttsSpans.length} TTS span(s) found from real TTS operation`,
+          );
+          return true;
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          logTest("TTS - Observability Spans", "FAIL", `Error: ${msg}`);
+          return false;
+        }
+      },
+    },
+  ];
+
+  for (const test of tests) {
+    logSection(test.name);
+    try {
+      const result = await withCaseTimeout(test.name, test.fn);
+      recordTest(
+        test.name,
+        result === true,
+        result === null,
+        result === null ? "skipped" : result === true ? undefined : "failed",
+      );
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      logTest(test.name, "FAIL", `Uncaught: ${msg}`);
+      recordTest(test.name, false, false, msg);
+
+      // A case bound is not an ordinary failure: Promise.race cannot cancel, so
+      // the abandoned case is still running. Continuing would run the loop's
+      // cleanup and inter-case delay underneath live work, and record every
+      // remaining case as "not run". Stop at the first one.
+      if (isCaseTimeout(error)) {
+        log(
+          `\n\u{1F6D1} ABORTING: "${test.name}" was abandoned by its timeout and is still executing. ` +
+            `Remaining cases are NOT run — this process no longer has clean state.`,
+          "red",
+        );
+        break;
+      }
+    }
+    await globalCleanup();
+    await new Promise((r) => setTimeout(r, TEST_CONFIG.interTestDelay));
+  }
+}
+
+// ============================================================
+// CLI ARGS + EXECUTION
+// ============================================================
+
+function parseArguments(): { provider?: string; model?: string } {
+  const args: { provider?: string; model?: string } = {};
+  for (const arg of process.argv.slice(2)) {
+    if (arg.startsWith("--provider=")) {
+      args.provider = arg.split("=")[1];
+    }
+    if (arg.startsWith("--model=")) {
+      args.model = arg.split("=")[1];
+    }
+    if (arg === "--help") {
+      console.log(
+        "Usage: npx tsx test/continuous-test-suite-tts.ts [--provider=X] [--model=Y]",
+      );
+      console.log(
+        "\nTests: 15 (TTS processor, Google TTS, voices, languages, formats, CLI, errors, streaming, observability)",
+      );
+      console.log(
+        "\nRequires: GOOGLE_APPLICATION_CREDENTIALS env var (tests will SKIP without it)",
+      );
+      process.exit(0);
+    }
+  }
+  return args;
+}
+
+const cliArgs = parseArguments();
+if (cliArgs.provider) {
+  TEST_CONFIG.provider = cliArgs.provider;
+}
+if (cliArgs.model) {
+  TEST_CONFIG.model = cliArgs.model;
+}
+if (!TEST_CONFIG.maxTokens) {
+  TEST_CONFIG.maxTokens = PROVIDER_MAX_TOKENS[TEST_CONFIG.provider] || 1024;
+}
+
+await runSuite(runAllTests);

@@ -4,8 +4,20 @@
 
 import type { UnknownRecord, JsonValue } from "./common.js";
 import type { AnalyticsData, TokenUsage } from "./analytics.js";
-import type { EvaluationData } from "../index.js";
+import type { EvaluationData } from "./evaluation.js";
 import type { ToolCall, ToolResult } from "./tools.js";
+import type { TTSResult } from "./tts.js";
+import type { VideoGenerationResult } from "./multimodal.js";
+import type { PPTGenerationResult } from "./ppt.js";
+import type { AvatarResult } from "./avatar.js";
+import type { MusicResult } from "./music.js";
+import type { TranscribeStreamEvent } from "./transcribe.js";
+import type { OAuthTokens } from "./auth.js";
+import type { AccountQuota, ProxyPassthroughAccount } from "./proxy.js";
+import type { ClaudeSubscriptionTier } from "./subscription.js";
+import type { ServerFramework } from "./server.js";
+import type { AuthProviderType } from "./auth.js";
+import type { AIProviderName } from "./enums.js";
 
 /**
  * Ollama command utilities type
@@ -48,107 +60,145 @@ export type BaseCommandArgs = {
 /**
  * Generate command arguments
  */
-export type GenerateCommandArgs = BaseCommandArgs & {
-  /** Input text or prompt */
-  input?: string;
-  /** AI provider to use */
-  provider?: string;
-  /** Model name */
-  model?: string;
-  /** System prompt */
-  system?: string;
-  /** Temperature setting */
-  temperature?: number;
-  /** Maximum tokens */
-  maxTokens?: number;
-  /** Enable analytics */
-  analytics?: boolean;
-  /** Enable evaluation */
-  evaluation?: boolean;
-  /** Context data */
-  context?: string;
-  /** Disable tools */
-  disableTools?: boolean;
-  /** Maximum steps for multi-turn */
-  maxSteps?: number;
-  /** Output file */
-  output?: string;
-  /** Enable extended thinking/reasoning */
-  thinking?: boolean;
-  /** Token budget for thinking */
-  thinkingBudget?: number;
-  /** Thinking level for extended reasoning */
-  thinkingLevel?: "minimal" | "low" | "medium" | "high";
-  /** Vertex AI region */
-  region?: string;
-  // Video generation options (Veo 3.1)
-  /** Output mode - 'text' for standard generation, 'video' for video generation */
-  outputMode?: "text" | "video";
-  /** Path to save generated video file */
-  videoOutput?: string;
-  /** Video output resolution (720p or 1080p) */
-  videoResolution?: "720p" | "1080p";
-  /** Video duration in seconds (4, 6, or 8) */
-  videoLength?: 4 | 6 | 8;
-  /** Video aspect ratio (9:16 for portrait, 16:9 for landscape) */
-  videoAspectRatio?: "9:16" | "16:9";
-  /** Enable/disable audio generation in video */
-  videoAudio?: boolean;
-  /** Custom path for generated image output */
-  imageOutput?: string;
-};
+export type GenerateCommandArgs = BaseCommandArgs &
+  CliToolRoutingFlags &
+  CliClassifierRouterFlags & {
+    /** Input text or prompt */
+    input?: string;
+    /** AI provider to use */
+    provider?: string;
+    /** Model name */
+    model?: string;
+    /** System prompt */
+    system?: string;
+    /** Prepend Neurolink's versioned terminal agent instructions */
+    agentMode?: boolean;
+    /** Temperature setting */
+    temperature?: number;
+    /** Maximum tokens */
+    maxTokens?: number;
+    /** Enable analytics */
+    analytics?: boolean;
+    /** Enable evaluation */
+    evaluation?: boolean;
+    /** Context data */
+    context?: string;
+    /** Disable tools */
+    disableTools?: boolean;
+    /** Keep the request on the selected provider and model. */
+    disableInternalFallback?: boolean;
+    /** Maximum steps for multi-turn */
+    maxSteps?: number;
+    /** Output file */
+    output?: string;
+    /** Enable extended thinking/reasoning */
+    thinking?: boolean;
+    /** Token budget for thinking */
+    thinkingBudget?: number;
+    /** Thinking level for extended reasoning */
+    thinkingLevel?: "minimal" | "low" | "medium" | "high";
+    /** Vertex AI region */
+    region?: string;
+    // Video generation options (Veo 3.1)
+    /** Output mode - 'text' for standard generation, 'video' for video generation, 'ppt' for presentation */
+    outputMode?: "text" | "video" | "ppt";
+    /** Path to save generated video file */
+    videoOutput?: string;
+    /** Video output resolution (720p or 1080p) */
+    videoResolution?: "720p" | "1080p";
+    /** Video duration in seconds (4, 6, or 8) */
+    videoLength?: 4 | 6 | 8;
+    /** Video aspect ratio (9:16 for portrait, 16:9 for landscape) */
+    videoAspectRatio?: "9:16" | "16:9";
+    /** Enable/disable audio generation in video */
+    videoAudio?: boolean;
+    // PPT generation options
+    /** Number of slides to generate (5-50) */
+    pptPages?: number;
+    /** Presentation theme/style */
+    pptTheme?: "modern" | "corporate" | "creative" | "minimal" | "dark";
+    /** Target audience */
+    pptAudience?: "business" | "students" | "technical" | "general";
+    /** Presentation tone/style */
+    pptTone?: "professional" | "casual" | "educational" | "persuasive";
+    /** Path to save generated PPTX file */
+    pptOutput?: string;
+    /** PPT aspect ratio */
+    pptAspectRatio?: "16:9" | "4:3";
+    /** Disable AI image generation for PPT slides */
+    pptNoImages?: boolean;
+    /** Custom path for generated image output */
+    imageOutput?: string;
+  };
 
 /**
  * Stream command arguments
  */
-export type StreamCommandArgs = BaseCommandArgs & {
-  /** Input text or prompt */
-  input?: string;
-  /** AI provider to use */
-  provider?: string;
-  /** Model name */
-  model?: string;
-  /** System prompt */
-  system?: string;
-  /** Temperature setting */
-  temperature?: number;
-  /** Maximum tokens */
-  maxTokens?: number;
-  /** Disable tools */
-  disableTools?: boolean;
-  /** Enable extended thinking/reasoning */
-  thinking?: boolean;
-  /** Token budget for thinking */
-  thinkingBudget?: number;
-  /** Thinking level for extended reasoning */
-  thinkingLevel?: "minimal" | "low" | "medium" | "high";
-  /** Vertex AI region */
-  region?: string;
-};
+export type StreamCommandArgs = BaseCommandArgs &
+  CliToolRoutingFlags &
+  CliClassifierRouterFlags & {
+    /** Input text or prompt */
+    input?: string;
+    /** AI provider to use */
+    provider?: string;
+    /** Model name */
+    model?: string;
+    /** System prompt */
+    system?: string;
+    /** Prepend Neurolink's versioned terminal agent instructions */
+    agentMode?: boolean;
+    /** Maximum tool-calling steps */
+    maxSteps?: number;
+    /** Temperature setting */
+    temperature?: number;
+    /** Maximum tokens */
+    maxTokens?: number;
+    /** Disable tools */
+    disableTools?: boolean;
+    /** Keep the request on the selected provider and model. */
+    disableInternalFallback?: boolean;
+    /** Enable extended thinking/reasoning */
+    thinking?: boolean;
+    /** Token budget for thinking */
+    thinkingBudget?: number;
+    /** Thinking level for extended reasoning */
+    thinkingLevel?: "minimal" | "low" | "medium" | "high";
+    /** Vertex AI region */
+    region?: string;
+  };
 
 /**
  * Batch command arguments
  */
-export type BatchCommandArgs = BaseCommandArgs & {
-  /** Input file path */
-  file?: string;
-  /** AI provider to use */
-  provider?: string;
-  /** Model name */
-  model?: string;
-  /** System prompt */
-  system?: string;
-  /** Temperature setting */
-  temperature?: number;
-  /** Maximum tokens */
-  maxTokens?: number;
-  /** Delay between requests (ms) */
-  delay?: number;
-  /** Output file */
-  output?: string;
-  /** Disable tools */
-  disableTools?: boolean;
-};
+export type BatchCommandArgs = BaseCommandArgs &
+  CliToolRoutingFlags &
+  CliClassifierRouterFlags & {
+    // #1191 round-5: named `promptsFile`, not `file` — yargs implicitly
+    // treats a positional's key as a recognized flag name too, so keeping
+    // this "file" would let `--file` silently pass strictOptions() despite
+    // not being a registered batch option, colliding with the (unrelated)
+    // common `--file` auto-detect flag that batch intentionally omits.
+    /** Prompts-list file path (the `<promptsFile>` positional) */
+    promptsFile?: string;
+    /** AI provider to use */
+    provider?: string;
+    /** Model name */
+    model?: string;
+    /** System prompt */
+    system?: string;
+    /** Temperature setting */
+    temperature?: number;
+    /** Maximum tokens */
+    maxTokens?: number;
+    /** Delay between requests (ms) */
+    delay?: number;
+    /** Output file */
+    output?: string;
+    /** Disable tools */
+    disableTools?: boolean;
+    /** Keep the request on the selected provider and model. */
+    disableInternalFallback?: boolean;
+  };
 
 /**
  * MCP command arguments - Enhanced with transport and server management
@@ -384,7 +434,7 @@ export type CommandResult = {
 /**
  * Generate command result
  */
-export type GenerateResult = CommandResult & {
+export type CliGenerateResult = CommandResult & {
   content: string;
   provider?: string;
   model?: string;
@@ -407,19 +457,27 @@ export type GenerateResult = CommandResult & {
     description: string;
   }>;
   /** TTS audio result when TTS is enabled */
-  audio?: import("./index.js").TTSResult;
+  audio?: TTSResult;
   /** Video generation result when video mode is enabled */
-  video?: import("./multimodal.js").VideoGenerationResult;
+  video?: VideoGenerationResult;
+  /** Avatar (talking-head) generation result when avatar mode is enabled */
+  avatar?: AvatarResult;
+  /** Music generation result when music mode is enabled */
+  music?: MusicResult;
+  /** PPT generation result when ppt mode is enabled */
+  ppt?: PPTGenerationResult;
   imageOutput?: {
     base64: string;
     savedPath?: string; // Local file path where image was saved
+    /** Encoded format, when the provider identified it (e.g. Recraft returns WebP). */
+    mimeType?: string;
   } | null; // Image generation output
 };
 
 /**
  * Stream result chunk
  */
-export type StreamChunk = {
+export type CliStreamChunk = {
   content?: string;
   delta?: string;
   done?: boolean;
@@ -546,12 +604,14 @@ export type RestorationToolContext = Record<string, unknown> & {
 /**
  * Type guard for generate result
  */
-export function isGenerateResult(value: unknown): value is GenerateResult {
+export function isCliGenerateResult(
+  value: unknown,
+): value is CliGenerateResult {
   return (
     typeof value === "object" &&
     value !== null &&
     "content" in value &&
-    typeof (value as GenerateResult).content === "string"
+    typeof (value as CliGenerateResult).content === "string"
   );
 }
 
@@ -630,7 +690,21 @@ export type SetupArgs = {
   status?: boolean;
   interactive?: boolean;
   help?: boolean;
+  check?: boolean;
+  nonInteractive?: boolean;
 };
+
+/**
+ * Narrowed ProviderInfo used by the main `neurolink setup` command,
+ * where the descriptive fields are always populated.
+ */
+export type SetupProviderInfo = ProviderInfo &
+  Required<
+    Pick<
+      ProviderInfo,
+      "bestFor" | "models" | "strengths" | "pricing" | "setupCommand"
+    >
+  >;
 
 /**
  * Provider information for setup display
@@ -688,17 +762,17 @@ export type CLIMCPServerConfig = {
  * OpenAI setup configuration types
  */
 export namespace OpenAISetup {
-  export type SetupOptions = {
+  export type OpenAISetupOptions = {
     checkOnly?: boolean;
     interactive?: boolean;
   };
 
-  export type SetupArgv = {
+  export type OpenAISetupArgv = {
     check?: boolean;
     nonInteractive?: boolean;
   };
 
-  export type Config = {
+  export type OpenAISetupConfig = {
     apiKey?: string;
     organization?: string;
     model?: string;
@@ -710,17 +784,17 @@ export namespace OpenAISetup {
  * Anthropic setup configuration types
  */
 export namespace AnthropicSetup {
-  export type SetupOptions = {
+  export type AnthropicSetupOptions = {
     checkOnly?: boolean;
     interactive?: boolean;
   };
 
-  export type SetupArgv = {
+  export type AnthropicSetupArgv = {
     check?: boolean;
     nonInteractive?: boolean;
   };
 
-  export type Config = {
+  export type AnthropicSetupConfig = {
     apiKey?: string;
     model?: string;
     isReconfiguring?: boolean;
@@ -731,17 +805,17 @@ export namespace AnthropicSetup {
  * Google AI setup configuration types
  */
 export namespace GoogleAISetup {
-  export type SetupOptions = {
+  export type GoogleAISetupOptions = {
     checkOnly?: boolean;
     interactive?: boolean;
   };
 
-  export type SetupArgv = {
+  export type GoogleAISetupArgv = {
     check?: boolean;
     nonInteractive?: boolean;
   };
 
-  export type Config = {
+  export type GoogleAISetupConfig = {
     apiKey?: string;
     model?: string;
     isReconfiguring?: boolean;
@@ -752,17 +826,17 @@ export namespace GoogleAISetup {
  * Azure setup configuration types
  */
 export namespace AzureSetup {
-  export type SetupOptions = {
+  export type AzureSetupOptions = {
     checkOnly?: boolean;
     interactive?: boolean;
   };
 
-  export type SetupArgv = {
+  export type AzureSetupArgv = {
     check?: boolean;
     nonInteractive?: boolean;
   };
 
-  export type Config = {
+  export type AzureSetupConfig = {
     apiKey?: string;
     endpoint?: string;
     deploymentName?: string;
@@ -776,12 +850,12 @@ export namespace AzureSetup {
  * AWS Bedrock setup configuration types
  */
 export namespace BedrockSetup {
-  export type SetupOptions = {
+  export type BedrockSetupOptions = {
     checkOnly?: boolean;
     interactive?: boolean;
   };
 
-  export type SetupArgv = {
+  export type BedrockSetupArgv = {
     check?: boolean;
     nonInteractive?: boolean;
   };
@@ -805,12 +879,12 @@ export namespace BedrockSetup {
  * GCP/Vertex AI setup configuration types
  */
 export namespace GCPSetup {
-  export type SetupOptions = {
+  export type GCPSetupOptions = {
     checkOnly?: boolean;
     interactive?: boolean;
   };
 
-  export type SetupArgv = {
+  export type GCPSetupArgv = {
     check?: boolean;
     nonInteractive?: boolean;
   };
@@ -827,7 +901,7 @@ export namespace GCPSetup {
  * Hugging Face setup configuration types
  */
 export namespace HuggingFaceSetup {
-  export type SetupArgs = {
+  export type HuggingFaceSetupArgs = {
     check?: boolean;
     nonInteractive?: boolean;
     help?: boolean;
@@ -838,9 +912,1432 @@ export namespace HuggingFaceSetup {
  * Mistral setup configuration types
  */
 export namespace MistralSetup {
-  export type SetupArgs = {
+  export type MistralSetupArgs = {
     check?: boolean;
     nonInteractive?: boolean;
     help?: boolean;
   };
 }
+
+// ============================================================================
+// PROXY CLI TYPES (moved from src/cli/commands/proxy.ts)
+// ============================================================================
+
+/** Arguments accepted by `neurolink proxy start` */
+export type ProxyStartArgs = {
+  port?: number;
+  /** Gate-only listener port. Defaults to `port + 1`. */
+  sharePort?: number;
+  host?: string;
+  strategy?: string;
+  healthInterval?: number;
+  quiet?: boolean;
+  debug?: boolean;
+  config?: string;
+  envFile?: string;
+  passthrough?: boolean;
+  dev?: boolean;
+  /** Bearer every inbound caller must present; also `NEUROLINK_PROXY_INBOUND_TOKEN`. */
+  inboundToken?: string;
+  /** Operator's explicit choice to bind off-loopback with no inbound auth. */
+  allowUnauthenticated?: boolean;
+};
+
+/** Arguments accepted by `neurolink proxy status` */
+export type ProxyStatusArgs = {
+  format?: "text" | "json";
+  quiet?: boolean;
+};
+
+/** Arguments accepted by `neurolink proxy analyze` */
+export type ProxyAnalyzeArgs = {
+  logsDir?: string;
+  since?: string;
+  until?: string;
+  format?: "text" | "json";
+  quiet?: boolean;
+};
+
+/** Arguments accepted by `neurolink proxy replay <export|compare>`. */
+export type ProxyReplayArgs = {
+  action?: "export" | "compare";
+  requestId?: string;
+  attempt?: number;
+  logsDir?: string;
+  bundle?: string;
+  output?: string;
+  execute?: boolean;
+  headerEnv?: string[];
+  bodyFile?: string;
+  url?: string;
+  timeoutMs?: number;
+  format?: "text" | "json";
+  quiet?: boolean;
+};
+
+/** Arguments accepted by hidden `neurolink proxy guard` command */
+export type ProxyGuardArgs = {
+  host?: string;
+  port?: number;
+  parentPid?: number;
+  maxWaitMs?: number;
+  failureThreshold?: number;
+  pollIntervalMs?: number;
+  quiet?: boolean;
+  /** Run update checks only; never mutate client settings. */
+  updaterOnly?: boolean;
+};
+
+/** Arguments accepted by `neurolink proxy telemetry <subcommand>` */
+export type ProxyTelemetryArgs = {
+  action?:
+    | "setup"
+    | "start"
+    | "stop"
+    | "status"
+    | "logs"
+    | "import-dashboard"
+    | "doctor"
+    | "query";
+  quiet?: boolean;
+  since?: string;
+  until?: string;
+  kind?: string;
+  format?: "json" | "text";
+  maxRows?: number;
+  proxyUrl?: string;
+  admissionLookbackMinutes?: number;
+  requestTimeoutMs?: number;
+  ingestionGraceMs?: number;
+};
+
+/** A fallback chain entry (serialisable subset of FallbackEntry) */
+export type FallbackInfo = { provider: string; model: string };
+
+export type ProxyRollingState = {
+  generation: number;
+  active: { pid: number; version: string; generation: number } | null;
+  candidate: {
+    pid: number;
+    expectedVersion: string;
+    generation: number;
+  } | null;
+  draining: Array<{ pid: number; version: string; generation: number }>;
+  queuedSockets: number;
+  pendingTransfers?: number;
+  rejectedSockets: number;
+  failedTransfers: number;
+  lastFailure: {
+    at: string;
+    generation: number;
+    version: string;
+    phase: "startup" | "activation" | "runtime" | "transfer";
+    message: string;
+    workerPid?: number;
+    workerExitCode?: number | null;
+    workerExitSignal?: string | null;
+    supervisorAction?:
+      | "none"
+      | "sigkill_after_transfer_failure"
+      | "cancel_socket_replace_before_drain"
+      | "cancel_uncommitted_socket";
+  } | null;
+};
+
+export type ProxySupervisorState = {
+  pid: number;
+  host: string;
+  port: number;
+  startTime: string;
+  /** Version loaded by the long-lived supervisor process. */
+  version?: string;
+  updaterPid?: number;
+  rolling: ProxyRollingState;
+};
+
+/** Persisted state for a running proxy instance */
+export type ProxyState = {
+  pid: number;
+  port: number;
+  host: string;
+  /** Gate-only listener port, present only while this node lends capacity. */
+  sharePort?: number;
+  strategy: string;
+  startTime: string;
+  ready?: boolean;
+  readyAt?: string;
+  healthPath?: string;
+  statusPath?: string;
+  envFile?: string;
+  /** Fallback chain from proxy config (persisted at start time) */
+  fallbackChain?: FallbackInfo[];
+  /** Normalized Anthropic account keys allowed for this proxy process. */
+  accountAllowlist?: string[];
+  /** Optional fail-open guard PID that reverts Claude settings if proxy dies */
+  guardPid?: number;
+  /** Dedicated updater PID for launchd-managed proxy installations. */
+  updaterPid?: number;
+  /** Stable listener supervisor PID when requests are served by socket workers. */
+  supervisorPid?: number;
+  /** How the proxy was launched — "launchd" if installed as service, "manual" otherwise */
+  managedBy?: "launchd" | "manual";
+  /** Whether the proxy is running in transparent passthrough mode */
+  passthrough?: boolean;
+  /** Active hot-reload configuration generation. */
+  configGeneration?: number;
+  /** Timestamp when the active configuration generation was loaded. */
+  configLoadedAt?: string;
+  /** Last rejected hot-reload error, when any. */
+  lastConfigReloadError?: string;
+  /** Absolute path watched for proxy routing configuration changes. */
+  configFile?: string;
+};
+
+// ============================================================================
+// AUTH CLI TYPES (moved from src/cli/commands/auth.ts)
+// ============================================================================
+
+/** Stored credentials for an authenticated provider. */
+export type StoredCredentials = {
+  type: "api-key" | "oauth";
+  apiKey?: string;
+  oauth?: OAuthTokens;
+  provider: string;
+  subscriptionTier?: ClaudeSubscriptionTier;
+  email?: string;
+  createdAt: number;
+  updatedAt: number;
+};
+
+/** Result of checking authentication status for a provider. */
+export type AuthStatusResult = {
+  provider: string;
+  isAuthenticated: boolean;
+  method: "api-key" | "oauth" | "none";
+  subscriptionTier?: string;
+  tokenExpiry?: string;
+  hasRefreshToken?: boolean;
+  needsRefresh?: boolean;
+};
+
+// ============================================================================
+// AUTH COMMAND FACTORY TYPES (moved from src/cli/factories/authCommandFactory.ts)
+// ============================================================================
+
+/** Auth command arguments interface */
+export type AuthCommandArgs = BaseCommandArgs & {
+  provider?: string;
+  method?: "api-key" | "oauth" | "create-api-key";
+  format?: "text" | "json";
+  quiet?: boolean;
+  debug?: boolean;
+  nonInteractive?: boolean;
+  add?: boolean;
+  label?: string;
+  account?: string;
+  force?: boolean;
+  /** `auth list --refresh`: fetch fresh provider limits before listing */
+  refresh?: boolean;
+  /** Path to the proxy config YAML, used by set-/get-/clear-primary */
+  config?: string;
+  /** Email passed to `auth set-primary <email>` */
+  email?: string;
+  /** Why an account is being disabled, recorded by `auth disable` */
+  reason?: string;
+  /** Subcommand verb for `auth cooldown <action>` */
+  action?: string;
+  /** `auth cooldown clear --all` */
+  all?: boolean;
+  /** Yargs positional arguments */
+  _?: (string | number)[];
+};
+
+/** Refresh state for a provider-qualified account. */
+export type AuthListRefreshStatus =
+  | "refreshed"
+  | "snapshot"
+  | "unavailable"
+  | "not_supported";
+
+/** Fresh-limit result for one provider-qualified account. */
+export type AuthListRefreshAccountResult = {
+  /** Provider prefix parsed from the configured account key. */
+  provider: string;
+  /** A missing limit is explicit rather than being rendered as an unexplained dash. */
+  status: AuthListRefreshStatus;
+  error?: string;
+};
+
+/** One direct quota-adapter result used by `auth list --refresh`. */
+export type AuthListDirectQuotaRefreshResult =
+  | { status: "refreshed"; quota: AccountQuota }
+  | { status: "unavailable" | "not_supported"; error?: string };
+
+/** Provider-specific quota capability used by the generic auth-list refresh. */
+export type AuthListQuotaRefreshAdapter = {
+  /** A successful local proxy `/limits` response is authoritative for this provider. */
+  supportsProxyRefresh?: boolean;
+  listAccounts: () => Promise<ProxyPassthroughAccount[]>;
+  priorQuotaKeys: (account: ProxyPassthroughAccount) => readonly string[];
+  refreshAccount: (
+    account: ProxyPassthroughAccount,
+    options: { prior: AccountQuota | null },
+  ) => Promise<AuthListDirectQuotaRefreshResult>;
+};
+
+/** Applies one account's explicit auth-list refresh state. */
+export type AuthListRefreshResultSetter = (
+  key: string,
+  status: AuthListRefreshStatus,
+  error?: string,
+) => void;
+
+/** Outcome of the `auth list --refresh` fresh-limit fetch. */
+export type AuthListRefreshOutcome = {
+  /** How the fresh limits were obtained ("none" when every path failed). */
+  via: "proxy" | "direct" | "mixed" | "none";
+  /** Freshly fetched quotas keyed by provider-qualified account key. */
+  quotas: Record<string, AccountQuota> | null;
+  /** Per-account refresh status, also keyed by provider-qualified account key. */
+  accounts: Record<string, AuthListRefreshAccountResult>;
+  /** Per-account and transport errors, already formatted for display. */
+  errors: string[];
+};
+
+// ============================================================================
+// TELEMETRY CLI TYPES (moved from src/cli/commands/telemetry.ts)
+// ============================================================================
+
+/** Telemetry command arguments */
+export type TelemetryCommandArgs = {
+  format?: "text" | "json" | "table";
+  quiet?: boolean;
+};
+
+/** Telemetry status sub-command args */
+export type TelemetryStatusArgs = TelemetryCommandArgs;
+
+/** Telemetry flush sub-command args */
+export type TelemetryFlushArgs = TelemetryCommandArgs & {
+  timeout?: number;
+};
+
+/** Telemetry stats sub-command args */
+export type TelemetryStatsArgs = TelemetryCommandArgs & {
+  detailed?: boolean;
+  byModel?: boolean;
+  byProvider?: boolean;
+};
+
+/** Staging-only native collector migration; never activates a service. */
+export type TelemetryNativePrepareArgs = {
+  collectorConfig: string;
+  output: string;
+  queueDirectory: string;
+  compactionDirectory: string;
+  bodyPort: number;
+  bodyStream?: string;
+  metadataQueueMib: number;
+  bodyQueueMib: number;
+  diskQuotaMib: number;
+  metadataRetentionDays: number;
+  bodyRetentionDays: number;
+};
+
+export type TelemetryNativeValidateArgs = {
+  directory: string;
+  collectorBin: string;
+};
+
+// ============================================================================
+// OBSERVABILITY CLI TYPES (moved from src/cli/commands/observability.ts)
+// Prefixed with "Observability" to avoid collision with telemetry types.
+// ============================================================================
+
+/** Observability command arguments */
+export type ObservabilityCommandArgs = {
+  format?: "text" | "json" | "table";
+  quiet?: boolean;
+};
+
+/** Observability status sub-command args */
+export type ObservabilityStatusArgs = ObservabilityCommandArgs;
+
+/** Observability metrics sub-command args */
+export type ObservabilityMetricsArgs = ObservabilityCommandArgs & {
+  detailed?: boolean;
+};
+
+/** Observability costs sub-command args */
+export type ObservabilityCostsArgs = ObservabilityCommandArgs & {
+  byModel?: boolean;
+  byProvider?: boolean;
+};
+
+// ============================================================================
+// DOCS CLI TYPES (moved from src/cli/commands/docs.ts)
+// ============================================================================
+
+/** Docs command arguments */
+export type DocsCommandArgs = {
+  transport?: "stdio" | "http";
+  port?: number;
+};
+
+// ============================================================================
+// RAG CLI TYPES (moved from src/cli/commands/rag.ts)
+// ============================================================================
+
+// Note: ChunkArgs, IndexArgs, QueryArgs are defined as RAGCommandArgs in rag/types.ts
+// These are the CLI-layer argument shapes.
+
+// ============================================================================
+// SERVER CLI TYPES (moved from src/cli/commands/server.ts)
+// ============================================================================
+
+/** Server command arguments */
+export type ServerCommandArgs = {
+  port?: number;
+  host?: string;
+  framework?: "hono" | "express" | "fastify" | "koa";
+  basePath?: string;
+  cors?: boolean;
+  rateLimit?: boolean;
+  quiet?: boolean;
+  format?: "text" | "json" | "yaml";
+  output?: string;
+  debug?: boolean;
+};
+
+/** Server status stored in state file */
+export type ServerState = {
+  pid: number;
+  port: number;
+  host: string;
+  framework: ServerFramework;
+  startTime: string;
+  basePath: string;
+};
+
+/** Server configuration stored in config file */
+export type ServerConfig = {
+  defaultPort: number;
+  defaultHost: string;
+  defaultFramework: "hono" | "express" | "fastify" | "koa";
+  defaultBasePath: string;
+  cors: {
+    enabled: boolean;
+    origins?: string[];
+  };
+  rateLimit: {
+    enabled: boolean;
+    windowMs?: number;
+    maxRequests?: number;
+  };
+  swagger: {
+    enabled: boolean;
+    path?: string;
+  };
+};
+
+// ============================================================================
+// SERVE CLI TYPES (moved from src/cli/commands/serve.ts)
+// ============================================================================
+
+/** Serve command arguments */
+export type ServeCommandArgs = {
+  port?: number;
+  host?: string;
+  framework?: ServerFramework;
+  basePath?: string;
+  cors?: boolean;
+  /** Browser origins allowed by CORS (`--cors-origin`, repeatable or comma-separated). */
+  corsOrigin?: string[];
+  /** Largest raw upload (multipart / audio bodies) the server accepts, e.g. "64mb" (`--max-upload`). */
+  maxUpload?: string;
+  rateLimit?: number;
+  swagger?: boolean;
+  config?: string;
+  watch?: boolean;
+  quiet?: boolean;
+  debug?: boolean;
+  format?: "text" | "json";
+};
+
+/** Server configuration file format */
+export type ServerConfigFile = {
+  port?: number;
+  host?: string;
+  framework?: ServerFramework;
+  basePath?: string;
+  cors?: {
+    enabled?: boolean;
+    origins?: string[];
+    methods?: string[];
+    headers?: string[];
+    credentials?: boolean;
+    maxAge?: number;
+  };
+  rateLimit?: {
+    enabled?: boolean;
+    windowMs?: number;
+    maxRequests?: number;
+    message?: string;
+    skipPaths?: string[];
+  };
+  bodyParser?: {
+    enabled?: boolean;
+    maxSize?: string;
+    jsonLimit?: string;
+    urlEncoded?: boolean;
+  };
+  logging?: {
+    enabled?: boolean;
+    level?: "debug" | "info" | "warn" | "error";
+    includeBody?: boolean;
+    includeResponse?: boolean;
+  };
+  timeout?: number;
+  enableMetrics?: boolean;
+  enableSwagger?: boolean;
+};
+
+// ============================================================================
+// CONVERSATION SELECTOR TYPES (moved from src/cli/loop/conversationSelector.ts)
+// ============================================================================
+
+/** Menu choice type for conversation selector (includes separators). */
+export type MenuChoice =
+  | ConversationChoice
+  | { type: "separator"; line?: string };
+
+// ============================================================================
+// SAGEMAKER CLI TYPES (moved from src/cli/factories/sagemakerCommandFactory.ts)
+// ============================================================================
+
+/**
+ * Type for language models that expose the low-level doGenerate method.
+ * Used by SageMaker CLI commands for direct endpoint testing and benchmarking.
+ */
+export type DoGenerateModel = {
+  doGenerate(options: Record<string, unknown>): Promise<{
+    text?: string;
+    finishReason?: string;
+    usage: {
+      /** Token count for the prompt (Vercel AI SDK convention) */
+      promptTokens?: number;
+      /** Token count for the completion (Vercel AI SDK convention) */
+      completionTokens?: number;
+      /** Token count for the input (SageMaker/provider convention) */
+      inputTokens?: number;
+      /** Token count for the output (SageMaker/provider convention) */
+      outputTokens?: number;
+      totalTokens?: number;
+    };
+  }>;
+};
+
+/** Redis client type (awaited return of createRedisClient). */
+export type CliRedisClient = {
+  get: (key: string) => Promise<string | null>;
+  set: (key: string, value: string, options?: unknown) => Promise<unknown>;
+  del: (key: string) => Promise<number>;
+  keys: (pattern: string) => Promise<string[]>;
+  quit: () => Promise<void>;
+  [key: string]: unknown;
+};
+
+/**
+ * Auth command argument types
+ */
+
+export type AuthProvidersArgs = {
+  format?: "text" | "json" | "table";
+};
+
+export type AuthValidateArgs = {
+  token: string;
+  provider: AuthProviderType;
+  domain?: string;
+  clientId?: string;
+  secretKey?: string;
+  secret?: string;
+  url?: string;
+  anonKey?: string;
+  apiKey?: string;
+  format?: "text" | "json";
+};
+
+export type AuthHealthArgs = {
+  provider: AuthProviderType;
+  domain?: string;
+  clientId?: string;
+  secretKey?: string;
+  secret?: string;
+  url?: string;
+  anonKey?: string;
+  apiKey?: string;
+  format?: "text" | "json";
+};
+
+export type SetupResult = {
+  selectedProviders: AIProviderName[];
+  credentials: Record<string, string>;
+  envFileBackup?: string;
+  testResults: Array<{
+    provider: AIProviderName;
+    status: "working" | "failed";
+    error?: string;
+    responseTime?: number;
+  }>;
+};
+
+/**
+ * Shared options for every provider-specific CLI setup command
+ * (anthropic, azure, bedrock, gcp, google-ai, openai).
+ */
+export type ProviderSetupOptions = {
+  checkOnly?: boolean;
+  interactive?: boolean;
+};
+
+/** Shared yargs-argv shape for every provider-specific CLI setup command. */
+export type ProviderSetupArgv = {
+  check?: boolean;
+  nonInteractive?: boolean;
+};
+
+/**
+ * Superset provider-setup config. `endpoint` is Azure-only; other providers
+ * leave it undefined. Pre-consolidation there were 4 near-duplicate types
+ * (Anthropic/Azure/GoogleAI/OpenAI); they are now one.
+ */
+export type ProviderSetupConfig = {
+  apiKey?: string;
+  model?: string;
+  endpoint?: string;
+  isReconfiguring?: boolean;
+};
+
+// =============================================================================
+// AUTH COMMAND (from cli/commands/auth.ts)
+// =============================================================================
+
+/** Providers with first-class credential flows implemented by `neurolink auth`. */
+export type SupportedProvider = "anthropic" | "codex";
+
+// =============================================================================
+// AUTORESEARCH COMMAND (from cli/commands/autoresearch.ts)
+// =============================================================================
+
+/** Arguments for `neurolink autoresearch init`. */
+export type AutoresearchInitArgs = {
+  repoPath: string;
+  tag: string;
+  target: string;
+  immutable: string;
+  runCommand: string;
+  metricName: string;
+  metricPattern: string;
+  metricDirection: string;
+  timeout: number;
+  provider?: string;
+  model?: string;
+};
+
+// =============================================================================
+// DECIDE COMMAND (from cli/commands/decide.ts)
+// =============================================================================
+
+/** Arguments for `neurolink decide` — the third inference type's CLI surface. */
+export type CliDecideArgs = {
+  state?: string;
+  stateFile?: string;
+  questions?: string;
+  questionsFile?: string;
+  /** Image files (or data: URLs) for a provider that reads images. */
+  image?: string[];
+  /** One video file (or data: URL) for a provider that reads video. */
+  video?: string;
+  /** One audio file (or data: URL) for a provider that reads audio. */
+  audio?: string;
+  provider?: string;
+  model?: string;
+  timeout?: number;
+  format?: "text" | "json";
+  debug?: boolean;
+};
+
+// =============================================================================
+// TRANSCRIBE COMMAND (from cli/commands/transcribe.ts)
+// =============================================================================
+
+/** Arguments for `neurolink transcribe <file|->`. */
+export type CliTranscribeArgs = {
+  /** Audio file path, or `-` to read the audio from stdin. */
+  file?: string;
+  provider?: string;
+  model?: string;
+  /** ISO / BCP-47 code, or `auto` (the default) to let the engine detect it. */
+  language?: string;
+  diarize?: boolean;
+  wordTimestamps?: boolean;
+  prompt?: string;
+  /** Path to a JSON array of `{ term, heardAs, meaning }`. */
+  dictionary?: string;
+  /** Inline dictionary entries: `"Term|heard,as|meaning"`. */
+  term?: string[];
+  correct?: boolean;
+  rewriteProvider?: string;
+  rewriteModel?: string;
+  /** `--no-rewrite` sets this to `false`. */
+  rewrite?: boolean;
+  transliterate?: "latin" | "native";
+  secondOpinion?: string;
+  /** `--to`: output languages (comma-separated BCP-47 tags). */
+  to?: string | string[];
+  fallback?: string;
+  context?: string;
+  stream?: boolean;
+  /** With `--stream`: which speech detector finds utterances. */
+  vad?: "auto" | "silero" | "energy";
+  format?: "text" | "json" | "srt" | "vtt";
+  timeout?: number;
+  quiet?: boolean;
+  debug?: boolean;
+};
+
+/** One subtitle cue built from segment or word timings (`--format srt|vtt`). */
+export type CliSubtitleCue = { start: number; end: number; text: string };
+
+/** Prints `transcribeStream()` events for one `--stream` run. */
+export type CliTranscribeStreamSink = {
+  event(event: TranscribeStreamEvent): void;
+  finish(): void;
+};
+
+// =============================================================================
+// EVALUATE COMMAND (from cli/commands/evaluate.ts)
+// =============================================================================
+
+/** Base options shared across all `neurolink evaluate` subcommands. */
+export type BaseEvaluateArgs = {
+  json?: boolean;
+  verbose?: boolean;
+  format?: "text" | "json" | "table";
+};
+
+/** Arguments for the bare `neurolink evaluate` invocation. */
+export type DirectEvaluateArgs = BaseEvaluateArgs & {
+  input?: string;
+  query?: string;
+  scorers?: string[];
+  context?: string;
+  threshold?: number;
+};
+
+/** Arguments for `neurolink evaluate run`. */
+export type EvaluateRunArgs = BaseEvaluateArgs & {
+  input?: string;
+  output?: string;
+  context?: string[];
+  groundTruth?: string;
+  pipeline?: string;
+  scorer?: string[];
+};
+
+/** Arguments for `neurolink evaluate score`. */
+export type EvaluateScoreArgs = BaseEvaluateArgs & {
+  scorer: string;
+  input?: string;
+  output?: string;
+  context?: string[];
+  groundTruth?: string;
+};
+
+/** Arguments for `neurolink evaluate report`. */
+export type EvaluateReportArgs = BaseEvaluateArgs & {
+  input?: string;
+  output?: string;
+  context?: string[];
+  groundTruth?: string;
+  "ground-truth"?: string;
+  pipeline?: string;
+  scorer?: string[];
+  outputFile?: string;
+  "output-file"?: string;
+};
+
+/** Arguments for `neurolink evaluate presets`. */
+export type EvaluatePresetsArgs = {
+  preset?: string;
+  json?: boolean;
+};
+
+/** Arguments for `neurolink evaluate scorers` (list-scorers). */
+export type EvaluateScorersArgs = {
+  category?: string;
+  type?: string;
+  json?: boolean;
+  detailed?: boolean;
+};
+
+/** Arguments for `neurolink evaluate run-pipeline`. */
+export type RunPipelineArgs = BaseEvaluateArgs & {
+  preset: string;
+  input: string;
+  query?: string;
+  context?: string;
+  threshold?: number;
+};
+
+// =============================================================================
+// MCP COMMAND (from cli/commands/mcp.ts)
+// =============================================================================
+
+/** Info row for an MCP tool annotation. */
+export type ToolAnnotationInfo = {
+  serverName: string;
+  serverId: string;
+  toolName: string;
+  description: string;
+  annotations: import("./mcp.js").MCPToolAnnotations;
+};
+
+/** Tool target used by the annotation printer. */
+export type AnnotatedToolTarget = {
+  name: string;
+  description: string;
+  serverId: string;
+  serverName: string;
+};
+
+// =============================================================================
+// RAG COMMAND (from cli/commands/rag.ts)
+// =============================================================================
+
+/** Arguments for `neurolink rag chunk`. */
+export type RagChunkArgs = import("./rag.js").RAGCommandArgs & {
+  file: string;
+  output?: string;
+  extract?: boolean;
+};
+
+/** Arguments for `neurolink rag index`. */
+export type RagIndexArgs = import("./rag.js").RAGCommandArgs & {
+  file: string;
+  indexName?: string;
+};
+
+/** Arguments for `neurolink rag query`. */
+export type RagQueryArgs = import("./rag.js").RAGCommandArgs & {
+  query: string;
+  indexName?: string;
+};
+
+// =============================================================================
+// SERVE COMMAND (from cli/commands/serve.ts)
+// =============================================================================
+
+/** Minimal server instance contract used by `neurolink serve`. */
+export type ServerInstance = {
+  initialize: () => Promise<void>;
+  start: () => Promise<void>;
+  stop: () => Promise<void>;
+  registerRouteGroup: (group: import("./server.js").RouteGroup) => void;
+  registerMiddleware: (
+    middleware: import("./server.js").MiddlewareDefinition,
+  ) => void;
+  listRoutes?: () => import("./server.js").RouteDefinition[];
+  /** The listening Node http.Server, when the adapter has one to attach WebSocket upgrades to. */
+  getNativeServer?: () => unknown;
+};
+
+/** Persisted state for a running `neurolink serve` process. */
+export type ServeState = {
+  pid: number;
+  port: number;
+  host: string;
+  framework: string;
+  startTime: string;
+  basePath: string;
+  configFile?: string;
+};
+
+// =============================================================================
+// BEDROCK SETUP COMMAND (from cli/commands/setup-bedrock.ts)
+// =============================================================================
+
+/** Captured Bedrock setup configuration data. */
+export type BedrockConfigData = {
+  accessKeyId?: string;
+  secretAccessKey?: string;
+  region?: string;
+  model?: string;
+};
+
+/** Status of Bedrock setup configuration flags. */
+export type BedrockConfigStatus = {
+  hasAccessKey: boolean;
+  hasSecretKey: boolean;
+  hasRegion: boolean;
+};
+
+// =============================================================================
+// GCP SETUP COMMAND (from cli/commands/setup-gcp.ts)
+// =============================================================================
+
+/** Status of each GCP auth method tried by setup-gcp. */
+export type GcpAuthMethodStatus = {
+  method1: {
+    complete: boolean;
+    hasCredentials: boolean;
+    missingVars: string[];
+  };
+  method2: {
+    complete: boolean;
+    hasServiceAccountKey: boolean;
+    missingVars: string[];
+  };
+  method3: {
+    complete: boolean;
+    hasClientEmail: boolean;
+    hasPrivateKey: boolean;
+    missingVars: string[];
+  };
+  common: {
+    hasProject: boolean;
+    hasLocation: boolean;
+    missingVars: string[];
+  };
+};
+
+// =============================================================================
+// PROVIDER SETUP COMMANDS (from cli/commands/setup-*.ts)
+// =============================================================================
+
+/** Arguments for `neurolink setup huggingface`. */
+export type SetupHuggingFaceArgs = {
+  check?: boolean;
+  "non-interactive"?: boolean;
+};
+
+/** Arguments for `neurolink setup mistral`. */
+export type SetupMistralArgs = {
+  check?: boolean;
+  "non-interactive"?: boolean;
+};
+
+// =============================================================================
+// TASK COMMAND (from cli/commands/task.ts)
+// =============================================================================
+
+/** Arguments for `neurolink task create`. */
+export type TaskCreateArgs = {
+  name: string;
+  prompt: string;
+  cron?: string;
+  timezone?: string;
+  every?: string;
+  at?: string;
+  mode: string;
+  provider?: string;
+  model?: string;
+  maxRuns?: number;
+  maxTokens?: number;
+  temperature?: number;
+  systemPrompt?: string;
+};
+
+/** Arguments for `neurolink task update`. */
+export type TaskUpdateArgs = {
+  taskId: string;
+  prompt?: string;
+  cron?: string;
+  every?: string;
+  at?: string;
+  mode?: string;
+};
+
+/** Arguments for `neurolink task logs`. */
+export type TaskLogsArgs = {
+  taskId: string;
+  limit: number;
+  status?: string;
+  full?: boolean;
+};
+
+// =============================================================================
+// VOICE SERVER COMMAND (from cli/commands/voiceServer.ts)
+// =============================================================================
+
+/** Arguments for `neurolink voice-server`. */
+export type VoiceServerArgs = {
+  port: number;
+};
+
+// `VoiceWebSocketOptions` was previously declared here; it was a server-tier
+// type (consumed by `setupWebSocket()` in `server/voice/voiceWebSocketHandler.ts`)
+// so it has been renamed to `ServerVoiceWebSocketOptions` and moved to
+// `server.ts` per CLAUDE.md Rule 9 (domain prefix) and Rule 2 (canonical
+// location). Import via the barrel.
+
+// =============================================================================
+// INTERACTIVE SETUP (from cli/utils/interactiveSetup.ts)
+// =============================================================================
+
+/** Provider config row used by the interactive setup wizard. */
+export type InteractiveProviderConfig = {
+  id: AIProviderName;
+  name: string;
+  description: string;
+  envVars: Array<{
+    key: string;
+    prompt: string;
+    secure?: boolean;
+    default?: string;
+    optional?: boolean;
+  }>;
+};
+
+// =============================================================================
+// VIDEO FILE UTILS (from cli/utils/videoFileUtils.ts)
+// =============================================================================
+
+/** Result of saving video to file. */
+export type VideoSaveResult = {
+  success: boolean;
+  path: string;
+  size: number;
+  error?: string;
+};
+
+// =============================================================================
+// CLI CONFIG (from cli/commands/config.ts)
+// =============================================================================
+
+/** Provider identifier recognized by the `neurolink config` command. */
+export type CliConfigProvider =
+  | "auto"
+  | "openai"
+  | "bedrock"
+  | "vertex"
+  | "anthropic"
+  | "azure"
+  | "google-ai"
+  | "huggingface"
+  | "ollama"
+  | "mistral";
+
+/** Analytics config for the healthcare evaluation domain. */
+export type CliHealthcareAnalyticsConfig = {
+  trackPatientData: boolean;
+  trackDiagnosticAccuracy: boolean;
+  trackTreatmentOutcomes: boolean;
+};
+
+/** Analytics config for the analytics evaluation domain. */
+export type CliAnalyticsDomainAnalyticsConfig = {
+  trackDataQuality: boolean;
+  trackModelPerformance: boolean;
+  trackBusinessImpact: boolean;
+};
+
+/** Analytics config for the finance evaluation domain. */
+export type CliFinanceAnalyticsConfig = {
+  trackRiskMetrics: boolean;
+  trackRegulatory: boolean;
+  trackPortfolioImpact: boolean;
+};
+
+/** Analytics config for the ecommerce evaluation domain. */
+export type CliEcommerceAnalyticsConfig = {
+  trackConversions: boolean;
+  trackUserBehavior: boolean;
+  trackRevenueImpact: boolean;
+};
+
+/** Generic shape of a single domain entry in the CLI config. */
+export type CliDomainConfig<
+  TAnalytics extends Record<string, boolean> = Record<string, boolean>,
+> = {
+  evaluationCriteria: string[];
+  analyticsConfig: TAnalytics;
+};
+
+/**
+ * Materialized shape of the CLI config parsed from `~/.neurolink/config.json`.
+ * Matches the output of `ConfigSchema.parse()` defined in
+ * `src/cli/commands/config.ts`. The schema is annotated with
+ * `z.ZodType<CliNeuroLinkConfig>` so drift fails at compile time.
+ */
+export type CliNeuroLinkConfig = {
+  defaultProvider: CliConfigProvider;
+  providers: {
+    openai?: { apiKey?: string; model: string; baseURL?: string };
+    bedrock?: {
+      region?: string;
+      accessKeyId?: string;
+      secretAccessKey?: string;
+      sessionToken?: string;
+      model: string;
+    };
+    vertex?: {
+      projectId?: string;
+      location: string;
+      credentials?: string;
+      serviceAccountKey?: string;
+      clientEmail?: string;
+      privateKey?: string;
+      model: string;
+    };
+    anthropic?: { apiKey?: string; model: string };
+    azure?: {
+      apiKey?: string;
+      endpoint?: string;
+      deploymentId?: string;
+      model: string;
+    };
+    "google-ai"?: { apiKey?: string; model: string };
+    huggingface?: { apiKey?: string; model: string };
+    ollama?: { baseUrl: string; model: string; timeout: number };
+    mistral?: { apiKey?: string; model: string };
+  };
+  profiles: Record<string, unknown>;
+  preferences: {
+    outputFormat: "text" | "json" | "yaml";
+    temperature: number;
+    maxTokens?: number;
+    enableLogging: boolean;
+    enableCaching: boolean;
+    cacheStrategy: "memory" | "file" | "redis";
+    defaultEvaluationDomain?: string;
+    enableAnalyticsByDefault: boolean;
+    enableEvaluationByDefault: boolean;
+  };
+  domains: {
+    healthcare: CliDomainConfig<CliHealthcareAnalyticsConfig>;
+    analytics: CliDomainConfig<CliAnalyticsDomainAnalyticsConfig>;
+    finance: CliDomainConfig<CliFinanceAnalyticsConfig>;
+    ecommerce: CliDomainConfig<CliEcommerceAnalyticsConfig>;
+  };
+};
+
+// =============================================================================
+// MCP TOOL DISCOVERY CLI (from cli/commands/mcp.ts)
+// =============================================================================
+
+/** Row in the MCP tools listing produced by `neurolink mcp tools`. */
+export type MCPToolWithServer = {
+  name: string;
+  description: string;
+  serverId: string;
+  serverName: string;
+  inputSchema?: object;
+  category?: string;
+  annotations?: {
+    readOnlyHint?: boolean;
+    destructiveHint?: boolean;
+    idempotentHint?: boolean;
+    requiresConfirmation?: boolean;
+    tags?: string[];
+  };
+};
+
+/** Per-server discovery result produced by `neurolink mcp discover`. */
+export type MCPDiscoveryResult = {
+  serverId: string;
+  serverName: string;
+  toolCount: number;
+  tools: Array<{
+    name: string;
+    description: string;
+    annotations: Record<string, unknown>;
+  }>;
+};
+
+// =============================================================================
+// SERVE COMMAND ROUTE REFLECTION (from cli/commands/server.ts)
+// =============================================================================
+
+/**
+ * Minimal route-group shape reflected at runtime by `neurolink serve routes`.
+ * Named with a `CliServe` prefix to disambiguate from the richer RouteGroup
+ * in server.ts (§Rule 9).
+ */
+export type CliServeRouteGroup = {
+  prefix: string;
+  routes: Array<{
+    method: string;
+    path: string;
+    description?: string;
+  }>;
+};
+
+/** Flat per-route row used by the `neurolink serve routes` listing. */
+export type CliServeFlatRoute = {
+  method: string;
+  path: string;
+  description?: string;
+  group: string;
+};
+
+// =============================================================================
+// TOOL-ROUTING CLI FLAGS (from cli/utils/toolRoutingFlags.ts)
+// =============================================================================
+
+/**
+ * Raw CLI flag shape for the tool-routing family of options.
+ * Keys are camelCase as yargs delivers them after parsing kebab-case aliases.
+ */
+export type CliToolRoutingFlags = {
+  /** Master enable switch (--tool-routing). */
+  toolRouting?: boolean;
+  /** Router LLM hard timeout in ms (--tool-routing-timeout). */
+  toolRoutingTimeout?: number;
+  /** Router LLM provider override (--tool-routing-router-provider). */
+  toolRoutingRouterProvider?: string;
+  /** Router LLM model override (--tool-routing-router-model). */
+  toolRoutingRouterModel?: string;
+  /** Router LLM region override (--tool-routing-router-region). */
+  toolRoutingRouterRegion?: string;
+  /**
+   * Server ids that are always kept and never offered to the router
+   * (--tool-routing-always-include, repeatable).
+   */
+  toolRoutingAlwaysInclude?: string[];
+  /**
+   * Path to a JSON file OR inline JSON array of server descriptors
+   * (--tool-routing-servers).
+   */
+  toolRoutingServers?: string;
+};
+
+/**
+ * CLI flags for the classifier router (`--classifier-*`). Builds a
+ * ClassifierRouterConfig that is injected at SDK construction time.
+ */
+export type CliClassifierRouterFlags = {
+  /** Master enable switch (--classifier-router). */
+  classifierRouter?: boolean;
+  /**
+   * Strategy: "auto" (default), "heuristic", "llm" or "jev"
+   * (--classifier-strategy). "auto" resolves to "jev" when a decision
+   * provider is configured (TYPESAFE_API_KEY, LAYA_API_KEY with
+   * LAYA_BASE_URL, XOR_API_KEY with XOR_BASE_URL, SUBQ_API_KEY, PERPLEXITY_API_KEY,
+   * CLOUDFLARE_API_KEY with CLOUDFLARE_ACCOUNT_ID, OPENAI_API_KEY, which does
+   * not count beside an OPENAI_BASE_URL, OPENAI_API_BASE or credentials.openai.baseURL naming a host other
+   * than https://api.openai.com, or SCALEDOWN_API_KEY) and "heuristic" otherwise.
+   */
+  classifierStrategy?: string;
+  /**
+   * Minimum confidence required to route UP to a costlier model
+   * (--classifier-min-upgrade-confidence). Only meaningful for "jev", whose
+   * confidence is calibrated. Default: 0.3.
+   */
+  classifierMinUpgradeConfidence?: number;
+  /**
+   * Minimum confidence required to route DOWN to a cheaper model
+   * (--classifier-min-downgrade-confidence). Higher than the upgrade bar
+   * because the mistakes cost differently. Default: 0.6.
+   */
+  classifierMinDowngradeConfidence?: number;
+  /** LLM-classifier provider override (--classifier-model-provider). */
+  classifierModelProvider?: string;
+  /** LLM-classifier model override (--classifier-model-name). */
+  classifierModelName?: string;
+  /** LLM-classifier region override (--classifier-model-region). */
+  classifierModelRegion?: string;
+  /**
+   * Path to a JSON file OR inline JSON array of pool members
+   * (--classifier-pool). Each entry: { provider, model?, region?, description?,
+   * tiers?, cost?, quality?, capabilities?, id? }.
+   */
+  classifierPool?: string;
+  /** LLM-classifier hard timeout in ms (--classifier-timeout). */
+  classifierTimeout?: number;
+};
+
+/**
+ * `neurolink voices` arguments — TTS voice discovery.
+ */
+export type CliVoicesCommandArgs = {
+  /** TTS provider whose voices to list (e.g. google-ai, openai-tts). */
+  provider: string;
+  /** Optional language filter passed through to the provider (e.g. en-US). */
+  language?: string;
+  /** Emit the raw list as JSON instead of a table. */
+  json?: boolean;
+};
+
+/**
+ * Agent command arguments for multi-agent orchestration
+ */
+export type CliAgentCommandArgs = BaseCommandArgs & {
+  /** Agent ID */
+  id?: string;
+  /** Agent name */
+  name?: string;
+  /** Agent description */
+  description?: string;
+  /** Agent instructions/system prompt */
+  instructions?: string;
+  /** AI provider to use */
+  provider?: string;
+  /** Model name */
+  model?: string;
+  /** Tools available to the agent */
+  tools?: string[];
+  /** Maximum execution steps */
+  maxSteps?: number;
+  /** Temperature setting */
+  temperature?: number;
+  /** Input prompt for execution */
+  input?: string;
+  /** Context data as JSON */
+  context?: string;
+  /** Agent definition file path */
+  file?: string;
+  /** Output file path */
+  output?: string;
+  /** Enable streaming output */
+  stream?: boolean;
+  /** Show detailed information */
+  detailed?: boolean;
+};
+
+/**
+ * Network command arguments for agent network orchestration
+ */
+export type CliNetworkCommandArgs = BaseCommandArgs & {
+  /** Network ID */
+  id?: string;
+  /** Network name */
+  name?: string;
+  /** Network description */
+  description?: string;
+  /** Network configuration file path */
+  file?: string;
+  /** Input message for execution */
+  input?: string;
+  /** Maximum execution steps */
+  maxSteps?: number;
+  /** Execution timeout in ms */
+  timeout?: number;
+  /** Context data as JSON */
+  context?: string;
+  /** Output file path */
+  output?: string;
+  /** Enable streaming output */
+  stream?: boolean;
+  /** Router provider */
+  routerProvider?: string;
+  /** Router model */
+  routerModel?: string;
+  /** Show detailed information */
+  detailed?: boolean;
+};
+
+/**
+ * A single audio-player invocation for CLI TTS playback: a binary plus its
+ * arguments for `execFile`. The player list is tried in order until one
+ * succeeds (see `src/cli/utils/audioPlayer.ts`).
+ */
+export type CliAudioPlayerCommand = {
+  command: string;
+  args: string[];
+};
+
+// =============================================================================
+// CLI INPUT VALIDATION (from cli/utils/inputValidation.ts)
+// =============================================================================
+
+/**
+ * The CLI flags validated by `validateCliInputFiles` before a
+ * generate/stream/batch run starts (--image/--csv/--pdf/--video/--file).
+ */
+export type CliValidatedFileOption =
+  | "--image"
+  | "--csv"
+  | "--pdf"
+  | "--video"
+  | "--file";
+
+/** Actions accepted by `neurolink proxy share`. */
+export type ProxyShareCliAction =
+  | "create"
+  | "list"
+  | "status"
+  | "pause"
+  | "resume"
+  | "revoke"
+  | "topup"
+  | "set"
+  | "link"
+  | "rotate"
+  | "level"
+  | "provision"
+  | "url"
+  | "note"
+  | "notes"
+  | "receipts"
+  | "delete";
+
+/** Named starting points for a grant's gate set. */
+export type ProxySharePresetName = "spare" | "spillover" | "metered" | "open";
+
+export type ProxyShareArgs = {
+  action?: ProxyShareCliAction;
+  /** Positional argument for actions that take one, e.g. `share url <url>`. */
+  value?: string;
+  /** `share url --clear`: forget this node's recorded public address. */
+  clear?: boolean;
+  peer?: string;
+  /** Lender account a complete share is minted from, for drift auditing. */
+  fromAccount?: string;
+  /** Authorization code from the lender's browser, for split provisioning. */
+  code?: string;
+  /** `share note`: how long the note stays redeemable. */
+  ttl?: string;
+  /** `share note`: free-text note carried on the coin note itself. */
+  memo?: string;
+  /** Complete-mode lease shape. */
+  offlineGrace?: string;
+  heartbeat?: string;
+  leaseTtl?: string;
+  /** Public URL this node is reachable at, used to mint a share link. */
+  publicUrl?: string;
+  level?: string;
+  preset?: string;
+  ledger?: string;
+  coins?: number;
+  refill?: string;
+  maxSlice?: string;
+  maxSlicePerAccount?: string;
+  reserve?: string;
+  spillover?: string;
+  models?: string[];
+  accounts?: string[];
+  rate?: string;
+  concurrency?: number;
+  schedule?: string;
+  expires?: string;
+  note?: string;
+  to?: string;
+  json?: boolean;
+  dev?: boolean;
+};
+
+export type ProxyExposeArgs = {
+  port?: number;
+  host?: string;
+  named?: string;
+  force?: boolean;
+};
+
+/** What `proxy expose` learned by asking the running proxy directly. */
+export type ProxyGateProbe = {
+  gated: boolean;
+  reachable: boolean;
+  detail: string;
+};

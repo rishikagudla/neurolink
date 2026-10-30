@@ -8,11 +8,11 @@ NeuroLink offers a simpler, more production-ready alternative to LangChain with 
 | ----------------------- | ------------------------------------------- | -------------------------------------------------- |
 | **TypeScript Support**  | Partial, many type issues                   | Full native TypeScript, complete type safety       |
 | **API Complexity**      | Complex chains, agents, memory abstractions | Single unified `generate()` API                    |
-| **Provider Support**    | Requires separate packages                  | 13 providers built-in, single package              |
+| **Provider Support**    | Requires separate packages                  | Supported providers built in, one package          |
 | **Enterprise Features** | Limited                                     | HITL workflows, Redis memory, middleware, failover |
 | **MCP Integration**     | None                                        | Native 58+ MCP servers with zero config            |
 | **Bundle Size**         | Large (many dependencies)                   | Optimized, tree-shakeable                          |
-| **Production Ready**    | Community-driven                            | Battle-tested at Juspay (enterprise scale)         |
+| **Production Ready**    | Community-driven                            | In production use at Juspay                        |
 
 **Migration time:** Most applications can migrate in 1-2 hours, with full feature parity and improved capabilities.
 
@@ -129,7 +129,7 @@ const result2 = await neurolink.generate({
 **Benefits:**
 
 - No separate packages for each provider
-- Consistent API across all 13 providers
+- Consistent API across supported providers
 - Runtime provider switching
 - Automatic failover
 
@@ -335,21 +335,23 @@ import { NeuroLink } from "@juspay/neurolink";
 
 const neurolink = new NeuroLink({ provider: "openai" });
 
-// Use middleware for callbacks
-neurolink.useMiddleware({
-  name: "logging",
-  requestHook: async (options) => {
-    console.log("Request:", options);
-    return options;
-  },
-  responseHook: async (result) => {
+// Use middleware for callbacks: pass it per call and enable it by id
+const loggingMiddleware = {
+  metadata: { id: "logging", name: "Request logging" },
+  wrapGenerate: async ({ doGenerate, params }) => {
+    console.log("Request:", params);
+    const result = await doGenerate();
     console.log("Response:", result);
     return result;
   },
-});
+};
 
 await neurolink.generate({
   input: { text: "Hello" },
+  middleware: {
+    middleware: [loggingMiddleware],
+    enabledMiddleware: ["logging"],
+  },
 });
 ```
 
@@ -358,14 +360,21 @@ await neurolink.generate({
 ```typescript
 import { NeuroLink } from "@juspay/neurolink";
 
-const neurolink = new NeuroLink({
+const neurolink = new NeuroLink();
+
+const result = await neurolink.generate({
+  input: { text: "Hello" },
   provider: "openai",
   middleware: {
-    analytics: { enabled: true },
-    autoEvaluation: { enabled: true },
+    middlewareConfig: {
+      analytics: { enabled: true },
+      autoEvaluation: { enabled: true },
+    },
   },
 });
 ```
+
+`autoEvaluation` scores each response with a judge model, which defaults to Vertex, so this call fails without Google credentials. Point the judge at a provider you have with `config: { provider: "openai" }` under `autoEvaluation`, or set `blocking: false` to let the call succeed when the judge fails.
 
 **Benefits:**
 
@@ -497,7 +506,7 @@ while (true) {
 }
 
 // Export conversation history
-const history = await neurolink.exportConversation({
+const history = await neurolink.exportAllSessions(undefined, {
   format: "json",
 });
 ```
@@ -634,7 +643,7 @@ for await (const chunk of result.stream!) {
 **Benefits:**
 
 - Simpler streaming API
-- Consistent across all providers
+- Consistent streaming API across supported providers
 - Built-in error handling
 
 ---

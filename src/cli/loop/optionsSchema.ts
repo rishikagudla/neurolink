@@ -1,7 +1,8 @@
 import { AIProviderName } from "../../lib/constants/enums.js";
-import type { TextGenerationOptions } from "../../lib/types/generateTypes.js";
-import type { OptionSchema } from "../../lib/types/cli.js";
-
+import type {
+  OptionSchema,
+  TextGenerationOptions,
+} from "../../lib/types/index.js";
 /**
  * Master schema for all text generation options.
  * This object provides metadata for validation and help text in the CLI loop.
@@ -25,8 +26,32 @@ export const textGenerationOptionsSchema: Record<
     | "evaluationCriteria"
     | "region"
     | "csvOptions"
+    | "pdfOptions"
+    | "imageOptions"
+    | "audioOptions" // Complex object (#413); SDK-only via GenerateOptions.audioOptions — no --audio-* flags exist yet, not `/set`
+    | "videoOptions" // Complex object, not set via simple CLI commands
+    | "officeOptions"
     | "tts"
+    | "stt" // Complex object, set via --stt* flags
     | "thinkingConfig" // Complex object, use thinking/thinkingBudget instead
+    | "requestId" // Observability ID, not CLI-settable
+    | "fileRegistry" // Internal: set by SDK, not by CLI
+    | "attachmentPolicy" // Internal: set by SDK, not by CLI
+    | "abortSignal" // Runtime object, not CLI-settable
+    | "toolFilter" // Array type, not simple CLI option
+    | "excludeTools" // Array type, not simple CLI option
+    | "toolChoice" // Complex type, not suitable for simple CLI input
+    | "prepareStep" // Callback function, only usable via SDK
+    | "credentials" // Complex per-provider object, only usable via SDK
+    | "onFinish" // Lifecycle callback, only usable via SDK
+    | "onError" // Lifecycle callback, only usable via SDK
+    | "processors" // Complex I/O processor config, only usable via SDK
+    | "piiDetection" // Complex config, wired via CLI flags instead
+    | "responseValidation" // Complex config, wired via CLI flags instead
+    | "inputValidation" // Complex config, wired via CLI flags instead
+    | "toolExecutionCapture" // Complex config object, only usable via SDK
+    | "toolExecutionRecorder" // Internal: set by BaseProvider, not by CLI
+    | "toolRoots" // Array type; set with --tool-root at session start
   >,
   OptionSchema
 > = {
@@ -49,6 +74,26 @@ export const textGenerationOptionsSchema: Record<
     type: "number",
     description: "The maximum number of tokens to generate.",
   },
+  compactionThreshold: {
+    type: "number",
+    description:
+      "Fraction of the context window (0-1) at which history is compacted. Default 0.8.",
+  },
+  topP: {
+    type: "number",
+    description:
+      "Top-p (nucleus) sampling parameter. Controls diversity of generated tokens (0.0-1.0).",
+  },
+  topK: {
+    type: "number",
+    description:
+      "Top-k sampling parameter. Limits the number of tokens considered (Google/Gemini models only).",
+  },
+  stopSequences: {
+    type: "string",
+    description:
+      "Stop sequences that will halt generation when encountered (comma-separated).",
+  },
   output: {
     type: "string",
     description:
@@ -63,13 +108,49 @@ export const textGenerationOptionsSchema: Record<
     type: "number",
     description: "Timeout for the generation request in milliseconds.",
   },
+  turnTimeoutMs: {
+    type: "number",
+    description:
+      "Wall-clock cap for the whole agentic turn in milliseconds (all steps + tool executions).",
+  },
+  stallTimeoutMs: {
+    type: "number",
+    description:
+      "Maximum time with no progress (no chunk, no tool activity) before the turn ends as stalled, in milliseconds.",
+  },
+  wrapupTimeLeadMs: {
+    type: "number",
+    description:
+      "Remaining-turn-time threshold that triggers a wrap-up nudge to the model, in milliseconds.",
+  },
+  toolTimeoutMs: {
+    type: "number",
+    description:
+      "Per-tool-execution timeout in milliseconds (default 300000). A timed-out tool fails that step; the turn continues.",
+  },
   disableTools: {
     type: "boolean",
     description: "Disable all tool usage for the AI.",
   },
+  enabledToolNames: {
+    type: "string",
+    description:
+      'Comma-separated list of tool names to enable (e.g., "read,write,search").',
+  },
   maxSteps: {
     type: "number",
     description: "Maximum number of tool execution steps.",
+  },
+  toolChoiceSteps: {
+    type: "number",
+    description:
+      "Leading steps a forced toolChoice (required / named tool) stays in force before the model chooses (default 1).",
+  },
+  replayToolSteps: {
+    type: "string",
+    description:
+      "How stored tool steps are replayed into the prompt: full, marker (default) or off.",
+    allowedValues: ["full", "marker", "off"],
   },
   enableAnalytics: {
     type: "boolean",
@@ -106,5 +187,25 @@ export const textGenerationOptionsSchema: Record<
     description:
       "Thinking level for Gemini 3 models: minimal, low, medium, high.",
     allowedValues: ["minimal", "low", "medium", "high"],
+  },
+  skipToolPromptInjection: {
+    type: "boolean",
+    description:
+      "Skip injecting tool descriptions into the system prompt. Useful when tool info is already provided.",
+  },
+  disableToolCache: {
+    type: "boolean",
+    description:
+      "Disable tool result caching for this request (overrides global mcp.cache.enabled).",
+  },
+  disableInternalFallback: {
+    type: "boolean",
+    description:
+      "Own fallback order yourself: skip NeuroLink's provider-priority walk and the catalog model fallback, so an invalid model or unavailable provider surfaces as its own error.",
+  },
+  disableToolCallRepair: {
+    type: "boolean",
+    description:
+      "Disable the schema-driven tool call repair mechanism (near-miss tool names, mis-typed arguments). Repair is enabled by default.",
   },
 };

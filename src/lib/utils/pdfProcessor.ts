@@ -5,17 +5,26 @@
  * - Native PDF support for providers that accept PDF directly (Google AI, Vertex, OpenAI, Anthropic, Bedrock)
  * - PDF → Image conversion for providers that don't support native PDF (Azure, Mistral, Ollama)
  *
- * The conversion uses pdf-to-img package (MuPDF-based) for high-quality conversion.
+ * Page counting, text extraction and page rendering all go through pdf-parse,
+ * so the process only ever loads pdf-parse's pdfjs-dist. pdfjs keeps its Node
+ * worker in a process-wide global, and a second pdfjs version fails its
+ * API-vs-Worker version check against whichever copy loaded first.
  */
 
+import { createRequire } from "node:module";
+import path from "node:path";
+import { PDF_LIMITS } from "../core/constants.js";
 import type {
   FileProcessingResult,
-  PDFProviderConfig,
   PDFProcessorOptions,
-} from "../types/fileTypes.js";
-import { PDF_LIMITS } from "../core/constants.js";
-import { logger } from "./logger.js";
+  PDFProviderConfig,
+  PDFImageConversionOptions,
+  PDFImageConversionResult,
+  PDFImagePage,
+  PDFRenderDocument,
+} from "../types/index.js";
 import { ErrorFactory } from "./errorHandling.js";
+import { logger } from "./logger.js";
 
 /**
  * Provider configurations for PDF handling
@@ -98,14 +107,14 @@ const PDF_PROVIDER_CONFIGS: Record<string, PDFProviderConfig> = {
   litellm: {
     maxSizeMB: 10,
     maxPages: 100,
-    supportsNative: true,
+    supportsNative: false, // LiteLLM is a proxy — underlying model may not support native PDF; default to safe text extraction
     requiresCitations: false,
     apiType: "files-api",
   },
   "openai-compatible": {
     maxSizeMB: 10,
     maxPages: 100,
-    supportsNative: true,
+    supportsNative: false,
     requiresCitations: false,
     apiType: "files-api",
   },
@@ -132,32 +141,6 @@ const PDF_PROVIDER_CONFIGS: Record<string, PDFProviderConfig> = {
   },
 };
 
-/**
- * Options for PDF to image conversion
- */
-export type PDFImageConversionOptions = {
-  /** Scale factor for image quality (1-4, default: 2) */
-  scale?: number;
-  /** Maximum number of pages to convert (default: 20 from PDF_LIMITS.DEFAULT_MAX_PAGES) */
-  maxPages?: number;
-  /** Output format (png or jpeg, default: png). Note: pdf-to-img outputs PNG, JPEG conversion would require additional processing */
-  format?: "png" | "jpeg";
-};
-
-/**
- * Result of PDF to image conversion
- */
-export type PDFImageConversionResult = {
-  /** Array of base64-encoded PNG images (one per page) */
-  images: string[];
-  /** Number of pages converted */
-  pageCount: number;
-  /** Total conversion time in milliseconds */
-  conversionTimeMs: number;
-  /** Any warnings during conversion */
-  warnings?: string[];
-};
-
 export class PDFProcessor {
   // PDF magic bytes: %PDF-
   private static readonly PDF_SIGNATURE = Buffer.from("%PDF-", "ascii");
@@ -173,7 +156,7 @@ export class PDFProcessor {
     const provider = (options?.provider || "unknown").toLowerCase();
     const config = PDF_PROVIDER_CONFIGS[provider];
 
-    if (!this.isValidPDF(content)) {
+    if (!PDFProcessor.isValidPDF(content)) {
       throw new Error(
         "Invalid PDF file format. File must start with %PDF- header.",
       );
@@ -199,7 +182,15 @@ export class PDFProcessor {
       );
     }
 
-    const metadata = this.extractBasicMetadata(content);
+    const metadata = PDFProcessor.extractBasicMetadata(content);
+
+    // #287: prefer an accurate page count (pdf-parse/pdfjs) over the unreliable
+    // header regex for both limit enforcement and returned metadata; fall back
+    // to the regex estimate when the accurate probe times out or fails.
+    const accuratePages = await PDFProcessor.getAccuratePageCount(content);
+    if (accuratePages !== null) {
+      metadata.estimatedPages = accuratePages;
+    }
 
     if (metadata.estimatedPages && metadata.estimatedPages > config.maxPages) {
       const enforceLimits = options?.enforceLimits !== false;
@@ -247,6 +238,10 @@ export class PDFProcessor {
         ...metadata,
         provider,
         apiType: config.apiType,
+        // #349: surface the provider's citations requirement so downstream
+        // provider adapters (e.g. Bedrock Converse document blocks) can act on
+        // it, instead of the config field being read nowhere.
+        requiresCitations: config.requiresCitations,
       },
     };
   }
@@ -266,14 +261,36 @@ export class PDFProcessor {
     return PDF_PROVIDER_CONFIGS[provider] || null;
   }
 
+  /**
+   * Best-effort page count for a PDF whose count the caller did not supply
+   * (#309). Mirrors what `process()` derives for the `input.pdfFiles` path:
+   * the accurate pdfjs count when the document parses, otherwise the header
+   * regex estimate. Returns null when neither can determine a count.
+   *
+   * Exists so the aggregate page-limit guard can enforce against PDFs handed
+   * in via `input.content`, where `metadata.pages` is optional and routinely
+   * omitted — without it, an absent count silently sums as zero.
+   */
+  static async resolvePageCount(buffer: Buffer): Promise<number | null> {
+    const accurate = await PDFProcessor.getAccuratePageCount(buffer);
+    if (accurate !== null) {
+      return accurate;
+    }
+    return PDFProcessor.extractBasicMetadata(buffer).estimatedPages;
+  }
+
   private static isValidPDF(buffer: Buffer): boolean {
     if (buffer.length < 5) {
       return false;
     }
-    return buffer.subarray(0, 5).equals(this.PDF_SIGNATURE);
+    return buffer.subarray(0, 5).equals(PDFProcessor.PDF_SIGNATURE);
   }
 
-  private static extractBasicMetadata(buffer: Buffer) {
+  private static extractBasicMetadata(buffer: Buffer): {
+    version: string;
+    estimatedPages: number | null;
+    filename: undefined;
+  } {
     const headerSize = Math.min(10000, buffer.length);
     const header = buffer.toString("utf-8", 0, headerSize);
 
@@ -290,6 +307,151 @@ export class PDFProcessor {
     };
   }
 
+  /**
+   * Accurate page count via pdf-parse (pdfjs) (#287). The header regex in
+   * `extractBasicMetadata` only sees plaintext `/Type /Page` markers and misses
+   * compressed/object-stream PDFs (and miscounts when a page dict spans a chunk
+   * boundary). This parses the document properly, bounded by a timeout so a
+   * pathological PDF can't block; returns null on timeout/failure so the caller
+   * falls back to the regex estimate.
+   */
+  private static async getAccuratePageCount(
+    buffer: Buffer,
+  ): Promise<number | null> {
+    try {
+      const { PDFParse } = await import("pdf-parse");
+      const pdf = new PDFParse({ data: new Uint8Array(buffer) });
+      // Captured outside the try so the `finally` below can always clear it
+      // — otherwise a `getInfo()` that wins the race leaves this timer
+      // running until PAGE_COUNT_TIMEOUT_MS fires for nothing. `.unref()`
+      // so it can never itself hold the process open in the meantime.
+      let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const info = await Promise.race([
+          pdf.getInfo(),
+          new Promise<never>((_, reject) => {
+            timeoutHandle = setTimeout(
+              () => reject(new Error("page-count timeout")),
+              PDF_LIMITS.PAGE_COUNT_TIMEOUT_MS,
+            );
+            timeoutHandle.unref?.();
+          }),
+        ]);
+        const total = (info as { total?: number }).total;
+        return typeof total === "number" && total > 0 ? total : null;
+      } finally {
+        if (timeoutHandle !== undefined) {
+          clearTimeout(timeoutHandle);
+        }
+        try {
+          // Optional call: guards against a runtime pdf-parse version whose
+          // instances lack destroy(), while the typed v2 class declares it.
+          await pdf.destroy?.();
+        } catch {
+          // A throwing destroy() must not discard an otherwise-valid page
+          // count returned above (matches fileReferenceRegistry.ts's
+          // pdf.destroy() cleanup pattern) — swallow it.
+        }
+      }
+    } catch (error) {
+      logger.debug(
+        `[PDF] Accurate page count unavailable; using regex estimate: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Font and CMap directories of the pdfjs-dist copy pdf-parse itself loads,
+   * so non-embedded standard fonts and CJK text render instead of dropping
+   * out. Resolved from pdf-parse's location, never our own, to stay on that
+   * single copy. Undefined when resolution fails; rendering still works, with
+   * pdfjs falling back to its built-in font substitution.
+   */
+  private static pdfjsAssetDirs:
+    | { standardFontDataUrl: string; cMapUrl: string }
+    | null
+    | undefined;
+
+  private static resolvePdfjsAssetDirs():
+    | { standardFontDataUrl: string; cMapUrl: string }
+    | undefined {
+    if (PDFProcessor.pdfjsAssetDirs === undefined) {
+      try {
+        const pdfParseEntry = createRequire(import.meta.url).resolve(
+          "pdf-parse",
+        );
+        const pdfjsRoot = path.dirname(
+          createRequire(pdfParseEntry).resolve("pdfjs-dist/package.json"),
+        );
+        PDFProcessor.pdfjsAssetDirs = {
+          standardFontDataUrl:
+            path.join(pdfjsRoot, "standard_fonts") + path.sep,
+          cMapUrl: path.join(pdfjsRoot, "cmaps") + path.sep,
+        };
+      } catch (error) {
+        logger.debug(
+          `[PDF→Image] pdfjs font/CMap directories unavailable: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        PDFProcessor.pdfjsAssetDirs = null;
+      }
+    }
+    return PDFProcessor.pdfjsAssetDirs ?? undefined;
+  }
+
+  /**
+   * Open a PDF for page-by-page PNG rendering through pdf-parse. Rejects with
+   * pdf-parse's PasswordException for encrypted PDFs (#258), which the callers
+   * map to typed errors.
+   */
+  private static async openForRendering(
+    pdfBuffer: Buffer,
+    scale: number,
+    password?: string,
+  ): Promise<PDFRenderDocument> {
+    const { PDFParse } = await import("pdf-parse");
+    const parser = new PDFParse({
+      data: new Uint8Array(pdfBuffer),
+      isEvalSupported: false,
+      cMapPacked: true,
+      ...PDFProcessor.resolvePdfjsAssetDirs(),
+      ...(password ? { password } : {}),
+    });
+    try {
+      const { total } = await parser.getInfo();
+      return {
+        length: total,
+        getPage: async (pageNumber: number): Promise<Buffer> => {
+          const shot = await parser.getScreenshot({
+            partial: [pageNumber],
+            scale,
+            imageBuffer: true,
+            imageDataUrl: false,
+          });
+          const page = shot.pages[0];
+          if (!page || page.data.length === 0) {
+            throw new Error(`page ${pageNumber} rendered no image data`);
+          }
+          return Buffer.from(page.data);
+        },
+        destroy: async (): Promise<void> => {
+          await parser.destroy().catch(() => {
+            /* cleanup - ignore destroy errors */
+          });
+        },
+      };
+    } catch (error) {
+      await parser.destroy().catch(() => {
+        /* cleanup - ignore destroy errors */
+      });
+      throw error;
+    }
+  }
+
   static estimateTokens(
     pageCount: number,
     mode: "text-only" | "visual" = "visual",
@@ -304,6 +466,42 @@ export class PDFProcessor {
   // ============================================================================
   // PDF → Image Conversion (for providers without native PDF support)
   // ============================================================================
+
+  /**
+   * Estimate the largest page's rendered pixel count from the PDF's MediaBox
+   * entries, WITHOUT rendering (#260). Parses `/MediaBox [llx lly urx ury]`
+   * (dimensions in points); rendered pixels ≈ (width·scale)·(height·scale).
+   * Returns 0 when no plaintext MediaBox is found (e.g. compressed object
+   * streams) — the caller then skips downscaling, matching prior behavior.
+   *
+   * A crafted/malformed MediaBox can have finite but astronomically large
+   * width/height; `width * height * scale * scale` can then overflow past
+   * `Number.MAX_VALUE` to `Infinity`. Clamp the product to
+   * `Number.MAX_SAFE_INTEGER` so it stays finite — a large-but-finite pixel
+   * estimate still triggers downscaling, whereas `Infinity` would collapse
+   * the computed downscale factor to 0 (see `convertToImages`).
+   */
+  private static largestPagePixels(pdfBuffer: Buffer, scale: number): number {
+    const text = pdfBuffer.toString("latin1");
+    const re =
+      /\/MediaBox\s*\[\s*(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s*\]/g;
+    let max = 0;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(text)) !== null) {
+      const width = Math.abs(parseFloat(match[3]) - parseFloat(match[1]));
+      const height = Math.abs(parseFloat(match[4]) - parseFloat(match[2]));
+      if (Number.isFinite(width) && Number.isFinite(height)) {
+        const pixels = width * height * scale * scale;
+        const boundedPixels = Number.isFinite(pixels)
+          ? Math.min(pixels, Number.MAX_SAFE_INTEGER)
+          : Number.MAX_SAFE_INTEGER;
+        if (boundedPixels > max) {
+          max = boundedPixels;
+        }
+      }
+    }
+    return max;
+  }
 
   /**
    * Convert a PDF buffer to an array of base64 PNG images
@@ -335,50 +533,24 @@ export class PDFProcessor {
   ): Promise<PDFImageConversionResult> {
     const startTime = Date.now();
     const {
-      scale = 2,
+      scale = PDF_LIMITS.DEFAULT_SCALE,
       maxPages = PDF_LIMITS.DEFAULT_MAX_PAGES,
       format = "png",
+      maxCanvasPixels = PDF_LIMITS.DEFAULT_MAX_CANVAS_PIXELS,
+      password,
+      onProgress,
     } = options || {};
     const images: string[] = [];
     const warnings: string[] = [];
+    const pageErrors: Array<{ page: number; error: string }> = [];
 
-    // ============================================================================
-    // INPUT VALIDATION (Security: Prevent malformed/malicious PDF processing)
-    // ============================================================================
-
-    // 0. Validate format is supported and case-sensitive
-    const SUPPORTED_FORMATS = ["png", "jpeg"] as const;
-    type SupportedFormat = (typeof SUPPORTED_FORMATS)[number];
-    if (!SUPPORTED_FORMATS.includes(format as SupportedFormat)) {
-      throw new Error(
-        `Invalid format: "${format}". Supported formats: "png", "jpeg".`,
-      );
-    }
-
-    // 1. Validate buffer is not empty or too small
-    if (!pdfBuffer || pdfBuffer.length < 5) {
-      throw new Error(
-        "Invalid PDF: Buffer is too small or empty. " +
-          "A valid PDF must be at least 5 bytes (PDF header).",
-      );
-    }
-
-    // 2. Validate PDF magic bytes (%PDF-)
-    if (!this.isValidPDF(pdfBuffer)) {
-      throw new Error(
-        "Invalid PDF: File must start with %PDF- header. " +
-          "The provided buffer does not appear to be a valid PDF file.",
-      );
-    }
-
-    // 3. Validate maximum buffer size to prevent memory exhaustion
-    const sizeMB = pdfBuffer.length / (1024 * 1024);
-    if (sizeMB > PDF_LIMITS.MAX_SIZE_MB) {
-      throw new Error(
-        `PDF too large for image conversion: ${sizeMB.toFixed(2)}MB exceeds ${PDF_LIMITS.MAX_SIZE_MB}MB limit. ` +
-          "Consider splitting the PDF or using a provider with native PDF support.",
-      );
-    }
+    // Validation shared with convertToImagesStream (#302).
+    const sizeMB = PDFProcessor.validateImageConversionInput(pdfBuffer, {
+      format,
+      scale,
+      maxCanvasPixels,
+      maxPages,
+    });
 
     logger.debug("[PDF→Image] ✅ PDF validation passed", {
       bufferSize: pdfBuffer.length,
@@ -386,45 +558,122 @@ export class PDFProcessor {
       maxPages,
     });
 
-    try {
-      // Dynamic import to avoid loading MuPDF binaries until needed
-      const pdfToImgModule = await import("pdf-to-img");
-      const pdf = pdfToImgModule.pdf;
+    // #297: surface an up-front memory estimate so an operator can spot a
+    // conversion that will allocate a lot before it runs. Uses the cheap regex
+    // page estimate (the accurate pdf-parse count runs in process(), not here).
+    const estimatedPages = Math.max(
+      1,
+      PDFProcessor.extractBasicMetadata(pdfBuffer).estimatedPages ?? 1,
+    );
+    const estimatedMemoryMB = PDFProcessor.estimateConversionMemoryUsage(
+      pdfBuffer.length,
+      estimatedPages,
+      scale,
+    );
+    logger.info("[PDF→Image] Estimated memory usage before conversion", {
+      scale,
+      estimatedPages,
+      estimatedMemoryMB,
+      sizeMB: Number(sizeMB.toFixed(2)),
+    });
 
+    let document: PDFRenderDocument | undefined;
+    try {
       logger.debug("[PDF→Image] Starting PDF to image conversion", {
         bufferSize: pdfBuffer.length,
         scale,
         maxPages: maxPages || "all",
       });
 
-      // Create PDF document iterator
-      const document = await pdf(pdfBuffer, { scale });
+      // #260: pre-flight page-size check WITHOUT rendering. The renderer applies
+      // `scale` uniformly with no per-page hook and no pixel guard, so a very
+      // large page (e.g. an architectural drawing with a huge MediaBox) can
+      // allocate gigabytes of canvas. Read the largest MediaBox from the PDF
+      // bytes and, if that page at the requested scale would exceed
+      // maxCanvasPixels, downscale the whole render uniformly to stay under it.
+      let effectiveScale = scale;
+      const largestPixels = PDFProcessor.largestPagePixels(pdfBuffer, scale);
+      if (largestPixels > maxCanvasPixels) {
+        const downscale = Math.sqrt(maxCanvasPixels / largestPixels);
+        // Floor the result: an astronomically large (but now finite, see
+        // `largestPagePixels`) pixel estimate would otherwise push `downscale`
+        // — and therefore `effectiveScale` — toward 0, handing the renderer a
+        // degenerate viewport instead of a small-but-renderable page.
+        effectiveScale = Math.max(
+          PDF_LIMITS.MIN_EFFECTIVE_SCALE,
+          scale * downscale,
+        );
+        // Recompute the ratio actually applied (may differ from `downscale`
+        // when the floor above kicks in) so the logged estimate stays honest.
+        const actualDownscale = effectiveScale / scale;
+        const beforeMB = (largestPixels * 4) / (1024 * 1024);
+        const afterMB =
+          (largestPixels * actualDownscale * actualDownscale * 4) /
+          (1024 * 1024);
+        const msg =
+          `Downscaled render (scale ${scale} → ${effectiveScale.toFixed(3)}): ` +
+          `the largest page would allocate ~${beforeMB.toFixed(0)}MB, above the ` +
+          `maxCanvasPixels ceiling; reduced to ~${afterMB.toFixed(0)}MB per page.`;
+        logger.warn(`[PDF→Image] ⚠️ ${msg}`);
+        warnings.push(msg);
+      }
 
-      let pageIndex = 0;
+      // Password forwarded for encrypted PDFs (#258). An indexed getPage()
+      // loop lets one bad page be isolated instead of aborting all.
+      document = await PDFProcessor.openForRendering(
+        pdfBuffer,
+        effectiveScale,
+        password,
+      );
 
-      // Iterate through pages and convert to base64
-      for await (const page of document) {
-        // Check if we've reached the max pages limit
-        if (maxPages !== undefined && pageIndex >= maxPages) {
+      const totalPages: number = document.length;
+
+      // #294: convert page-by-page with per-page isolation. A single page whose
+      // canvas render throws (e.g. a degenerate MediaBox) no longer discards
+      // every already-converted page — it is recorded in `errors` and the rest
+      // continue.
+      for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
+        if (maxPages !== undefined && pageNum - 1 >= maxPages) {
           warnings.push(
-            `Stopped at page ${pageIndex} (maxPages limit: ${maxPages})`,
+            `Stopped at page ${pageNum - 1} (maxPages limit: ${maxPages})`,
           );
           break;
         }
-
-        // Convert PNG buffer to base64
-        const base64Image = page.toString("base64");
-        images.push(base64Image);
-        pageIndex++;
-
-        logger.debug(`[PDF→Image] Converted page ${pageIndex}`, {
-          imageSizeBytes: page.length,
-          base64Length: base64Image.length,
-        });
+        try {
+          const page = await document.getPage(pageNum);
+          const base64Image = page.toString("base64");
+          images.push(base64Image);
+          logger.debug(`[PDF→Image] Converted page ${pageNum}`, {
+            imageSizeBytes: page.length,
+            base64Length: base64Image.length,
+          });
+          // #302: report progress after each successfully converted page.
+          if (onProgress) {
+            await onProgress({
+              pagesConverted: images.length,
+              totalPages,
+              elapsedMs: Date.now() - startTime,
+            });
+          }
+        } catch (pageError) {
+          const msg =
+            pageError instanceof Error ? pageError.message : String(pageError);
+          logger.warn(
+            `[PDF→Image] ⚠️ page ${pageNum} failed to render: ${msg}`,
+          );
+          pageErrors.push({ page: pageNum, error: msg });
+        }
       }
 
-      // Check for empty PDF (0 pages)
+      // Empty PDF (0 pages) or every page failed → treat as a conversion
+      // failure (kept inside the try so the password/format mapping below still
+      // applies), otherwise return the pages that did convert.
       if (images.length === 0) {
+        if (pageErrors.length > 0) {
+          throw new Error(
+            `All ${pageErrors.length} page(s) failed to render. First error: ${pageErrors[0].error}`,
+          );
+        }
         throw new Error("PDF has 0 pages. Cannot convert empty PDF to images.");
       }
 
@@ -432,6 +681,7 @@ export class PDFProcessor {
 
       logger.info("[PDF→Image] ✅ PDF conversion completed", {
         pageCount: images.length,
+        failedPages: pageErrors.length,
         conversionTimeMs,
         totalImageBytes: images.reduce((sum, img) => sum + img.length, 0),
       });
@@ -441,6 +691,7 @@ export class PDFProcessor {
         pageCount: images.length,
         conversionTimeMs,
         warnings: warnings.length > 0 ? warnings : undefined,
+        errors: pageErrors.length > 0 ? pageErrors : undefined,
       };
     } catch (error) {
       const conversionTimeMs = Date.now() - startTime;
@@ -452,7 +703,207 @@ export class PDFProcessor {
         conversionTimeMs,
       });
 
-      throw new Error(`PDF to image conversion failed: ${errorMessage}`);
+      // #258: map pdfjs's PasswordException to an actionable typed error so a
+      // caller learns to supply (or correct) the password instead of seeing a
+      // generic "conversion failed". pdfjs code 1 = NEED_PASSWORD, 2 = INCORRECT.
+      const pdfErr = error as { name?: string; code?: number };
+      if (
+        pdfErr?.name === "PasswordException" ||
+        /password/i.test(errorMessage)
+      ) {
+        const incorrect =
+          pdfErr.code === 2 || /incorrect|invalid/i.test(errorMessage);
+        throw incorrect
+          ? ErrorFactory.pdfIncorrectPassword()
+          : ErrorFactory.pdfPasswordRequired();
+      }
+
+      throw new Error(`PDF to image conversion failed: ${errorMessage}`, {
+        cause: error,
+      });
+    } finally {
+      await document?.destroy();
+    }
+  }
+
+  /**
+   * Shared input validation for the image-conversion paths. Returns the PDF
+   * size in MB (needed by the memory-estimate log). Throws on any invalid input
+   * with the same messages the batch path has always used.
+   */
+  private static validateImageConversionInput(
+    pdfBuffer: Buffer,
+    opts: {
+      format: string;
+      scale: number;
+      maxCanvasPixels: number;
+      maxPages?: number;
+    },
+  ): number {
+    if (opts.format !== "png") {
+      throw new Error(
+        `Invalid format: "${opts.format}". Only "png" format is currently supported.`,
+      );
+    }
+    if (
+      !Number.isFinite(opts.scale) ||
+      opts.scale < PDF_LIMITS.MIN_SCALE ||
+      opts.scale > PDF_LIMITS.MAX_SCALE
+    ) {
+      throw new Error(
+        `Invalid scale: ${opts.scale}. Scale must be a finite number between ${PDF_LIMITS.MIN_SCALE} and ${PDF_LIMITS.MAX_SCALE}.`,
+      );
+    }
+    if (!Number.isFinite(opts.maxCanvasPixels) || opts.maxCanvasPixels <= 0) {
+      throw new Error(
+        `Invalid maxCanvasPixels: ${opts.maxCanvasPixels}. Must be a finite number greater than 0.`,
+      );
+    }
+    // #297: maxPages became caller-controlled, and an unvalidated 0/-1/NaN
+    // silently converts nothing, surfacing later as a misleading
+    // "PDF has 0 pages" from deep inside the renderer. Reject it here where
+    // the message can still name the offending option.
+    if (
+      opts.maxPages !== undefined &&
+      (!Number.isInteger(opts.maxPages) || opts.maxPages < 1)
+    ) {
+      throw new Error(
+        `Invalid maxPages: ${opts.maxPages}. Must be a whole number of at least 1.`,
+      );
+    }
+    if (!pdfBuffer || pdfBuffer.length < 5) {
+      throw new Error(
+        "Invalid PDF: Buffer is too small or empty. " +
+          "A valid PDF must be at least 5 bytes (PDF header).",
+      );
+    }
+    if (!PDFProcessor.isValidPDF(pdfBuffer)) {
+      throw new Error(
+        "Invalid PDF: File must start with %PDF- header. " +
+          "The provided buffer does not appear to be a valid PDF file.",
+      );
+    }
+    const sizeMB = pdfBuffer.length / (1024 * 1024);
+    if (sizeMB > PDF_LIMITS.MAX_SIZE_MB) {
+      throw new Error(
+        `PDF too large for image conversion: ${sizeMB.toFixed(2)}MB exceeds ${PDF_LIMITS.MAX_SIZE_MB}MB limit. ` +
+          "Consider splitting the PDF or using a provider with native PDF support.",
+      );
+    }
+    return sizeMB;
+  }
+
+  /**
+   * Streaming variant of {@link convertToImages} (#302): yields each page's
+   * base64 PNG as soon as it renders instead of buffering the whole document,
+   * and reports progress via `options.onProgress`. A page that fails to render
+   * is yielded with `error` set (per-page isolation, #294) rather than aborting
+   * the stream.
+   *
+   * NOT a wrapper of/over {@link convertToImages}, despite the similar
+   * contract — the two are independent, parallel implementations (each does
+   * its own document open, downscale calculation, and page loop)
+   * rather than one delegating to the other. Keep behavior changes (page
+   * isolation, downscale, password handling) in sync across both by hand.
+   */
+  static async *convertToImagesStream(
+    pdfBuffer: Buffer,
+    options?: PDFImageConversionOptions,
+  ): AsyncGenerator<PDFImagePage, void, void> {
+    const startTime = Date.now();
+    const {
+      scale = PDF_LIMITS.DEFAULT_SCALE,
+      maxPages = PDF_LIMITS.DEFAULT_MAX_PAGES,
+      format = "png",
+      maxCanvasPixels = PDF_LIMITS.DEFAULT_MAX_CANVAS_PIXELS,
+      password,
+      onProgress,
+    } = options || {};
+
+    PDFProcessor.validateImageConversionInput(pdfBuffer, {
+      format,
+      scale,
+      maxCanvasPixels,
+      maxPages,
+    });
+
+    // #260: uniform downscale so the largest page stays under maxCanvasPixels.
+    let effectiveScale = scale;
+    const largestPixels = PDFProcessor.largestPagePixels(pdfBuffer, scale);
+    if (largestPixels > maxCanvasPixels) {
+      effectiveScale = scale * Math.sqrt(maxCanvasPixels / largestPixels);
+    }
+
+    // #258: map pdfjs's PasswordException to the same actionable typed error
+    // convertToImages raises — kept in sync per the class docstring above.
+    // Unlike the per-page loop below, a failure here happens before any page
+    // can be isolated, so it must reject the generator outright rather than
+    // being yielded as a page error.
+    let document: PDFRenderDocument;
+    try {
+      document = await PDFProcessor.openForRendering(
+        pdfBuffer,
+        effectiveScale,
+        password,
+      );
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : String(error);
+      const pdfErr = error as { name?: string; code?: number };
+      if (
+        pdfErr?.name === "PasswordException" ||
+        /password/i.test(errorMessage)
+      ) {
+        const incorrect =
+          pdfErr.code === 2 || /incorrect|invalid/i.test(errorMessage);
+        throw incorrect
+          ? ErrorFactory.pdfIncorrectPassword()
+          : ErrorFactory.pdfPasswordRequired();
+      }
+      throw new Error(`PDF to image conversion failed: ${errorMessage}`, {
+        cause: error,
+      });
+    }
+    const totalPages: number = document.length;
+    let converted = 0;
+
+    try {
+      for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
+        if (maxPages !== undefined && pageNum - 1 >= maxPages) {
+          break;
+        }
+        try {
+          const page = await document.getPage(pageNum);
+          const base64Image = page.toString("base64");
+          converted++;
+          if (onProgress) {
+            await onProgress({
+              pagesConverted: converted,
+              totalPages,
+              elapsedMs: Date.now() - startTime,
+            });
+          }
+          yield {
+            pageIndex: pageNum,
+            image: base64Image,
+            imageSizeBytes: page.length,
+          };
+        } catch (pageError) {
+          const msg =
+            pageError instanceof Error ? pageError.message : String(pageError);
+          logger.warn(
+            `[PDF→Image] ⚠️ page ${pageNum} failed to render (stream): ${msg}`,
+          );
+          yield {
+            pageIndex: pageNum,
+            image: "",
+            imageSizeBytes: 0,
+            error: msg,
+          };
+        }
+      }
+    } finally {
+      await document.destroy();
     }
   }
 
@@ -469,18 +920,18 @@ export class PDFProcessor {
   ): Promise<PDFImageConversionResult> {
     const fs = await import("fs/promises");
     const pdfBuffer = await fs.readFile(pdfPath);
-    return this.convertToImages(pdfBuffer, options);
+    return PDFProcessor.convertToImages(pdfBuffer, options);
   }
 
   /**
    * Check if PDF to image conversion is available
    * Useful for feature detection
    *
-   * @returns true if pdf-to-img package is available
+   * @returns true if the pdf-parse renderer is available
    */
   static async isImageConversionAvailable(): Promise<boolean> {
     try {
-      await import("pdf-to-img");
+      await import("pdf-parse");
       return true;
     } catch {
       return false;
@@ -498,11 +949,11 @@ export class PDFProcessor {
   static estimateConversionMemoryUsage(
     pdfSizeBytes: number,
     pageCount: number,
-    scale: number = 2,
+    scale: number = PDF_LIMITS.DEFAULT_SCALE,
   ): number {
     // Rough estimation:
     // - Each page at scale 2 produces ~1-3MB PNG
-    // - MuPDF needs ~2x PDF size for processing
+    // - pdfjs needs ~2x PDF size for processing
     // - Output images need ~2MB per page on average
 
     const pdfProcessingMB = (pdfSizeBytes / (1024 * 1024)) * 2;

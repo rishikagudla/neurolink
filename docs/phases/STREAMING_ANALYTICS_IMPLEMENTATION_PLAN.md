@@ -1,5 +1,11 @@
 # Streaming Analytics Implementation Plan
 
+> **⚠️ HISTORICAL DOCUMENT (August 2025)**
+>
+> This audit was conducted when NeuroLink shipped 9 providers. At audit time, v9.62.0 (May 2026) shipped 24 providers including DeepSeek, NVIDIA NIM, LM Studio, llama.cpp, plus voice (TTS/STT/realtime). References to "9 providers" or "8/9 working" in this file reflect the state at time of analysis.
+>
+> For current capabilities see [README on GitHub](https://github.com/juspay/neurolink/blob/main/README.md) and [Provider Capabilities Audit](https://github.com/juspay/neurolink/blob/main/docs/reference/provider-capabilities-audit.md).
+
 **Created**: August 3, 2025  
 **Phase**: 3.2B - Fix Real Streaming Architecture  
 **Priority**: CRITICAL  
@@ -84,7 +90,7 @@ onFinish: (event) => {
 #### 2.1: Create Analytics Collection Interface
 
 ```typescript
-export interface StreamAnalyticsCollector {
+export type StreamAnalyticsCollector = {
   collectUsage(result: StreamTextResult): Promise<TokenUsage>;
   collectMetadata(result: StreamTextResult): Promise<ResponseMetadata>;
   collectToolData(result: StreamTextResult): Promise<ToolUsageData>;
@@ -95,7 +101,7 @@ export interface StreamAnalyticsCollector {
     responseTime: number,
     metadata?: Record<string, unknown>,
   ): AnalyticsData;
-}
+};
 ```
 
 #### 2.2: Base Analytics Collector Implementation
@@ -188,14 +194,14 @@ Same pattern - only returns textStream without analytics.
 #### 4.1: Update StreamResult Interface
 
 ```typescript
-export interface StreamResult {
+export type StreamResult = {
   stream: AsyncGenerator<StreamChunk>;
   provider: AIProviderName;
   model: string;
   metadata?: Record<string, unknown>;
   analytics?: Promise<AnalyticsData>; // NEW: Analytics available after stream completion
   evaluation?: Promise<EvaluationResult>; // NEW: Evaluation after completion
-}
+};
 ```
 
 #### 4.2: Update BaseProvider.stream() Logic

@@ -1,0 +1,98 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / CatalogQuirks
+
+# Type Alias: CatalogQuirks
+
+> **CatalogQuirks** = `object`
+
+## Properties
+
+### maxTokensField?
+
+> `optional` **maxTokensField?**: `"max_completion_tokens"`
+
+Send the caller's fitted maxTokens budget as max_completion_tokens and
+omit max_tokens. Omitted preserves the ordinary OpenAI-compatible field.
+
+---
+
+### omitStreamOptions?
+
+> `optional` **omitStreamOptions?**: `boolean`
+
+Omit stream_options where the endpoint does not document that extension.
+Does not discard usage that the endpoint returns without requesting it.
+
+---
+
+### timeoutErrorClass?
+
+> `optional` **timeoutErrorClass?**: `"provider"`
+
+---
+
+### messageContentFormat?
+
+> `optional` **messageContentFormat?**: `"string"`
+
+Vendor speaks OpenAI for chat but restricts how message content is
+encoded. "string": `messages[].content` must be a plain string —
+the content-parts array and the `null` OpenAI uses on an assistant
+message with tool_calls are both rejected with HTTP 400. Normalized by
+ConfiguredOpenAICompatProvider so tool round-trips work.
+
+---
+
+### registryDefaultIgnoresModelEnvVar?
+
+> `optional` **registryDefaultIgnoresModelEnvVar?**: `boolean`
+
+---
+
+### responseFormatDowngrade?
+
+> `optional` **responseFormatDowngrade?**: `"json-schema-to-json-object"`
+
+Vendor rejects `response_format: { type: "json_schema" }` outright but
+accepts `{ type: "json_object" }`. Normalized by
+ConfiguredOpenAICompatProvider so `generate({ schema })` keeps working
+(mirrors the pre-catalog `supportsStructuredOutputs: false` behavior).
+
+---
+
+### replayReasoningContent?
+
+> `optional` **replayReasoningContent?**: `boolean`
+
+Vendor wants each assistant turn's `reasoning_content` sent back on
+every later request of the conversation (DeepSeek documents a 400
+without it once tools are in play). ConfiguredOpenAICompatProvider
+turns on the replay; every other provider leaves the field off.
+
+---
+
+### rejectRequiredToolChoice?
+
+> `optional` **rejectRequiredToolChoice?**: `boolean`
+
+The endpoint accepts auto/none/named tool choices but not required.
+Reject that explicit caller intent with nonempty tools before sending;
+never silently downgrade it to auto. Omitted preserves existing behavior.
+
+---
+
+### authHeaderStyle?
+
+> `optional` **authHeaderStyle?**: `"x-api-key"`
+
+Vendor's chat-completions endpoint authenticates with a vendor-specific
+header instead of the OpenAI-standard `Authorization: Bearer <key>`.
+"x-api-key": send `X-Api-Key: <key>` and omit Authorization entirely —
+Reka's OpenAPI spec declares this as its one security scheme (the
+OpenAI-SDK-style examples elsewhere in its docs pass the key through a
+client that still emits this header under the hood). Normalized by
+ConfiguredOpenAICompatProvider.getAuthHeaders(); omitted means the
+inherited Bearer default.

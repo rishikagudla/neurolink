@@ -1,23 +1,44 @@
-/**
- * RAG Integration for generate() and stream()
- *
- * Provides automatic RAG pipeline setup when `rag` config is provided
- * in GenerateOptions or StreamOptions. Handles file loading, chunking,
- * embedding generation, vector storage, and tool creation internally
- * so developers only need to pass `rag: { files: [...] }`.
- */
-
-import type { Tool } from "ai";
-import { existsSync, readFileSync } from "fs";
 import { extname, resolve } from "path";
 import { z } from "zod";
+import {
+  SpanSerializer,
+  SpanType,
+  SpanStatus,
+  getMetricsAggregator,
+} from "../observability/index.js";
 import { logger } from "../utils/logger.js";
-import { ChunkerRegistry } from "./chunking/index.js";
+import { redactUrlForError } from "../utils/logSanitize.js";
+import { ErrorFactory } from "../utils/errorHandling.js";
+import { ImageProcessor } from "../utils/imageProcessor.js";
+import {
+  readAttachmentFile,
+  resolveAttachmentPath,
+  resolveAttachmentPolicy,
+} from "../utils/attachmentPolicy.js";
+import { createChunker } from "./ChunkerFactory.js";
 import {
   createVectorQueryTool,
   InMemoryVectorStore,
 } from "./retrieval/vectorQueryTool.js";
-import type { ChunkingStrategy, RAGConfig } from "./types.js";
+import { ImageLoader } from "./document/imageLoader.js";
+import { IMAGE_EXTENSIONS } from "../processors/config/index.js";
+import type {
+  AttachmentPolicy,
+  ChunkingStrategy,
+  RAGConfig,
+  VectorQueryResult,
+  RAGPreparedTool,
+} from "../types/index.js";
+import { withSpan } from "../telemetry/withSpan.js";
+import { tracers } from "../telemetry/tracers.js";
+import type { Tool } from "../types/index.js";
+
+/**
+ * Ceiling for one `rag.files` text source: 50 MiB. A file is chunked and
+ * embedded in full, so a larger one is a mistake rather than a document;
+ * `attachments.maxBytes` lowers it.
+ */
+const RAG_FILE_MAX_BYTES = 50 * 1024 * 1024;
 
 /**
  * Maps file extensions to recommended chunking strategies
@@ -57,47 +78,138 @@ function detectStrategy(filePath: string): ChunkingStrategy {
   return EXTENSION_TO_STRATEGY[ext] || "recursive";
 }
 
+/** Embedding dimension used by {@link generateSimpleEmbedding}. */
+const EMBEDDING_DIMENSION = 128;
+
+/**
+ * Longest text, in UTF-16 code units, that {@link generateSimpleEmbedding}
+ * will hash: 1,048,576.
+ *
+ * The 128-dimension output does not bound the work. The function walks every
+ * character and every word of its input, and nothing upstream limits that
+ * input: a chunk is as large as the caller's `chunkSize` allows, and a search
+ * query is whatever the model sends. A default chunk is 1,000 characters, so
+ * this is about a thousand times that and no ordinary input reaches it. Longer
+ * text is refused with an error rather than truncated, because a clipped text
+ * would be embedded as a different document and rank as one.
+ *
+ * It applies only to the hash embedding. A configured embedding provider
+ * receives the text as before and applies its own limits.
+ */
+const MAX_HASH_EMBEDDING_TEXT_LENGTH = 1_048_576;
+
+/**
+ * Simple hash function for strings (FNV-1a variant).
+ * Maps a word to a bucket index deterministically.
+ */
+function hashWord(word: string, buckets: number): number {
+  let hash = 2166136261;
+  for (let i = 0; i < word.length; i++) {
+    hash ^= word.charCodeAt(i);
+    hash = (hash * 16777619) >>> 0;
+  }
+  return hash % buckets;
+}
+
 /**
  * Generate deterministic embeddings for chunks.
- * Uses a simple hash-based approach for the in-memory vector store.
+ * Combines character-frequency (40%) with word-level hash features (60%)
+ * for better semantic discrimination than pure character frequency.
  * When a real embedding provider is configured, it will be used instead.
  */
 function generateSimpleEmbedding(text: string, dimension: number): number[] {
-  const embedding = new Array(dimension).fill(0);
+  if (text.length > MAX_HASH_EMBEDDING_TEXT_LENGTH) {
+    throw ErrorFactory.invalidParameters(
+      "rag.hashEmbedding",
+      new Error(
+        `text is ${text.length} characters, over the ${MAX_HASH_EMBEDDING_TEXT_LENGTH} character limit of the built-in hash embedding. Lower chunkSize, shorten the query, or configure an embeddingProvider.`,
+      ),
+      { length: text.length, maxLength: MAX_HASH_EMBEDDING_TEXT_LENGTH },
+    );
+  }
 
-  // Simple character-frequency based embedding
+  const charEmbedding = new Array(dimension).fill(0);
+  const wordEmbedding = new Array(dimension).fill(0);
+
+  // Character-frequency features
   for (let i = 0; i < text.length; i++) {
     const charCode = text.charCodeAt(i);
     const idx = charCode % dimension;
-    embedding[idx] += 1;
+    charEmbedding[idx] += 1;
+  }
+
+  // Word-level hash features (TF-IDF-like)
+  const words = text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, "")
+    .split(/\s+/)
+    .filter((w) => w.length > 1);
+  for (const word of words) {
+    const idx = hashWord(word, dimension);
+    wordEmbedding[idx] += 1;
+  }
+
+  // Combine: 40% character, 60% word
+  const combined = new Array(dimension);
+  for (let i = 0; i < dimension; i++) {
+    combined[i] = 0.4 * charEmbedding[i] + 0.6 * wordEmbedding[i];
   }
 
   // Normalize to unit vector
   const magnitude = Math.sqrt(
-    embedding.reduce((sum: number, v: number) => sum + v * v, 0),
+    combined.reduce((sum: number, v: number) => sum + v * v, 0),
   );
   if (magnitude > 0) {
     for (let i = 0; i < dimension; i++) {
-      embedding[i] /= magnitude;
+      combined[i] /= magnitude;
     }
   }
 
-  return embedding;
+  return combined;
 }
 
 /**
- * Result of preparing RAG for a generate/stream call
+ * Diversify retrieval results via round-robin across source files.
+ * Ensures at least one chunk per source file appears in the top-K results,
+ * preventing any single file from dominating retrieval.
  */
-export type RAGPreparedTool = {
-  /** The tool to inject into the tools Record */
-  tool: Tool;
-  /** Tool name (key for the tools Record) */
-  toolName: string;
-  /** Number of chunks indexed */
-  chunksIndexed: number;
-  /** Number of files loaded */
-  filesLoaded: number;
-};
+function diversifyResults(
+  results: VectorQueryResult[],
+  topK: number,
+): VectorQueryResult[] {
+  // Group by source file
+  const byFile = new Map<string, VectorQueryResult[]>();
+  for (const r of results) {
+    const source = (r.metadata?.source as string) || "unknown";
+    if (!byFile.has(source)) {
+      byFile.set(source, []);
+    }
+    const sourceGroup = byFile.get(source);
+    if (sourceGroup) {
+      sourceGroup.push(r);
+    }
+  }
+
+  // If only one source file, no diversification needed
+  if (byFile.size <= 1) {
+    return results.slice(0, topK);
+  }
+
+  // Round-robin selection from each source file group
+  const diversified: VectorQueryResult[] = [];
+  const iterators = [...byFile.values()].map((arr) => ({ arr, idx: 0 }));
+  while (
+    diversified.length < topK &&
+    iterators.some((it) => it.idx < it.arr.length)
+  ) {
+    for (const it of iterators) {
+      if (it.idx < it.arr.length && diversified.length < topK) {
+        diversified.push(it.arr[it.idx++]);
+      }
+    }
+  }
+  return diversified;
+}
 
 /**
  * Prepare RAG tools from the provided configuration.
@@ -112,17 +224,59 @@ export type RAGPreparedTool = {
  * @param ragConfig - RAG configuration from generate/stream options
  * @param fallbackProvider - Provider to use for embeddings if not specified in ragConfig
  * @returns Prepared RAG tool to inject into the tools record
+ * @throws When `files` is empty, when no source can be loaded, and when the
+ * built-in hash embedding is given a chunk longer than 1,048,576 characters (it
+ * is the default, and the fallback when a configured embedding provider fails).
+ * The returned tool rejects a query over the same length the same way.
  */
 export async function prepareRAGTool(
   ragConfig: RAGConfig,
   fallbackProvider?: string,
+  attachmentPolicy: AttachmentPolicy = resolveAttachmentPolicy(),
+): Promise<RAGPreparedTool> {
+  const span = SpanSerializer.createSpan(SpanType.RAG, "rag.prepare", {
+    "rag.operation": "prepare",
+    "rag.files_count": ragConfig.files?.length ?? 0,
+    "rag.strategy": ragConfig.strategy ?? "auto",
+    "rag.chunk_size": ragConfig.chunkSize ?? 1000,
+  });
+  const startTime = Date.now();
+  try {
+    const result = await _prepareRAGToolInner(
+      ragConfig,
+      fallbackProvider,
+      attachmentPolicy,
+    );
+    span.durationMs = Date.now() - startTime;
+    const endedSpan = SpanSerializer.endSpan(span, SpanStatus.OK);
+    endedSpan.attributes = {
+      ...endedSpan.attributes,
+      "rag.chunks_indexed": result.chunksIndexed,
+      "rag.files_loaded": result.filesLoaded,
+    };
+    getMetricsAggregator().recordSpan(endedSpan);
+    return result;
+  } catch (error) {
+    span.durationMs = Date.now() - startTime;
+    const endedSpan = SpanSerializer.endSpan(span, SpanStatus.ERROR);
+    endedSpan.statusMessage =
+      error instanceof Error ? error.message : String(error);
+    getMetricsAggregator().recordSpan(endedSpan);
+    throw error;
+  }
+}
+
+async function _prepareRAGToolInner(
+  ragConfig: RAGConfig,
+  fallbackProvider: string | undefined,
+  attachmentPolicy: AttachmentPolicy,
 ): Promise<RAGPreparedTool> {
   const {
     files,
     strategy: userStrategy,
     chunkSize = 1000,
     chunkOverlap = 200,
-    topK = 5,
+    topK: userTopK = 5,
     toolName = "search_knowledge_base",
     toolDescription = "REQUIRED: Search through pre-loaded local documents to find relevant information. Use this tool FIRST before any web search or other tools. This searches an indexed knowledge base of documents the user has provided.",
     embeddingProvider,
@@ -133,32 +287,124 @@ export async function prepareRAGTool(
     throw new Error("RAG config requires at least one file path in 'files'");
   }
 
-  // 1. Load files
+  // 1. Load files — separate text and image files
   const fileContents: Array<{
     path: string;
     content: string;
     strategy: ChunkingStrategy;
   }> = [];
 
+  const imageFiles: Array<{
+    path: string;
+    ext: string;
+  }> = [];
+
   for (const filePath of files) {
+    // HTTP(S) sources are handled by ImageLoader directly and must not go
+    // through resolve()/existsSync(), which would mangle the URL into a
+    // bogus local path and always report it as missing.
+    if (/^https?:\/\//i.test(filePath)) {
+      // `new URL()` throws on a string the guarding regex still accepts —
+      // "https://" is the minimal case. Uncaught, it leaves this loop, is
+      // rethrown by prepareRAGTool, and disables RAG for the WHOLE call, so
+      // one bad entry discards every file already loaded. Skip the source
+      // instead, matching how an unreadable local file is handled below.
+      let ext: string;
+      try {
+        ext = extname(new URL(filePath).pathname).toLowerCase();
+      } catch {
+        logger.warn(
+          `[RAG] Malformed URL source, skipping: ${redactUrlForError(filePath)}`,
+        );
+        continue;
+      }
+      if (ext === ".svg") {
+        // IMAGE_EXTENSIONS includes .svg, but every consumer downstream of
+        // here treats an image as raster bytes: ImageLoader returns the file
+        // verbatim, captioning base64s it into a vision call, and the Bedrock
+        // embed path ships it as-is — Nova rejects the format outright and
+        // Titan accepts markup it cannot embed meaningfully. Skipping is
+        // honest; supporting it needs a rasterize-or-sanitize step in
+        // ImageLoader, not a classification change here.
+        logger.warn(
+          `[RAG] SVG is not supported as a RAG image source, skipping: ${redactUrlForError(filePath)}`,
+        );
+        continue;
+      }
+      if ((IMAGE_EXTENSIONS as readonly string[]).includes(ext)) {
+        imageFiles.push({ path: filePath, ext });
+      } else {
+        logger.warn(
+          `[RAG] Unsupported URL source, skipping: ${redactUrlForError(filePath)}`,
+        );
+      }
+      continue;
+    }
+
     const resolvedPath = resolve(filePath);
-    if (!existsSync(resolvedPath)) {
-      logger.warn(`[RAG] File not found, skipping: ${resolvedPath}`);
+
+    // Detect image files by extension
+    const ext = extname(resolvedPath).toLowerCase();
+    if (ext === ".svg") {
+      // See the URL branch above for why SVG is excluded from the raster path.
+      logger.warn(
+        `[RAG] SVG is not supported as a RAG image source, skipping: ${resolvedPath}`,
+      );
+      continue;
+    }
+    if ((IMAGE_EXTENSIONS as readonly string[]).includes(ext)) {
+      // The same containment as the text branch below; ImageLoader then reads
+      // the real path this returned. A path outside the roots is skipped with
+      // the same warning as an unreadable one, so the tool keeps working on
+      // the files it may read.
+      try {
+        const real = await resolveAttachmentPath(
+          resolvedPath,
+          attachmentPolicy,
+          "RAG image",
+        );
+        imageFiles.push({ path: real, ext });
+      } catch (error) {
+        logger.warn(
+          `[RAG] Failed to read image: ${resolvedPath}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
       continue;
     }
 
     try {
-      const content = readFileSync(resolvedPath, "utf-8");
+      // Roots containment when configured, O_NOFOLLOW open of the real path,
+      // regular files only, and a bounded read — where this was a bare
+      // `readFileSync` of whatever string arrived.
+      const read = await readAttachmentFile(resolvedPath, {
+        policy: attachmentPolicy,
+        maxBytes: RAG_FILE_MAX_BYTES,
+        label: "RAG file",
+      });
+      const content = read.buffer.toString("utf-8");
       const strategy = userStrategy || detectStrategy(resolvedPath);
       fileContents.push({ path: resolvedPath, content, strategy });
     } catch (error) {
+      const code = (error as { code?: unknown } | undefined)?.code;
+      if (code === "ENOENT") {
+        logger.warn(`[RAG] File not found, skipping: ${resolvedPath}`);
+        continue;
+      }
       logger.warn(
         `[RAG] Failed to read file: ${resolvedPath}: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
   }
 
-  if (fileContents.length === 0) {
+  // Auto-increase topK for multi-file scenarios to ensure coverage
+  // (computed after loading so it reflects only files that actually exist).
+  // Image files count toward the file total so image-only RAG gets a topK
+  // that covers every source.
+  const totalSources = fileContents.length + imageFiles.length;
+  const topK =
+    totalSources > 1 ? Math.max(userTopK, totalSources * 3) : userTopK;
+
+  if (fileContents.length === 0 && imageFiles.length === 0) {
     throw new Error(
       "RAG: No files could be loaded. Check that file paths exist and are readable.",
     );
@@ -174,10 +420,11 @@ export async function prepareRAGTool(
 
   for (const { path, content, strategy } of fileContents) {
     try {
-      const chunker = ChunkerRegistry.get(strategy);
-      const chunks = await chunker.chunk(content, {
+      const chunker = await createChunker(strategy, {
         maxSize: chunkSize,
-        overlap: chunkOverlap,
+        overlap: Math.min(chunkOverlap, Math.floor(chunkSize * 0.5)),
+      });
+      const chunks = await chunker.chunk(content, {
         metadata: { source: path },
       });
 
@@ -200,26 +447,194 @@ export async function prepareRAGTool(
   }
 
   logger.info(
-    `[RAG] Created ${allChunks.length} chunks from ${fileContents.length} files`,
+    `[RAG] Created ${allChunks.length} chunks from ${fileContents.length} text files`,
   );
 
+  // 2b. Load image files (multi-modal RAG).
+  //
+  // Deliberately NOT embedded here. Images are vectorised below through the
+  // same `embedFn` as the text chunks, because index-wide a single embedding
+  // space is the whole precondition for similarity to mean anything. Embedding
+  // them here — as this path originally did, with a hash of the caption —
+  // produced a 128-dimension image vector sitting in an index whose text
+  // vectors came from a provider at 768 or 1536, which is not a worse ranking
+  // but an incomparable one.
+  const imageChunks: Array<{
+    id: string;
+    text: string;
+    metadata: Record<string, unknown>;
+  }> = [];
+
+  if (imageFiles.length > 0) {
+    const imageLoader = new ImageLoader();
+
+    for (const { path: imgPath } of imageFiles) {
+      try {
+        const imageDoc = await imageLoader.load(imgPath);
+
+        // The two `ext === ".svg"` checks above are a cheap early-out, not the
+        // boundary: both match the NAME exactly, and the name is not what
+        // decides the type. ImageLoader resolves it two ways that disagree
+        // with a bare `.svg` comparison — `.svgz` maps to image/svg+xml
+        // through EXTENSION_MIME_MAP, and loadFromURL ignores the extension
+        // entirely and sniffs the bytes, so any image-extension URL actually
+        // serving SVG resolves to image/svg+xml here. A local raster suffix
+        // has the opposite problem: loadFromPath trusts the extension before
+        // the bytes, so inspect both. Otherwise `hasImage: true` below sends
+        // SVG markup to the raster embed call. Skip rather than throw,
+        // matching the early-outs and the identical guard
+        // in RAGPipeline.ingestImages — the two entry points are independent
+        // (prepareRAGTool builds its chunks here, not via ingestImages), so
+        // each needs its own.
+        if (
+          imageDoc.mimeType === "image/svg+xml" ||
+          ImageProcessor.detectImageType(imageDoc.image) === "image/svg+xml"
+        ) {
+          logger.warn(
+            `[RAG] SVG is not supported as a RAG image source, skipping: ${redactUrlForError(imgPath)}`,
+          );
+          continue;
+        }
+
+        // Use filename-based text representation for simple embedding
+        const imageText = imageDoc.text;
+
+        imageChunks.push({
+          id: `img-chunk-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          text: imageText,
+          metadata: {
+            text: imageText,
+            source: imgPath,
+            hasImage: true,
+            mimeType: imageDoc.mimeType,
+            imageWidth: imageDoc.metadata.width,
+            imageHeight: imageDoc.metadata.height,
+          },
+        });
+      } catch (error) {
+        logger.warn(
+          `[RAG] Failed to load image: ${imgPath}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+
+    logger.info(
+      `[RAG] Loaded ${imageChunks.length} image files for multi-modal RAG`,
+    );
+  }
+
   // 3. Generate embeddings and store in vector store
-  const EMBEDDING_DIMENSION = 128;
   const vectorStore = new InMemoryVectorStore();
   const indexName = "rag-index";
 
-  const items = allChunks.map((chunk, i) => ({
-    id: `rag-chunk-${i}`,
-    vector: generateSimpleEmbedding(chunk.text, EMBEDDING_DIMENSION),
-    metadata: {
-      text: chunk.text,
-      ...chunk.metadata,
-    },
-  }));
+  // When the caller configured an embedding provider/model, embed BOTH the
+  // index chunks and (below) the queries through that provider — previously
+  // those config fields had no runtime effect and retrieval always used the
+  // deterministic hash embedding, which is a lexical fingerprint rather than
+  // a semantic space. Index and query must share one embedding space, so the
+  // provider path replaces the hash path wholesale; a provider failure while
+  // creating the provider or building the index falls back to the hash for
+  // both sides, but one at query time fails that search.
+  const wantProviderEmbeddings = Boolean(embeddingProvider || embeddingModel);
+  const embedProviderName = embeddingProvider || fallbackProvider || "vertex";
+  const embedModelName = embeddingModel || "gemini-2.5-flash";
+  let embedFn = (text: string): Promise<number[]> =>
+    Promise.resolve(generateSimpleEmbedding(text, EMBEDDING_DIMENSION));
+  let embeddingFromProvider = false;
+  if (wantProviderEmbeddings) {
+    try {
+      const { AIProviderFactory } = await import("../core/factory.js");
+      const embedderProvider = (await AIProviderFactory.createProvider(
+        embedProviderName,
+        embedModelName,
+      )) as { embed?: (text: string, model?: string) => Promise<number[]> };
+      if (typeof embedderProvider.embed === "function") {
+        const providerEmbed = embedderProvider.embed.bind(embedderProvider);
+        embedFn = (text: string) => providerEmbed(text, embedModelName);
+        embeddingFromProvider = true;
+      } else {
+        logger.warn(
+          `[RAG] Embedding provider '${embedProviderName}' has no embed(); falling back to hash embeddings`,
+        );
+      }
+    } catch (error) {
+      logger.warn(
+        "[RAG] Failed to create embedding provider; falling back to hash embeddings",
+        { error: error instanceof Error ? error.message : String(error) },
+      );
+    }
+  }
+
+  // Text and image captions embed together, in one call and under one
+  // fallback. Splitting them into two try/catch blocks would let the text side
+  // succeed on the provider while the image side fell back to the hash, which
+  // is the mixed-space index this is trying to prevent.
+  let chunkVectors: number[][];
+  let imageVectors: number[][];
+  try {
+    const allVectors = await Promise.all([
+      ...allChunks.map((chunk) => embedFn(chunk.text)),
+      ...imageChunks.map((chunk) => embedFn(chunk.text)),
+    ]);
+    chunkVectors = allVectors.slice(0, allChunks.length);
+    imageVectors = allVectors.slice(allChunks.length);
+  } catch (error) {
+    // The hash embedding refuses text over its length limit. With no provider
+    // in use there is nothing to fall back from, and retrying would only repeat
+    // that refusal after a log line claiming a provider failed.
+    if (!embeddingFromProvider) {
+      throw error;
+    }
+    // One failed chunk must not leave a mixed-space index — flip the whole
+    // index AND all queries back to the hash space together.
+    logger.warn(
+      "[RAG] Provider embedding failed mid-index; falling back to hash embeddings for index and queries",
+      { error: error instanceof Error ? error.message : String(error) },
+    );
+    embedFn = (text: string) =>
+      Promise.resolve(generateSimpleEmbedding(text, EMBEDDING_DIMENSION));
+    chunkVectors = allChunks.map((chunk) =>
+      generateSimpleEmbedding(chunk.text, EMBEDDING_DIMENSION),
+    );
+    imageVectors = imageChunks.map((chunk) =>
+      generateSimpleEmbedding(chunk.text, EMBEDDING_DIMENSION),
+    );
+  }
+  const items = [
+    ...allChunks.map((chunk, i) => ({
+      id: `rag-chunk-${i}`,
+      vector: chunkVectors[i],
+      metadata: {
+        text: chunk.text,
+        ...chunk.metadata,
+      },
+    })),
+    ...imageChunks.map((chunk, i) => ({
+      id: chunk.id,
+      vector: imageVectors[i],
+      metadata: chunk.metadata,
+    })),
+  ];
+
+  // The guard near the top of this function fires when no source was found
+  // at all. This one covers the other way to end up with an empty index:
+  // sources WERE found and every one of them failed to load — an image over
+  // the size ceiling, a corrupt file, an unreachable URL. Each of those is
+  // caught and warned individually, so without this the call returns
+  // `chunksIndexed: 0` alongside a positive `filesLoaded` and reports
+  // success, and the caller gets a silently empty knowledge base.
+  if (items.length === 0) {
+    throw new Error(
+      "RAG: every source failed to load, so nothing was indexed. " +
+        "Check the warnings above for the per-source reason.",
+    );
+  }
 
   await vectorStore.upsert(indexName, items);
 
-  logger.info(`[RAG] Indexed ${items.length} chunks in vector store`);
+  logger.info(
+    `[RAG] Indexed ${items.length} chunks (${allChunks.length} text + ${imageChunks.length} images) in vector store`,
+  );
 
   // 4. Create the search tool
   // Determine embedding provider/model for the query tool
@@ -241,57 +656,92 @@ export async function prepareRAGTool(
   // Convert to Vercel AI SDK Tool format
   const aiTool: Tool = {
     description: queryTool.description,
-    parameters: z.object({
+    inputSchema: z.object({
       query: z
         .string()
         .describe("The search query to find relevant information"),
     }),
     execute: async ({ query }: { query: string }) => {
-      // For the in-memory store with simple embeddings,
-      // generate a query embedding using the same method
-      const queryEmbedding = generateSimpleEmbedding(
-        query,
-        EMBEDDING_DIMENSION,
+      return withSpan(
+        {
+          name: "neurolink.rag.search",
+          tracer: tracers.rag,
+          observationType: "span",
+          attributes: {
+            "rag.query_length": query ? String(query).length : 0,
+            "rag.top_k": topK ?? 5,
+          },
+        },
+        async (span) => {
+          // Query through the same embedding space the index was built in.
+          // A failure here must fail the search: swapping in a hash vector
+          // would be scored against provider-space vectors of another
+          // dimension, which cosine reads as 0 for every chunk, so the tool
+          // would return arbitrary chunks as if they were relevant. A hash-built
+          // index only rejects here for a query over the hash length limit.
+          const queryEmbedding = await embedFn(query);
+
+          // Fetch more candidates than needed so diversity can select across files and images
+          const loadedSources = fileContents.length + imageChunks.length;
+          const fetchK = loadedSources > 1 ? topK * 3 : topK;
+          const rawResults = await vectorStore.query({
+            indexName,
+            queryVector: queryEmbedding,
+            topK: fetchK,
+          });
+
+          // Apply source-file diversity for multi-file/multi-image RAG
+          const results =
+            loadedSources > 1
+              ? diversifyResults(rawResults, topK)
+              : rawResults.slice(0, topK);
+
+          if (results.length === 0) {
+            span.setAttribute("rag.results_count", 0);
+            return {
+              relevantContext: "No relevant documents found for the query.",
+              sources: [],
+              totalResults: 0,
+            };
+          }
+
+          const relevantContext = results
+            .map(
+              (r, i) =>
+                `[${i + 1}] ${(r.metadata?.text as string) || r.text || ""}` +
+                ((r.metadata?.hasImage as boolean) ? " [image]" : ""),
+            )
+            .join("\n\n");
+
+          span.setAttribute("rag.results_count", results.length);
+          return {
+            relevantContext,
+            sources: results.map((r) => ({
+              id: r.id,
+              score: r.score,
+              source: r.metadata?.source,
+              text: ((r.metadata?.text as string) || r.text || "").slice(
+                0,
+                200,
+              ),
+              hasImage: (r.metadata?.hasImage as boolean) ?? false,
+            })),
+            totalResults: results.length,
+          };
+        },
       );
-
-      const results = await vectorStore.query({
-        indexName,
-        queryVector: queryEmbedding,
-        topK,
-      });
-
-      if (results.length === 0) {
-        return {
-          relevantContext: "No relevant documents found for the query.",
-          sources: [],
-          totalResults: 0,
-        };
-      }
-
-      const relevantContext = results
-        .map(
-          (r, i) =>
-            `[${i + 1}] ${(r.metadata?.text as string) || r.text || ""}`,
-        )
-        .join("\n\n");
-
-      return {
-        relevantContext,
-        sources: results.map((r) => ({
-          id: r.id,
-          score: r.score,
-          source: r.metadata?.source,
-          text: ((r.metadata?.text as string) || r.text || "").slice(0, 200),
-        })),
-        totalResults: results.length,
-      };
     },
   };
 
   return {
     tool: aiTool,
     toolName,
-    chunksIndexed: allChunks.length,
-    filesLoaded: fileContents.length,
+    chunksIndexed: allChunks.length + imageChunks.length,
+    filesLoaded: fileContents.length + imageChunks.length,
   };
 }
+
+/** @internal Exported for testing only */
+export { generateSimpleEmbedding as _generateSimpleEmbedding };
+/** @internal Exported for testing only */
+export { diversifyResults as _diversifyResults };

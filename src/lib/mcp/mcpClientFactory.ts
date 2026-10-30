@@ -5,33 +5,238 @@
  * Enhanced with retry, rate limiting, and OAuth 2.1 support
  */
 
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
-import { WebSocketClientTransport } from "@modelcontextprotocol/sdk/client/websocket.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+// The SDK client and transport classes are loaded with `await import(...)`
+// at their construction sites below, so requiring this module doesn't pull
+// in every transport implementation for callers who only use one.
+import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type {
   ClientCapabilities,
   Implementation,
 } from "@modelcontextprotocol/sdk/types.js";
-import { spawn, type ChildProcess } from "child_process";
+import type { ChildProcess } from "child_process";
 import { mcpLogger } from "../utils/logger.js";
 import { globalCircuitBreakerManager } from "./mcpCircuitBreaker.js";
+import { CircuitBreakerOpenError } from "../types/index.js";
 import {
   withHTTPRetry,
   DEFAULT_HTTP_RETRY_CONFIG,
 } from "./httpRetryHandler.js";
 import { globalRateLimiterManager } from "./httpRateLimiter.js";
 import { NeuroLinkOAuthProvider, InMemoryTokenStorage } from "./auth/index.js";
-import type { MCPOAuthConfig } from "../types/mcpTypes.js";
-import type { MCPTransportType } from "../types/externalMcp.js";
-import type { MCPServerInfo, MCPClientResult } from "../types/mcpTypes.js";
+import { assertMcpTransportUrlAllowed } from "./transportUrlPolicy.js";
 import type {
+  MCPOAuthConfig,
+  MCPTransportType,
+  MCPServerInfo,
+  MCPClientResult,
   TransportResult,
-  TransportWithProcessResult,
   NetworkTransportResult,
-} from "../types/typeAliases.js";
+} from "../types/index.js";
+import {
+  SpanSerializer,
+  SpanType,
+  SpanStatus,
+  getMetricsAggregator,
+} from "../observability/index.js";
+import { getActiveTraceContext } from "../telemetry/traceContext.js";
+/**
+ * Default timeout for MCP client creation in milliseconds.
+ * Configurable via MCP_CLIENT_TIMEOUT env var.
+ * Covers process spawn, transport setup, connection, and handshake.
+ * Set to 60s to accommodate stdio servers that may be slow to start,
+ * especially when multiple MCP servers are started concurrently.
+ */
+const DEFAULT_CLIENT_TIMEOUT = Math.max(
+  5000,
+  Number(process.env.MCP_CLIENT_TIMEOUT) || 60000,
+);
+
+/**
+ * How many stderr lines to keep per stdio server. Enough for a Python
+ * traceback or an OOM message; small enough that a chatty server logging
+ * every request to stderr costs nothing.
+ */
+const STDERR_TAIL_LINES = 20;
+
+/**
+ * Bounded buffer of the most recent stderr lines a stdio server wrote.
+ *
+ * A crashing server explains itself on stderr and nowhere else. With the
+ * stream ignored — as it was — a `Connection closed` said nothing about
+ * why, and the ExternalServerManager could only report that a process it
+ * never saw had gone. Keeping a short tail per transport lets the
+ * disconnect log, the connect error and the `disconnected` event all carry
+ * the server's last words.
+ */
+class StderrTail {
+  private readonly lines: string[] = [];
+  private partial = "";
+
+  append(chunk: Buffer | string): void {
+    this.partial += chunk.toString();
+    const pieces = this.partial.split(/\r?\n/);
+    this.partial = pieces.pop() ?? "";
+    for (const piece of pieces) {
+      if (piece.trim().length === 0) {
+        continue;
+      }
+      this.lines.push(piece);
+      if (this.lines.length > STDERR_TAIL_LINES) {
+        this.lines.shift();
+      }
+    }
+  }
+
+  snapshot(): string[] {
+    const out = [...this.lines];
+    if (this.partial.trim().length > 0) {
+      out.push(this.partial);
+    }
+    return out.slice(-STDERR_TAIL_LINES);
+  }
+}
+
+const stderrTails = new WeakMap<Transport, StderrTail>();
+
+/**
+ * Stdio servers this process has spawned and has not yet seen close.
+ *
+ * A transport is tracked from creation to close, not only until the server
+ * answers `initialize`, because two things leave a server running with nothing
+ * to stop it. Until the manager records the client, which happens only after
+ * `connect()` and the handshake, no shutdown path knows the server exists, and
+ * `npx -y <pkg>` does not read its stdin until the package has downloaded.
+ * After that, a server holding a timer, a connection pool or a file watcher
+ * ignores its stdin closing, and `process.exit()` runs neither `beforeExit`
+ * nor the manager's async shutdown.
+ *
+ * `transport.close()` takes a transport out through `onclose` once the child
+ * has exited, so a server the manager closed is not signalled again.
+ */
+const liveStdioTransports = new Set<Transport>();
+
+/**
+ * Children of transports whose `close()` has started and whose process has
+ * not yet closed.
+ *
+ * `close()` drops its reference to the child before it does anything else, so
+ * from then on `transport.pid` reads null, and a transport in that state is
+ * invisible to the set above. The close lasts up to four seconds for a server
+ * that ignores EOF and SIGTERM (`stdin.end()`, 2s, SIGTERM, 2s, SIGKILL). A
+ * host that calls `process.exit()` inside that window never reaches the SDK's
+ * escalation, so the exit hook signals the child held here.
+ *
+ * The child is held as a `ChildProcess` and signalled with `child.kill()`,
+ * never as a pid handed to `process.kill()`. Node clears the child's handle in
+ * the same callback in which libuv reaps it, and `kill()` signals only through
+ * that handle, so it does nothing for a child that has exited. The kernel
+ * cannot reuse a pid before the reap, which means this can never reach a
+ * process that merely inherited the number. A child leaves this set when it
+ * exits or closes, whichever comes first.
+ */
+const closingStdioChildren = new Set<ChildProcess>();
+let stdioExitHookInstalled = false;
+let stdioChildProcessClass: typeof ChildProcess | undefined;
+
+/**
+ * The SDK exposes no handle on the child; `pid` and `stderr` are its whole
+ * public surface. `_process` is private, so it is read through `Reflect.get`
+ * and used only if it is a real `ChildProcess`. An SDK release that renames or
+ * reshapes it yields undefined here.
+ */
+const stdioChildOf = (
+  transport: Transport,
+  childProcessClass: typeof ChildProcess,
+): ChildProcess | undefined => {
+  const candidate: unknown = Reflect.get(transport, "_process");
+  return candidate instanceof childProcessClass ? candidate : undefined;
+};
+
+/**
+ * Synchronous on purpose: it is the one thing that can run inside the
+ * `exit` event, and signals are delivered by the kernel even though this
+ * process is already on its way out.
+ *
+ * A live server is signalled through `child.kill()` whenever its transport
+ * still holds the child, for the reason given on `closingStdioChildren`:
+ * between a child's exit and its `close` event `transport.pid` still reads the
+ * old number, which the kernel may already have handed to another process.
+ * `transport.pid` remains only for an SDK that no longer exposes the child.
+ *
+ * A server whose close() was already under way gets SIGKILL. The SDK had
+ * committed to stopping it and would have escalated to SIGKILL within four
+ * seconds; the `exit` event cannot wait for that, so a server that ignores
+ * SIGTERM would otherwise be left running.
+ */
+export const terminateLiveStdioServers = (): void => {
+  for (const transport of liveStdioTransports) {
+    const child =
+      stdioChildProcessClass && stdioChildOf(transport, stdioChildProcessClass);
+    try {
+      if (child) {
+        child.kill("SIGTERM");
+      } else if ("pid" in transport && typeof transport.pid === "number") {
+        process.kill(transport.pid, "SIGTERM");
+      }
+    } catch {
+      // Already gone.
+    }
+  }
+  for (const child of closingStdioChildren) {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  }
+};
+
+/**
+ * Without the child, an SDK release that hides it leaves the close window as
+ * open as it was before this set existed.
+ */
+const holdChildWhileClosing = (
+  transport: Transport,
+  childProcessClass: typeof ChildProcess,
+): void => {
+  const child = stdioChildOf(transport, childProcessClass);
+  if (!child || child.exitCode !== null || child.signalCode !== null) {
+    return;
+  }
+  closingStdioChildren.add(child);
+  const release = (): void => {
+    closingStdioChildren.delete(child);
+  };
+  child.once("exit", release);
+  child.once("close", release);
+};
+
+const trackStdioTransport = (
+  transport: Transport,
+  childProcessClass: typeof ChildProcess,
+): void => {
+  if (!stdioExitHookInstalled) {
+    stdioExitHookInstalled = true;
+    process.on("exit", terminateLiveStdioServers);
+  }
+  stdioChildProcessClass = childProcessClass;
+  liveStdioTransports.add(transport);
+  // Client.connect() chains an onclose that is already set rather than
+  // replacing it, and the manager listens on client.onclose, so this one
+  // survives for the life of the connection. A spawn that fails still closes
+  // the transport.
+  transport.onclose = () => {
+    liveStdioTransports.delete(transport);
+  };
+  // The child has to be read before close() starts, which is the last moment
+  // the transport still has it.
+  const closeTransport = transport.close.bind(transport);
+  transport.close = async (): Promise<void> => {
+    holdChildWhileClosing(transport, childProcessClass);
+    await closeTransport();
+  };
+};
 
 /**
  * MCPClientFactory
@@ -43,8 +248,13 @@ export class MCPClientFactory {
     version: "1.0.0",
   };
 
+  /**
+   * No `sampling` here: advertising it tells a server it may send
+   * `sampling/createMessage` and have this client run an LLM call on its
+   * behalf, and the client has no handler for it. Only what is implemented
+   * is announced.
+   */
   private static readonly DEFAULT_CAPABILITIES: ClientCapabilities = {
-    sampling: {},
     roots: {
       listChanged: false,
     },
@@ -56,9 +266,25 @@ export class MCPClientFactory {
    */
   static async createClient(
     config: MCPServerInfo,
-    timeout = 10000,
+    timeout = DEFAULT_CLIENT_TIMEOUT,
   ): Promise<MCPClientResult> {
+    const connectionTimeout = config.httpOptions?.connectionTimeout;
+    if (connectionTimeout !== undefined) {
+      timeout = Math.min(timeout, connectionTimeout);
+    }
     const startTime = Date.now();
+    const { traceId, parentSpanId } = getActiveTraceContext();
+    const obsSpan = SpanSerializer.createSpan(
+      SpanType.MCP_TRANSPORT,
+      "mcp.connect",
+      {
+        "mcp.transport": config.transport,
+        "mcp.operation": "connect",
+        "mcp.server_id": config.id,
+      },
+      parentSpanId,
+      traceId,
+    );
 
     try {
       mcpLogger.info(`[MCPClientFactory] Creating client for ${config.id}`, {
@@ -148,6 +374,10 @@ export class MCPClientFactory {
         },
       );
 
+      obsSpan.durationMs = Date.now() - startTime;
+      const endedObsSpan = SpanSerializer.endSpan(obsSpan, SpanStatus.OK);
+      getMetricsAggregator().recordSpan(endedObsSpan);
+
       return {
         ...result,
         success: true,
@@ -157,10 +387,45 @@ export class MCPClientFactory {
       const errorMessage =
         error instanceof Error ? error.message : String(error);
 
-      mcpLogger.error(
+      // Circuit breaker open: log at warn (not error) since this is expected
+      // protection behavior, and preserve the structured metadata.
+      if (error instanceof CircuitBreakerOpenError) {
+        mcpLogger.warn(
+          `[MCPClientFactory] Client creation blocked by circuit breaker for ${config.id}`,
+          {
+            serverId: config.id,
+            breakerState: error.breakerState,
+            retryAfter: error.retryAfter,
+            retryAfterMs: error.retryAfterMs,
+            failureCount: error.failureCount,
+          },
+        );
+
+        obsSpan.durationMs = Date.now() - startTime;
+        const endedObsSpan = SpanSerializer.endSpan(obsSpan, SpanStatus.ERROR);
+        endedObsSpan.statusMessage = `Circuit breaker open: ${errorMessage}`;
+        getMetricsAggregator().recordSpan(endedObsSpan);
+
+        return {
+          success: false,
+          error: errorMessage,
+          duration: Date.now() - startTime,
+        };
+      }
+
+      // debug, not error: this failure propagates up through
+      // ExternalServerManager to NeuroLink.addExternalMCPServer, which emits
+      // the single ERROR record. Logging at every layer turned one failed
+      // server registration into 5 ERROR lines in production.
+      mcpLogger.debug(
         `[MCPClientFactory] Failed to create client for ${config.id}:`,
         error,
       );
+
+      obsSpan.durationMs = Date.now() - startTime;
+      const endedObsSpan = SpanSerializer.endSpan(obsSpan, SpanStatus.ERROR);
+      endedObsSpan.statusMessage = errorMessage;
+      getMetricsAggregator().recordSpan(endedObsSpan);
 
       return {
         success: false,
@@ -180,25 +445,40 @@ export class MCPClientFactory {
     // Create transport
     const transportResult = await this.createTransport(config);
 
-    // Extract transport and process with necessary type assertions
-    // Note: Type assertions required due to TransportResult using 'unknown' to avoid circular imports
+    // Note: Type assertion required due to TransportResult using 'unknown' to avoid circular imports
     const transport = transportResult.transport as Transport;
-    const process = transportResult.process as ChildProcess | undefined;
 
     try {
       // Create client
+      const { Client } =
+        await import("@modelcontextprotocol/sdk/client/index.js");
       const client = new Client(this.NEUROLINK_IMPLEMENTATION, {
         capabilities: this.DEFAULT_CAPABILITIES,
       });
 
+      const requestTimeout = config.httpOptions?.requestTimeout;
+      if (requestTimeout !== undefined) {
+        const request = client.request.bind(client);
+        client.request = (payload, resultSchema, options) =>
+          request(payload, resultSchema, {
+            ...options,
+            timeout: Math.min(
+              requestTimeout,
+              options?.timeout ?? requestTimeout,
+            ),
+            maxTotalTimeout: Math.min(
+              requestTimeout,
+              options?.maxTotalTimeout ?? requestTimeout,
+            ),
+          });
+      }
+
       // Connect with timeout
-      await Promise.race([
-        client.connect(transport),
-        this.createTimeoutPromise(
-          timeout,
-          `Client connection timeout for ${config.id}`,
-        ),
-      ]);
+      await this.raceWithTimeout(
+        client.connect(transport, { timeout }),
+        timeout,
+        `Client connection timeout for ${config.id}`,
+      );
 
       // Perform handshake to get server capabilities
       const serverCapabilities = await this.performHandshake(client, timeout);
@@ -213,11 +493,11 @@ export class MCPClientFactory {
       return {
         client,
         transport,
-        process,
         capabilities: serverCapabilities,
       };
     } catch (error) {
-      // Clean up on failure
+      // Clean up on failure. For stdio, transport.close() ends stdin and
+      // escalates SIGTERM → SIGKILL on the child it spawned.
       try {
         await transport.close();
       } catch (closeError) {
@@ -227,12 +507,29 @@ export class MCPClientFactory {
         );
       }
 
-      if (process && !process.killed) {
-        process.kill("SIGTERM");
+      // A server that died during the handshake wrote its reason to stderr.
+      // Attach it, so "Connection closed" arrives with the traceback that
+      // explains it instead of leaving the operator to reproduce by hand.
+      const stderrTail = this.getStderrTail(transport);
+      if (error instanceof Error && stderrTail.length > 0) {
+        throw new Error(
+          `${error.message}\nServer stderr (last ${stderrTail.length} lines):\n${stderrTail.join("\n")}`,
+          { cause: error },
+        );
       }
 
       throw error;
     }
+  }
+
+  /**
+   * The most recent stderr lines written by the stdio server behind
+   * `transport`. Empty for network transports and for servers that have
+   * written nothing. Lines are captured from before the process is even
+   * started, so an early boot failure is included.
+   */
+  static getStderrTail(transport: Transport): string[] {
+    return stderrTails.get(transport)?.snapshot() ?? [];
   }
 
   /**
@@ -246,12 +543,15 @@ export class MCPClientFactory {
         return this.createStdioTransport(config);
 
       case "sse":
+        await this.assertNetworkUrlAllowed(config);
         return this.createSSETransport(config);
 
       case "websocket":
+        await this.assertNetworkUrlAllowed(config);
         return this.createWebSocketTransport(config);
 
       case "http":
+        await this.assertNetworkUrlAllowed(config);
         return this.createHTTPTransport(config);
 
       default:
@@ -260,11 +560,47 @@ export class MCPClientFactory {
   }
 
   /**
-   * Create stdio transport with process spawning
+   * Apply the transport URL policy (`transportUrlPolicy.ts`) before any
+   * network transport is built: TLS unless loopback, and no private,
+   * link-local or metadata destinations unless the server config says
+   * `allowPrivateNetwork: true`. Runs for every network server, whether it
+   * came from a project config or from `addExternalMCPServer`.
+   */
+  private static async assertNetworkUrlAllowed(
+    config: MCPServerInfo,
+  ): Promise<void> {
+    if (!config.url) {
+      throw new Error(`URL is required for ${config.transport} transport`);
+    }
+    await assertMcpTransportUrlAllowed(config.url, {
+      transport: config.transport,
+      allowPrivateNetwork: config.allowPrivateNetwork,
+      hostOwnedEgress: typeof config.fetch === "function",
+      serverId: config.id,
+    });
+  }
+
+  /**
+   * Create a stdio transport.
+   *
+   * The SDK's StdioClientTransport owns the server process: it spawns the
+   * child inside `client.connect()` and reports the child's death through
+   * `transport.onclose`, which the Client forwards as `client.onclose`. There
+   * is deliberately no `spawn()` here. An earlier "startup probe" launched
+   * the command a second time, and that duplicate — never spoken to, never
+   * closed — was the process every lifecycle hook ended up watching while
+   * the real server could die unnoticed. It also leaked as an orphan on
+   * every shutdown.
+   *
+   * stderr is piped rather than ignored so a crashing server's last lines
+   * survive to the disconnect log and the connect error. A pipe nobody reads
+   * would back-pressure the child once the buffer fills, so the tail
+   * listener is attached before `start()`; the SDK creates the stderr
+   * PassThrough in its constructor for exactly this reason.
    */
   private static async createStdioTransport(
     config: MCPServerInfo,
-  ): Promise<TransportWithProcessResult> {
+  ): Promise<TransportResult> {
     mcpLogger.debug(
       `[MCPClientFactory] Creating stdio transport for ${config.id}`,
       {
@@ -273,93 +609,55 @@ export class MCPClientFactory {
       },
     );
 
-    // Validate command is present
     if (!config.command) {
       throw new Error(`Command is required for stdio transport`);
     }
 
-    // Spawn the process
-    const childProcess = spawn(config.command, config.args || [], {
-      stdio: ["pipe", "pipe", "pipe"],
-      env: Object.fromEntries(
-        Object.entries({
-          ...process.env,
-          ...config.env,
-        })
-          .filter(([, value]) => value !== undefined)
-          .map(([k, v]) => [k, String(v)]),
-      ) as Record<string, string>,
-      cwd: config.cwd,
-    });
-
-    // Handle process errors
-    const processErrorPromise = new Promise<never>((_, reject) => {
-      childProcess.on("error", (error: Error) => {
-        reject(new Error(`Process spawn error: ${error.message}`));
-      });
-
-      childProcess.on(
-        "exit",
-        (code: number | null, signal: NodeJS.Signals | null) => {
-          if (code !== 0) {
-            reject(
-              new Error(`Process exited with code ${code}, signal ${signal}`),
-            );
-          }
-        },
-      );
-    });
-
-    // Wait for process to be ready or fail using AbortController for better async patterns
-    const processStartupController = new AbortController();
-    const processStartupTimeout = setTimeout(() => {
-      processStartupController.abort();
-    }, 1000);
-
-    try {
-      await Promise.race([
-        new Promise<void>((resolve) => {
-          const checkReady = () => {
-            if (processStartupController.signal.aborted) {
-              resolve(); // Timeout reached, continue
-            } else {
-              setTimeout(checkReady, 100);
-            }
-          };
-          checkReady();
-        }),
-        processErrorPromise,
-      ]);
-    } finally {
-      clearTimeout(processStartupTimeout);
-    }
-
-    // Check if process is still running
-    if (childProcess.killed || childProcess.exitCode !== null) {
-      throw new Error("Process failed to start or exited immediately");
-    }
-
-    // Create transport
-    if (!config.command) {
-      throw new Error(`Command is required for stdio transport`);
-    }
-
+    const { StdioClientTransport, getDefaultEnvironment } =
+      await import("@modelcontextprotocol/sdk/client/stdio.js");
+    const { ChildProcess: childProcessClass } =
+      await import("node:child_process");
+    // The child gets the SDK's minimal default environment (HOME, PATH,
+    // SHELL, TERM, USER, LOGNAME on POSIX) plus the server's own `env`. It
+    // used to get the whole parent `process.env` — every provider key and
+    // token this process held — and an `npx -y <package>` server is exactly
+    // the kind of code that should not. `inheritParentEnv: true` restores
+    // the old behaviour for a server that needs it; a single variable is
+    // better passed through explicitly: `"env": {"X": "${X}"}`.
+    const baseEnv: Record<string, string | undefined> =
+      config.inheritParentEnv === true
+        ? { ...process.env }
+        : getDefaultEnvironment();
     const transport = new StdioClientTransport({
       command: config.command,
       args: config.args || [],
       env: Object.fromEntries(
         Object.entries({
-          ...process.env,
+          ...baseEnv,
           ...config.env,
         })
           .filter(([, value]) => value !== undefined)
           .map(([key, value]) => [key, String(value)]),
       ),
       cwd: config.cwd,
-      stderr: "ignore", // Suppress MCP server startup messages
+      stderr: "pipe",
     });
 
-    return { transport, process: childProcess };
+    trackStdioTransport(transport, childProcessClass);
+
+    const tail = new StderrTail();
+    stderrTails.set(transport, tail);
+    transport.stderr?.on("data", (chunk: Buffer | string) => {
+      tail.append(chunk);
+      if (mcpLogger.shouldLog("debug")) {
+        const text = chunk.toString().trim();
+        if (text.length > 0) {
+          mcpLogger.debug(`[MCPClientFactory] ${config.id} stderr:`, text);
+        }
+      }
+    });
+
+    return { transport };
   }
 
   /**
@@ -381,12 +679,24 @@ export class MCPClientFactory {
 
     try {
       const url = new URL(config.url);
-      const transport = new SSEClientTransport(url);
+      const { SSEClientTransport } =
+        await import("@modelcontextprotocol/sdk/client/sse.js");
+      const transportFetch = this.createEnhancedFetch(
+        config,
+        config.httpOptions?.requestTimeout ?? 60000,
+      );
+      const transport = new SSEClientTransport(url, {
+        requestInit: { headers: config.headers },
+        fetch: transportFetch,
+        // EventSource prefers this fetch over the transport-level hook for GET.
+        eventSourceInit: { fetch: transportFetch },
+      });
 
       return { transport };
     } catch (error) {
       throw new Error(
         `Invalid SSE URL: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
       );
     }
   }
@@ -408,16 +718,54 @@ export class MCPClientFactory {
       },
     );
 
-    try {
-      const url = new URL(config.url);
-      const transport = new WebSocketClientTransport(url);
+    // The SDK's WebSocket transport opens the platform `WebSocket`, which
+    // takes a URL and a subprotocol and nothing else: there is no way to
+    // send `headers` or an `auth` token with the handshake. Dropping them
+    // silently would connect unauthenticated to a server the operator
+    // configured credentials for, so this fails closed instead.
+    const headerCount = Object.keys(config.headers ?? {}).length;
+    if (headerCount > 0 || config.auth !== undefined) {
+      throw new Error(
+        `WebSocket transport for ${config.id} cannot send the configured ${
+          headerCount > 0 ? "headers" : "auth"
+        }: the WebSocket handshake carries no custom headers. Use the "http" or "sse" transport for an authenticated server, or remove the credentials.`,
+      );
+    }
 
-      return { transport };
+    let url: URL;
+    let transportModule: typeof import("@modelcontextprotocol/sdk/client/websocket.js");
+    try {
+      url = new URL(config.url);
+      transportModule =
+        await import("@modelcontextprotocol/sdk/client/websocket.js");
     } catch (error) {
       throw new Error(
         `Invalid WebSocket URL: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
       );
     }
+
+    const transport = new transportModule.WebSocketClientTransport(url);
+
+    // Same connect bound as the HTTP transports: a socket that never opens
+    // or errors would otherwise leave `connect()` pending for the whole
+    // client timeout. On expiry the socket is closed so nothing lingers.
+    const connectTimeoutMs = config.httpOptions?.connectionTimeout ?? 30000;
+    const start = transport.start.bind(transport);
+    transport.start = async (): Promise<void> => {
+      try {
+        await this.raceWithTimeout(
+          start(),
+          connectTimeoutMs,
+          `WebSocket connection timeout for ${config.id} after ${connectTimeoutMs}ms`,
+        );
+      } catch (error) {
+        await transport.close().catch(() => undefined);
+        throw error;
+      }
+    };
+
+    return { transport };
   }
 
   /**
@@ -484,6 +832,8 @@ export class MCPClientFactory {
         headers: Object.keys(headers).length > 0 ? headers : undefined,
       };
 
+      const { StreamableHTTPClientTransport } =
+        await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
       const transport = new StreamableHTTPClientTransport(url, {
         requestInit,
         fetch: fetchWithEnhancements,
@@ -493,6 +843,7 @@ export class MCPClientFactory {
     } catch (error) {
       throw new Error(
         `Invalid HTTP URL: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
       );
     }
   }
@@ -500,13 +851,29 @@ export class MCPClientFactory {
   /**
    * Create a fetch wrapper with timeout support
    */
-  private static createFetchWithTimeout(timeoutMs: number): typeof fetch {
+  private static createFetchWithTimeout(
+    timeoutMs: number,
+    transportFetch: typeof globalThis.fetch,
+  ): typeof fetch {
     return async (input: RequestInfo | URL, init?: RequestInit) => {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
       try {
-        return await fetch(input, { ...init, signal: controller.signal });
+        const response = await transportFetch(input, {
+          ...init,
+          // EventSource requests "follow"; enforcing this here covers its GET
+          // as well as MCP POSTs and prevents credentials crossing a redirect.
+          redirect: "manual",
+          signal: init?.signal
+            ? AbortSignal.any([controller.signal, init.signal])
+            : controller.signal,
+        });
+        if (response.status >= 300 && response.status < 400) {
+          await response.body?.cancel();
+          throw new Error("MCP transport redirects are not permitted");
+        }
+        return response;
       } finally {
         clearTimeout(timeoutId);
       }
@@ -521,7 +888,10 @@ export class MCPClientFactory {
     timeoutMs: number,
     oauthProvider?: NeuroLinkOAuthProvider,
   ): typeof fetch {
-    const fetchWithTimeout = this.createFetchWithTimeout(timeoutMs);
+    const fetchWithTimeout = this.createFetchWithTimeout(
+      timeoutMs,
+      config.fetch ?? globalThis.fetch,
+    );
 
     return async (input: RequestInfo | URL, init?: RequestInit) => {
       // If OAuth is configured, ensure we have valid tokens
@@ -632,10 +1002,11 @@ export class MCPClientFactory {
     try {
       // The MCP SDK handles the handshake automatically during connect()
       // We can request server info to verify the connection
-      const serverInfo = await Promise.race<Record<string, unknown>>([
+      const serverInfo = await this.raceWithTimeout<Record<string, unknown>>(
         this.getServerInfo(client),
-        this.createTimeoutPromise<never>(timeout, "Handshake timeout"),
-      ]);
+        timeout,
+        "Handshake timeout",
+      );
 
       // Extract capabilities from server info
       return this.extractCapabilities(serverInfo);
@@ -691,27 +1062,44 @@ export class MCPClientFactory {
   }
 
   /**
-   * Create a timeout promise with AbortController support
-   * Provides consistent async timeout patterns across the factory
+   * Race an operation against a timeout (with optional AbortController
+   * support), clearing the timer on every outcome. A bare
+   * `Promise.race([operation, timeoutPromise])` leaves the timeout's
+   * `setTimeout` handle ref'd and pending until it fires even after
+   * `operation` already won the race — on the (common) success path that
+   * stray timer holds the event loop open for the full timeout duration for
+   * no reason.
    */
-  private static createTimeoutPromise<T>(
+  private static async raceWithTimeout<T>(
+    operation: Promise<T>,
     timeout: number,
     message: string,
     abortSignal?: AbortSignal,
   ): Promise<T> {
-    return new Promise((_, reject) => {
-      const timeoutId = setTimeout(() => {
+    let timeoutId: NodeJS.Timeout | undefined;
+    let onAbort: (() => void) | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutId = setTimeout(() => {
         reject(new Error(message));
       }, timeout);
 
       // Support abortion for better async cleanup
       if (abortSignal) {
-        abortSignal.addEventListener("abort", () => {
+        onAbort = () => {
           clearTimeout(timeoutId);
           reject(new Error(`Operation aborted: ${message}`));
-        });
+        };
+        abortSignal.addEventListener("abort", onAbort);
       }
     });
+    try {
+      return await Promise.race([operation, timeoutPromise]);
+    } finally {
+      clearTimeout(timeoutId);
+      if (abortSignal && onAbort) {
+        abortSignal.removeEventListener("abort", onAbort);
+      }
+    }
   }
 
   /**

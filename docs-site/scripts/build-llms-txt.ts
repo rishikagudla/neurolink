@@ -25,16 +25,18 @@ const DOCS_BASE_URL = process.env.DOCS_BASE_URL || "https://docs.neurolink.ink";
 // Summary file constraints
 const SUMMARY_MAX_SIZE_KB = 50;
 const SUMMARY_CONTENT_TRUNCATE_CHARS = 500;
+const SUMMARY_MIN_TRUNCATE_CHARS = 250;
+const SUMMARY_TRUNCATE_STEP_CHARS = 25;
 
 // Directories to exclude
 const EXCLUDED_DIRS = ["tracking", "phases", "analysis", "plans", "test-reports"];
 
 // Priority definitions for summary file (lower number = higher priority)
-interface PriorityRule {
+type PriorityRule = {
   pattern: string | RegExp;
   priority: number;
   includeInSummary: boolean;
-}
+};
 
 const PRIORITY_RULES: PriorityRule[] = [
   { pattern: /^index\.md$/, priority: 1, includeInSummary: true },
@@ -80,7 +82,7 @@ const SECTION_ORDER = [
   "visual-content",
 ];
 
-interface DocFile {
+type DocFile = {
   relativePath: string;
   section: string;
   title: string;
@@ -89,11 +91,38 @@ interface DocFile {
   priority: number;
   includeInSummary: boolean;
   order: number;
-}
+};
 
-interface ProviderInfo {
+type ProviderInfo = {
   name: string;
   slug: string;
+};
+
+/**
+ * Remove every `<...>` span, keeping the text between them.
+ *
+ * Same result as `replace(/<[^>]+>/g, "")` (an empty `<>` and a `<` with no
+ * `>` after it stay as written), but read left to right in one pass: text is
+ * only copied from outside a removed span, so removing one span cannot join
+ * the fragments around it into a new tag. Plain text conversion for the llms
+ * files; not output sanitization.
+ */
+function removeTagSpans(content: string): string {
+  const lastClose = content.lastIndexOf(">");
+  let output = "";
+  let copied = 0;
+  let open = content.indexOf("<");
+  while (open !== -1 && open < lastClose) {
+    const close = content.indexOf(">", open + 1);
+    if (close === open + 1) {
+      open = content.indexOf("<", open + 1);
+      continue;
+    }
+    output += content.slice(copied, open);
+    copied = close + 1;
+    open = content.indexOf("<", copied);
+  }
+  return output + content.slice(copied);
 }
 
 /**
@@ -122,7 +151,7 @@ function stripFormatting(content: string): string {
   stripped = stripped.replace(/<[A-Z][a-zA-Z]*[^>]*>[\s\S]*?<\/[A-Z][a-zA-Z]*>/g, "");
 
   // Remove HTML tags (but keep content)
-  stripped = stripped.replace(/<[^>]+>/g, "");
+  stripped = removeTagSpans(stripped);
 
   // Remove image references (keep alt text if available)
   stripped = stripped.replace(/!\[([^\]]*)\]\([^)]+\)/g, (_, alt) => (alt ? `[Image: ${alt}]` : ""));
@@ -262,23 +291,53 @@ function truncateContent(content: string, maxChars: number): string {
     return content;
   }
 
-  // Try to cut at a sentence boundary
   const truncated = content.substring(0, maxChars);
-  const lastPeriod = truncated.lastIndexOf(".");
-  const lastNewline = truncated.lastIndexOf("\n");
+  const trailer = "\n\n[Content truncated - see llms-full.txt for complete documentation]";
 
-  const cutPoint = Math.max(lastPeriod, lastNewline);
-  if (cutPoint > maxChars * 0.5) {
-    return truncated.substring(0, cutPoint + 1) + "\n\n[Content truncated - see llms-full.txt for complete documentation]";
+  // Prefer breaking at a newline (paragraph) boundary — never split mid-line
+  // because mid-line cuts can land inside a markdown link or URL.
+  const lastNewline = truncated.lastIndexOf("\n");
+  if (lastNewline > maxChars * 0.5) {
+    return truncated.substring(0, lastNewline) + trailer;
   }
 
-  return truncated + "...\n\n[Content truncated - see llms-full.txt for complete documentation]";
+  // No newline boundary in the back half — fall back to the last sentence
+  // boundary that is NOT inside a URL or markdown link.
+  for (let i = truncated.length - 1; i > maxChars * 0.5; i--) {
+    if (truncated[i] === "." && truncated[i + 1] === " ") {
+      // Bail if the period sits inside a URL ("https://" appears between
+      // the previous whitespace and this position).
+      const tail = truncated.substring(0, i);
+      const lastWhitespace = Math.max(
+        tail.lastIndexOf(" "),
+        tail.lastIndexOf("\n"),
+      );
+      const segment = tail.substring(lastWhitespace + 1);
+      if (!/^https?:\/\//.test(segment) && !segment.includes("](")) {
+        return truncated.substring(0, i + 1) + trailer;
+      }
+    }
+  }
+
+  // Last resort: cut at the last whitespace boundary so we never split a URL.
+  const lastWhitespace = Math.max(
+    truncated.lastIndexOf(" "),
+    truncated.lastIndexOf("\n"),
+  );
+  if (lastWhitespace > 0) {
+    return truncated.substring(0, lastWhitespace) + "..." + trailer;
+  }
+
+  return trailer.trimStart();
 }
 
 /**
- * Extract provider information from documentation
+ * Extract provider information from documentation.
+ *
+ * NOTE: This list should be kept in sync with supported providers in
+ * src/lib/factories/providerRegistry.ts when adding or removing providers.
  */
-function extractProviders(files: DocFile[]): ProviderInfo[] {
+function extractProviders(): ProviderInfo[] {
   const providers: ProviderInfo[] = [
     { name: "OpenAI", slug: "openai" },
     { name: "Anthropic Claude", slug: "anthropic" },
@@ -335,12 +394,23 @@ function extractApiSignatures(): string {
 `.trim();
 }
 
+/** Total-order tiebreak by codepoint. `localeCompare` is not used: collation
+ *  depends on the Node ICU build, so it could order CI and a laptop
+ *  differently and reintroduce the churn this replaces. */
+function byCodepoint(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 /**
  * Get all documentation files
  */
 async function getDocFiles(): Promise<DocFile[]> {
   const pattern = "**/*.md";
-  const files = await glob(pattern, { cwd: DOCS_DIR, nodir: true });
+  // glob resolves in filesystem order, which differs between machines and
+  // between runs. Sort it before anything downstream depends on it.
+  const files = (await glob(pattern, { cwd: DOCS_DIR, nodir: true })).sort(
+    byCodepoint,
+  );
 
   const docFiles: DocFile[] = [];
 
@@ -376,8 +446,13 @@ async function getDocFiles(): Promise<DocFile[]> {
     });
   }
 
-  // Sort by order
-  docFiles.sort((a, b) => a.order - b.order);
+  // `order` alone is not a total order — many files share one. Ties used to
+  // fall back to glob's filesystem order, so two identical builds produced
+  // different output (215,862 differing lines in llms-full.txt). Tiebreak on
+  // the path so the result is a pure function of the docs.
+  docFiles.sort(
+    (a, b) => a.order - b.order || byCodepoint(a.relativePath, b.relativePath),
+  );
 
   return docFiles;
 }
@@ -406,15 +481,19 @@ function sortSections(sections: Map<string, DocFile[]>): string[] {
     const bIndex = SECTION_ORDER.indexOf(b);
     const aOrder = aIndex >= 0 ? aIndex : 999;
     const bOrder = bIndex >= 0 ? bIndex : 999;
-    return aOrder - bOrder;
+    // Every section outside SECTION_ORDER scores 999, so without this tiebreak
+    // their relative order came from Map insertion order — i.e. file order.
+    return aOrder - bOrder || byCodepoint(a, b);
   });
 }
 
 /**
  * Build the summary llms.txt content (~50KB)
  */
-function buildSummaryLlmsTxt(files: DocFile[]): string {
-  const timestamp = new Date().toISOString();
+function buildSummaryLlmsTxt(
+  files: DocFile[],
+  truncateChars: number = SUMMARY_CONTENT_TRUNCATE_CHARS,
+): string {
   const lines: string[] = [];
 
   // Header
@@ -422,17 +501,17 @@ function buildSummaryLlmsTxt(files: DocFile[]): string {
   lines.push("");
   lines.push("> Enterprise AI Development Platform - Unified provider access, MCP integration, professional CLI");
   lines.push("");
-  lines.push(`Generated: ${timestamp}`);
   lines.push(`Full documentation: ${DOCS_BASE_URL}/llms-full.txt`);
   lines.push("");
   lines.push("---");
   lines.push("");
 
   // Project Overview
+  const providers = extractProviders();
   lines.push("## Project Overview");
   lines.push("");
   lines.push("NeuroLink is an enterprise AI development platform that provides:");
-  lines.push("- Unified access to 13+ AI providers through a single consistent API");
+  lines.push(`- Unified access to ${providers.length}+ AI providers through a single consistent API`);
   lines.push("- 58+ MCP (Model Context Protocol) tools and integrations");
   lines.push("- TypeScript SDK and professional CLI");
   lines.push("- Production-ready features: Redis memory, failover, telemetry");
@@ -440,7 +519,6 @@ function buildSummaryLlmsTxt(files: DocFile[]): string {
   lines.push("");
 
   // Provider Summary
-  const providers = extractProviders(files);
   lines.push("## Supported Providers");
   lines.push("");
   for (const provider of providers) {
@@ -495,7 +573,7 @@ function buildSummaryLlmsTxt(files: DocFile[]): string {
       lines.push("");
 
       // Truncate content for summary
-      const truncated = truncateContent(file.content, SUMMARY_CONTENT_TRUNCATE_CHARS);
+      const truncated = truncateContent(file.content, truncateChars);
       lines.push(truncated);
       lines.push("");
       lines.push("---");
@@ -515,11 +593,31 @@ function buildSummaryLlmsTxt(files: DocFile[]): string {
   return lines.join("\n");
 }
 
+function buildSummaryWithinTarget(files: DocFile[]): {
+  content: string;
+  truncateChars: number;
+} {
+  let truncateChars = SUMMARY_CONTENT_TRUNCATE_CHARS;
+  let content = buildSummaryLlmsTxt(files, truncateChars);
+
+  while (
+    Buffer.byteLength(content, "utf8") > SUMMARY_MAX_SIZE_KB * 1024 &&
+    truncateChars > SUMMARY_MIN_TRUNCATE_CHARS
+  ) {
+    truncateChars = Math.max(
+      SUMMARY_MIN_TRUNCATE_CHARS,
+      truncateChars - SUMMARY_TRUNCATE_STEP_CHARS,
+    );
+    content = buildSummaryLlmsTxt(files, truncateChars);
+  }
+
+  return { content, truncateChars };
+}
+
 /**
  * Build the full llms-full.txt content
  */
 function buildFullLlmsTxt(files: DocFile[]): string {
-  const timestamp = new Date().toISOString();
   const sections = groupBySection(files);
   const sortedSections = sortSections(sections);
   const lines: string[] = [];
@@ -529,7 +627,6 @@ function buildFullLlmsTxt(files: DocFile[]): string {
   lines.push("");
   lines.push("> Enterprise AI Development Platform - Unified provider access, MCP integration, professional CLI");
   lines.push("");
-  lines.push(`Generated: ${timestamp}`);
   lines.push(`Summary version: ${DOCS_BASE_URL}/llms.txt`);
   lines.push(`Total files: ${files.length}`);
   lines.push("");
@@ -617,15 +714,22 @@ async function buildLlmsTxtFiles(): Promise<void> {
 
   // Build summary version
   console.log("Building llms.txt (summary)...");
-  const summaryContent = buildSummaryLlmsTxt(files);
+  const summaryBuild = buildSummaryWithinTarget(files);
+  const summaryContent = summaryBuild.content;
   fs.writeFileSync(SUMMARY_OUTPUT, summaryContent, "utf-8");
   const summaryStats = fs.statSync(SUMMARY_OUTPUT);
   const summarySizeKB = (summaryStats.size / 1024).toFixed(2);
   console.log(`  Output: ${SUMMARY_OUTPUT}`);
   console.log(`  Size: ${summarySizeKB} KB`);
-
+  if (summaryBuild.truncateChars !== SUMMARY_CONTENT_TRUNCATE_CHARS) {
+    console.log(
+      `  Adjusted truncation length to ${summaryBuild.truncateChars} characters to stay within target size`,
+    );
+  }
   if (summaryStats.size > SUMMARY_MAX_SIZE_KB * 1024) {
-    console.log(`  Warning: Summary exceeds target size of ${SUMMARY_MAX_SIZE_KB}KB`);
+    console.log(
+      `  Warning: Summary still exceeds target size of ${SUMMARY_MAX_SIZE_KB}KB`,
+    );
   }
 
   // Build full version

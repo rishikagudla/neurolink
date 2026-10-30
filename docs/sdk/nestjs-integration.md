@@ -152,7 +152,7 @@ export class NeuroLinkService implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleDestroy() {
-    await this.ai.cleanup();
+    await this.ai.dispose();
     this.logger.log("NeuroLink resources cleaned up");
   }
 
@@ -162,8 +162,8 @@ export class NeuroLinkService implements OnModuleInit, OnModuleDestroy {
   ) {
     return this.ai.generate({
       input: { text: prompt },
-      providerName: options?.provider,
-      modelName: options?.model,
+      provider: options?.provider,
+      model: options?.model,
       temperature: options?.temperature,
     });
   }
@@ -172,11 +172,12 @@ export class NeuroLinkService implements OnModuleInit, OnModuleDestroy {
     prompt: string,
     options?: { provider?: string; model?: string },
   ) {
-    return this.ai.generateStream({
+    const result = await this.ai.stream({
       input: { text: prompt },
-      providerName: options?.provider,
-      modelName: options?.model,
+      provider: options?.provider,
+      model: options?.model,
     });
+    return result.stream;
   }
 
   async chat(
@@ -185,7 +186,7 @@ export class NeuroLinkService implements OnModuleInit, OnModuleDestroy {
   ) {
     return this.ai.generate({
       input: { messages },
-      providerName: options?.provider,
+      provider: options?.provider,
     });
   }
 }
@@ -261,8 +262,8 @@ export class AIController {
         model: dto.model,
       });
       for await (const chunk of stream) {
-        if (chunk.text)
-          res.write(`data: ${JSON.stringify({ text: chunk.text })}\n\n`);
+        if ("content" in chunk && chunk.content)
+          res.write(`data: ${JSON.stringify({ text: chunk.content })}\n\n`);
       }
       res.write("data: [DONE]\n\n");
     } catch (error) {
@@ -591,7 +592,7 @@ export class AppModule {}
 ### CacheInterceptor with @nestjs/cache-manager
 
 ```bash
-npm install @nestjs/cache-manager cache-manager cache-manager-ioredis-yet
+npm install @nestjs/cache-manager cache-manager cache-manager-redis-yet
 ```
 
 ```typescript
@@ -697,10 +698,10 @@ export class AIStreamController {
 
     let tokenCount = 0;
     for await (const chunk of stream) {
-      if (chunk.text) {
+      if ("content" in chunk && chunk.content) {
         tokenCount++;
         subject.next({
-          data: { text: chunk.text, index: tokenCount },
+          data: { text: chunk.content, index: tokenCount },
           type: "token",
         });
       }
@@ -1053,10 +1054,10 @@ volumes:
 
 ## Related Documentation
 
-- [Express.js Integration Guide](/docs/guides/frameworks/express) - Lightweight REST API setup
-- [Next.js Integration Guide](/docs/guides/frameworks/nextjs) - Full-stack React applications
-- [Streaming Guide](/docs/advanced/streaming) - SSE and WebSocket streaming
-- [API Reference](/docs/sdk/api-reference) - Complete SDK documentation
+- [Express.js Integration Guide](../guides/frameworks/express.md) - Lightweight REST API setup
+- [Next.js Integration Guide](../guides/frameworks/nextjs.md) - Full-stack React applications
+- [Streaming Guide](../advanced/streaming.md) - SSE and WebSocket streaming
+- [API Reference](./api-reference.md) - Complete SDK documentation
 
 ---
 

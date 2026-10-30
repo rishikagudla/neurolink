@@ -3,7 +3,7 @@
  */
 
 import { ErrorCategory, ErrorSeverity } from "../constants/enums.js";
-import type { UnifiedGenerationOptions } from "./generateTypes.js";
+import type { UnifiedGenerationOptions } from "./generate.js";
 import type { ExecutionContext } from "./tools.js";
 
 /**
@@ -75,8 +75,24 @@ export type LogEntry = {
 };
 
 /**
+ * Minimal emitter shape the logger forwards `"log-event"` payloads to.
+ *
+ * Structurally satisfied by `node:events`' `EventEmitter` and by NeuroLink's
+ * own typed emitter, so a sink can be either.
+ */
+export type LogEventEmitter = {
+  emit: (event: string, ...args: unknown[]) => boolean;
+};
+
+/**
  * Logger interface matching the logger object shape
  * Used for SDK tool contexts and other components that need a logger
+ *
+ * Deliberately a subset of the real logger: the per-instance routing methods
+ * (`runInInstanceScope`, `addScopedEventEmitter`, …) are internal plumbing
+ * between the SDK entry points and the logger, and this type is a structural
+ * contract a caller can satisfy — `SDKToolContext.logger`. Adding required
+ * members here would break anyone constructing that context themselves.
  */
 export type Logger = {
   debug: (...args: unknown[]) => void;
@@ -88,9 +104,7 @@ export type Logger = {
   setLogLevel: (level: LogLevel) => void;
   getLogs: (level?: LogLevel) => LogEntry[];
   clearLogs: () => void;
-  setEventEmitter: (emitter: {
-    emit: (event: string, ...args: unknown[]) => boolean;
-  }) => void;
+  setEventEmitter: (emitter: LogEventEmitter) => void;
   clearEventEmitter: () => void;
 };
 
@@ -281,3 +295,103 @@ export type ImageCacheStats = {
   /** Cache hit rate as percentage */
   hitRate: number;
 };
+
+// =============================================================================
+// RATE LIMITER (from utils/rateLimiter.ts)
+// =============================================================================
+
+/**
+ * Pending request held by TokenBucketRateLimiter's queue.
+ * Named RateLimiterPendingRequest to disambiguate from the MCP
+ * PendingRequest in mcp.ts (Rule 9).
+ */
+export type RateLimiterPendingRequest = {
+  resolve: () => void;
+  reject: (error: Error) => void;
+  timestamp: number;
+  timeoutTimer?: ReturnType<typeof setTimeout>;
+};
+
+// =============================================================================
+// TOOL END EMITTER (from utils/toolEndEmitter.ts)
+// =============================================================================
+
+/**
+ * Shape of a completed tool result as returned by the AI SDK in
+ * `onStepFinish`. Both `output` (AI SDK v4) and `result` (older shape)
+ * are supported so the helper works across SDK versions.
+ */
+export type StepToolResult = {
+  toolName: string;
+  output?: unknown;
+  result?: unknown;
+  error?: string;
+};
+
+// =============================================================================
+// JSON COERCION (from utils/json/coerce.ts)
+// =============================================================================
+
+/**
+ * Result of coercing arbitrary model text into canonical, valid JSON.
+ * `content` is a JSON.stringify of the recovered object; `structuredData` is
+ * the parsed object itself.
+ */
+export type JsonCoercionResult = {
+  content: string;
+  structuredData: unknown;
+  /** True when jsonrepair altered the model text to make it parse. */
+  repaired: boolean;
+  /**
+   * True when the recovered object came from a truncated (unclosed) span —
+   * the response likely hit the output-token cap and data may be incomplete.
+   */
+  truncated: boolean;
+};
+
+/**
+ * Decision returned by `recoverScalarRoot`. Each caller applies it to its own
+ * result shape and logger prefix, preserving its existing warning behaviour:
+ *
+ *   - `empty`     — the text is a JSON-encoded empty string (an EMPTY
+ *                   completion, not a recovered scalar). Callers normalize to a
+ *                   true empty.
+ *   - `accepted`  — a scalar root the caller's schema accepts; safe to publish
+ *                   as `structuredData`.
+ *   - `rejected`  — a scalar root the caller's schema rejects (e.g. a raw
+ *                   string under an object schema — the shape a truncated
+ *                   response degrades to). Do NOT publish it.
+ *   - `nullish`   — the text is the JSON literals `null`/`undefined`; there is
+ *                   no structured value to publish.
+ *   - `not-json`  — the text is not JSON at all.
+ */
+export type ScalarRecoveryDecision =
+  | { kind: "empty" }
+  | { kind: "accepted"; value: unknown }
+  | { kind: "rejected"; value: unknown }
+  | { kind: "nullish" }
+  | { kind: "not-json" };
+
+// ---------------------------------------------------------------------------
+// HTML → Markdown conversion (utils/htmlToMarkdown.ts)
+// ---------------------------------------------------------------------------
+
+/**
+ * An element in the parsed HTML tree used for Markdown conversion.
+ */
+export type MarkdownHtmlElementNode = {
+  kind: "element";
+  /** Lower-cased tag name. */
+  tag: string;
+  /** Lower-cased attribute names mapped to their decoded values. */
+  attrs: Record<string, string>;
+  children: MarkdownHtmlNode[];
+};
+
+/**
+ * A node in the parsed HTML tree used for Markdown conversion: either a text
+ * run or an element.
+ */
+export type MarkdownHtmlNode =
+  | { kind: "text"; value: string }
+  | MarkdownHtmlElementNode;

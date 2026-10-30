@@ -1,0 +1,5349 @@
+import type {
+  ProxyTokenBudgetLease,
+  ProxyTokenBudgetSnapshot,
+} from "./proxyBudget.js";
+import type { CodexRuntimeAccount } from "./codex.js";
+import type { TokenUsage } from "./analytics.js";
+import type { JsonObject, JsonValue } from "./common.js";
+import type {
+  ProxyContextEvidence,
+  ProxyPreparedContext,
+} from "./proxyContext.js";
+/**
+ * Proxy type definitions for NeuroLink
+ *
+ * Consolidates all proxy-related types from:
+ * - src/lib/proxy/claudeFormat.ts (Claude API types, SSE types, internal result)
+ * - src/lib/proxy/cloaking/types.ts (cloaking pipeline types)
+ * - src/lib/proxy/cloaking/plugins/ (plugin option types)
+ * - src/lib/proxy/modelRouter.ts (routing types)
+ * - src/lib/proxy/proxyConfig.ts (config file types)
+ * - src/lib/proxy/requestLogger.ts (log entry type)
+ * - src/lib/proxy/usageStats.ts (stats types)
+ * - src/lib/proxy/tokenRefresh.ts (refresh types)
+ * - src/lib/proxy/accountQuota.ts (quota type)
+ * - src/lib/server/routes/claudeProxyRoutes.ts (runtime state, deps)
+ */
+
+import type { Counter, Histogram, Span } from "@opentelemetry/api";
+import type { LogRecordExporter } from "@opentelemetry/sdk-logs";
+
+/** HTTP exporter with an explicit bounded-shutdown cancellation boundary. */
+export type ProxyOtlpLogTransport = LogRecordExporter & {
+  abortPending: () => void;
+};
+import type { Hono } from "hono";
+import type { Ora } from "ora";
+import type { MCPToolRegistry } from "../mcp/toolRegistry.js";
+import type { ProxyTracer } from "../proxy/proxyTracer.js";
+import type {
+  ACCOUNT_COOLING_REASONS,
+  PROXY_ACCOUNT_TYPES,
+  PROXY_ACCOUNT_ROUTING_MODES,
+  PROXY_ACCOUNT_ROUTING_REASONS,
+  PROXY_ACCOUNT_ROUTING_STRATEGIES,
+} from "../proxy/routingEvidence.js";
+import type {
+  CodexFallbackTarget,
+  FallbackEntry,
+  ModelMapping,
+  ProxyRoutingConfig,
+  CloakingConfig,
+} from "./subscription.js";
+import type { RouteDeprecation, ServerContext } from "./server.js";
+import type { StoredOAuthTokens } from "./auth.js";
+
+/**
+ * Type describing the ModelRouter contract.
+ * Defined here to avoid a circular dependency between types and implementation.
+ */
+export type ModelRouterInterface = {
+  resolve(requestedModel: string): RouteResult;
+  isClaudeTarget(requestedModel: string): boolean;
+  getFallbackChain(): FallbackEntry[];
+  isAutoFallbackEnabled?(): boolean;
+  getMaxInflightPerAccount?(): number | undefined;
+  getModelMappings?: () => ModelMapping[];
+  getPassthroughModels?: () => string[];
+};
+
+// =============================================================================
+// CLAUDE API TYPES (from claudeFormat.ts)
+// =============================================================================
+
+/**
+ * Anthropic prompt-cache breakpoint marker.
+ *
+ * Anthropic caching is explicit: the prefix up to each marker is cached, and a
+ * request carrying none is cached not at all. Four markers is the hard ceiling.
+ */
+export type ClaudeCacheControl = {
+  type: "ephemeral";
+  /**
+   * How long the marked prefix stays cached. The API accepts a 5-minute or a
+   * 1-hour window, priced at 1.25x and 2x base input respectively; omitting it
+   * means 5 minutes. Without this field a caller cannot express the 1-hour
+   * marker at all.
+   */
+  ttl?: "5m" | "1h";
+};
+
+/** TTL override for applyClaudeRequestCacheBreakpoints's breakpoint 1 only. */
+export type ClaudeCacheBreakpointOptions = {
+  ttl?: "5m" | "1h";
+};
+
+/** Where a Claude-shaped request originated, for cache/cost attribution. */
+export type ProxyRequestOrigin = "native" | "codex-fallback";
+
+/** Session-affinity routing key for Codex-origin fallback requests. */
+export type CodexAnthropicAffinityKey =
+  | `codex-thread:${string}`
+  | `codex-session:${string}`
+  | `codex-prefix:${string}`;
+
+/** A single text block in a Claude content array. */
+export type ClaudeTextBlock = {
+  type: "text";
+  text: string;
+  cache_control?: ClaudeCacheControl;
+};
+
+/** A single image block in a Claude content array. */
+export type ClaudeImageBlock = {
+  type: "image";
+  source: {
+    type: "base64" | "url";
+    media_type?: string;
+    data?: string;
+    url?: string;
+  };
+};
+
+/** Tool-use block returned by Claude in assistant messages. */
+export type ClaudeToolUseBlock = {
+  type: "tool_use";
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+};
+
+/** Tool-result block sent back by the caller. */
+export type ClaudeToolResultBlock = {
+  type: "tool_result";
+  tool_use_id: string;
+  content: string | ClaudeContentBlock[];
+  cache_control?: ClaudeCacheControl;
+};
+
+/** A thinking/reasoning block in a Claude content array. */
+export type ClaudeThinkingBlock = {
+  type: "thinking";
+  thinking: string;
+};
+
+export type ClaudeContentBlock =
+  | ClaudeTextBlock
+  | ClaudeImageBlock
+  | ClaudeToolUseBlock
+  | ClaudeToolResultBlock
+  | ClaudeThinkingBlock;
+
+/** A single message in a Claude conversation. */
+export type ClaudeMessage = {
+  role: "user" | "assistant";
+  content: string | ClaudeContentBlock[];
+};
+
+/** Tool definition in the Claude Messages API format. */
+export type ClaudeTool = {
+  name: string;
+  description?: string;
+  input_schema: Record<string, unknown>;
+  cache_control?: ClaudeCacheControl;
+};
+
+/** Metadata attached to a Claude Messages API request. */
+export type ClaudeMetadata = {
+  user_id?: string;
+};
+
+/**
+ * Inbound Claude Messages API request body.
+ * Matches POST /v1/messages.
+ */
+export type ClaudeRequest = {
+  model: string;
+  messages: ClaudeMessage[];
+  max_tokens: number;
+  system?: string | ClaudeTextBlock[];
+  temperature?: number;
+  top_p?: number;
+  top_k?: number;
+  stop_sequences?: string[];
+  stream?: boolean;
+  tools?: ClaudeTool[];
+  tool_choice?:
+    | { type: "none" }
+    | { type: "auto" | "any"; disable_parallel_tool_use?: boolean }
+    | { type: "tool"; name: string; disable_parallel_tool_use?: boolean };
+  thinking?: { type: string; budget_tokens?: number };
+  metadata?: ClaudeMetadata;
+};
+
+// =============================================================================
+// CLAUDE RESPONSE TYPES (from claudeFormat.ts)
+// =============================================================================
+
+/** Usage counters returned in a Claude response. */
+export type ClaudeUsage = {
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
+  /** The 1-hour-TTL share of `cache_creation_input_tokens` (a subset, not
+   *  additive), read from Anthropic's `usage.cache_creation.ephemeral_1h_input_tokens`.
+   *  Omitted means "none known to be 1h", matching `UsageContext.cacheCreation1hTokens`'s
+   *  own contract — every path that does not observe the breakdown prices exactly
+   *  as before. */
+  cacheCreation1hTokens?: number;
+};
+
+/** Non-streaming response matching the Claude Messages API. */
+export type ClaudeResponse = {
+  id: string;
+  type: "message";
+  role: "assistant";
+  content: ClaudeContentBlock[];
+  model: string;
+  stop_reason: string | null;
+  stop_sequence: string | null;
+  usage: ClaudeUsage;
+};
+
+/** Claude API error envelope. */
+export type ClaudeErrorResponse = {
+  type: "error";
+  error: {
+    type: string;
+    message: string;
+  };
+};
+
+// =============================================================================
+// SSE EVENT TYPES (from claudeFormat.ts)
+// =============================================================================
+
+/** Content block descriptor for content_block_start events. */
+export type SSEContentBlockDescriptor =
+  | { type: "text"; text: "" }
+  | { type: "thinking"; thinking: "" }
+  | { type: "tool_use"; id: string; name: string; input: "" };
+
+/** Delta descriptor for content_block_delta events. */
+export type SSEDeltaDescriptor =
+  | { type: "text_delta"; text: string }
+  | { type: "thinking_delta"; thinking: string }
+  | { type: "input_json_delta"; partial_json: string };
+
+export type SSEMessageStart = {
+  type: "message_start";
+  message: Omit<ClaudeResponse, "content"> & { content: [] };
+};
+
+export type SSEContentBlockStart = {
+  type: "content_block_start";
+  index: number;
+  content_block: SSEContentBlockDescriptor;
+};
+
+export type SSEContentBlockDelta = {
+  type: "content_block_delta";
+  index: number;
+  delta: SSEDeltaDescriptor;
+};
+
+export type SSEContentBlockStop = {
+  type: "content_block_stop";
+  index: number;
+};
+
+export type SSEMessageDelta = {
+  type: "message_delta";
+  delta: { stop_reason: string | null; stop_sequence: string | null };
+  usage: {
+    output_tokens: number;
+    input_tokens?: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+  };
+};
+
+export type SSEMessageStop = {
+  type: "message_stop";
+};
+
+export type SSEPing = {
+  type: "ping";
+};
+
+export type SSEEvent =
+  | SSEMessageStart
+  | SSEContentBlockStart
+  | SSEContentBlockDelta
+  | SSEContentBlockStop
+  | SSEMessageDelta
+  | SSEMessageStop
+  | SSEPing;
+
+// =============================================================================
+// INTERNAL RESULT TYPE (from claudeFormat.ts)
+// =============================================================================
+
+/**
+ * Minimal subset of NeuroLink's GenerateResult that the proxy layer consumes.
+ * Kept intentionally narrow so the proxy layer does not depend on every
+ * field of the full type.
+ */
+export type InternalResult = {
+  content: string;
+  model?: string;
+  finishReason?: string;
+  /** Thinking/reasoning text from provider (Anthropic thinking blocks, Gemini thought parts) */
+  reasoning?: string;
+  usage?: TokenUsage;
+  toolCalls?: Array<{
+    toolCallId: string;
+    toolName: string;
+    args: Record<string, unknown>;
+  }>;
+};
+
+/**
+ * Parsed representation of a Claude request, ready for NeuroLink's
+ * generate() / stream() pipeline.
+ */
+export type ParsedClaudeRequest = {
+  model: string;
+  maxTokens: number;
+  temperature?: number;
+  topP?: number;
+  topK?: number;
+  systemPrompt?: string | Array<{ type: string; text: string }>;
+  stream: boolean;
+
+  /** Flat prompt string derived from the last user message. */
+  prompt: string;
+
+  /** Images extracted from content blocks (base64 data URIs or URLs). */
+  images: string[];
+
+  /**
+   * Full conversation history converted to NeuroLink's ChatMessage shape.
+   * Includes all messages, not just the last one.
+   */
+  conversationMessages: Array<{ role: string; content: string }>;
+
+  /** Tools translated to AI SDK-compatible shape for provider fallback. */
+  tools: Record<
+    string,
+    {
+      description?: string;
+      inputSchema: unknown;
+      execute?: (...args: unknown[]) => unknown;
+    }
+  >;
+
+  /**
+   * Tool choice mapping from Claude format.
+   * - "auto" -> let the model decide
+   * - "required" -> force tool use (any tool)
+   * - "none" -> no tool use
+   */
+  toolChoice?: "auto" | "required" | "none";
+
+  /** When toolChoice came from `{type: "tool", name: "..."}`, the tool name. */
+  toolChoiceName?: string;
+
+  /** Thinking configuration parsed from the request. */
+  thinkingConfig?: {
+    enabled: boolean;
+    budgetTokens?: number;
+    thinkingLevel?: "minimal" | "low" | "medium" | "high";
+  };
+
+  /** Original request metadata (if any). */
+  metadata?: ClaudeMetadata;
+
+  /** Stop sequences from the original request. */
+  stopSequences?: string[];
+};
+
+/** Lifecycle state for the SSE serializer. */
+export type StreamLifecycleState = "idle" | "streaming" | "done" | "error";
+
+/** The type of content block currently being streamed. */
+export type ContentBlockType = "text" | "thinking" | "tool_use" | null;
+
+// =============================================================================
+// CLOAKING PIPELINE TYPES (from cloaking/types.ts)
+// =============================================================================
+
+/** Minimal account shape needed by the cloaking pipeline. */
+export type CloakingAccount = {
+  id: string;
+  type: "api_key" | "oauth";
+  status: "healthy" | "quota_exceeded" | "error";
+  consecutiveFailures: number;
+  requestCount: number;
+  lastUsed: number;
+  apiKey?: string;
+};
+
+/** Request envelope for cloaking pipeline. */
+export type CloakingRequest = {
+  headers: Record<string, string | undefined>;
+  body: {
+    messages: Array<{
+      role: string;
+      content: string | Array<Record<string, unknown>>;
+    }>;
+    system?: string | Array<{ type: string; text: string }>;
+    metadata?: Record<string, unknown>;
+    [key: string]: unknown;
+  };
+  url: string;
+};
+
+/** Response envelope for cloaking pipeline. */
+export type CloakingResponse = {
+  headers: Record<string, string | undefined>;
+  body: Record<string, unknown>;
+  status: number;
+};
+
+/** Cloaking mode configuration. */
+export type CloakingMode = "auto" | "always" | "never";
+
+/** Context passed through the cloaking pipeline. */
+export type CloakingContext = {
+  request: CloakingRequest;
+  account: CloakingAccount;
+  config: {
+    mode: CloakingMode;
+    plugins: Record<string, unknown>;
+  };
+  response?: { headers: Record<string, string>; body: unknown };
+};
+
+/** Plugin interface for cloaking pipeline. */
+export type CloakingPlugin = {
+  /** Human-readable name for logging / debugging. */
+  name: string;
+
+  /** Execution order -- lower numbers run first in processRequest. */
+  order: number;
+
+  /** Whether this plugin is active. Disabled plugins are skipped. */
+  enabled: boolean;
+
+  /**
+   * Transform the outgoing request before it reaches the upstream API.
+   * Must return a (possibly mutated) context.
+   */
+  transformRequest: (ctx: CloakingContext) => Promise<CloakingContext>;
+
+  /**
+   * Transform the incoming response before it reaches the client.
+   * Optional -- plugins that only touch requests can skip this.
+   */
+  transformResponse?: (ctx: CloakingContext) => Promise<CloakingContext>;
+};
+
+// =============================================================================
+// CLOAKING PLUGIN OPTIONS (from cloaking/plugins/)
+// =============================================================================
+
+/** Options for the HeaderScrubber cloaking plugin. */
+export type HeaderScrubberOptions = {
+  /** Additional header names (lower-cased) to strip. */
+  extraHeaders?: string[];
+};
+
+/** Options for the SystemPromptInjector cloaking plugin. */
+export type SystemPromptInjectorOptions = {
+  /** IDE name to inject (default: "vscode"). */
+  ide?: string;
+  /** IDE version (default: "1.96.2"). */
+  ideVersion?: string;
+  /** Platform string (default: "darwin"). */
+  platform?: string;
+  /** Working directory to inject (default: "/home/user/project"). */
+  cwd?: string;
+  /** Extra preamble to prepend. */
+  preamble?: string;
+};
+
+/** Options for the TlsFingerprint cloaking plugin. */
+export type TlsFingerprintOptions = {
+  /** Target fingerprint profile (e.g. "chrome-131", "node-22", "claude-code"). */
+  profile?: string;
+  /** Whether the stub should log a warning that it is a no-op. */
+  warnOnUse?: boolean;
+};
+
+// =============================================================================
+// PROXY MODE
+// =============================================================================
+
+/**
+ * Proxy operating mode:
+ * - "full"        — managed accounts, retry, rotation, polyfill (default)
+ * - "passthrough" — no polyfill/retry/rotation, but body is still parsed and re-serialized
+ * - "transparent" — zero-mutation byte relay: raw body forwarded as-is, minimal header filtering,
+ *                   SSE interceptor for cache metrics only (bytes pass through unmodified)
+ */
+export type ProxyMode = "full" | "passthrough" | "transparent";
+
+// =============================================================================
+// MODEL ROUTER TYPES (from modelRouter.ts)
+// =============================================================================
+
+export type RouteResult = {
+  provider: string | null;
+  model: string;
+};
+
+// =============================================================================
+// PROXY CONFIG TYPES (from proxyConfig.ts)
+// =============================================================================
+
+/** Individual account configuration within a proxy config file. */
+export type ProxyAccountConfig = {
+  /** Human-readable name for the account */
+  name: string;
+  /** API key or token (may contain env var references) */
+  apiKey: string;
+  /** Base URL override for the provider endpoint */
+  baseUrl?: string;
+  /** Organization ID (e.g., OpenAI orgs) */
+  orgId?: string;
+  /** Weight for weighted round-robin selection (default: 1) */
+  weight?: number;
+  /** Whether this account is currently enabled (default: true) */
+  enabled?: boolean;
+  /** Maximum requests per minute for this account */
+  rateLimit?: number;
+  /** Arbitrary metadata attached to the account */
+  metadata?: Record<string, unknown>;
+};
+
+/** Top-level proxy configuration structure. */
+export type ProxyConfigFile = {
+  /** Configuration schema version */
+  version?: number;
+  /** Default provider name to apply when not specified per-account */
+  defaultProvider?: string;
+  /** Default base URL applied to accounts that omit baseUrl */
+  defaultBaseUrl?: string;
+  /** Map of provider names to their account lists */
+  accounts: Record<string, ProxyAccountConfig[]>;
+  /** Routing configuration (strategy, model mappings, fallback chain) */
+  routing?: Partial<ProxyRoutingConfig>;
+  /** Cloaking plugin configuration */
+  cloaking?: CloakingConfig;
+};
+
+/** Options for loadProxyConfig. */
+export type LoadProxyConfigOptions = {
+  /** Resolve environment variables in string values (default: true) */
+  resolveEnv?: boolean;
+  /** Custom environment object (defaults to process.env) */
+  env?: Record<string, string | undefined>;
+};
+
+// =============================================================================
+// REQUEST LOGGER TYPES (from requestLogger.ts)
+// =============================================================================
+
+export type ProxyAccountRoutingStrategy =
+  (typeof PROXY_ACCOUNT_ROUTING_STRATEGIES)[number];
+
+export type ProxyAccountRoutingMode =
+  (typeof PROXY_ACCOUNT_ROUTING_MODES)[number];
+
+export type ProxyAccountRoutingReason =
+  (typeof PROXY_ACCOUNT_ROUTING_REASONS)[number];
+
+export type ProxyAccountType = (typeof PROXY_ACCOUNT_TYPES)[number];
+
+export type ProxyQuotaFreshness =
+  | "unknown"
+  | "fresh"
+  | "stale_known"
+  | "refresh_due";
+
+export type ProxyQuotaRefreshReason =
+  | "startup_unknown"
+  | "handoff_prewarm"
+  | "ambiguous_snapshot"
+  | "manual";
+
+export type ProxyQuotaSaturationKind = "none" | "soft" | "hard";
+
+export type ProxyTransportScope =
+  | "shared_provider_transport"
+  | "connection_transport"
+  | "account_specific";
+
+export type ProxyNetworkTransportScope = Exclude<
+  ProxyTransportScope,
+  "account_specific"
+>;
+
+export type ProxyProviderTransportProbeOutcome =
+  | "recovered"
+  | "failed"
+  | "abandoned";
+
+export type ProxyProviderTransportPermit =
+  | { allowed: true; probe: boolean; generation: number }
+  | {
+      allowed: false;
+      errorCode: string | null;
+      transportScope: ProxyNetworkTransportScope;
+      /** The degrading failure happened before any request byte was sent. */
+      connectPhase: boolean;
+    };
+
+export type ProxyAccountRoutingCandidate = {
+  account: string;
+  accountType: ProxyAccountType;
+  sourceIndex: number;
+  rank: number;
+  configuredPrimary: boolean;
+  usable: boolean;
+  saturated: boolean;
+  quotaObserved: boolean;
+  quotaStale: boolean;
+  quotaFreshness?: ProxyQuotaFreshness;
+  refreshNeeded?: boolean;
+  refreshReason?: ProxyQuotaRefreshReason | null;
+  refreshInFlight?: boolean;
+  lastRefreshAttemptAt?: number | null;
+  lastRefreshSuccessAt?: number | null;
+  nextRefreshEligibleAt?: number | null;
+  saturationKind?: ProxyQuotaSaturationKind;
+  softLimitOverrideReason?: "overage" | "weekly_expiry" | null;
+  quotaLastUpdated: number | null;
+  quotaAgeMs: number | null;
+  coolingActive: boolean;
+  coolingReason: AccountCoolingReason | null;
+  coolingUntil: number | null;
+  unifiedStatus: string | null;
+  fallbackStatus?: string | null;
+  upgradePaths?: string | null;
+  overageEligible?: boolean;
+  overageStatus: string | null;
+  sessionStatus: string | null;
+  sessionUsed: number | null;
+  sessionResetAt: number | null;
+  sessionResetBucket: number | null;
+  weeklyStatus: string | null;
+  weeklyUsed: number | null;
+  weeklyResetAt: number | null;
+  /** Display name of the model-scoped window that matched the requested model
+   *  (e.g. "Fable"), or null when the account reports no scoped cap for it.
+   *  Optional so schema-v1 readers of older records stay valid. */
+  scopedModel?: string | null;
+  scopedStatus?: string | null;
+  scopedUsed?: number | null;
+  scopedResetAt?: number | null;
+};
+
+export type ProxyAccountRoutingDecision = {
+  schemaVersion: 1;
+  evaluatedAt: string;
+  strategy: ProxyAccountRoutingStrategy;
+  mode: ProxyAccountRoutingMode;
+  selectionReason: ProxyAccountRoutingReason;
+  quotaRoutingEnabled: boolean;
+  quotaInputsUsed: boolean;
+  sessionSoftLimit: number;
+  sessionResetToleranceMs: number;
+  configuredPrimaryAccount: string | null;
+  configuredPrimaryMatched: boolean;
+  rotationOffset: number;
+  initialAccount: string;
+  candidates: ProxyAccountRoutingCandidate[];
+  policy?: ProxyRoutingPolicySnapshot;
+  affinity?: ProxyAccountRoutingAffinityEvidence;
+  spill?: ProxyAccountRoutingSpillEvidence;
+};
+
+export type ProxyAccountSortMetrics = {
+  usable: boolean;
+  saturated: boolean;
+  hasQuota: boolean;
+  quotaEvidenceRank: number;
+  quotaStale: boolean;
+  quotaFreshness: ProxyQuotaFreshness;
+  refreshNeeded: boolean;
+  refreshReason: ProxyQuotaRefreshReason | null;
+  refreshInFlight: boolean;
+  lastRefreshAttemptAt: number | null;
+  lastRefreshSuccessAt: number | null;
+  nextRefreshEligibleAt: number | null;
+  saturationKind: ProxyQuotaSaturationKind;
+  softLimitOverrideReason: "overage" | "weekly_expiry" | null;
+  quotaLastUpdated: number | null;
+  quotaAgeMs: number | null;
+  coolingActive: boolean;
+  coolingReason: AccountCoolingReason | null;
+  coolingUntil: number;
+  unifiedStatus: string | null;
+  fallbackStatus?: string | null;
+  upgradePaths?: string | null;
+  overageEligible?: boolean;
+  overageStatus: string | null;
+  sessionStatus: string | null;
+  sessionUsed: number | null;
+  sessionResetBucket: number;
+  sessionReset: number;
+  weeklyStatus: string | null;
+  weeklyReset: number;
+  weeklyUsed: number | null;
+  weeklyUsedForSort: number;
+  /** Model-scoped weekly window matching the requested model. All null/false
+   *  when the account reports no scoped cap for it (the common case), which
+   *  makes every scoped comparator rung a no-op for unscoped traffic. */
+  scopedModel: string | null;
+  scopedStatus: string | null;
+  scopedUsed: number | null;
+  scopedReset: number;
+  scopedUsedForSort: number;
+  scopedSaturated: boolean;
+};
+
+export type ProxyAccountRankingPolicy = "expiry-first" | "headroom-first";
+
+export type ProxyAccountRoutingAffinitySkipReason =
+  | "unusable"
+  | "session_saturated"
+  | "expired"
+  | "no_session"
+  | "disabled";
+
+/** The five routing.* values in effect for one request, as reported on the decision. */
+export type ProxyRoutingPolicySnapshot = {
+  ranking: ProxyAccountRankingPolicy;
+  preferPrimary: boolean;
+  sessionAffinity: boolean;
+  sessionAffinityIdleTtlMs: number;
+  spillInflight: number;
+};
+
+export type ProxyAccountRoutingAffinityEvidence = {
+  sessionBound: boolean;
+  boundAccount: string | null;
+  applied: boolean;
+  skippedReason: ProxyAccountRoutingAffinitySkipReason | null;
+};
+
+export type ProxyAccountRoutingSpillEvidence = {
+  from: string;
+  to: string;
+  inflight: number;
+};
+
+/** Why the precedence step skipped a bound account it could see. */
+export type ProxyAffinityPrecedenceSkipReason = Extract<
+  ProxyAccountRoutingAffinitySkipReason,
+  "unusable" | "session_saturated"
+>;
+
+/** The reasons a precedence step (affinity, then prefer-primary) places rank 0. */
+export type ProxyAccountPrecedenceReason = Extract<
+  ProxyAccountRoutingReason,
+  "session_affinity" | "preferred_primary"
+>;
+
+/**
+ * A spill decision in account keys; the route reports it with account labels
+ * as ProxyAccountRoutingSpillEvidence.
+ */
+export type ProxyAccountSpillMove = ProxyAccountRoutingSpillEvidence;
+
+export type RequestLogEntry = {
+  /** Whether model identifies observed serving output rather than a routing target. */
+  servingModelStatus?: "observed" | "unavailable";
+  /** Whether retrying unchanged input can resolve this terminal failure. */
+  retryable?: boolean;
+  tokenBudget?: ProxyTokenBudgetSnapshot;
+  contextPreflight?: ProxyContextEvidence;
+  /** Internal adapter requests link to their one client-facing parent. */
+  parentRequestId?: string;
+  accountingScope?: "client" | "internal";
+  /** Exactly this request owns usage; bridge parents never duplicate it. */
+  usageOwnerRequestId?: string;
+
+  /** API price-table estimate, never a subscription charge or quota measure.
+   * Null when complete usage and an exact model rate are not both available. */
+  apiEquivalentCostUsd?: number | null;
+  /** API-equivalent cache-read savings against uncached input at the same rate. */
+  apiEquivalentCacheSavingsUsd?: number | null;
+  pricingStatus?:
+    | "exact"
+    | "inferred"
+    | "unavailable"
+    | "usage_incomplete"
+    | "owned_by_child";
+  pricingBasis?: "api_price_table";
+  pricingProvider?: string;
+
+  /** Credential identity is unavailable when the SDK does not expose it. */
+  accountIdentityStatus?: "observed" | "unavailable";
+  /** First text, refusal or populated tool output, excluding SSE control frames. */
+  firstUsefulOutputMs?: number;
+  /** Why first-useful-output timing is absent; never substitute a zero. */
+  firstUsefulOutputStatus?: "observed" | "no_useful_output" | "not_observed";
+  /** Native protocol event that established the first useful output. */
+  firstUsefulOutputEvent?: string;
+  /** Why first-output timing could not be established for this response. */
+  firstUsefulOutputUnavailableReason?: string;
+  /** Requested reasoning effort retained independently of body capture. */
+  reasoningEffort?: string;
+  /** Small routing evidence retained even when response bodies are pruned. */
+  fallbackPlan?: Array<{
+    provider: string;
+    model: string;
+    reasoningEffort?: string;
+  }>;
+  timestamp: string;
+  requestId: string;
+  method: string;
+  path: string;
+  model: string;
+  /** Client model when a different upstream model served the request. */
+  requestedModel?: string;
+  stream: boolean;
+  toolCount: number;
+  account: string;
+  /** Provider-qualified account key for collision-free reconstruction. */
+  accountKey?: string;
+  accountType: string;
+  responseStatus: number;
+  responseTimeMs: number;
+  errorType?: string;
+  errorMessage?: string;
+  /** Low-level transport code such as ETIMEDOUT or EADDRNOTAVAIL. */
+  errorCode?: string;
+  /** Whether changing credentials can affect this transport failure. */
+  transportScope?: ProxyTransportScope;
+  /** True when input includes the cache breakdown (native Codex wire usage). */
+  inputIncludesCachedTokens?: boolean;
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheCreationTokens?: number;
+  /** 1h-TTL share of `cacheCreationTokens` (subset); unset when not reported. */
+  cacheCreation1hTokens?: number;
+  cacheReadTokens?: number;
+  /**
+   * Whether the provider reported each cache count. Omitted means observed,
+   * so every path that genuinely reports a breakdown is unchanged. When
+   * false the count is absent rather than zero, and the reporting and
+   * pricing paths must not read it as a cache miss: a zero folded into a
+   * hit-rate denominator biases every rate built on these records down.
+   */
+  cacheReadTokensObserved?: boolean;
+  cacheCreationTokensObserved?: boolean;
+  /** Reasoning tokens are a subset of output, never additional usage. */
+  reasoningTokens?: number;
+  /**
+   * Provider that actually served the request, for costing. Absent on records
+   * written before this field existed; `proxyAnalysis` then falls back to a
+   * cross-provider model lookup rather than assuming Anthropic.
+   */
+  provider?: string;
+  /** Terminal state of the client-facing response when known. */
+  terminalOutcome?:
+    | "completed"
+    | "bodyless"
+    | "client_cancelled"
+    | "stream_error"
+    | "handler_error";
+  /**
+   * Which CLI made the request, derived from User-Agent, and the raw header it
+   * was derived from.
+   *
+   * Both are stored. The derived name is what a dashboard groups on, but the
+   * classifier only knows the clients it has seen — keeping the raw header
+   * means a client it does not recognise is still attributable rather than
+   * collapsing into "unknown" with everything else.
+   */
+  clientApp?: string;
+  /** Raw User-Agent, truncated. See clientApp. */
+  userAgent?: string;
+  /** OTel trace ID for correlation with distributed traces */
+  traceId?: string;
+  /** OTel span ID for correlation with distributed traces */
+  spanId?: string;
+  /** Original OTel sampling flags retained through deferred logging. */
+  traceFlags?: number;
+  /** Exact secret-free inputs and result of initial account selection. */
+  routingDecision?: ProxyAccountRoutingDecision;
+};
+
+/** File-sink evidence is independent of model/request success counters. */
+export type ProxyRequestLogSinkSnapshot = {
+  attempted: number;
+  written: number;
+  inFlight: number;
+  pending: number;
+  /** Records not admitted because the bounded writer queue was full. */
+  dropped: number;
+  writeTimeouts: number;
+  unconfirmedWrites: number;
+  lastErrorCode?: string;
+};
+
+export type ProcessedProxyBodyCapture = {
+  headers?: Record<string, string>;
+  stored: StoredBodyArtifact;
+  error?: string;
+  /** Admission plus worker queue time; retained for existing consumers. */
+  queueWaitMs?: number;
+  admissionWaitMs?: number;
+  workerQueueWaitMs?: number;
+  processingMs?: number;
+  admission?: ProxyBodyCaptureAdmission;
+};
+/** Exact bounded-admission state; records no request content. */
+export type ProxyBodyCaptureAdmission = {
+  limitingResource: "entry" | "captures" | "bytes" | "worker";
+  estimatedBytes?: number;
+  /** Per-entry clone ceiling, independent of the aggregate queue ceiling. */
+  maxEntryBytes?: number;
+  pending: number;
+  pendingBytes: number;
+  maxPending: number;
+  maxPendingBytes: number;
+};
+export type ProxyBodyCaptureWorkerSnapshot = {
+  processing?: number;
+  publishing?: number;
+  oldestAdmissionWaitMs?: number;
+  oldestProcessingMs?: number;
+  oldestPublicationMs?: number;
+  attempted: number;
+  completed: number;
+  rejected: number;
+  failed: number;
+  pending: number;
+  pendingBytes: number;
+  maxPending: number;
+  maxPendingBytes: number;
+  highWaterPending: number;
+  highWaterBytes: number;
+  /** Admission failures by exact guard, independent of processing failures. */
+  rejectionReasons: Record<string, number>;
+  lastError?: string;
+  lastRejectedAt?: string;
+} & ProxyBodyCaptureWaitingSnapshot;
+
+/** Collector transport evidence; acknowledgement does not prove backend storage. */
+export type ProxyBodyDeliveryResult = {
+  status:
+    | "transport_acknowledged"
+    | "export_unconfirmed"
+    | "rejected"
+    | "partial";
+  /** Absent when publication was rejected before chunking. */
+  expectedChunks?: number;
+  acknowledgedChunks: number;
+  unconfirmedChunks: number;
+  droppedChunks: number;
+  notSubmittedChunks?: number;
+  /** Total publication elapsed time, including capacity and exporter waits. */
+  publicationMs?: number;
+  capacityWaitMs?: number;
+  /** Maximum per-chunk residence before an OTLP export starts. */
+  maxChunkQueueWaitMs?: number;
+  /** Maximum per-chunk transport duration; never sums overlapping exports. */
+  maxChunkExportMs?: number;
+  reason?: string;
+};
+
+/** One-hop reference to identical redacted bytes from the same request. */
+export type ProxyBodyCaptureReference = {
+  captureId: string;
+  requestId: string;
+  bodySha256: string;
+  redactedBodyBytes: number;
+  /** Source export settlement time, used to bound backend reconstruction. */
+  exportedAt: string;
+};
+export type ProxyBodyCapturePublication = {
+  delivery?:
+    | ProxyBodyDeliveryResult
+    | { status: "reference"; reason: "identical_redacted_payload" }
+    | {
+        status: "policy_excluded";
+        reason: "body_byte_budget_exhausted" | "body_byte_budget_invalid";
+      };
+  reference?: ProxyBodyCaptureReference;
+};
+export type ProxyBodyCapturePolicyOptions = {
+  bytesPerMinute?: string;
+  deduplicate?: boolean;
+  now?: () => number;
+};
+export type ProxyBodyCapturePolicySnapshot = {
+  deduplicationEnabled: boolean;
+  maxReferences: number;
+  referenceTtlMs: number;
+  references: number;
+  byteBudgetPerMinute: number | null;
+  invalidByteBudget: boolean;
+  availableBytes: number | null;
+  submittedBytes: number;
+  deduplicatedCaptures: number;
+  deduplicatedBytes: number;
+  policyExcludedCaptures: number;
+  policyExcludedBytes: number;
+};
+export type ProxyBodyDeduplicationEntry = {
+  reference: ProxyBodyCaptureReference;
+  expiresAt: number;
+  acknowledged: Promise<boolean>;
+};
+
+/** One bounded body publication, tracked across exporter callbacks. */
+export type ProxyBodyPublicationProgress = {
+  acknowledged: number;
+  unconfirmed: number;
+  dropped: number;
+  emitted: number;
+  maxChunkQueueWaitMs?: number;
+  maxChunkExportMs?: number;
+  notify?: () => void;
+};
+
+/** Bounded metadata-only evidence for an unconfirmed or locally rejected OTLP batch. */
+export type ProxyOtelExportFailure = {
+  id: string;
+  at: string;
+  reason: "export_unconfirmed" | "queue_full";
+  error?: string;
+  records: Array<{
+    eventId: string;
+    kind?: string;
+    requestId?: string;
+    captureId?: string;
+  }>;
+};
+
+/** Read adapter configuration; credentials never appear in diagnostic reports. */
+export type ProxyTelemetryBackend = {
+  baseUrl: string;
+  organization: string;
+  stream: string;
+  /** Optional separate backend storage for bulk body chunks. */
+  bodyStream?: string;
+  authorization?: string;
+  collectorMetricsUrl?: string;
+};
+export type ProxyTelemetryNativeConfig = {
+  exporters?: Record<
+    string,
+    { endpoint?: string; headers?: Record<string, string> }
+  >;
+};
+export type ProxyTelemetryQueryBudget = { used: number; limit: number };
+export type ProxyTelemetryQueryOptions = {
+  sql: string;
+  signal?: string;
+  startTime: number;
+  endTime: number;
+  size?: number;
+  offset?: number;
+};
+export type ProxyTelemetryDoctorOptions = {
+  backend: ProxyTelemetryBackend;
+  startTime: number;
+  endTime: number;
+  proxyUrl?: string;
+  maxRows?: number;
+  /** Explicit age-search horizon; older admissions are outside this proof. */
+  admissionLookbackMs?: number;
+  requestTimeoutMs?: number;
+  ingestionGraceMs?: number;
+  fetchImpl?: typeof fetch;
+};
+export type ProxyTelemetryCheck = {
+  name: string;
+  status: "pass" | "fail" | "warn" | "unverified";
+  evidence: unknown;
+};
+/** Small stored metadata used by the doctor; bodies are queried separately. */
+export type ProxyTelemetryStoredRecord = Partial<RequestLogEntry> & {
+  recordedAtMicroseconds?: number;
+  id?: string;
+  at?: string;
+  captureId?: string;
+  bodySha256?: string;
+  redactedBodyBytes?: number;
+  bodyDelivery?: { status?: string };
+  captureError?: string;
+  captureAdmission?: ProxyBodyCaptureAdmission;
+  bodyTruncated?: boolean;
+  phase?: string;
+  event?: string;
+  telemetryStatus?: string;
+  outcomeSource?: string;
+  requestTimeoutMs?: number;
+  redactionLossy?: boolean;
+};
+export type ProxyTelemetryFieldCoverage = {
+  records: number;
+  traceMissing: number;
+  durationMissing: number;
+  outcomeMissing: number;
+  firstOutputUnexplained: number;
+};
+
+/** Chunk emission stays in the request logger, which owns request attributes. */
+export type ProxyBodyChunkEmitter = (
+  chunk: string,
+  index: number,
+  count: number,
+) => void;
+export type ProxyRequestLoggerSnapshot = {
+  diskEnabled?: boolean;
+  otel?: ReturnType<
+    typeof import("../proxy/otelLogSink.js").getProxyOtelLogSnapshot
+  >;
+  bodyCapture?: ProxyBodyCaptureWorkerSnapshot;
+  bodyCapturePolicy?: ProxyBodyCapturePolicySnapshot;
+  enabled: boolean;
+  requests: ProxyRequestLogSinkSnapshot;
+  attempts: ProxyRequestLogSinkSnapshot;
+  debug: ProxyRequestLogSinkSnapshot;
+};
+
+export type RequestAttemptLogEntry = {
+  /** False for a local context/budget refusal before a provider call. */
+  upstreamDispatched?: boolean;
+  /** Client model name retained independently of the dispatched model. */
+  requestedModel?: string;
+  tokenBudget?: ProxyTokenBudgetSnapshot;
+  contextPreflight?: ProxyContextEvidence;
+  accountingScope?: "client" | "internal";
+  usageOwnerRequestId?: string;
+  timestamp: string;
+  requestId: string;
+  /** Parent client request for an internal fallback invocation. */
+  parentRequestId?: string;
+  /** Requested effort retained independently of full body captures. */
+  reasoningEffort?: string;
+  attempt: number;
+  method: string;
+  path: string;
+  model: string;
+  stream: boolean;
+  toolCount: number;
+  account: string;
+  /** Provider-qualified account key for collision-free reconstruction. */
+  accountKey?: string;
+  accountType: string;
+  responseStatus: number;
+  /** End-to-end request age when this attempt completed. */
+  responseTimeMs: number;
+  /** Time spent in this specific account attempt. */
+  attemptDurationMs?: number;
+  /** Time this attempt waited on the shared transport-recovery gate before
+   *  dispatch. Not part of `attemptDurationMs`; omitted when zero. */
+  transportWaitMs?: number;
+  errorType?: string;
+  errorMessage?: string;
+  /** Low-level transport code such as ETIMEDOUT or EADDRNOTAVAIL. */
+  errorCode?: string;
+  /** Whether changing credentials can affect this transport failure. */
+  transportScope?: ProxyTransportScope;
+  /** Whether this failed attempt may be retried without changing the request. */
+  retryable?: boolean;
+  /** The transport failure happened before any request byte was sent. */
+  connectPhase?: boolean;
+  /** Distinguishes short-lived admission throttles from exhausted quota windows. */
+  rateLimitKind?: "transient" | "quota";
+  /** Reset-aware cooldown reason selected for a rate-limited attempt. */
+  cooldownReason?: "transient" | "session" | "weekly" | "unified";
+  /** Reset reported by a structured quota rejection, epoch milliseconds. */
+  quotaResetAt?: number;
+  /** Unknown scope never implies an account-wide long-window rejection. */
+  quotaScope?: "session" | "weekly" | "unknown";
+  /** True when input includes the cache breakdown (native Codex wire usage). */
+  inputIncludesCachedTokens?: boolean;
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheCreationTokens?: number;
+  cacheReadTokens?: number;
+  /** Reasoning tokens are a subset of output, never additional usage. */
+  reasoningTokens?: number;
+  /** Provider that received this upstream attempt. */
+  provider?: string;
+  /** OTel trace ID for correlation with distributed traces */
+  traceId?: string;
+  /** OTel span ID for correlation with distributed traces */
+  spanId?: string;
+  /** Original OTel sampling flags retained through deferred logging. */
+  traceFlags?: number;
+};
+
+/** Additional fields recorded when a Codex response becomes client-final. */
+export type CodexFinalLogExtra = Partial<
+  Pick<
+    RequestLogEntry,
+    | "errorType"
+    | "errorMessage"
+    | "errorCode"
+    | "transportScope"
+    | "inputTokens"
+    | "outputTokens"
+    | "cacheReadTokens"
+    | "cacheCreationTokens"
+    | "cacheCreation1hTokens"
+    | "cacheReadTokensObserved"
+    | "cacheCreationTokensObserved"
+    | "reasoningTokens"
+    | "terminalOutcome"
+    | "firstUsefulOutputMs"
+    | "firstUsefulOutputStatus"
+    | "firstUsefulOutputEvent"
+    | "retryable"
+    | "accountingScope"
+    | "usageOwnerRequestId"
+    | "model"
+    | "provider"
+    | "account"
+    | "accountKey"
+    | "accountType"
+  >
+>;
+
+/** Who served a Codex turn the outbound fallback handed to a Claude target.
+ *  The outer Codex entry records it, as the OpenAI bridge's does, so the
+ *  final log names the served engine instead of the Codex pool. */
+export type CodexOutboundServedAttribution = Required<
+  Pick<RequestLogEntry, "account" | "accountType" | "provider" | "model">
+> &
+  Pick<RequestLogEntry, "accountKey">;
+
+/** Additional fields recorded for each upstream Codex account attempt. */
+export type CodexAttemptLogExtra = Partial<
+  Pick<
+    RequestAttemptLogEntry,
+    | "inputTokens"
+    | "outputTokens"
+    | "cacheReadTokens"
+    | "cacheCreationTokens"
+    | "reasoningTokens"
+    | "inputIncludesCachedTokens"
+    | "errorType"
+    | "errorMessage"
+    | "errorCode"
+    | "transportScope"
+    | "retryable"
+    | "rateLimitKind"
+    | "cooldownReason"
+    | "quotaResetAt"
+    | "quotaScope"
+  >
+>;
+
+/** Mutable per-request state shared by the Codex request helpers. */
+export type CodexRequestState = {
+  body: JsonObject;
+  bodyStr: string;
+  contextPreflight?: ProxyContextEvidence;
+  budgetLease?: ProxyTokenBudgetLease;
+  budgetDispatched: boolean;
+  finalOutcomeRecorded: boolean;
+};
+
+/** Everything the Codex request helpers need to serve and account one turn. */
+export type CodexRequestRuntime = {
+  ctx: ServerContext;
+  model: string;
+  tracer?: ProxyTracer;
+  requestStartTime: number;
+  isFallbackRequest: boolean;
+  state: CodexRequestState;
+  runtimeConfigProvider?: ProxyRuntimeConfigProvider;
+  loopbackPort?: number;
+  internalDispatch?: (request: Request) => Response | Promise<Response>;
+  settleBudget: (actualTokens?: number) => Promise<void>;
+  recordFinalOutcome: (
+    account: CodexRuntimeAccount | undefined,
+    responseStatus: number,
+    extra?: CodexFinalLogExtra,
+  ) => Promise<void>;
+  writeAttempt: (
+    account: CodexRuntimeAccount,
+    attempt: number,
+    startedAt: number,
+    responseStatus: number,
+    extra?: CodexAttemptLogExtra,
+  ) => void;
+};
+
+/** Failure details recorded when a Codex account is rotated past. */
+export type CodexRotationFailure = {
+  lastFailure: CodexFinalLogExtra;
+  lastErrorStatus: number;
+  lastErrorCode: string | undefined;
+  lastErrorMessage: string;
+  /** The upstream refused the request itself (a policy or invalid-request
+   *  code), not the account: no other account would answer differently, so the
+   *  pool ends the request here instead of rotating. */
+  refusedRequest?: boolean;
+};
+
+/** Minimal persistence contract needed by Codex rotating-token refreshes. */
+export type CodexRefreshTokenStore = {
+  peekTokens(provider: string): Promise<StoredOAuthTokens | null>;
+  saveTokens(provider: string, tokens: StoredOAuthTokens): Promise<void>;
+};
+
+/** Result contract for a Codex OAuth refresh operation. */
+export type CodexTokenRefresher = (refreshToken: string) => Promise<{
+  accessToken: string;
+  refreshToken?: string;
+  expiresAt?: number;
+}>;
+
+export type ProxyBodyCaptureInput = {
+  phase: string;
+  /** The stream observer retained only a bounded prefix. */
+  sourceTruncated?: boolean;
+  headers?: Record<string, string>;
+  body?: unknown;
+  bodySize?: number;
+  contentType?: string;
+  responseStatus?: number;
+  durationMs?: number;
+  account?: string;
+  accountType?: string;
+  attempt?: number;
+  metadata?: Record<string, unknown>;
+};
+
+export type ProxyBodyCaptureLogger = (capture: ProxyBodyCaptureInput) => void;
+
+export type ClaudeFinalRequestLogger = (
+  status: number,
+  accountLabel: string,
+  accountType: string,
+  errorType?: string,
+  errorMessage?: string,
+  extra?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    cacheCreationTokens?: number;
+    /** 1h-TTL share of `cacheCreationTokens` (subset); unset when not reported. */
+    cacheCreation1hTokens?: number;
+    cacheReadTokens?: number;
+    /** False when the provider reported no cache breakdown; see RequestLogEntry. */
+    cacheReadTokensObserved?: boolean;
+    cacheCreationTokensObserved?: boolean;
+    reasoningTokens?: number;
+    errorCode?: string;
+    retryable?: boolean;
+    transportScope?: ProxyTransportScope;
+  },
+) => void;
+
+export type ClaudeLoggedErrorBuilder = (
+  status: number,
+  message: string,
+  errorType?: string,
+  extra?: {
+    account?: string;
+    accountType?: string;
+    attempt?: number;
+    errorCode?: string;
+    retryable?: boolean;
+    transportScope?: ProxyTransportScope;
+  },
+) => ClaudeErrorResponse;
+
+export type ClaudeRequestRuntimeContext = {
+  tracer?: ProxyTracer;
+  requestStartTime: number;
+  logProxyBody: ProxyBodyCaptureLogger;
+  logFinalRequest: ClaudeFinalRequestLogger;
+  buildLoggedClaudeError: ClaudeLoggedErrorBuilder;
+};
+
+export type RoutedClaudeRequestRuntimeContext = ClaudeRequestRuntimeContext & {
+  setRoutingDecision: (decision: ProxyAccountRoutingDecision) => void;
+};
+
+export type AnthropicAttemptLogger = (
+  status: number,
+  errorType?: string,
+  errorMessage?: string,
+  extra?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    cacheCreationTokens?: number;
+    /** 1h-TTL share of `cacheCreationTokens` (subset); unset when not reported. */
+    cacheCreation1hTokens?: number;
+    cacheReadTokens?: number;
+    retryable?: boolean;
+    /** The transport failure happened before any request byte was sent. */
+    connectPhase?: boolean;
+    /** Low-level transport code such as ETIMEDOUT or EADDRNOTAVAIL. */
+    errorCode?: string;
+    transportScope?: ProxyTransportScope;
+    rateLimitKind?: "transient" | "quota";
+    cooldownReason?: "transient" | "session" | "weekly" | "unified";
+    /** Override for nested retries whose attempt starts after this logger. */
+    attemptDurationMs?: number;
+    /** Override used when one account selection performs an OAuth retry fetch. */
+    attempt?: number;
+  },
+) => void;
+
+export type AnthropicLoopState = {
+  lastError: unknown;
+  sawRateLimit: boolean;
+  sawNetworkError: boolean;
+  sawTransientFailure: boolean;
+  invalidRequestFailure: {
+    status: number;
+    body: string;
+    contentType?: string;
+  } | null;
+  authFailureMessage: string | null;
+  authCooldownMessage: string | null;
+  entitlementFailure: AnthropicEntitlementFailure | null;
+  scopedExhaustion: AnthropicScopedExhaustion | null;
+  fallbackFailureMessage?: string;
+  attemptNumber: number;
+  lastTransportErrorCode?: string;
+  lastTransportScope?: ProxyNetworkTransportScope;
+};
+
+export type AnthropicUpstreamBody = {
+  bodyStr: string;
+  sessionId?: string;
+  preparedContext: ProxyPreparedContext<ClaudeRequest>;
+};
+
+export type AnthropicUpstreamBodyBuilder = (
+  token: string,
+) => AnthropicUpstreamBody;
+
+export type LoadedClaudeAccountContext = {
+  accounts: ProxyPassthroughAccount[];
+  enabledAccounts: ProxyPassthroughAccount[];
+  orderedAccounts: ProxyPassthroughAccount[];
+  bodyStr: string;
+  requestStart: number;
+  toolCount: number;
+  url: string;
+  clientHeaders: Record<string, string | undefined>;
+  isClaudeClientRequest: boolean;
+  sessionId?: string;
+};
+
+export type AnthropicSuccessResult =
+  | {
+      retryNextAccount: true;
+      failure?: {
+        message: string;
+        rateLimit: boolean;
+        retryDelayMs?: number;
+        /**
+         * Set only for a transient (burst) rate limit: the attempt loop may
+         * retry the same account within the shared budget before rotating,
+         * exactly as it does for an HTTP 429.
+         */
+        sameAccountRetry?: { coolingUntil: number; retryAfterMs: number };
+      };
+    }
+  | {
+      response: Response | unknown;
+      holdsAccountAdmission?: boolean;
+      /**
+       * True only when an Anthropic account genuinely produced this response.
+       * False for a same-shaped terminal error synthesized locally (e.g. no
+       * upstream body, or the stream failing before its first chunk) — these
+       * reuse the `{ response }` shape because the client still gets a
+       * response, but no account served anything, so session affinity must
+       * not bind on them.
+       */
+      served: boolean;
+    };
+
+/** A release handle for one in-flight request admitted to an OAuth account. */
+export type AccountAdmissionLease = { release(): void };
+
+/** A cancellable queued request for per-account admission capacity. */
+export type QueuedAccountAdmission = {
+  accountKey: string;
+  promise: Promise<AccountAdmissionLease>;
+  cancel(): void;
+};
+
+/** One queued request waiting for per-account admission capacity. */
+export type AccountAdmissionWaiter = {
+  capacity: number;
+  /** Runtime-config generation of the snapshot the request queued under.
+   *  The route always passes one (0 from its fallback snapshot when no
+   *  runtime config store is attached); only direct callers such as test
+   *  hooks leave it absent. */
+  generation?: number;
+  resolve: (lease: AccountAdmissionLease) => void;
+};
+
+/** In-process request admission state for an OAuth account. */
+export type AccountAdmissionState = {
+  active: number;
+  waiters: AccountAdmissionWaiter[];
+};
+
+/** Result of buffering only enough upstream SSE to make a retry-safe decision. */
+export type AnthropicStreamPreflightResult =
+  | { kind: "ready"; chunks: Uint8Array[] }
+  | { kind: "empty"; chunks: Uint8Array[] }
+  | { kind: "transport_error"; chunks: Uint8Array[]; error: unknown }
+  | {
+      kind: "sse_error";
+      chunks: Uint8Array[];
+      errorType: string;
+      message: string;
+    };
+
+/** One complete Server-Sent Event extracted from an incremental buffer. */
+export type ParsedSSEEvent = { event: string; data: string };
+
+/** Complete SSE events plus the trailing partial frame. */
+export type ParsedSSEBuffer = {
+  events: ParsedSSEEvent[];
+  remainder: string;
+};
+
+export type AnthropicAuthRetryResult = {
+  response?: Response | unknown;
+  holdsAccountAdmission?: boolean;
+  continueLoop: boolean;
+  /** Failure-path pacing before rotating after provider-wide overload. */
+  retryDelayMs?: number;
+  lastError: unknown;
+  authFailureMessage: string | null;
+  entitlementFailure: AnthropicEntitlementFailure | null;
+  sawRateLimit: boolean;
+  sawTransientFailure: boolean;
+  sawNetworkError: boolean;
+  upstreamSpan?: Span;
+};
+
+export type AnthropicNonOkResult = {
+  response?: Response | unknown;
+  continueLoop: boolean;
+  retrySameAccount?: boolean;
+  /** Failure-path pacing before rotating after provider-wide overload. */
+  retryDelayMs?: number;
+  lastError: unknown;
+  authFailureMessage: string | null;
+  sawTransientFailure: boolean;
+  invalidRequestFailure: {
+    status: number;
+    body: string;
+    contentType?: string;
+  } | null;
+  entitlementFailure: AnthropicEntitlementFailure | null;
+  upstreamSpan?: Span;
+};
+
+export type PreparedAnthropicAccountAttempt = {
+  continueLoop: boolean;
+  lastError: unknown;
+  authFailureMessage: string | null;
+  headers?: Record<string, string>;
+  /** The upstream `anthropic-beta` carries a value the client asked for that
+   *  the proxy would not have sent itself. A rejection of it is then the
+   *  client's doing, and must not re-rank the pool for everyone. */
+  clientSuppliedBetaForwarded?: boolean;
+  buildUpstreamBody?: AnthropicUpstreamBodyBuilder;
+  finalBodyStr?: string;
+  preparedContext?: ProxyPreparedContext<ClaudeRequest>;
+  fetchStartMs?: number;
+  upstreamSpan?: Span;
+};
+
+/** How to cool an account after a genuine (non-anti-abuse) 429, derived from
+ *  the response's quota headers + retry-after. */
+export type RateLimitCoolingReason = Exclude<AccountCoolingReason, "auth">;
+
+export type AccountCooldownPlan = {
+  reason: RateLimitCoolingReason;
+  /**
+   * Whether this limit applies to every request on the account or only to the
+   * requested model. Model scope must never be persisted as an account
+   * cooldown; the quota window itself remains the routing evidence.
+   */
+  scope: "account" | "model";
+  /** Epoch-ms until which the limiting window is expected to recover. */
+  coolingUntil: number;
+  /** When true (unified/5h/7d rejected), rotate immediately — retrying the
+   *  same account is futile until its window resets. When false (transient
+   *  burst), a small number of jittered same-account retries is allowed first. */
+  rotateImmediately: boolean;
+};
+
+export type ProxyQuotaCooldownUpdate =
+  | {
+      kind: "cooled";
+      coolingUntil: number;
+      coolingReason: AccountCoolingReason;
+    }
+  | { kind: "cleared"; coolingUntil: number }
+  | null;
+
+export type TransientRateLimitRetryBudget = {
+  coolingUntil: number;
+  retriesClaimed: number;
+};
+
+export type AnthropicUpstreamFetchResult = {
+  continueLoop: boolean;
+  retrySameAccount?: boolean;
+  transportScope?: ProxyNetworkTransportScope;
+  errorCode?: string;
+  /** The transport failure happened while connecting, before any request
+   *  byte was sent, so retrying it cannot duplicate provider work. */
+  connectPhase?: boolean;
+  /** When set, the caller should wait this many ms before retrying (from upstream retry-after). */
+  retryAfterMs?: number;
+  /** Set on a genuine 429: how long / why to cool this account before rotating. */
+  cooldownPlan?: AccountCooldownPlan;
+  /** Quota snapshot parsed from the response headers (429 or success), if present. */
+  quota?: AccountQuota;
+  /** A terminal upstream rejection already captured and classified by the
+   *  fetch layer. The route must finalize it directly instead of feeding it
+   *  through the generic non-OK handler a second time. */
+  terminalError?: {
+    status: number;
+    body: string;
+    headers: Record<string, string>;
+    errorType: "construction_rejection";
+  };
+  response?: Response;
+  lastError: unknown;
+  sawRateLimit: boolean;
+  sawNetworkError: boolean;
+  upstreamSpan?: Span;
+};
+
+// =============================================================================
+// USAGE STATS TYPES (from usageStats.ts)
+// =============================================================================
+
+export type ProxyTerminalErrorCategory =
+  | "authentication"
+  | "client_cancelled"
+  | "fallback_exhausted"
+  | "invalid_request"
+  | "proxy_error"
+  | "rate_limit"
+  | "stream_error"
+  | "unclassified"
+  | "upstream_error"
+  | "other";
+
+/** Compact, redacted terminal failure retained independently of body logs. */
+export type ProxyTerminalErrorSummary = {
+  id: string;
+  at: number;
+  status: number;
+  category: ProxyTerminalErrorCategory;
+  requestId?: string;
+  account?: string;
+  /** Provider-qualified account identity when the failure was attributable. */
+  accountKey?: string;
+  accountType?: string;
+  errorType?: string;
+  errorCode?: string;
+  terminalOutcome?: string;
+  message?: string;
+};
+
+/** Optional terminal context supplied when a final request error is recorded. */
+export type ProxyTerminalErrorDetails = {
+  requestId?: string;
+  /** Exact provider-qualified account key when the caller has it. */
+  accountKey?: string;
+  errorType?: string;
+  errorCode?: string;
+  terminalOutcome?: string;
+  message?: string;
+};
+
+export type AccountStats = {
+  /**
+   * Provider-qualified account identity for rows written by current builds.
+   * Omitted only by legacy snapshots whose bare map keys are intentionally
+   * treated as unattributed rather than guessed at during status rendering.
+   */
+  key?: string;
+  label: string;
+  type: string;
+  attemptCount: number;
+  /** Failed upstream attempts, including retries that later recovered. */
+  attemptErrorCount: number;
+  /** Final requests successfully completed by this account. */
+  successCount: number;
+  /** Final requests that terminated as errors on this account. */
+  errorCount: number;
+  /** All upstream attempts that returned 429. */
+  rateLimitCount: number;
+  transientRateLimitCount: number;
+  quotaRateLimitCount: number;
+  lastAttemptAt: number;
+  lastErrorAt?: number;
+};
+
+export type ProxyStats = {
+  startedAt: number;
+  totalAttempts: number;
+  totalAttemptErrors: number;
+  totalRequests: number;
+  totalSuccess: number;
+  totalErrors: number;
+  totalRateLimits: number;
+  totalTransientRateLimits: number;
+  totalQuotaRateLimits: number;
+  accounts: Record<string, AccountStats>;
+};
+
+/** Bounded terminal-error state stored separately from counters and body logs. */
+export type ProxyTerminalErrorJournal = {
+  startedAt: number;
+  totalErrors: number;
+  counts: Record<ProxyTerminalErrorCategory, number>;
+  recent: ProxyTerminalErrorSummary[];
+};
+
+export type ProxyUsageStatsSnapshot = {
+  stats: ProxyStats;
+  statsVersion: number;
+  terminalErrors: ProxyTerminalErrorJournal;
+  terminalErrorsVersion: number;
+};
+
+/** Durability and reconciliation state for the proxy usage counters. */
+export type ProxyStatsPersistenceStatus = {
+  enabled: boolean;
+  filePath: string | null;
+  revision: number;
+  pendingMutations: number;
+  inFlightMutations: number;
+  unpersistedMutations: number;
+  lastFlushedAt: number | null;
+  lastReconciledAt: number | null;
+  lastRecoveryAt: number | null;
+  lastError: string | null;
+  terminalErrorsFilePath?: string | null;
+  terminalErrorsRevision?: number;
+  terminalErrorsPending?: number;
+  terminalErrorsInFlight?: number;
+  terminalErrorsUnpersisted?: number;
+  terminalErrorsLastFlushedAt?: number | null;
+  terminalErrorsLastRecoveryAt?: number | null;
+  terminalErrorsLastError?: string | null;
+};
+
+/** Versioned on-disk snapshot shared by overlapping proxy workers. */
+export type PersistedProxyStatsSnapshot = {
+  schemaVersion: 1;
+  revision: number;
+  updatedAt: number;
+  stats: ProxyStats;
+};
+
+/** Versioned terminal-error snapshot isolated from rolling-worker counter writes. */
+export type PersistedProxyTerminalErrorSnapshot = {
+  schemaVersion: 1;
+  revision: number;
+  updatedAt: number;
+  journal: ProxyTerminalErrorJournal;
+};
+
+/** Ownership metadata for the proxy statistics cross-process lock. */
+export type ProxyStatsLockOwner = {
+  token: string;
+  pid: number;
+  acquiredAt: number;
+};
+
+/** Construction options for an isolated proxy statistics store. */
+export type ProxyUsageStatsStoreOptions = {
+  filePath?: string;
+  terminalErrorsFilePath?: string;
+  flushIntervalMs?: number;
+  lockTimeoutMs?: number;
+  staleLockMs?: number;
+  now?: () => number;
+};
+
+// =============================================================================
+// TOKEN REFRESH TYPES (from tokenRefresh.ts)
+// =============================================================================
+
+export type RefreshableAccount = {
+  token: string;
+  refreshToken?: string;
+  expiresAt?: number;
+  label: string;
+};
+
+export type RefreshResult = {
+  success: boolean;
+  error?: string;
+  status?: number;
+};
+
+/** Result shared by callers waiting on the same rotating refresh token. */
+export type SharedRefreshResult = {
+  result: RefreshResult;
+  token: string;
+  refreshToken?: string;
+  expiresAt?: number;
+};
+
+export type TokenPersistTarget =
+  | string
+  | { credPath: string }
+  | { providerKey: string };
+
+// =============================================================================
+// ACCOUNT QUOTA TYPES (from accountQuota.ts)
+// =============================================================================
+
+export type AccountQuota = {
+  /** Top-level unified status. A rejected value can be authoritative even
+   *  while both 5h and 7d sub-window statuses still report allowed. */
+  unifiedStatus?: string;
+  /** 0.0-1.0 utilization; ignore the numeric placeholder when status is unknown. */
+  sessionUsed: number;
+  /** "allowed" | "throttled" | "rejected" | "unknown" */
+  sessionStatus: string;
+  /** Unix timestamp (seconds) when the 5h window resets */
+  sessionResetAt: number;
+  /** 0.0-1.0 utilization; ignore the numeric placeholder when status is unknown. */
+  weeklyUsed: number;
+  /** "allowed" | "throttled" | "rejected" | "unknown" */
+  weeklyStatus: string;
+  /** Unix timestamp (seconds) when the 7d window resets */
+  weeklyResetAt: number;
+  /** 0.0-1.0  (from fallback-percentage) */
+  fallbackPercentage: number;
+  /** Provider fallback availability, for example "available". */
+  fallbackStatus?: string;
+  /** Comma-separated provider upgrade paths, for example "overage". */
+  upgradePaths?: string;
+  /** "allowed" | "rejected" */
+  overageStatus: string;
+  /** Whether Anthropic reports that paid overage is actively serving traffic. */
+  overageInUse?: boolean;
+  /** Why overage is unavailable, verbatim from
+   *  anthropic-ratelimit-unified-overage-disabled-reason (e.g.
+   *  "org_level_disabled"). Present only when the provider states one. */
+  overageDisabledReason?: string;
+  /** Authoritative extra-usage switch from the usage API's
+   *  `extra_usage.is_enabled`. Unlike the header trio this is reported even for
+   *  an account that has never served a request. */
+  overageEnabled?: boolean;
+  /** Which window Anthropic considers binding right now, verbatim from
+   *  anthropic-ratelimit-unified-representative-claim (e.g. "five_hour"). */
+  representativeClaim?: string;
+  /** Epoch ms when we last captured this data */
+  lastUpdated: number;
+  /** Dynamic per-plan limit buckets from the usage API `limits[]` array
+   *  (session / weekly_all / model-scoped weeklies such as Fable / future
+   *  kinds). Absent on purely header-sourced snapshots. */
+  windows?: AccountQuotaWindow[];
+  /** Epoch ms when `windows` was last refreshed from the usage API. */
+  windowsUpdatedAt?: number;
+  /** Provenance of this snapshot's numbers. */
+  source?: AccountQuotaSource;
+};
+
+/** Where an AccountQuota snapshot came from.
+ *  - "headers"   : passive capture of anthropic-ratelimit-unified-* response
+ *                  headers on a routed request (the automatic path).
+ *  - "usage-api" : an explicit refresh against Anthropic's OAuth usage
+ *                  endpoint (manual refetch path). */
+export type AccountQuotaSource = "headers" | "usage-api";
+
+/** One dynamic limit bucket from the usage API. Provider vocabulary (`kind`,
+ *  `group`, `severity`) is preserved verbatim so buckets Anthropic adds later
+ *  survive storage and display without a code change. */
+export type AccountQuotaWindow = {
+  /** Provider kind, verbatim ("session", "weekly_all", "weekly_scoped", ...). */
+  kind: string;
+  /** Provider group, verbatim ("session" | "weekly" | future values). */
+  group?: string;
+  /** 0.0-1.0 utilization (provider percent / 100). */
+  used: number;
+  /** Provider severity, verbatim ("normal", ...). */
+  severity?: string;
+  /** Derived "allowed" | "rejected" (see usageToQuota status mapping). */
+  status: string;
+  /** Unix timestamp (seconds) when this window resets; 0 when unparseable. */
+  resetsAt: number;
+  isActive?: boolean;
+  /** Model display name for model-scoped windows (e.g. "Fable"). */
+  scopeModel?: string;
+  /** Wire model id for the scope when the provider reports one
+   *  (`scope.model.id`), which matches a request's `model` exactly and so beats
+   *  display-name matching. Often null in practice. */
+  scopeModelId?: string;
+  /** Surface scope when the provider reports one. */
+  scopeSurface?: string;
+  /** Epoch ms this individual window was observed. Lets a header-derived window
+   *  and a usage-API window on the same account age independently — the flat
+   *  `lastUpdated` refreshes on every response and would otherwise make a
+   *  days-old scoped window look current. */
+  updatedAt?: number;
+  /** Provenance of this window, mirroring AccountQuotaSource. */
+  source?: AccountQuotaSource;
+  /** Raw unified header token for header-derived windows, e.g. "7d_oi". */
+  headerWindow?: string;
+};
+
+/** One utilization window from the OAuth usage endpoint (wire shape, loose). */
+export type AnthropicUsageWindow = {
+  /** 0-100 percent (note: NOT the 0-1 fraction used by headers). */
+  utilization?: number | null;
+  /** ISO-8601 timestamp. */
+  resets_at?: string | null;
+};
+
+/** One entry of the usage endpoint's generic `limits[]` array (wire shape). */
+export type AnthropicUsageLimit = {
+  kind?: string;
+  group?: string;
+  /** 0-100 percent. */
+  percent?: number | null;
+  severity?: string | null;
+  resets_at?: string | null;
+  scope?: {
+    model?: { id?: string | null; display_name?: string | null } | null;
+    surface?: string | null;
+  } | null;
+  is_active?: boolean | null;
+};
+
+/** Response body of GET https://api.anthropic.com/api/oauth/usage (loose —
+ *  unknown keys are ignored, known keys may be absent or null). */
+export type AnthropicUsageResponse = {
+  five_hour?: AnthropicUsageWindow | null;
+  seven_day?: AnthropicUsageWindow | null;
+  limits?: AnthropicUsageLimit[] | null;
+  extra_usage?: { is_enabled?: boolean | null } | null;
+};
+
+/** Outcome of one account's usage-endpoint fetch. Return-not-throw. */
+export type AccountUsageFetchResult =
+  | { ok: true; usage: AnthropicUsageResponse }
+  | {
+      ok: false;
+      reason: "not_oauth" | "auth" | "http" | "network" | "parse";
+      error: string;
+      status?: number;
+    };
+
+export type ProxyQuotaRefreshRuntimeState = {
+  inFlight: boolean;
+  lastAttemptAt?: number;
+  lastSuccessAt?: number;
+  nextEligibleAt?: number;
+  consecutiveFailures: number;
+  lastFailureReason?: string;
+  lastCompletedTrigger?: string;
+  coalesced: number;
+};
+
+export type ProxyQuotaRefreshMetrics = {
+  attempted: number;
+  succeeded: number;
+  failed: number;
+  coalesced: number;
+  backoffSuppressed: number;
+  triggerDeduplicated: number;
+};
+
+export type ProxyQuotaRefreshRunResult =
+  | {
+      kind: "completed";
+      result: AccountUsageFetchResult;
+      /** Lower bound for the freshness of the returned usage snapshot. */
+      startedAt: number;
+    }
+  | { kind: "backoff"; nextEligibleAt: number }
+  | { kind: "not_due" };
+
+/** Per-account result inside a GET /limits response. */
+export type ProxyLimitsAccountResult = {
+  /** Account label (quota-store key). */
+  account: string;
+  /** Token-store key ("anthropic:<label>" or "codex:<label>"). */
+  key: string;
+  /**
+   * Which pool engine owns this login. Two logins can share a label — an
+   * operator may use one email for both — so the key, not the label, is the
+   * identity, and this names the engine without parsing the key's prefix.
+   */
+  provider: ProxyAccountProvider;
+  type: ProxyAccountType;
+  status: "refreshed" | "throttled" | "skipped_api_key" | "snapshot" | "error";
+  /** Fresh quota on "refreshed"; last known snapshot otherwise (may be null). */
+  quota: AccountQuota | null;
+  error?: string;
+  coolingUntil?: number;
+  coolingReason?: AccountCoolingReason;
+};
+
+/** The pool engine a login belongs to, as named on limits and accounts rows. */
+export type ProxyAccountProvider = "anthropic" | "codex";
+
+/**
+ * Test-only replacement for the token store behind the account-exposing
+ * routes. The token store is a module singleton bound to the real home at
+ * import, so a suite cannot redirect it; this lets a case state which logins
+ * exist (`knownKeys`, including disabled ones) and which are routable per
+ * engine, exactly as the real listers would answer.
+ */
+export type ProxyAccountDirectoryOverride = {
+  knownKeys: Set<string>;
+  anthropic: ProxyPassthroughAccount[];
+  codex: ProxyPassthroughAccount[];
+};
+
+/** Response body of the proxy's GET /limits endpoint. */
+export type ProxyLimitsRefreshResponse = {
+  fetchedAt: number;
+  /** True when served from stored state without contacting Anthropic. */
+  snapshot: boolean;
+  results: ProxyLimitsAccountResult[];
+  /** Process-local refresh activity; contains no credentials or response body. */
+  refreshMetrics?: ProxyQuotaRefreshMetrics;
+};
+
+/**
+ * Provenance of the quota numbers attached to a single proxy response.
+ *  - "live"     : parsed from THIS upstream response's headers.
+ *  - "snapshot" : the last known snapshot for the serving account; the upstream
+ *                 response carried no quota headers.
+ *  - "none"     : no Anthropic account served this request (fallback provider,
+ *                 or a failure before any account was reached).
+ *
+ * Consumers must not treat "snapshot" as current. Without this distinction a
+ * stale reading is indistinguishable from a fresh one.
+ */
+export type ProxyQuotaSource = "live" | "snapshot" | "none";
+
+/** Aggregate account-pool headroom at the moment a response was produced. */
+export type ProxyPoolHeadroom = {
+  /** Accounts eligible to serve a request right now (not cooling/disabled). */
+  available: number;
+  /** Accounts currently in a cooldown window. */
+  cooling: number;
+  /** Best session headroom across available accounts, as a percentage 0-100.
+   *  Undefined when no available account has a quota snapshot. */
+  bestSessionLeftPct?: number;
+};
+
+/**
+ * Everything the proxy knows about limits and routing for one response.
+ * Consumed by `buildQuotaResponseHeaders` — kept as data (not headers) so the
+ * assembly stays pure and testable.
+ */
+export type ProxyQuotaHeaderContext = {
+  quota: AccountQuota | null;
+  source: ProxyQuotaSource;
+  /** Account label that served the request; omitted for fallback/no-account. */
+  accountLabel?: string;
+  accountType?: string;
+  /** Which upstream actually produced the response ("anthropic" or a fallback
+   *  provider name). Lets a consumer avoid attributing quota to the wrong one. */
+  servedBy?: string;
+  /** 1-based attempt index within the routing loop. */
+  attempt?: number;
+  /** Epoch ms until which the serving account is cooling, when applicable. */
+  coolingUntil?: number;
+  coolingReason?: AccountCoolingReason;
+  pool?: ProxyPoolHeadroom;
+};
+
+// =============================================================================
+// CLAUDE PROXY ROUTE TYPES (from claudeProxyRoutes.ts)
+// =============================================================================
+
+/** Why an account is currently cooling. Drives cooldown duration and logging.
+ *  - "weekly"    : 7d unified limit rejected — cool until the weekly reset.
+ *  - "session"   : 5h unified limit rejected — cool until the session reset.
+ *  - "unified"   : top-level unified limit rejected — cool for retry-after.
+ *  - "transient" : short per-minute/burst 429 — cool for retry-after only.
+ *  - "auth"      : transient refresh failure with bounded backoff. */
+export type AccountCoolingReason = (typeof ACCOUNT_COOLING_REASONS)[number];
+
+/** Restart-safe cooldown snapshot for one account. */
+export type PersistedAccountCooldown = {
+  coolingUntil: number;
+  reason: AccountCoolingReason;
+  updatedAt: number;
+};
+
+/** Normalized Anthropic account keys eligible for proxy routing. */
+export type AccountAllowlist = ReadonlySet<string>;
+
+/** Runtime state for a proxy account. */
+export type RuntimeAccountState = {
+  consecutiveRefreshFailures: number;
+  permanentlyDisabled: boolean;
+  lastToken?: string;
+  lastRefreshToken?: string;
+  /** Epoch-ms timestamp until which the account should not be used for new
+   *  requests. Set from the actual Anthropic reset/retry window or from
+   *  bounded refresh backoff. Other requests arriving during this window skip
+   *  the account rather than hammering it. */
+  coolingUntil?: number;
+  /** Why the account is cooling (set alongside coolingUntil). */
+  coolingReason?: AccountCoolingReason;
+  /** Latest quota snapshot parsed from Anthropic `anthropic-ratelimit-unified-*`
+   *  headers on ANY response (success or 429). Drives proactive, reset-aware
+   *  selection so we don't have to eat a 429 to discover an account is spent. */
+  quota?: AccountQuota;
+};
+
+/** A passthrough account used in the proxy route handler. */
+export type ProxyPassthroughAccount = {
+  key: string;
+  label: string;
+  token: string;
+  refreshToken?: string;
+  expiresAt?: number;
+  type: ProxyAccountType;
+  persistTarget?: TokenPersistTarget;
+};
+
+/** Dependencies for creating Claude proxy routes. */
+export type ClaudeProxyDeps = {
+  modelRouter?: ModelRouterInterface;
+};
+
+// =============================================================================
+// SERVER ADAPTER TYPES
+// =============================================================================
+
+/** Rate limit store entry (Koa adapter). */
+export type KoaRateLimitEntry = {
+  count: number;
+  resetAt: number;
+};
+
+/** Rate limit context (Fastify adapter). */
+export type FastifyRateLimitContext = {
+  ttl: number;
+  ban?: boolean;
+};
+
+/** Rate limit store entry (Hono adapter). */
+export type HonoRateLimitEntry = {
+  count: number;
+  resetAt: number;
+};
+
+/** Information about a deprecated route. */
+export type DeprecatedRouteInfo = {
+  method: string;
+  path: string;
+  deprecation: RouteDeprecation;
+};
+
+/** Cache entry for response caching middleware. */
+export type ResponseCacheEntry<T = unknown> = {
+  value: T;
+  expiresAt: number;
+};
+
+/** Close handler for data stream writers. */
+export type CloseHandler = () => void;
+
+// =============================================================================
+// SESSION IDENTITY TYPES (from cloaking/plugins/sessionIdentity.ts)
+// =============================================================================
+
+/** Cached session entry with TTL for the SessionIdentity cloaking plugin. */
+export type CachedSession = {
+  userId: string;
+  expiresAt: number;
+};
+
+// =============================================================================
+// PROXY ROUTING POLICY TYPES (from routingPolicy.ts)
+// =============================================================================
+
+/** Model tier classification for proxy routing decisions. */
+export type ClaudeProxyModelTier = "opus" | "sonnet" | "haiku" | "other";
+
+/** A single provider attempt in the proxy translation plan. */
+export type ProxyTranslationAttempt = {
+  provider?: string;
+  model?: string;
+  reasoningEffort?: FallbackEntry["reasoningEffort"];
+  label: string;
+};
+
+/** Ordered plan of provider attempts for a proxy request. */
+export type ProxyTranslationPlan = {
+  requestedModel: string;
+  modelTier: ClaudeProxyModelTier;
+  attempts: ProxyTranslationAttempt[];
+  skipped: never[];
+};
+
+// =============================================================================
+// PROXY HEALTH / READINESS TYPES (from proxyHealth.ts)
+// =============================================================================
+
+/** Mutable readiness state tracked by the proxy process. */
+export type ProxyReadinessState = {
+  startTimeMs: number;
+  acceptingConnections: boolean;
+  ready: boolean;
+  /** True only while the updater is draining inference traffic. */
+  drainingForUpdate: boolean;
+  readyAtMs?: number;
+};
+
+/** Structured response returned by the proxy /health endpoint. */
+export type ProxyHealthResponse = {
+  status: "ok" | "starting";
+  ready: boolean;
+  acceptingConnections: boolean;
+  drainingForUpdate: boolean;
+  strategy: string;
+  passthrough: boolean;
+  version: string;
+  startedAt: string;
+  readyAt: string | null;
+  uptime: number;
+  healthPath: "/health";
+  statusPath: "/status";
+};
+
+export type ProxyPaths = {
+  /** Base directory for proxy state files */
+  stateDir: string;
+  /** logs/ — request/response logs */
+  logsDir: string;
+  /** account-quotas.json — per-account rate limit state */
+  quotaFile: string;
+  /** account-cooldowns.json — restart-safe account cooldown state */
+  cooldownFile: string;
+  /** proxy-usage-stats.json — restart- and handoff-safe usage counters */
+  statsFile?: string;
+  /** proxy-grants.json — grants this node has issued to borrowers */
+  grantsFile?: string;
+  /** proxy-share-ledger.json — coin balances, holds and settled spend */
+  ledgerFile?: string;
+  /** proxy-peers.json — lenders this node may borrow from */
+  peersFile?: string;
+  /** Whether this is a dev-mode isolated instance */
+  isDev: boolean;
+};
+
+// =============================================================================
+// PROXY TRACER TYPES (from proxy/proxyTracer.ts)
+// =============================================================================
+
+/** OTel metric instruments used by the proxy tracer. */
+export type ProxyMetrics = {
+  requestsTotal: Counter;
+  requestDuration: Histogram;
+  tokensInput: Counter;
+  tokensOutput: Counter;
+  tokensCacheRead: Counter;
+  tokensCacheCreation: Counter;
+  tokensReasoning: Counter;
+  costTotal: Counter;
+  errorsTotal: Counter;
+  retriesTotal: Counter;
+  modelSubstitutionTotal: Counter;
+  requestBodySize: Histogram;
+  responseBodySize: Histogram;
+  fallbackAttemptsTotal: Counter;
+  fallbackSuccessTotal: Counter;
+  fallbackFailureTotal: Counter;
+  /** Codex-outbound: a declared tool's JSON Schema needed flattening or lost
+   *  a feature (circular $ref, dropped `strict`, a custom grammar tool wrapped
+   *  into a one-string schema) on its way to a Claude tool. */
+  schemaDegradedTotal: Counter;
+  /** Codex-outbound: an inbound field this repo cannot faithfully represent
+   *  in the Claude request was dropped rather than failing the translation. */
+  unsupportedFieldTotal: Counter;
+};
+
+/** Context for a proxy request at the root span level. */
+export type ProxyRequestContext = {
+  requestId: string;
+  method: string;
+  path: string;
+  model: string;
+  stream: boolean;
+  toolCount: number;
+  /** Names of the tools advertised in the request (what the caller exposed). */
+  toolNames?: string[];
+  sessionId?: string;
+  userAgent?: string;
+  clientApp?: string;
+  /**
+   * Provider that will serve the request, used for costing. Defaults to
+   * "anthropic" when omitted, which is correct for the /v1/messages engine;
+   * the OpenAI-compatible engine must pass whatever ModelRouter resolved, or
+   * every non-Anthropic model prices to $0.
+   */
+  provider?: string;
+  /** Whether this span owns client request, latency, and error metrics. */
+  recordRequestMetrics?: boolean;
+  /** Provider usage ownership. Defaults to recordRequestMetrics for backwards
+   * compatibility: internal Codex fallback spans suppress both, while bridge
+   * children explicitly retain usage and their parent owns client outcomes. */
+  recordUsageMetrics?: boolean;
+};
+
+/** Response-side details parsed from the upstream reply (model, finish, tools). */
+export type ResponseInfoContext = {
+  responseModel?: string;
+  finishReason?: string;
+  stopSequence?: string;
+  /** Names of the tools the model actually invoked (tool_use blocks). */
+  toolCalls?: string[];
+  output?: JsonValue | Array<{ type?: string; toolName?: string }>;
+  firstOutputAt?: number;
+};
+
+/** Context recorded when an account is selected for a proxy request. */
+export type AccountSelectionContext = {
+  strategy: string;
+  accountsTotal: number;
+  accountsHealthy: number;
+  selectedAccount: string;
+  accountType: string;
+  rateLimitBefore5h?: number;
+  rateLimitBefore7d?: number;
+};
+
+/** Context for a single upstream attempt (one per retry). */
+export type UpstreamAttemptContext = {
+  attempt: number;
+  account: string;
+  polyfillHeaders: boolean;
+  polyfillBody: boolean;
+  upstreamUrl: string;
+};
+
+/** Token usage and rate-limit utilisation recorded at end of request. */
+export type UsageContext = {
+  /** True when input includes the cache breakdown (native Codex wire usage). */
+  inputIncludesCachedTokens?: boolean;
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens: number;
+  /**
+   * The 1-hour-TTL share of `cacheCreationTokens` (a subset, not additive).
+   * Omitted means "none known to be 1h", so every path that does not read the
+   * upstream `cache_creation` breakdown prices exactly as it did before.
+   */
+  cacheCreation1hTokens?: number;
+  cacheReadTokens: number;
+  /**
+   * Whether the provider actually reported each cache count. Omitted means
+   * observed, so every path that genuinely reports a breakdown is unchanged.
+   * When false the count is not recorded at all, because a zero written into
+   * `proxy_tokens_cache_read` is indistinguishable from a real cache miss and
+   * biases every rate built on that counter downward.
+   */
+  cacheReadTokensObserved?: boolean;
+  cacheCreationTokensObserved?: boolean;
+  reasoningTokens?: number;
+  rateLimitAfter5h?: number;
+  rateLimitAfter7d?: number;
+};
+
+/** Keep trace usage when a child request owns its token and cost metrics. */
+export type ProxyUsageAttributionOptions = {
+  /** Defaults to the tracer's configured ownership when omitted. */
+  recordMetrics?: boolean;
+};
+
+// =============================================================================
+// PROXY ENV TYPES (from proxy/proxyEnv.ts)
+// =============================================================================
+
+/** Where a proxy env file path was sourced from. */
+export type ProxyEnvSource = "cli" | "environment" | "default" | "none";
+
+/** Result of resolving which proxy env file to load. */
+export type ProxyEnvResolution = {
+  path?: string;
+  source: ProxyEnvSource;
+  required: boolean;
+};
+
+/** Result of loading the proxy env file. */
+export type ProxyEnvLoadResult = {
+  loaded: boolean;
+  path?: string;
+  source: ProxyEnvSource;
+};
+
+/** Options controlling proxy env file resolution. */
+export type ProxyEnvOptions = {
+  explicitEnvFile?: string;
+  env?: NodeJS.ProcessEnv;
+  homeDir?: string;
+};
+
+// =============================================================================
+// PROXY FETCH TYPES (from proxy/proxyFetch.ts)
+// =============================================================================
+
+/** Snapshot of proxy-related environment variables captured at startup. */
+export type ProxyEnvironmentSnapshot = {
+  httpsProxy?: string;
+  httpProxy?: string;
+  allProxy?: string;
+  socksProxy?: string;
+  noProxy?: string;
+};
+
+/** Transport deadlines for a proxied upstream request. */
+export type ProxyTimeouts = {
+  headersTimeout?: number;
+  bodyTimeout?: number;
+};
+
+// =============================================================================
+// QUIET DETECTOR (from proxy/quietDetector.ts)
+// =============================================================================
+
+/** Result of a traffic-quiet check. */
+export type QuietStatus = {
+  isQuiet: boolean;
+  lastActivityAt: Date | null;
+  silenceDurationMs: number;
+};
+
+/** In-process proxy request activity used to protect streaming restarts. */
+export type ProxyActivitySnapshot = {
+  activeRequests: number;
+  lastActivityAt: Date | null;
+};
+
+/** Activity payload exposed by the running proxy status endpoint. */
+export type ProxyRuntimeActivity = {
+  activeRequests: number;
+  lastActivityAt: string | null;
+  /** Supervisor-wide resources that must settle before process replacement. */
+  drainingWorkers?: number;
+  queuedSockets?: number;
+  pendingTransfers?: number;
+  candidateWorkers?: number;
+};
+
+/** Terminal state observed while the HTTP adapter relays a response body. */
+export type ProxyResponseTerminalOutcome =
+  | "completed"
+  | "bodyless"
+  | "client_cancelled"
+  | "stream_error";
+
+/** Non-blocking callbacks for response lifecycle metadata. */
+export type ProxyResponseTrackingObserver = {
+  onFirstChunk?: (details: {
+    /** Decoded response-body bytes observed by the adapter. */
+    observedBodyBytes: number;
+    responseChunks: 1;
+  }) => void;
+  onTerminal?: (details: {
+    outcome: ProxyResponseTerminalOutcome;
+    /** Underlying read failure for structured transport diagnostics. */
+    error?: unknown;
+    /** Decoded response-body bytes observed by the adapter. */
+    observedBodyBytes: number;
+    responseChunks: number;
+  }) => unknown;
+};
+
+/** Versioned lifecycle event names persisted by the proxy adapter. */
+export type ProxyLifecycleEventName =
+  | "runtime_sample"
+  | "supervisor_event"
+  | "request_accepted"
+  | "response_headers"
+  | "response_first_chunk"
+  | "request_terminal";
+
+/** Client-facing terminal classifications recorded by lifecycle metadata. */
+export type ProxyLifecycleTerminalOutcome =
+  | ProxyResponseTerminalOutcome
+  | "handler_error"
+  | "unknown";
+
+/** Content-free lifecycle event accepted by the bounded metadata logger. */
+export type ProxyLifecycleEventInput = {
+  /** Hard admission-to-terminal deadline used by reconciliation. */
+  requestTimeoutMs?: number;
+  /** Internal adapter requests link to their one client-facing parent. */
+  parentRequestId?: string;
+  accountingScope?: "client" | "internal";
+  /** Exactly this request owns usage; bridge parents never duplicate it. */
+  usageOwnerRequestId?: string;
+
+  event: ProxyLifecycleEventName;
+  requestId: string;
+  method: string;
+  path: string;
+  model?: string;
+  stream?: boolean;
+  toolCount?: number;
+  sessionHash?: string;
+  requestBytes?: number;
+  responseStatus?: number;
+  /** Semantic final status; the HTTP status may already have been committed. */
+  finalStatus?: number;
+  /** Terminal bookkeeping health, separate from the model outcome. */
+  telemetryStatus?: "complete" | "timeout" | "observer_error" | "missing_final";
+  /** Transport completion is independent of successful model completion. */
+  transportOutcome?: ProxyResponseTerminalOutcome;
+  outcomeSource?:
+    | "final_request"
+    | "transport_error"
+    | "http_status"
+    | "unknown";
+  /** Decoded response-body bytes observed by the adapter. */
+  observedBodyBytes?: number;
+  responseChunks?: number;
+  elapsedMs?: number;
+  terminalOutcome?: ProxyLifecycleTerminalOutcome;
+  errorType?: string;
+  errorCode?: string;
+  timestampMs?: number;
+  monotonicMs?: number;
+  /** Parent-owned evidence, independent of the serving worker's journal tail. */
+  supervisorEvent?: RollingWorkerSupervisorEvent;
+  runtimeSample?: ProxyRuntimeSample;
+};
+
+/** Process CPU and event-loop evidence; host load is not a request count. */
+export type ProxyRuntimeSample = {
+  intervalMs: number;
+  cpuPercentOneCore: number;
+  rssBytes: number;
+  heapUsedBytes: number;
+  eventLoopDelayP99Ms: number;
+  eventLoopDelayMaxMs: number;
+  hostLoad1m: number;
+  availableParallelism: number;
+};
+
+/** Data-quality counters for the bounded lifecycle metadata sink. */
+export type ProxyLifecycleLoggerSnapshot = {
+  sink?: "otel" | "file";
+  admissionPolicy?: "best-effort" | "durable-file";
+  enabled: boolean;
+  schemaVersion: number;
+  processInstanceId: string;
+  nextSequence: number;
+  attempted: number;
+  /** Records delegated to the OTel sink; delivery is reported by its queues. */
+  otelSubmitted: number;
+  enqueued: number;
+  written: number;
+  dropped: number;
+  queueDrops: number;
+  invalidDrops: number;
+  writeDrops: number;
+  writeFailures: number;
+  /** Events requeued after a transient lifecycle metadata write failure. */
+  writeRetries: number;
+  /** Slow appends still owned by the original writer, never replayed on timeout. */
+  writeTimeouts: number;
+  /** Records in failed appends that may have partially reached the file. */
+  unconfirmedWrites: number;
+  pending: number;
+  inFlight: number;
+  flushing: boolean;
+};
+
+/** Lifecycle logger configuration. Queue overrides are used by stress tests. */
+export type ProxyLifecycleLoggerOptions = {
+  filePrefix?: "proxy-lifecycle" | "proxy-supervisor";
+  enabled: boolean;
+  logDir?: string;
+  queueCapacity?: number;
+  batchSize?: number;
+  flushIntervalMs?: number;
+  /** Bounded retries for a metadata batch that cannot be appended immediately. */
+  maxWriteRetries?: number;
+};
+
+/** Serialized lifecycle line awaiting a bounded batch write. */
+export type QueuedProxyLifecycleEvent = {
+  filePrefix?: string;
+  logDir: string;
+  date: string;
+  record: Record<string, unknown>;
+  writeRetries: number;
+  /** Resolve only after the original append settles; uncertain writes fail. */
+  onPersisted?: (confirmed: boolean) => void;
+};
+
+/** Percentile summary used by offline proxy log analysis. */
+export type ProxyLatencySummary = {
+  count: number;
+  p50: number | null;
+  p95: number | null;
+  p99: number | null;
+  max: number | null;
+};
+
+/** Per-account request and rate-limit totals reconstructed from JSONL logs. */
+export type ProxyAnalysisAccount = {
+  account: string;
+  accountType: string;
+  attempts: number;
+  attemptErrors: number;
+  finalRequests: number;
+  finalErrors: number;
+  transientRateLimits: number;
+  quotaRateLimits: number;
+  unclassifiedRateLimits: number;
+};
+
+/** Offline report generated from proxy request, attempt, and lifecycle logs. */
+export type ProxyAnalysisStreamName =
+  | "lifecycle"
+  | "requests"
+  | "attempts"
+  | "debug";
+
+export type ProxyAnalysisReport = {
+  runtime: {
+    samples: number;
+    maxEventLoopDelayMs: number | null;
+    maxRssBytes: number | null;
+    maxCpuPercentOneCore: number | null;
+    maxHostLoad1m: number | null;
+  };
+  generatedAt: string;
+  since: string;
+  until: string;
+  logsDir: string;
+  files: {
+    lifecycle: number;
+    requests: number;
+    attempts: number;
+    debug: number;
+  };
+  coverage: {
+    lifecycle: boolean;
+    finalRequests: boolean;
+    attempts: boolean;
+    attemptLatency: boolean;
+    cacheUsage: boolean;
+    routingDecisions: boolean;
+    /** True only when every stream needed for cross-stream request/attempt
+     * reconciliation begins at or before the requested analysis window. */
+    comparableRequestAttempts: boolean;
+  };
+  dataQuality: {
+    linesRead: number;
+    malformedLines: number;
+    unsupportedLifecycleLines: number;
+    lifecycleSequenceGaps: number;
+    lifecycleSequenceDuplicates: number;
+    conflictingLifecycleDuplicates: number;
+    duplicateAttempts: number;
+    finalOutcomeConflicts: number;
+    /** Missing evidence; may include in-flight or interrupted requests. */
+    acceptedWithoutFinal: number;
+    terminalWithoutFinal: number;
+    streams: Record<
+      ProxyAnalysisStreamName,
+      {
+        observedFrom: string | null;
+        observedTo: string | null;
+        startsAtOrBeforeRequestedWindow: boolean;
+        /** Whether this stream can support claims covering the full window. */
+        completeWindow: boolean;
+      }
+    >;
+    bodyArtifacts: {
+      capturesIndexed: number;
+      artifactsReferenced: number;
+      artifactsPresent: number;
+      artifactsMissing: number;
+      invalidPaths: number;
+      writeFailures: number;
+      truncatedCaptures: number;
+    };
+    routingDecisions: {
+      valid: number;
+      invalid: number;
+      absent: number;
+    };
+  };
+  lifecycle: {
+    /** Accepted requests lacking transport terminals when their worker exited. */
+    unconfirmedAtWorkerExit: Array<{
+      requestId: string;
+      workerProcessInstanceId: string;
+      at: string;
+      workerExitCode: number | null;
+      workerExitSignal: string | null;
+      providerFinalRecorded: boolean;
+    }>;
+    accepted: number;
+    internalAccepted?: number;
+    internalTerminal?: number;
+    internalUnsettled?: number;
+    /** Accepted metadata requests that do not require model final records. */
+    auxiliaryRequests: number;
+    headers: number;
+    firstChunks: number;
+    terminal: number;
+    unsettled: number;
+    terminalOutcomes: Record<string, number>;
+    errorTypes: Record<string, number>;
+    errorCodes: Record<string, number>;
+  };
+  requests: {
+    completed: number;
+    /** Linked internal adapter finals excluded from client request totals. */
+    internalCompleted?: number;
+    success: number;
+    errors: number;
+    finalRateLimits: number;
+    recoveredAfterRetry: number;
+    errorTypes: Record<string, number>;
+    errorCodes: Record<string, number>;
+  };
+  attempts: {
+    total: number;
+    errors: number;
+    errorTypes: Record<string, number>;
+    errorCodes: Record<string, number>;
+    transportScopes: Record<string, number>;
+  };
+  rateLimits: {
+    attemptRateLimits: number;
+    transient: number;
+    quota: number;
+    unclassified: number;
+  };
+  latencyMs: {
+    headers: ProxyLatencySummary;
+    firstChunk: ProxyLatencySummary;
+    firstUsefulOutput: ProxyLatencySummary;
+    terminal: ProxyLatencySummary;
+    finalRequest: ProxyLatencySummary;
+    attempt: ProxyLatencySummary;
+    singleAttemptDelta: ProxyLatencySummary;
+  };
+  cache: {
+    requestsWithUsage: number;
+    requestsWithCacheRead: number;
+    /**
+     * Turns whose cache breakdown the provider actually reported, and the
+     * denominator of `requestHitRate`. A turn that reported none is not a
+     * miss, so counting it would bias the rate down.
+     */
+    requestsWithCacheObservation: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
+    /** Ordinary input, excluding the separately reported cache read/write buckets. */
+    inputTokens: number;
+    outputTokens: number;
+    requestHitRate: number | null;
+    /**
+     * Summed per-request cost in USD. Records that carry no model, or whose
+     * model matches no pricing table, contribute 0 — so this is a floor, not
+     * an exact bill. `requestsPriced` says how many records actually priced.
+     */
+    estimatedCostUsd: number;
+    requestsPriced: number;
+    /**
+     * Requests whose cost came from a longest-prefix fallback rather than an
+     * exact pricing row — the rate is inherited from a similarly-named model
+     * and may be wrong. Adding the real row makes these exact.
+     */
+    requestsPricedByPrefix: number;
+    /** Distinct models priced by prefix fallback, for the operator to chase. */
+    modelsPricedByPrefix: string[];
+    /** Requests carrying usage whose model matched no pricing row at all. */
+    requestsUnpriced: number;
+    /** Distinct models with no pricing row at all. */
+    unpricedModels: string[];
+  };
+  routing: {
+    modes: Record<string, number>;
+    selectionReasons: Record<string, number>;
+    initialAccounts: Record<string, number>;
+    finalAccountChanges: number;
+    finalOutsideCandidateSet: number;
+    /** Number of routing decisions aggregated before sampling records. */
+    totalRecords: number;
+    /** Most recent bounded sample retained for offline inspection. */
+    records: ProxyAnalysisRoutingRecord[];
+  };
+  accounts: ProxyAnalysisAccount[];
+};
+
+/** Inputs for the offline proxy JSONL analyzer. */
+export type ProxyAnalysisOptions = {
+  logsDir?: string;
+  since?: string;
+  until?: string;
+  nowMs?: number;
+};
+
+/** Attempt timing retained while joining offline proxy log records. */
+export type ProxyAnalysisAttemptRecord = {
+  count: number;
+  hadError: boolean;
+  totalDurationMs: number;
+  durationCount: number;
+};
+
+/** Final request fields retained while joining offline proxy log records. */
+export type ProxyAnalysisFinalRequestRecord = {
+  accountingScope?: "client" | "internal";
+  parentRequestId?: string;
+  usageOwnerRequestId?: string;
+  firstUsefulOutputMs: number | null;
+  timestamp: string;
+  status: number;
+  durationMs: number | null;
+  account: string;
+  accountType: string;
+  model: string | null;
+  provider: string | null;
+  inputIncludesCachedTokens?: boolean;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cacheReadTokens: number | null;
+  cacheCreationTokens: number | null;
+  /** 1h-TTL share of `cacheCreationTokens` (subset); null when not reported. */
+  cacheCreation1hTokens: number | null;
+  /**
+   * False when the provider reported no cache breakdown. Such a turn is not a
+   * cache miss, so it is excluded from the hit-rate denominator rather than
+   * counted as a zero.
+   */
+  cacheReadTokensObserved?: boolean;
+  cacheCreationTokensObserved?: boolean;
+  errorType: string | null;
+  errorCode: string | null;
+  routingDecision: ProxyAccountRoutingDecision | null;
+};
+
+/**
+ * A stream transformer that also handles cancellation.
+ *
+ * The Streams standard gives `Transformer` a `cancel()` callback — invoked when
+ * the stream is aborted rather than closed cleanly — and Node implements it,
+ * but TypeScript's bundled lib does not declare it yet. Without it there is no
+ * way to observe a client hanging up mid-response.
+ */
+export type ProxyCancellableTransformer<I, O> = Transformer<I, O> & {
+  cancel?: (reason?: unknown) => void;
+};
+
+/**
+ * Token usage scraped from a Codex (OpenAI Responses) SSE stream.
+ *
+ * Verified against real traffic: captured from a live `codex exec` run through
+ * the proxy on 2026-08-21 (`test/fixtures/codex-response-usage.sse`). The
+ * shape is `response.completed` → `response.usage`, carrying `input_tokens`,
+ * `output_tokens`, and an `input_tokens_details` object with `cached_tokens`
+ * and `cache_write_tokens`. The parser also accepts the common variants. Treat
+ * a null result as "not observed", never as "zero tokens".
+ */
+export type CodexStreamUsage = {
+  /** Distinguish missing provider usage from a reported zero. */
+  inputTokensObserved?: boolean;
+  outputTokensObserved?: boolean;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  /** Cache writes, which bill at a premium over both reads and plain input. */
+  cacheCreationTokens: number;
+  /**
+   * Whether the provider supplied each cache count, tracked per field.
+   *
+   * Without this a reply that omits `input_tokens_details` is recorded as a
+   * total cache miss rather than as unknown, which biases every measured cache
+   * rate downward. Input, output and reasoning already carry this distinction.
+   *
+   * The two fields are tracked separately because a reply can carry one and
+   * not the other: a single flag covering both would let a missing
+   * `cache_write_tokens` ride in on an observed `cached_tokens` and be
+   * recorded as a real zero. A count that is present but not a finite,
+   * non-negative number is not observed either — `nonNegativeInt` floors it to
+   * zero, which is indistinguishable from a genuine zero once recorded.
+   */
+  cacheReadTokensObserved?: boolean;
+  cacheCreationTokensObserved?: boolean;
+  reasoningTokens: number;
+  /** Whether the provider supplied a valid reasoning breakdown. */
+  reasoningTokensObserved?: boolean;
+};
+
+/** Semantic completion evidence observed in native Codex SSE bytes. */
+export type CodexStreamEvidence = {
+  completed: boolean;
+  terminalBytes: number;
+  /** Malformed, oversized or undispatched frames prevent proving output absence. */
+  observationIncomplete?: boolean;
+  /** Output items past the recorded-size cap were left out of `response.output`. */
+  outputItemsOmitted?: boolean;
+  firstUsefulOutputAt?: number;
+  firstUsefulOutputEvent?: string;
+  errorType?: string;
+  errorMessage?: string;
+  errorCode?: string;
+  response?: JsonObject;
+};
+
+/** Validated account-routing evidence joined to a final request log. */
+export type ProxyAnalysisRoutingRecord = {
+  requestId: string;
+  timestamp: string;
+  responseStatus: number;
+  finalAccount: string;
+  finalAccountType: string;
+  decision: ProxyAccountRoutingDecision;
+};
+
+/** Request metadata retained by the HTTP adapter for terminal error logging. */
+export type RuntimeRequestMetadata = {
+  /** Internal adapter requests link to their one client-facing parent. */
+  parentRequestId?: string;
+  accountingScope?: "client" | "internal";
+  /** Exactly this request owns usage; bridge parents never duplicate it. */
+  usageOwnerRequestId?: string;
+  abortController?: AbortController;
+
+  /** Last dispatched attempt, retained until this HTTP request terminates. */
+  lastUpstreamAttempt?: RequestAttemptLogEntry;
+  requestId: string;
+  /** Ingress OTel correlation survives detached stream/error callbacks. */
+  traceId?: string;
+  spanId?: string;
+  /** Original OTel sampling flags retained through deferred logging. */
+  traceFlags?: number;
+  method: string;
+  path: string;
+  startedAt: number;
+  model: string;
+  stream: boolean;
+  toolCount: number;
+  /** Admission decision captured before an updater drain can race the route. */
+  rejectForUpdate?: boolean;
+  terminalErrorType?: string;
+  terminalErrorCode?: string;
+  /** Canonical final record, populated synchronously before asynchronous I/O. */
+  terminalResult?: RequestLogEntry;
+  /** Releases this request's peer-share concurrency slot. Set by the share
+   *  gate for borrowed traffic; invoked once the response body completes, so a
+   *  long stream holds its slot for as long as it is actually streaming. */
+  shareRelease?: () => void;
+};
+
+// =============================================================================
+// RAW STREAM CAPTURE (from proxy/rawStreamCapture.ts)
+// =============================================================================
+
+/** Accumulated upstream body capture from a raw stream. */
+export type RawStreamCapture = {
+  totalBytes: number;
+  text: string;
+  truncated: boolean;
+};
+
+/** Transformed stream pair used to capture upstream bodies without buffering. */
+export type RawStreamCaptureResult = {
+  stream: TransformStream<Uint8Array, Uint8Array>;
+  capture: Promise<RawStreamCapture>;
+};
+
+// =============================================================================
+// REQUEST LOGGER (from proxy/requestLogger.ts)
+// =============================================================================
+
+/** Single captured body/headers entry written to disk by the proxy logger. */
+export type ProxyBodyCaptureEntry = {
+  /** Unique capture identity shared by its index and every exported chunk. */
+  captureId?: string;
+  timestamp: string;
+  requestId: string;
+  phase: string;
+  model: string;
+  stream: boolean;
+  headers?: Record<string, string>;
+  body?: unknown;
+  bodySize?: number;
+  /** The bounded stream observer omitted a suffix before redaction/processing. */
+  sourceTruncated?: boolean;
+  contentType?: string;
+  responseStatus?: number;
+  durationMs?: number;
+  account?: string;
+  accountType?: string;
+  attempt?: number;
+  traceId?: string;
+  spanId?: string;
+  /** Original OTel sampling flags retained through deferred logging. */
+  traceFlags?: number;
+  metadata?: Record<string, unknown>;
+};
+
+/** JSON object retained in deterministic proxy replay artifacts. */
+export type ProxyReplayJsonRecord = Record<string, unknown>;
+
+/** One verified body-capture record in a proxy replay bundle. */
+export type ProxyReplayCapture = {
+  timestamp: string;
+  phase: string;
+  attempt: number | null;
+  model: string | null;
+  stream: boolean | null;
+  account: string | null;
+  accountType: string | null;
+  responseStatus: number | null;
+  durationMs: number | null;
+  contentType: string | null;
+  headers: Record<string, string>;
+  body: string | null;
+  bodySha256: string | null;
+  bodyTruncated: boolean;
+  observedBodyBytes: number | null;
+  metadata: ProxyReplayJsonRecord | null;
+  source: {
+    indexFile: string;
+    indexLine: number;
+    artifactPath: string | null;
+  };
+  issues: string[];
+};
+
+/** Deterministic, redacted reconstruction of one captured proxy request. */
+export type ProxyReplayBundle = {
+  schemaVersion: 1;
+  kind: "neurolink.proxy.replay-bundle";
+  requestId: string;
+  selectedAttempt: number;
+  source: {
+    logsDirectory: string;
+    indexFiles: string[];
+  };
+  completeness: {
+    captures: number;
+    phasesPresent: string[];
+    missingRequiredPhases: string[];
+    truncatedCaptures: number;
+    artifactsWithIssues: number;
+    replayable: boolean;
+    blockers: string[];
+  };
+  request: {
+    method: string;
+    url: string | null;
+    headers: Record<string, string>;
+    requiredHeaderInputs: string[];
+    body: string | null;
+    bodySha256: string | null;
+    bodyTruncated: boolean;
+    contentType: string | null;
+    account: string | null;
+    accountType: string | null;
+    model: string | null;
+    stream: boolean | null;
+  };
+  capturedResponse: ProxyReplayCapture | null;
+  captures: ProxyReplayCapture[];
+};
+
+/** Redacted direct-upstream response and comparison with captured evidence. */
+export type ProxyReplayComparison = {
+  schemaVersion: 1;
+  kind: "neurolink.proxy.replay-comparison";
+  requestId: string;
+  selectedAttempt: number;
+  endpoint: string;
+  request: {
+    method: string;
+    headers: Record<string, string>;
+    bodySha256: string;
+    bodyBytes: number;
+    usedBodyOverride: boolean;
+  };
+  captured: {
+    status: number | null;
+    contentType: string | null;
+    bodySha256: string | null;
+    bodyBytes: number | null;
+    bodyTruncated: boolean;
+    jsonShape: string[] | null;
+  } | null;
+  direct: {
+    status: number;
+    headers: Record<string, string>;
+    contentType: string | null;
+    body: string;
+    bodySha256: string;
+    observedBodyBytes: number;
+    storedBodyBytes: number;
+    bodyTruncated: boolean;
+    timeToHeadersMs: number;
+    totalMs: number;
+    jsonShape: string[] | null;
+  };
+  comparison: {
+    statusMatches: boolean | null;
+    contentTypeMatches: boolean | null;
+    bodyHashMatches: boolean | null;
+    jsonShapeMatches: boolean | null;
+  };
+};
+
+/** Inputs for deterministic proxy replay bundle export. */
+export type ExportProxyReplayOptions = {
+  requestId: string;
+  logsDir?: string;
+  attempt?: number;
+};
+
+/** Inputs for an explicitly authorized direct-upstream comparison. */
+export type CompareProxyReplayOptions = {
+  execute: boolean;
+  headerValues?: Record<string, string>;
+  bodyOverride?: string;
+  urlOverride?: string;
+  timeoutMs?: number;
+  now?: () => number;
+  fetchImpl?: typeof fetch;
+};
+
+/** Persisted artifact produced when a body is stored to disk. */
+export type StoredBodyArtifact = {
+  /** Bytes supplied to redaction, after any source observer limit. */
+  inputRetainedBytes?: number;
+  inputEncoding?: "utf8_text" | "structured_object";
+  sourceTruncated?: boolean;
+  processingTruncated?: boolean;
+  /** Invalid structured frames were removed for secret safety. */
+  redactionLossy?: boolean;
+  unparseableRedactedFrames?: number;
+  bodyPath?: string;
+  bodySha256?: string;
+  redactedBodyBytes?: number;
+  storedFileBytes?: number;
+  redactedBody?: string;
+  bodyTruncated?: boolean;
+  bodyCaptureLimitBytes?: number;
+  originalRedactedBodyBytes?: number;
+  bodyWriteFailed?: boolean;
+};
+
+/** File the proxy logger tracks for rotation and cleanup. */
+export type ManagedLogFile = {
+  path: string;
+  mtime: number;
+  size: number;
+};
+
+// =============================================================================
+// SSE INTERCEPTOR (from proxy/sseInterceptor.ts)
+// =============================================================================
+
+/** Individual content block observed during an SSE stream. */
+export type SSEContentBlock = {
+  index: number;
+  type: "text" | "thinking" | "tool_use" | "tool_result";
+  /** Accumulated text for text blocks. Capped at MAX_BLOCK_CONTENT_BYTES. */
+  text?: string;
+  /** Accumulated thinking content. Capped at MAX_BLOCK_CONTENT_BYTES. */
+  thinking?: string;
+  /** Tool name for tool_use blocks. */
+  toolName?: string;
+  /** Tool call id for tool_use blocks. */
+  toolId?: string;
+  /** Accumulated partial JSON input for tool_use blocks. Capped at MAX_BLOCK_CONTENT_BYTES. */
+  toolInput?: string;
+};
+
+/** Aggregated telemetry resolved when an SSE stream completes. */
+export type SSETelemetry = {
+  messageStopReceived: boolean;
+  firstUsefulOutputAt?: number;
+  firstUsefulOutputEvent?: string;
+  observationIncomplete?: boolean;
+  messageId: string;
+  model: string;
+  usage: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheCreationInputTokens: number;
+    /** 1h-TTL share of `cacheCreationInputTokens`; absent when not reported. */
+    cacheCreation1hInputTokens?: number;
+    cacheReadInputTokens: number;
+    totalTokens: number;
+  };
+  contentBlocks: SSEContentBlock[];
+  stopReason: string | null;
+  stopSequence: string | null;
+  eventCount: number;
+  streamDurationMs: number;
+  totalBytesReceived: number;
+  events: Array<{ type: string; timestamp: number; data: string }>;
+  /** Error carried as a terminal SSE `event: error`, if one was observed. */
+  streamErrorMessage?: string;
+  rawText?: string;
+  rawTextTruncated?: boolean;
+};
+
+/** Terminal outcome of a response body after the HTTP headers were sent. */
+export type StreamTerminalOutcome =
+  | { kind: "completed" }
+  | { kind: "upstream_error"; message: string }
+  | { kind: "client_cancelled" };
+
+/** First-writer-wins tracker for an upstream streaming response. */
+export type StreamTerminalOutcomeTracker = {
+  outcome: Promise<StreamTerminalOutcome>;
+  complete: () => void;
+  fail: (message: string) => void;
+  cancel: () => void;
+};
+
+/** Mutable accumulator the SSE interceptor uses internally. */
+export type TelemetryAccumulator = {
+  messageStopReceived: boolean;
+  firstUsefulOutputAt?: number;
+  firstUsefulOutputEvent?: string;
+  observationIncomplete?: boolean;
+  messageId: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationInputTokens: number;
+  cacheCreation1hInputTokens?: number;
+  cacheReadInputTokens: number;
+  contentBlocks: SSEContentBlock[];
+  blockByteCounts: Map<number, number>;
+  stopReason: string | null;
+  stopSequence: string | null;
+  eventCount: number;
+  startTime: number;
+  totalBytesReceived: number;
+  events: Array<{ type: string; timestamp: number; data: string }>;
+  rawTextChunks?: string[];
+  rawTextBytes: number;
+  rawTextTruncated: boolean;
+  eventLogTruncated: boolean;
+  streamErrorMessage?: string;
+};
+
+/** Result of createSSEInterceptor: the pass-through stream and a telemetry promise. */
+export type SSEInterceptorResult = {
+  stream: TransformStream<Uint8Array, Uint8Array>;
+  telemetry: Promise<SSETelemetry>;
+};
+
+/** Options for createSSEInterceptor. */
+export type SSEInterceptorOptions = {
+  captureRawText?: boolean;
+};
+
+// =============================================================================
+// UPDATE CHECKER (from proxy/updateChecker.ts, proxy/updateState.ts)
+// =============================================================================
+
+/** Outcome of a proxy auto-update version check against npm. */
+export type UpdateCheckResult = {
+  currentVersion: string;
+  latestVersion: string;
+  updateAvailable: boolean;
+} & (
+  | { checkSucceeded: true; checkError?: never }
+  | { checkSucceeded: false; checkError: string; updateAvailable: false }
+);
+
+/** Immutable identity of the worker an update attempt is allowed to replace. */
+export type ProxyServingWorkerIdentity = {
+  version: string;
+  pid: number;
+  /** Rolling generation; null only for a legacy single-process service. */
+  generation: number | null;
+};
+
+/** Result of one local proxy health probe by the updater or fail-open guard. */
+export type ProxyHealthProbe = {
+  healthy: boolean;
+  durationMs: number;
+  failure: "http_status" | "network" | "timeout" | null;
+  statusCode: number | null;
+  errorCode: string | null;
+};
+
+/** Parsed major.minor.patch components of a semver string. */
+export type SemVer = {
+  major: number;
+  minor: number;
+  patch: number;
+};
+
+/** Entry describing a version suppressed from auto-update. */
+export type SuppressedVersion = {
+  suppressedAt: string;
+  reason: string;
+};
+
+/** Persisted state for the proxy auto-update feature. */
+export type UpdateState = {
+  lastCheckAt: string;
+  lastCheckVersion: string;
+  /** Last attempt is distinct from the last successful registry observation. */
+  lastCheckAttemptAt?: string;
+  lastCheckError?: string | null;
+  suppressedVersions: Record<string, SuppressedVersion>;
+  /**
+   * Last package version whose stable trampoline was successfully validated.
+   *
+   * Optional because `UpdateState` is part of the published type surface and a
+   * required addition would break every downstream object literal — and because
+   * state files written before this field existed legitimately omit it.
+   * `loadUpdateState()` always materializes it, so runtime readers see a value.
+   */
+  installedVersion?: string | null;
+  lastUpdateAt: string | null;
+  lastUpdateVersion: string | null;
+  /** Installed by the updater but not yet confirmed as the running version. */
+  pendingRestartVersion: string | null;
+  /** Why an available update has not yet reached a safe install/restart boundary. */
+  deferredUpdate: {
+    version: string;
+    since: string;
+    updatedAt: string;
+    reason:
+      | "waiting_for_quiet"
+      | "draining"
+      | "drain_timeout"
+      | "drain_unavailable"
+      | "activity_unavailable";
+    activeRequests: number | null;
+  } | null;
+  /** Last updater failure, retained until a successful update or replacement. */
+  lastFailure: {
+    at: string;
+    version: string;
+    stage: "check" | "install" | "validation" | "restart" | "health";
+    message: string;
+  } | null;
+};
+
+/** Result from waiting for a non-disruptive updater execution window. */
+export type ProxyUpdateWindowResult = {
+  ready: boolean;
+  draining: boolean;
+  reason?:
+    | "stopping"
+    | "parent_stopped"
+    | "drain_failed"
+    | "drain_timeout"
+    | "busy";
+};
+
+/** Dependencies and timing controls for the updater's safe-window coordinator. */
+export type ProxyUpdateWindowOptions = {
+  quietThresholdMs: number;
+  quietWaitMs: number;
+  drainWaitMs: number;
+  pollIntervalMs: number;
+  /** Automatic supervisor refresh must defer instead of draining busy traffic. */
+  allowBusyDrain?: boolean;
+  getActivity: () => Promise<ProxyRuntimeActivity | null>;
+  setDraining: (draining: boolean) => Promise<boolean>;
+  isStopping: () => boolean;
+  isParentAlive: () => boolean;
+  onPhase?: (
+    phase: "waiting_for_quiet" | "draining" | "drain_timeout",
+    activity: ProxyRuntimeActivity | null,
+  ) => void;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+};
+
+/** Result of validating a newly installed CLI through the stable trampoline. */
+export type InstalledVersionValidation = {
+  version?: string;
+  attempts: number;
+  failure?: string;
+};
+
+/** Supported global package managers for proxy self-updates. */
+export type GlobalInstallerKind = "npm" | "pnpm";
+
+/** Result of probing one global package-manager executable. */
+export type GlobalInstallerProbe = {
+  kind: GlobalInstallerKind;
+  bin: string;
+  version?: string;
+  globalRoot?: string;
+  globalBinDir?: string;
+  working: boolean;
+  installable: boolean;
+  matchesCurrentInstall: boolean;
+  reason?: string;
+};
+
+/** Selected package manager plus all candidates considered. */
+export type GlobalInstallerResolution = {
+  installer?: GlobalInstallerProbe;
+  tried: GlobalInstallerProbe[];
+};
+
+/** Injectable command runner used by global-installer tests. */
+export type GlobalInstallerExecFile =
+  typeof import("node:child_process").execFileSync;
+
+/** Overrides used while resolving the global package manager. */
+export type ResolveGlobalInstallerOptions = {
+  entryScript?: string;
+  env?: NodeJS.ProcessEnv;
+  homeDir?: string;
+  execFileSync?: GlobalInstallerExecFile;
+};
+
+/** Options for validating a newly installed CLI through its stable executable. */
+export type ValidateInstalledVersionOptions = {
+  binPath: string;
+  expectedVersion: string;
+  maxAttempts?: number;
+  delayMs?: number;
+  timeoutMs?: number;
+  execFileSync?: GlobalInstallerExecFile;
+  sleep?: (ms: number) => Promise<void>;
+};
+
+/** Dependencies and callbacks used to supervise the updater worker process. */
+export type UpdaterWorkerSupervisorOptions = {
+  spawnWorker: () => number | undefined;
+  isProcessRunning: (pid: number) => boolean;
+  stopWorker: (pid: number) => void;
+  onPidChange?: (pid: number | undefined) => void;
+  log?: (message: string) => void;
+  intervalMs?: number;
+};
+
+/** Handle used by the proxy process to inspect and stop updater supervision. */
+export type UpdaterWorkerSupervisor = {
+  currentPid: () => number | undefined;
+  checkNow: () => number | undefined;
+  stop: () => void;
+};
+
+// =============================================================================
+// ROLLING PROXY WORKER HANDOFF
+// =============================================================================
+
+export type ProxyWorkerControlMessage =
+  | { type: "proxy-worker:activate"; generation: number }
+  | { type: "proxy-worker:drain"; generation: number }
+  | { type: "proxy-worker:shutdown"; generation: number }
+  | { type: "proxy-worker:socket-offer"; generation: number; socketId: string }
+  | {
+      type: "proxy-worker:socket-commit";
+      generation: number;
+      socketId: string;
+    }
+  | {
+      type: "proxy-worker:socket-cancel";
+      generation: number;
+      socketId: string;
+    };
+
+export type ProxyWorkerStatusMessage =
+  | {
+      type: "proxy-worker:ready";
+      generation: number;
+      pid: number;
+      version: string;
+      processInstanceId?: string;
+      /** New supervisors defer sending descriptors until commit. */
+      socketOfferProtocol?: "control-before-handle";
+      /** New workers confirm descriptor adoption before a generation drains. */
+      socketCommitProtocol?: "worker-ack";
+    }
+  | {
+      type: "proxy-worker:drained";
+      generation: number;
+      pid: number;
+    }
+  | {
+      type: "proxy-worker:activated";
+      generation: number;
+      pid: number;
+    }
+  | {
+      type: "proxy-worker:fatal";
+      generation: number;
+      pid: number;
+      message: string;
+    }
+  | {
+      type: "proxy-worker:socket-accepted";
+      generation: number;
+      pid: number;
+      socketId: string;
+    }
+  | {
+      type: "proxy-worker:socket-committed";
+      generation: number;
+      pid: number;
+      socketId: string;
+    }
+  | {
+      type: "proxy-worker:replacement-requested";
+      generation: number;
+      pid: number;
+      reason: "environment";
+    };
+
+export type ProxyWorkerSocketMessage = {
+  type: "proxy-worker:socket";
+  generation: number;
+  socketId: string;
+};
+
+export type ProxyWorkerIpcMessage =
+  | ProxyWorkerControlMessage
+  | ProxyWorkerStatusMessage
+  | ProxyWorkerSocketMessage;
+
+export type TransferableProxySocket = Pick<
+  import("node:net").Socket,
+  "destroy" | "end" | "pause" | "resume" | "once"
+>;
+
+/** A transferred socket whose temporary handoff listeners can be detached. */
+export type DetachableTransferableProxySocket = TransferableProxySocket &
+  Pick<import("node:net").Socket, "off">;
+
+export type RollingWorkerHandle = {
+  pid: number;
+  /** Combined offer and commit budget, before any retry. Defaults to 60s. */
+  socketTransferTimeoutMs?: number;
+  sendControl: (message: ProxyWorkerControlMessage) => void;
+  sendSocket: (
+    generation: number,
+    socket: TransferableProxySocket,
+    callback: (error?: Error | null) => void,
+    /** Absolute admission deadline shared by queueing and any safe retry. */
+    deadlineAt?: number,
+  ) => void;
+  terminate: (signal?: NodeJS.Signals) => void;
+  onMessage: (
+    listener: (message: ProxyWorkerStatusMessage) => void,
+  ) => () => void;
+  onExit: (
+    listener: (code: number | null, signal: string | null) => void,
+  ) => () => void;
+};
+
+export type SpawnProxySocketWorkerOptions = {
+  /** Injectable process boundary for deterministic IPC fault tests. */
+  spawn?: typeof import("node:child_process").spawn;
+  generation: number;
+  expectedVersion: string;
+  command: string;
+  args: string[];
+  env?: NodeJS.ProcessEnv;
+  stdout?: "inherit" | "ignore";
+  stderr?: "inherit" | "ignore";
+  socketAckTimeoutMs?: number;
+};
+
+export type RollingWorkerFailureDetails = {
+  workerPid?: number;
+  workerExitCode?: number | null;
+  workerExitSignal?: string | null;
+  supervisorAction?:
+    | "none"
+    | "sigkill_after_transfer_failure"
+    | "cancel_socket_replace_before_drain"
+    | "cancel_uncommitted_socket";
+};
+
+export type RollingWorkerSupervisorEvent = {
+  at: string;
+  type:
+    | "activated"
+    | "failure"
+    | "failed_transfer"
+    | "rejected_socket"
+    | "worker_exit";
+  generation: number | null;
+  version: string | null;
+  phase?: "startup" | "activation" | "runtime" | "transfer";
+  reason?: string;
+  workerPid?: number;
+  workerProcessInstanceId?: string;
+  workerExitCode?: number | null;
+  workerExitSignal?: string | null;
+  supervisorAction?: RollingWorkerFailureDetails["supervisorAction"];
+};
+
+export type RollingWorkerSupervisorSnapshot = {
+  generation: number;
+  active: { pid: number; version: string; generation: number } | null;
+  candidate: {
+    pid: number;
+    expectedVersion: string;
+    generation: number;
+  } | null;
+  draining: Array<{ pid: number; version: string; generation: number }>;
+  queuedSockets: number;
+  /** Offered sockets awaiting acknowledgement or commit, across all workers. */
+  pendingTransfers?: number;
+  rejectedSockets: number;
+  failedTransfers: number;
+  /** Bounded generation-scoped evidence for attributing lifetime counters. */
+  recentEvents: RollingWorkerSupervisorEvent[];
+  lastFailure:
+    | ({
+        at: string;
+        generation: number;
+        version: string;
+        phase: "startup" | "activation" | "runtime" | "transfer";
+        message: string;
+      } & RollingWorkerFailureDetails)
+    | null;
+};
+
+export type RollingWorkerSupervisorOptions = {
+  spawnWorker: (
+    generation: number,
+    expectedVersion: string,
+  ) => RollingWorkerHandle;
+  readyTimeoutMs?: number;
+  socketQueueLimit?: number;
+  /** Bound IPC socket offers independently of active HTTP requests. */
+  maxPendingTransfers?: number;
+  socketQueueTimeoutMs?: number;
+  shutdownTimeoutMs?: number;
+  onStateChange?: (snapshot: RollingWorkerSupervisorSnapshot) => void;
+  onEvent?: (event: RollingWorkerSupervisorEvent) => void;
+  onReplacementRequested?: (request: {
+    generation: number;
+    pid: number;
+    reason:
+      | "environment"
+      | "socket_offer_timeout"
+      | "socket_commit_timeout"
+      | "socket_transfer_failure";
+  }) => void;
+  log?: (message: string) => void;
+};
+
+export type RollingProxyServerOptions = {
+  host: string;
+  port: number;
+  initialVersion: string;
+  spawnWorker: (
+    generation: number,
+    expectedVersion: string,
+  ) => RollingWorkerHandle;
+  readyTimeoutMs?: number;
+  socketQueueLimit?: number;
+  maxPendingTransfers?: number;
+  socketQueueTimeoutMs?: number;
+  shutdownTimeoutMs?: number;
+  recoveryDelayMs?: number;
+  maxRecoveryDelayMs?: number;
+  /** Backoff after failed pressure-induced replacement, while old worker serves. */
+  stallReplacementDelayMs?: number;
+  maxStallReplacementDelayMs?: number;
+  onStateChange?: (snapshot: RollingWorkerSupervisorSnapshot) => void;
+  onEvent?: (event: RollingWorkerSupervisorEvent) => void;
+  log?: (message: string) => void;
+};
+
+export type RollingProxyServer = {
+  address: { host: string; port: number };
+  replace: (
+    expectedVersion: string,
+  ) => Promise<RollingWorkerSupervisorSnapshot>;
+  snapshot: () => RollingWorkerSupervisorSnapshot;
+  close: () => Promise<void>;
+};
+
+export type RollingManagedWorker = {
+  handle: RollingWorkerHandle;
+  generation: number;
+  version: string;
+  dispose: () => void;
+  pendingTransfers: number;
+  drainRequested: boolean;
+};
+
+export type RollingCandidateWorker = RollingManagedWorker & {
+  expectedVersion: string;
+  activationRequested: boolean;
+  settle: (error?: Error) => void;
+};
+
+export type RollingSocketAdmission = {
+  socket: TransferableProxySocket;
+  deadlineAt: number;
+  retried: boolean;
+};
+
+export type RollingQueuedSocket = RollingSocketAdmission & {
+  timeout: NodeJS.Timeout;
+};
+
+export type SocketWorkerRuntime = {
+  acceptSocket: (socket: TransferableProxySocket) => void;
+  drain: () => void;
+  close: () => void;
+  snapshot: () => {
+    draining: boolean;
+    sockets: number;
+    activeRequests: number;
+    drained: boolean;
+  };
+};
+
+export type SocketWorkerRuntimeOptions = {
+  onDrained?: () => void;
+  /** Bound for a committed socket's first HTTP request while draining. */
+  firstRequestGraceMs?: number;
+};
+
+// =============================================================================
+// YAML LOADER (from proxy/proxyConfig.ts)
+// =============================================================================
+
+/** Shape of the dynamically-imported js-yaml module. `dump` is optional —
+ *  read-only consumers (proxy config loader) only need `load`; writers
+ *  (CLI primary-account commands) check `dump` before calling. */
+export type YamlModule = {
+  load(content: string): unknown;
+  dump?: (obj: unknown, opts?: Record<string, unknown>) => string;
+  default?: {
+    load(content: string): unknown;
+    dump?: (obj: unknown, opts?: Record<string, unknown>) => string;
+  };
+};
+
+/** Snapshot of a parsed proxy config file used by CLI primary-account
+ *  read/edit/write helpers. Tracks the original format and whether comments
+ *  were present (so the CLI can warn that comments will not round-trip). */
+export type CliProxyConfigDoc = {
+  data: Record<string, unknown>;
+  format: "yaml" | "json";
+  hadComments: boolean;
+};
+
+/** Primary-account info exposed by the proxy `/status` endpoint.
+ *  `source` is "configured" when the operator's `routing.primaryAccount` is
+ *  authenticated and enabled, otherwise "fallback" — either no primary set
+ *  or the configured one is missing/disabled. */
+export type ProxyStatusPrimaryAccount = {
+  configured: string | null;
+  key: string | null;
+  label: string | null;
+  source: "configured" | "fallback";
+};
+
+// =============================================================================
+// CLAUDE SNAPSHOT (from server/routes/claudeProxyRoutes.ts)
+// =============================================================================
+
+/**
+ * Identity tuple captured from a genuine Claude Code client request body.
+ *
+ * Deliberately carries no prompt text. An earlier shape persisted the client's
+ * "agent block" `system` text and replayed it as the system prompt of every
+ * later non-Claude-Code request on the account, so one hostile request could
+ * plant instructions into everyone else's sessions. The agent block is now a
+ * compiled-in constant; `billingHeader` is stored only in its normalised
+ * two-field form.
+ */
+export type ClaudeSnapshotBody = {
+  metadataUserId?: string;
+  billingHeader?: string;
+  sessionId?: string;
+};
+
+/** The identity tuple plus one request-shape probe that is never persisted. */
+export type ClaudeSnapshotBodyProbe = ClaudeSnapshotBody & {
+  hasAgentBlock?: boolean;
+};
+
+/** Snapshot of headers and body from a Claude Code request, used for polyfill. */
+export type ClaudeSnapshot = {
+  accountKey: string;
+  capturedAt: string;
+  source: "claude-code";
+  /**
+   * Set only by a capture that verified the client was Claude Code itself
+   * (session header and `claude-cli/` user-agent). A snapshot without it was
+   * written by a release whose heuristic any caller could satisfy, so its
+   * identity tuple is not trusted and is dropped on load.
+   */
+  capturedFrom?: "genuine-claude-code";
+  headers: Record<string, string>;
+  body?: ClaudeSnapshotBody;
+};
+
+/** Parsed shape of a Claude API error body. */
+export type ParsedClaudeError = {
+  errorType?: string;
+  message?: string;
+  /** `error.details.error_code`, e.g. "oauth_not_allowed_for_organization".
+   *  Absent on payloads that carry no details object. */
+  errorCode?: string;
+};
+
+/**
+ * Accounts rejected by an organization/plan entitlement policy during a single
+ * request. Anthropic answers such an account with a `permission_error` that no
+ * amount of retrying or token refreshing can fix, but which a *different*
+ * account may not hit at all — so it drives rotation, and is reported to the
+ * client only once every account has been tried.
+ */
+export type AnthropicEntitlementFailure = {
+  status: number;
+  /** Labels of every account that rejected this request on entitlement. */
+  accounts: string[];
+  /** Upstream message from the first such rejection. */
+  message: string;
+  errorCode?: string;
+};
+
+/**
+ * Every account's model-scoped window for the requested model is spent. Unlike
+ * a cooldown this is per-model: the same accounts stay healthy for every other
+ * model, so the client is told to switch model rather than to back off.
+ */
+export type AnthropicScopedExhaustion = {
+  /** Wire model id from the request. */
+  model: string;
+  /** Display name of the exhausted window, e.g. "Fable". */
+  scopeModel: string;
+  /** Epoch ms of the soonest reset across the exhausted accounts. */
+  earliestResetMs: number;
+  accounts: string[];
+  /** Provider reason overage is unavailable, e.g. "org_level_disabled". */
+  overageDisabledReason?: string;
+};
+
+// =============================================================================
+// PROXY CLI COMMAND TYPES (from cli/commands/proxy.ts)
+// =============================================================================
+
+/** ora spinner instance held by proxy CLI commands, nullable when --quiet. */
+export type ProxySpinner = Ora | null;
+
+/** Load-balancing strategy used by the proxy across accounts. */
+export type ProxyStartStrategy = "round-robin" | "fill-first";
+
+/** Alias for the model router's constructor configuration. */
+export type ProxyModelRouterConfig = ProxyRoutingConfig;
+
+/** Partial proxy config consumed by the start command. */
+export type LoadedProxyConfig = {
+  routing?: Partial<ProxyModelRouterConfig> & {
+    strategy?: ProxyStartStrategy;
+  };
+};
+
+/** Routing values captured once when a proxy request begins. */
+export type ProxyRequestRoutingSnapshot = {
+  generation: number;
+  strategy: ProxyStartStrategy;
+  modelRouter?: ModelRouterInterface;
+  passthrough: boolean;
+  primaryAccountKey?: string;
+  accountAllowlist?: ReadonlySet<string>;
+  quotaRoutingEnabled: boolean;
+  sessionSoftLimit: number;
+  sessionResetToleranceMs: number;
+  /** Operator policy on spending paid extra usage once a subscription window is
+   *  spent. Only "never" can override the provider's own signal. */
+  useOverage: ProxyOveragePolicy;
+  accountRanking: ProxyAccountRankingPolicy;
+  preferPrimary: boolean;
+  sessionAffinity: boolean;
+  sessionAffinityIdleTtlMs: number;
+  spillInflight: number;
+  codexOutboundFallbackEnabled: boolean;
+  codexOutboundFallbackTargets: CodexFallbackTarget[];
+  codexOutboundFallbackModelMappings: ModelMapping[];
+};
+
+/** Operator policy for paid extra usage. */
+export type ProxyOveragePolicy = "auto" | "always" | "never";
+
+/** Immutable last-known-good proxy configuration published at runtime. */
+export type ProxyRuntimeConfigSnapshot = ProxyRequestRoutingSnapshot & {
+  loadedAt: string;
+  configHash: string;
+  proxyConfig: LoadedProxyConfig | null;
+};
+
+/** Source that requested a runtime configuration reload. */
+export type ProxyRuntimeConfigReloadSource =
+  | "startup"
+  | "watch"
+  | "sighup"
+  | "manual";
+
+/** Result returned after a serialized runtime configuration reload attempt. */
+export type ProxyRuntimeConfigReloadResult = {
+  applied: boolean;
+  changed: boolean;
+  generation: number;
+  environmentChanged?: boolean;
+  error?: string;
+};
+
+/** Safe runtime configuration diagnostics exposed through proxy status. */
+export type ProxyRuntimeConfigStatus = {
+  configPath: string;
+  envFilePath?: string;
+  generation: number;
+  loadedAt: string;
+  configHash: string;
+  watching: boolean;
+  lastReloadAttemptAt?: string;
+  lastReloadAt?: string;
+  lastReloadSource?: ProxyRuntimeConfigReloadSource;
+  lastReloadError?: string;
+  consecutiveFailures: number;
+};
+
+/** Constructor options for the proxy runtime configuration store. */
+export type ProxyRuntimeConfigStoreOptions = {
+  configPath: string;
+  configRequired: boolean;
+  envFilePath?: string;
+  envFileRequired?: boolean;
+  baseEnv: Record<string, string | undefined>;
+  strategyOverride?: ProxyStartStrategy;
+  passthrough: boolean;
+  watchIntervalMs?: number;
+  watchDebounceMs?: number;
+};
+
+/** Runtime configuration provider captured by route factories. */
+export type ProxyRuntimeConfigProvider = () => ProxyRequestRoutingSnapshot;
+
+/**
+ * Inbound authentication for a mounted proxy route group.
+ *
+ * `token` is the bearer every caller must present (header
+ * `x-neurolink-inbound-token`, or `Authorization: Bearer <token>`); when
+ * omitted it is read from `NEUROLINK_PROXY_INBOUND_TOKEN`. With neither, the
+ * routes serve any caller that reaches them, and the factory says so loudly
+ * unless `allowUnauthenticated` records that the operator chose that
+ * (loopback-only bind, or an authenticating reverse proxy in front).
+ */
+export type ProxyInboundAuthOptions = {
+  token?: string;
+  allowUnauthenticated?: boolean;
+};
+
+/** Optional runtime configuration wiring for Claude proxy route factories. */
+export type ClaudeProxyRouteRuntimeOptions = {
+  accountAllowlist?: AccountAllowlist;
+  runtimeConfigProvider?: ProxyRuntimeConfigProvider;
+  inboundAuth?: ProxyInboundAuthOptions;
+};
+
+/**
+ * Whether a listener may bind where it was asked to.
+ *
+ * A non-loopback bind needs something in front of the pooled subscriptions:
+ * the share gate (`NEUROLINK_PROXY_REQUIRE_GRANT`), an inbound token, or the
+ * operator's explicit `allowUnauthenticated`.
+ */
+export type ProxyBindPolicyDecision =
+  | { allowed: true; warning?: string }
+  | { allowed: false; reason: string };
+
+/** Inputs to the bind policy, resolved from flags and the environment. */
+export type ProxyBindPolicyInput = {
+  host: string;
+  inboundToken?: string;
+  requireGrant: boolean;
+  allowUnauthenticated: boolean;
+};
+
+/** Listener invoked after a new configuration generation is published. */
+export type ProxyRuntimeConfigListener = (
+  snapshot: ProxyRuntimeConfigSnapshot,
+) => void;
+
+/** Listener invoked after every successful or rejected reload attempt. */
+export type ProxyRuntimeConfigReloadListener = (
+  result: ProxyRuntimeConfigReloadResult,
+  status: ProxyRuntimeConfigStatus,
+) => void;
+
+/**
+ * Handle for a NeuroLink runtime created by the proxy start command.
+ * The `neurolink` field is typed structurally (only the method used by the
+ * proxy layer is exposed) so types/proxy.ts does not depend on the full
+ * NeuroLink class.
+ */
+export type ProxyNeurolinkRuntime = {
+  neurolink: {
+    getToolRegistry(): MCPToolRegistry;
+  };
+  logsDir: string;
+};
+
+/** Data passed to the isolated proxy log-retention worker. */
+export type ProxyLogCleanupWorkerData = {
+  logsDir: string;
+  maxAgeDays: number;
+  maxSizeMb: number;
+};
+
+/** Lifecycle handle for non-blocking proxy log retention. */
+export type ProxyLogCleanupScheduler = {
+  trigger: () => boolean;
+  stop: () => Promise<void>;
+};
+
+/** Hono app + readiness state created by the proxy start command. */
+export type ProxyStartApp = {
+  app: Hono;
+  readiness: ProxyReadinessState;
+};
+
+/** Stats shape consumed by the proxy status printer. */
+export type StatusStats = {
+  startedAt?: number;
+  totalAttempts?: number;
+  totalAttemptErrors?: number;
+  totalRequests: number;
+  totalSuccess: number;
+  totalErrors: number;
+  totalRateLimits: number;
+  totalTransientRateLimits?: number;
+  totalQuotaRateLimits?: number;
+  terminalErrors?: ProxyTerminalErrorJournal;
+  lastTerminalError?: ProxyTerminalErrorSummary | null;
+  terminalErrorDetailsComparable?: boolean;
+  terminalErrorDetailsMissing?: number;
+  terminalErrorDetailsExcess?: number;
+  /** Whether this status response reconciled shared state or used local memory. */
+  snapshotSource?: "reconciled" | "memory";
+  accounts?: {
+    /** Provider-qualified key; null for explicitly unattributed legacy rows. */
+    key?: string | null;
+    provider?: "anthropic" | "codex" | "vertex" | "other" | "unknown";
+    label: string;
+    type: string;
+    attempts?: number;
+    requests?: number;
+    success?: number;
+    errors?: number;
+    attemptErrors?: number;
+    rateLimits?: number;
+    transientRateLimits?: number;
+    quotaRateLimits?: number;
+    cooling: boolean;
+    allowed?: boolean;
+    expired?: boolean;
+    status?:
+      | "active"
+      | "cooling"
+      | "disabled"
+      | "expired"
+      | "excluded"
+      | "removed"
+      | "internal"
+      | "unattributed";
+  }[];
+  persistence?: ProxyStatsPersistenceStatus;
+};
+
+/** Sub-action of the `proxy telemetry` CLI command. */
+export type ProxyTelemetryAction =
+  | "doctor"
+  | "query"
+  | "setup"
+  | "start"
+  | "stop"
+  | "status"
+  | "logs"
+  | "import-dashboard";
+
+// =============================================================================
+// PROXY FORMAT (from proxy/proxyTranslationEngine.ts)
+// =============================================================================
+
+/** Wire format a proxy request is using. */
+export type ProxyFormat = "claude" | "openai" | "gemini";
+
+/**
+ * Common adapter interface that hides the differences between
+ * Claude and OpenAI stream serializers from the unified translation engine.
+ */
+export type StreamSerializerAdapter = {
+  start(): Iterable<string>;
+  pushDelta(text: string): Iterable<string>;
+  pushToolUse(id: string, name: string, input: unknown): Iterable<string>;
+  finish(finishReason: string, usage: TokenUsage): Iterable<string>;
+  emitError(message: string): Iterable<string>;
+};
+
+// =============================================================================
+// OPENAI CHAT COMPLETIONS TYPES (for OpenCode proxy support)
+// =============================================================================
+
+/** OpenAI content part in a user message. */
+export type OpenAIContentPartText = { type: "text"; text: string };
+export type OpenAIContentPartImage = {
+  type: "image_url";
+  image_url: { url: string; detail?: "auto" | "low" | "high" };
+};
+export type OpenAIContentPart = OpenAIContentPartText | OpenAIContentPartImage;
+
+/** OpenAI message types. */
+export type OpenAISystemMessage = { role: "system"; content: string };
+export type OpenAIUserMessage = {
+  role: "user";
+  content: string | OpenAIContentPart[];
+};
+export type OpenAIAssistantMessage = {
+  role: "assistant";
+  content?: string | null;
+  tool_calls?: OpenAIToolCall[];
+};
+export type OpenAIToolMessage = {
+  role: "tool";
+  tool_call_id: string;
+  content: string;
+};
+export type OpenAIMessage =
+  | OpenAISystemMessage
+  | OpenAIUserMessage
+  | OpenAIAssistantMessage
+  | OpenAIToolMessage;
+
+/** OpenAI tool call (in assistant messages and responses). */
+export type OpenAIToolCall = {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string }; // arguments is stringified JSON
+};
+
+/** OpenAI tool definition. */
+export type OpenAIToolDef = {
+  type: "function";
+  function: {
+    name: string;
+    description?: string;
+    parameters: Record<string, unknown>;
+  };
+};
+
+/** OpenAI tool_choice options. */
+export type OpenAIToolChoice =
+  | "auto"
+  | "required"
+  | "none"
+  | { type: "function"; function: { name: string } };
+
+/** OpenAI Chat Completions request body. */
+export type OpenAICompletionRequest = {
+  model: string;
+  messages: OpenAIMessage[];
+  tools?: OpenAIToolDef[];
+  tool_choice?: OpenAIToolChoice;
+  stream?: boolean;
+  temperature?: number;
+  top_p?: number;
+  max_tokens?: number;
+  max_completion_tokens?: number;
+  stop?: string | string[];
+  n?: number;
+  response_format?: {
+    type: "text" | "json_object" | "json_schema";
+    json_schema?: unknown;
+  };
+  stream_options?: { include_usage?: boolean };
+};
+
+/** OpenAI usage counters. */
+export type OpenAIUsage = {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  prompt_tokens_details?: { cached_tokens: number };
+  completion_tokens_details?: { reasoning_tokens: number };
+};
+
+/** OpenAI non-streaming response. */
+export type OpenAICompletionResponse = {
+  id: string;
+  object: "chat.completion";
+  created: number;
+  model: string;
+  choices: Array<{
+    index: number;
+    message: {
+      role: "assistant";
+      content: string | null;
+      tool_calls?: OpenAIToolCall[];
+    };
+    finish_reason: "stop" | "tool_calls" | "length" | "content_filter" | null;
+  }>;
+  usage: OpenAIUsage;
+};
+
+/** OpenAI streaming chunk. */
+export type OpenAIStreamChunk = {
+  id: string;
+  object: "chat.completion.chunk";
+  created: number;
+  model: string;
+  choices: Array<{
+    index: number;
+    delta: {
+      role?: "assistant";
+      content?: string;
+      tool_calls?: Array<{
+        index: number;
+        id?: string;
+        type?: "function";
+        function?: { name?: string; arguments?: string };
+      }>;
+    };
+    finish_reason: string | null;
+  }>;
+  usage?: OpenAIUsage;
+};
+
+/** OpenAI error response. */
+export type OpenAIErrorResponse = {
+  error: { message: string; type: string; code: string | null };
+};
+
+/** Parsed OpenAI request — intermediate form for NeuroLink pipeline. */
+/** One part of a Gemini `contents[].parts[]` entry. */
+export type ProxyGeminiPart = {
+  text?: string;
+  inlineData?: { mimeType?: string; data?: string };
+};
+
+/** One turn in a Gemini `contents[]` array. */
+export type ProxyGeminiContent = { role?: string; parts?: ProxyGeminiPart[] };
+
+/**
+ * A Gemini `generateContent` request, reduced to what translation needs.
+ *
+ * Google's shape differs from both others in three ways that matter here:
+ * roles are `user`/`model` rather than `user`/`assistant`, the system prompt
+ * lives in a sibling `systemInstruction` rather than in the turn list, and
+ * generation settings are nested under `generationConfig` instead of sitting
+ * at the top level.
+ */
+export type ParsedGeminiRequest = {
+  model: string;
+  maxTokens?: number;
+  temperature?: number;
+  topP?: number;
+  systemPrompt?: string;
+  stream: boolean;
+  prompt: string;
+  images: string[];
+  conversationMessages: Array<{ role: string; content: string }>;
+  tools: Record<
+    string,
+    {
+      description?: string;
+      inputSchema: unknown;
+      execute?: (...args: unknown[]) => unknown;
+    }
+  >;
+  stopSequences?: string[];
+};
+
+export type ParsedOpenAIRequest = {
+  model: string;
+  maxTokens?: number;
+  temperature?: number;
+  topP?: number;
+  systemPrompt?: string;
+  stream: boolean;
+  prompt: string;
+  images: string[];
+  conversationMessages: Array<{ role: string; content: string }>;
+  tools: Record<
+    string,
+    {
+      description?: string;
+      inputSchema: unknown;
+      execute?: (...args: unknown[]) => unknown;
+    }
+  >;
+  toolChoice?: "auto" | "required" | "none";
+  toolChoiceName?: string;
+  stopSequences?: string[];
+  responseFormat?: { type: string; jsonSchema?: unknown };
+};
+
+// =============================================================================
+// PEER SHARING TYPES (from proxy/shareGrants.ts, sharePolicy.ts, peerPool.ts)
+// =============================================================================
+
+/**
+ * How a borrower reaches the lender's capacity.
+ *
+ * - `live` — the borrower forwards each request to the lender's exposed proxy.
+ *   The lender's credentials never leave the lender's device and every request
+ *   passes the lender's gate, so control is immediate and cryptographic. The
+ *   borrower is dependent on the lender's device being reachable.
+ * - `complete` — the borrower holds an independently provisioned OAuth grant on
+ *   the lender's account and calls the upstream directly. Survives the lender
+ *   being offline; control is enforced by a signed lease plus usage audit,
+ *   which makes it cooperative rather than cryptographic.
+ */
+export type ProxyShareLevel = "live" | "complete";
+
+export type ProxyShareGrantState = "active" | "paused" | "revoked" | "expired";
+
+/** Whether consumption is metered against a coin balance or uncapped. */
+export type ProxyShareLedgerMode = "coins" | "unlimited";
+
+/** A ceiling expressed as a percentage of each subscription window. */
+export type ProxyShareWindowSlice = {
+  /** Percent of the 5-hour session window. */
+  session5hPct?: number;
+  /** Percent of the 7-day weekly window. */
+  weekly7dPct?: number;
+};
+
+/**
+ * Use-it-or-lose-it capacity: admit the borrower only in the run-up to a window
+ * reset, and only when little of that window was consumed. `maxSlicePct` caps
+ * how much of the remaining window the borrower may take while spilling over,
+ * so a spillover grant can still carry a hard ceiling.
+ */
+export type ProxyShareSpilloverGate = {
+  beforeResetHours: number;
+  whenUtilizationBelowPct: number;
+  maxSlicePct?: number;
+};
+
+/** Hour-of-day admission window, evaluated in the lender's local time. */
+export type ProxyShareSchedule = {
+  fromHour: number;
+  toHour: number;
+};
+
+export type ProxyShareRate = {
+  perMinute?: number;
+  concurrency?: number;
+};
+
+/**
+ * The gate set. Every configured gate must pass; the effective allowance is the
+ * minimum across all of them. Gates are deliberately orthogonal so a headroom
+ * grant can also carry a window-slice ceiling, a spillover grant can also carry
+ * a model allowlist, and so on.
+ */
+export type ProxyShareGates = {
+  /** Hard ceiling on how much of the **pool** the borrower may consume, as a
+   *  percentage of one window's worth of capacity. Pool-wide because an
+   *  operator saying "a fifth" means a fifth of what they have, not a fifth of
+   *  every credential they happen to own. */
+  maxSlice?: ProxyShareWindowSlice;
+  /** Per-account ceiling. Rare — reach for `maxSlice` unless you specifically
+   *  mean "this much of every credential, independently". */
+  maxSlicePerAccount?: ProxyShareWindowSlice;
+  /** Admit only while the lender's own utilization leaves this much headroom. */
+  reserveFloor?: ProxyShareWindowSlice;
+  spillover?: ProxyShareSpilloverGate;
+  /** Model tier allowlist, matched case-insensitively as substrings. */
+  models?: string[];
+  /** Which of the lender's accounts are lendable under this grant. */
+  accounts?: string[];
+  rate?: ProxyShareRate;
+  schedule?: ProxyShareSchedule;
+  /** Grant expiry, epoch ms. */
+  notAfter?: number;
+};
+
+export type ProxyShareRefillPeriod = "session" | "week";
+
+export type ProxyShareEntitlement = {
+  ledger: ProxyShareLedgerMode;
+  /** Remaining balance when `ledger` is "coins". */
+  coins?: number;
+  refill?: {
+    amount: number;
+    per: ProxyShareRefillPeriod;
+    lastAt?: number;
+  };
+};
+
+/** One lender-issued authorization for one borrower. */
+export type ProxyShareGrant = {
+  schemaVersion: 1;
+  id: string;
+  peerLabel: string;
+  /** sha256(salt + token). The token itself is never persisted. */
+  tokenHash: string;
+  tokenSalt: string;
+  level: ProxyShareLevel;
+  state: ProxyShareGrantState;
+  entitlement: ProxyShareEntitlement;
+  gates: ProxyShareGates;
+  createdAt: number;
+  updatedAt: number;
+  lastUsedAt?: number;
+  note?: string;
+  /** Complete-mode only: shared secret the lease signature is keyed by. */
+  leaseSecret?: string;
+  /**
+   * Shared secret receipts and netting claims are keyed by. Minted with the
+   * grant and handed to the borrower in the share link; deliberately survives
+   * `share rotate`, so receipts issued under an old token stay checkable.
+   */
+  receiptSecret?: string;
+  /** Cumulative coins forgiven by reciprocal netting on this grant. */
+  nettedCoins?: number;
+  /** Complete-mode only: which of the lender's own accounts was provisioned. */
+  provisionedAccount?: string;
+  /** Complete-mode lease shape. Absent means the defaults apply. */
+  leasePolicy?: {
+    ttlMs: number;
+    heartbeatEveryMs: number;
+    offlineGraceMs: number;
+  };
+};
+
+export type ProxyShareGrantFile = {
+  schemaVersion: 1;
+  grants: Record<string, ProxyShareGrant>;
+  /** This node's stable public address, when it has one. Recorded once so
+   *  every share link is minted against it without retyping. */
+  publicUrl?: string;
+  /** Node-level secret coin notes are signed with. Minted on first issue. */
+  noteSecret?: string;
+};
+
+/** Why a borrowed request was refused. Surfaced verbatim in a response header. */
+export type ProxyShareRefusalReason =
+  | "missing_token"
+  | "unknown_token"
+  | "malformed_token"
+  | "paused"
+  | "revoked"
+  | "expired"
+  | "out_of_window"
+  | "model_not_allowed"
+  | "exhausted"
+  | "rate_limited"
+  | "concurrency_limited"
+  | "reserve_floor"
+  /** Spillover is configured and the lender is not yet spilling. Transient. */
+  | "spillover_inactive"
+  | "slice_exhausted"
+  | "no_capacity";
+
+/**
+ * Result of evaluating an inbound borrowed request.
+ *
+ * A refusal carries its own status and reason so the borrower can distinguish
+ * "you are out of credits" from an upstream rate limit. Conflating the two makes
+ * a borrower cool the peer as if it were throttled and retry forever.
+ */
+export type ProxyShareAdmission =
+  | { admitted: true; grant: ProxyShareGrant }
+  | {
+      admitted: false;
+      status: number;
+      reason: ProxyShareRefusalReason;
+      message: string;
+      retryAfterSeconds?: number;
+      grant?: ProxyShareGrant;
+    };
+
+/** The refusing half of {@link ProxyShareAdmission}. */
+export type ProxyShareRefusedAdmission = Extract<
+  ProxyShareAdmission,
+  { admitted: false }
+>;
+
+/** Request-scoped view of the grant serving the current borrowed request. */
+export type ProxyShareRequestContext = {
+  grantId: string;
+  peerLabel: string;
+  level: ProxyShareLevel;
+  gates: ProxyShareGates;
+  ledger: ProxyShareLedgerMode;
+  /** Pre-authorization opened at admission; settlement closes it. */
+  holdId?: string;
+  /** Model the borrower asked for, carried so settlement can price it. */
+  model?: string;
+};
+
+/** What `share create` returns — the only moment the raw token exists. */
+export type ProxyShareIssuedGrant = {
+  grant: ProxyShareGrant;
+  token: string;
+};
+
+/** Everything `createShareGrant` needs to mint a grant. */
+export type ProxyShareGrantInput = {
+  peerLabel: string;
+  level: ProxyShareLevel;
+  entitlement: ProxyShareEntitlement;
+  gates: ProxyShareGates;
+  note?: string;
+};
+
+/** Partial edit applied by `share set` / `share topup` / `share level`. */
+export type ProxyShareGrantPatch = {
+  entitlement?: Partial<ProxyShareEntitlement>;
+  gates?: ProxyShareGates;
+  level?: ProxyShareLevel;
+  note?: string;
+};
+
+/** Runtime counters the rate gates need, supplied by the caller so the policy
+ *  evaluator stays pure. */
+export type ProxyShareRuntimeCounters = {
+  requestsInLastMinute: number;
+  inFlight: number;
+};
+
+/** Everything `evaluateShareAdmission` needs. Pure input — no I/O. */
+export type ProxyShareAdmissionInput = {
+  grant: ProxyShareGrant;
+  now: number;
+  /** Requested model, used against the model allowlist. */
+  model?: string;
+  counters: ProxyShareRuntimeCounters;
+  /** Remaining coins; omitted for an unlimited grant. */
+  coinBalance?: number;
+};
+
+/** One candidate account as the share gates see it. */
+export type ProxyShareAccountView = {
+  accountKey: string;
+  /** 0..1 utilization of the 5h window, or null when unobserved. */
+  sessionUsed: number | null;
+  /** 0..1 utilization of the 7d window, or null when unobserved. */
+  weeklyUsed: number | null;
+  /** Epoch ms when the 5h window resets, or null when unknown. */
+  sessionResetAt: number | null;
+  /** Epoch ms when the 7d window resets, or null when unknown. */
+  weeklyResetAt: number | null;
+  /** Fraction (0..1) of the current 5h window this grant has already taken. */
+  borrowedSessionFraction: number;
+  /** Fraction (0..1) of the current 7d window this grant has already taken. */
+  borrowedWeeklyFraction: number;
+};
+
+/**
+ * A grant's consumption of the pool, normalised to one window's worth.
+ *
+ * `Σ per-account fractions / accountCount`, so 0.2 means the borrower has taken
+ * a fifth of total pool capacity however it was spread across credentials.
+ */
+export type ProxySharePoolUsage = {
+  sessionFraction: number;
+  weeklyFraction: number;
+};
+
+/**
+ * One borrower's outstanding request for a resident credential.
+ *
+ * Holds the challenge, never a verifier and never a token — the lender is not
+ * in a position to leak what it does not have. `code` exists only between the
+ * lender authorizing and the borrower claiming, and is erased by consumption.
+ */
+export type ProxyShareProvisionRequest = {
+  schemaVersion: 1;
+  grantId: string;
+  /** Base64url SHA-256 of the borrower's verifier. */
+  codeChallenge: string;
+  challengeMethod: "S256";
+  /** Borrower-chosen state, echoed through the authorization round trip. */
+  state: string;
+  requestedAt: number;
+  expiresAt: number;
+  status: ProxyShareProvisionStatus;
+  /** Present only between authorization and the single claim that consumes it. */
+  code?: string;
+  authorizedAt?: number;
+  claimedAt?: number;
+  /** Which of the lender's accounts was authorized, for the drift audit. */
+  accountLabel?: string;
+};
+
+export type ProxyShareProvisionStatus = "pending" | "authorized" | "consumed";
+
+export type ProxyShareProvisionFile = {
+  schemaVersion: 1;
+  requests: Record<string, ProxyShareProvisionRequest>;
+};
+
+/**
+ * A lender's signed statement that one borrowed request was settled, and for
+ * how much.
+ *
+ * `usage` travels with it so the borrower can recompute the charge from the
+ * response it actually received, rather than taking the coin figure on faith.
+ * `sequence` is contiguous per grant, so a withheld receipt shows up as a gap.
+ */
+export type ProxyShareReceipt = {
+  schemaVersion: 1;
+  grantId: string;
+  /** Monotonic, contiguous, per grant. */
+  sequence: number;
+  settledAt: number;
+  model?: string;
+  usage: ProxyShareUsage;
+  coins: number;
+  /** Remaining balance after this charge; null on an unlimited grant. */
+  balanceAfter: number | null;
+  signature: string;
+};
+
+export type ProxyShareReceiptFile = {
+  schemaVersion: 1;
+  /** Per grant, oldest first, bounded. */
+  receipts: Record<string, ProxyShareReceipt[]>;
+  /** Cumulative coins each grant has had forgiven by netting. */
+  netted: Record<string, number>;
+  /**
+   * Lifetime coins receipted per grant.
+   *
+   * Kept separately because `receipts` is trimmed: summing the retained history
+   * would quietly under-count a busy grant, and netting reads this number.
+   */
+  consumedTotal?: Record<string, number>;
+  /**
+   * Highest sequence issued per grant, for the same reason.
+   *
+   * Taking it from the retained tail is right only until the tail is trimmed
+   * away, and a sequence that restarts would look like a replay to the
+   * borrower's audit.
+   */
+  highestSequence?: Record<string, number>;
+};
+
+/** What a borrower makes of the receipts it collected. */
+export type ProxyShareStatement = {
+  grantId: string;
+  receipts: number;
+  coins: number;
+  /** Receipts whose signature did not verify against the shared secret. */
+  unverified: number;
+  /** Receipts whose coin figure disagrees with its own usage block. */
+  miscounted: number;
+  /** Sequence numbers missing from an otherwise contiguous run. */
+  gaps: number[];
+  latestSequence: number;
+};
+
+/** One side's position in a reciprocal netting round. */
+export type ProxyShareNettingClaim = {
+  /** Cumulative coins the *other* node has consumed under my grant to them. */
+  consumedByYou: number;
+  /** Cumulative coins already forgiven on my side, so a replay nets nothing. */
+  alreadyNetted: number;
+  signature: string;
+};
+
+export type ProxyShareNettingResult = {
+  /** Coins forgiven in this round, on both sides. */
+  netted: number;
+  /** Cumulative total after this round. */
+  totalNetted: number;
+  detail: string;
+};
+
+/**
+ * A bearer credit one node issued, which any node holding it may redeem against
+ * the issuer.
+ *
+ * Signed by the issuer with a node-level secret, because the grant that
+ * eventually redeems it need not have existed when it was issued.
+ */
+export type ProxyShareNote = {
+  schemaVersion: 1;
+  noteId: string;
+  issuer: string;
+  coins: number;
+  issuedAt: number;
+  notAfter: number;
+  memo?: string;
+  signature: string;
+};
+
+export type ProxyShareNoteStatus =
+  | "valid"
+  | "spent"
+  | "expired"
+  | "unknown"
+  | "forged";
+
+export type ProxyShareNoteRecord = {
+  noteId: string;
+  coins: number;
+  issuedAt: number;
+  notAfter: number;
+  memo?: string;
+  redeemedAt?: number;
+  redeemedByGrant?: string;
+};
+
+export type ProxyShareNoteFile = {
+  schemaVersion: 1;
+  notes: Record<string, ProxyShareNoteRecord>;
+};
+
+/** The slice of a node HTTP server the proxy runtime actually closes. */
+export type ProxyClosableServer = {
+  close?: (callback?: (error?: Error) => void) => void;
+};
+
+/** A running gate-only share listener, as its supervisor sees it. */
+export type ProxyShareListenerHandle = {
+  port: number;
+  close: () => Promise<void>;
+};
+
+/** Result of lodging or authorizing a split-PKCE provisioning request. */
+export type ProxyShareProvisionOutcome =
+  | { ok: true; request: ProxyShareProvisionRequest }
+  | { ok: false; reason: string };
+
+/** Result of authenticating a `/peer/*` caller by its share token. */
+export type ProxyPeerAuthOutcome =
+  | { ok: true; grant: ProxyShareGrant }
+  | { ok: false; body: ProxyShareRefusalResponse["body"] };
+
+/** What a borrower gets back when its authorization code is ready to collect. */
+export type ProxyShareProvisionClaim = {
+  code: string;
+  state: string;
+  accountLabel: string;
+  leaseSecret: string;
+  lease: ProxyShareLease;
+  lenderUrl: string;
+};
+
+/** The verifier a borrower is holding while it waits to be authorized. */
+export type ProxyPeerPendingProvision = {
+  codeVerifier: string;
+  state: string;
+  requestedAt: number;
+};
+
+/**
+ * What `GET /peer/limits` tells a borrower.
+ *
+ * Scoped to the caller's own grant on purpose: it carries no account labels and
+ * no per-account figures, so it cannot be used to describe — or count — the
+ * lender's pool. `null` on a slice means no ceiling is configured for that
+ * window, which is different from a ceiling with nothing left.
+ */
+export type ProxyPeerLimitsSnapshot = {
+  grantState: ProxyShareGrantState;
+  level: ProxyShareLevel;
+  ledger: ProxyShareLedgerMode;
+  remainingCoins?: number;
+  /** Whether at least one of the lender's accounts can serve this grant now. */
+  servable: boolean;
+  withheldReason?: ProxyShareRefusalReason;
+  sliceLeftPct: {
+    session: number | null;
+    weekly: number | null;
+  };
+  retryAfterSeconds?: number;
+};
+
+/** Why one account was withheld from a grant. */
+export type ProxyShareAccountExclusion = {
+  accountKey: string;
+  reason: ProxyShareRefusalReason;
+};
+
+export type ProxyShareAccountFilterResult = {
+  allowed: string[];
+  excluded: ProxyShareAccountExclusion[];
+};
+
+/** A refusal rendered for the wire: status, headers and Anthropic-shaped body. */
+export type ProxyShareRefusalResponse = {
+  status: number;
+  headers: Record<string, string>;
+  body: {
+    type: "error";
+    error: { type: string; message: string };
+  };
+};
+
+/**
+ * What the inbound gate decided.
+ *
+ * `local` is the unauthenticated path a node's own client takes on loopback; it
+ * carries no grant and no accounting. `admitted` owns a concurrency slot that
+ * the caller must release. `refused` is ready to write to the wire as-is.
+ */
+export type ProxyShareGateOutcome =
+  | { kind: "local" }
+  | {
+      kind: "admitted";
+      context: ProxyShareRequestContext;
+      release: () => void;
+    }
+  | { kind: "refused"; response: ProxyShareRefusalResponse };
+
+/** Per-grant sliding-window request timestamps and in-flight count. */
+export type ProxyShareGrantCounters = {
+  timestamps: number[];
+  inFlight: number;
+};
+
+/** Model-weighted token usage settled against a grant. */
+export type ProxyShareUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens?: number;
+  cacheReadTokens?: number;
+};
+
+/**
+ * One grant's consumption of one account's current windows.
+ *
+ * Keyed by the window's reset timestamp so a reset starts a fresh bucket
+ * automatically — without that, a slice ceiling would latch permanently after
+ * the first busy window.
+ */
+export type ProxyShareLedgerBucket = {
+  grantId: string;
+  accountKey: string;
+  sessionResetAt: number | null;
+  weeklyResetAt: number | null;
+  /** Accumulated 5h-window utilization attributable to this grant (0..1). */
+  sessionFraction: number;
+  /** Accumulated 7d-window utilization attributable to this grant (0..1). */
+  weeklyFraction: number;
+  coinsSpent: number;
+  requests: number;
+  updatedAt: number;
+};
+
+export type ProxyShareLedgerFile = {
+  schemaVersion: 1;
+  buckets: Record<string, ProxyShareLedgerBucket>;
+};
+
+/** An open pre-authorization against a grant's balance. */
+export type ProxyShareHold = {
+  id: string;
+  grantId: string;
+  coins: number;
+  openedAt: number;
+};
+
+/** Coin settlement for a finished borrowed request. */
+export type ProxyShareSettlement = {
+  grantId: string;
+  accountKey: string;
+  model?: string;
+  usage: ProxyShareUsage;
+  holdId?: string;
+};
+
+/**
+ * A before/after utilization observation for one borrowed request.
+ *
+ * Recorded where the response's quota headers are parsed, because that is the
+ * only point at which both the previous snapshot and the new one are in hand.
+ * Token usage settles separately: on a stream it is not known until
+ * `message_delta`, long after the headers arrived.
+ */
+export type ProxyShareWindowObservation = {
+  grantId: string;
+  accountKey: string;
+  sessionBefore?: number | null;
+  sessionAfter?: number | null;
+  sessionResetAt?: number | null;
+  weeklyBefore?: number | null;
+  weeklyAfter?: number | null;
+  weeklyResetAt?: number | null;
+};
+
+/** Per-grant rollup for `share status`. */
+export type ProxyShareGrantUsageSummary = {
+  grantId: string;
+  coinsSpent: number;
+  requests: number;
+  accounts: number;
+  lastUsedAt: number | null;
+};
+
+// =============================================================================
+// PEER BORROWING TYPES (from proxy/peerStore.ts, peerTransport.ts)
+// =============================================================================
+
+/** Why a peer is temporarily not worth trying. */
+export type ProxyPeerCooldownReason =
+  | "exhausted"
+  | "paused"
+  | "revoked"
+  | "expired"
+  | "withheld"
+  | "unreachable"
+  | "upstream_error";
+
+/** Last thing a peer told us, kept so `peer status` can answer offline. */
+export type ProxyPeerObservation = {
+  grantStatus?: string;
+  grantReason?: string;
+  remainingCoins?: number;
+  observedAt: number;
+};
+
+/** A lender this node may borrow from. */
+export type ProxyPeer = {
+  schemaVersion: 1;
+  name: string;
+  url: string;
+  token: string;
+  /** Lower is tried first. Peers of equal priority keep insertion order. */
+  priority: number;
+  enabled: boolean;
+  createdAt: number;
+  updatedAt: number;
+  note?: string;
+  lastUsedAt?: number;
+  cooldownUntil?: number;
+  cooldownReason?: ProxyPeerCooldownReason;
+  lastObservation?: ProxyPeerObservation;
+  /** Set while a split-PKCE provisioning request is outstanding. */
+  pendingProvision?: ProxyPeerPendingProvision;
+  /** Shared secret this lender's receipts are signed with, when known. */
+  receiptSecret?: string;
+  /** Label of the grant this node issued to the same person, for netting. */
+  reciprocalPeer?: string;
+  /** Highest receipt sequence collected from this lender. */
+  lastReceiptSequence?: number;
+};
+
+export type ProxyPeerFile = {
+  schemaVersion: 1;
+  peers: Record<string, ProxyPeer>;
+};
+
+/** Outcome of forwarding one request to one peer. */
+export type ProxyPeerAttempt =
+  | { ok: true; response: Response; peer: ProxyPeer }
+  | {
+      ok: false;
+      peer: ProxyPeer;
+      status?: number;
+      reason: ProxyPeerCooldownReason;
+      message: string;
+      retryAfterSeconds?: number;
+    };
+
+/** What `peer add` accepts. */
+export type ProxyPeerInput = {
+  name: string;
+  url: string;
+  token: string;
+  /** Shared secret this lender signs receipts with, when the link carried one. */
+  receiptSecret?: string;
+  priority?: number;
+  note?: string;
+};
+
+export type ProxyPeerArgs = {
+  action?:
+    | "add"
+    | "request"
+    | "list"
+    | "status"
+    | "sync"
+    | "receipts"
+    | "net"
+    | "redeem"
+    | "test"
+    | "remove"
+    | "pause"
+    | "resume"
+    | "set";
+  /** `peer request --claim`: collect a code the lender has authorized. */
+  claim?: boolean;
+  /** Shared secret for verifying this lender's receipts, when added by hand. */
+  receiptSecret?: string;
+  /** `peer net`: label of the grant this node issued to the same person. */
+  reciprocal?: string;
+  /** `peer redeem`: the coin note to present. */
+  noteValue?: string;
+  /** `peer redeem --check`: ask the issuer about a note without spending it. */
+  check?: boolean;
+  /** Local account label for a provisioned credential. */
+  label?: string;
+  name?: string;
+  url?: string;
+  token?: string;
+  link?: string;
+  priority?: number;
+  note?: string;
+  json?: boolean;
+  dev?: boolean;
+};
+
+// =============================================================================
+// COMPLETE-MODE LEASE TYPES (from proxy/shareLease.ts)
+// =============================================================================
+
+/**
+ * The offline-survivable projection of a grant.
+ *
+ * A complete-mode borrower holds a credential on the lender's account and calls
+ * the upstream directly, so the lender's gate is not in the request path. The
+ * lease is what control looks like without that gate: the borrower enforces it
+ * locally, refreshes it by heartbeat, and stops when it can no longer prove the
+ * lender still consents.
+ */
+export type ProxyShareLease = {
+  schemaVersion: 1;
+  grantId: string;
+  peerLabel: string;
+  issuedAt: number;
+  /** Hard stop, honored even by a borrower that never calls home again. */
+  notAfter: number;
+  /** How often the borrower should check in. */
+  heartbeatEveryMs: number;
+  /** How long the borrower may keep serving while the lender is unreachable. */
+  offlineGraceMs: number;
+  /** The gate set, snapshotted at issue time. */
+  gates: ProxyShareGates;
+  /** Coin balance at issue time; "unlimited" for an uncapped grant. */
+  entitlementSnapshot: number | "unlimited";
+  /** HMAC over the payload, keyed by the grant's lease secret. */
+  signature: string;
+};
+
+/** Why a lease is not currently usable. */
+export type ProxyShareLeaseVerdict =
+  | { usable: true; nextHeartbeatDueAt: number }
+  | {
+      usable: false;
+      reason: "unsigned" | "expired" | "grace_elapsed" | "stopped";
+      detail: string;
+    };
+
+/** The refusing half of {@link ProxyShareLeaseVerdict}. */
+export type ProxyShareLeaseRefusal = Extract<
+  ProxyShareLeaseVerdict,
+  { usable: false }
+>;
+
+/** What a borrower sends when checking in. */
+export type ProxyShareHeartbeatRequest = {
+  grantId: string;
+  /** Coins the borrower believes it has spent since the last heartbeat. */
+  coinsSpent?: number;
+  requests?: number;
+  /** Borrower's clock, for drift diagnostics only. */
+  reportedAt: number;
+};
+
+/** What the lender answers with. */
+export type ProxyShareHeartbeatResponse =
+  | { ok: true; lease: ProxyShareLease }
+  | { ok: false; stop: true; reason: string };
+
+/** The stopping half of {@link ProxyShareHeartbeatResponse}. */
+export type ProxyShareHeartbeatStop = Extract<
+  ProxyShareHeartbeatResponse,
+  { ok: false }
+>;
+
+/** The renewing half of {@link ProxyShareHeartbeatResponse}. */
+export type ProxyShareHeartbeatRenewal = Extract<
+  ProxyShareHeartbeatResponse,
+  { ok: true }
+>;
+
+/** A credential provisioned onto a borrower's device under a complete grant. */
+export type ProxyResidentGrant = {
+  schemaVersion: 1;
+  /** Local tokenStore label, unique on the borrower's device. */
+  accountLabel: string;
+  grantId: string;
+  lenderName: string;
+  lenderUrl: string;
+  /** Shared secret used to verify leases from this lender. */
+  leaseSecret: string;
+  lease: ProxyShareLease;
+  lastHeartbeatAt?: number;
+  /** Coins spent since the last successful heartbeat, awaiting report. */
+  unreportedCoins?: number;
+  unreportedRequests?: number;
+};
+
+export type ProxyResidentGrantFile = {
+  schemaVersion: 1;
+  grants: Record<string, ProxyResidentGrant>;
+};
+
+// =============================================================================
+// COMPLETE-MODE DRIFT AUDIT (from proxy/shareAudit.ts)
+// =============================================================================
+
+/**
+ * One heartbeat's worth of evidence about a complete-mode grant.
+ *
+ * The lender cannot see a resident credential's requests — they never touch this
+ * node. What it *can* see is the account's own utilization, which the provider
+ * reports and the borrower cannot influence. Pairing that with what the borrower
+ * claimed to spend is the whole audit.
+ */
+export type ProxyShareAuditObservation = {
+  at: number;
+  /** 0..1 utilization of the account's 5h window at this heartbeat. */
+  sessionUsed: number | null;
+  /** 0..1 utilization of the account's 7d window at this heartbeat. */
+  weeklyUsed: number | null;
+  /** Coins the borrower reported since the previous heartbeat. */
+  reportedCoins: number;
+  /** Requests this node itself served on the account **since the previous
+   *  observation**. A per-interval delta, not a running total: the drift check
+   *  asks whether the lender used the account during this interval. */
+  lenderRequests: number;
+};
+
+/** Rolling audit state for one complete-mode grant. */
+export type ProxyShareAuditRecord = {
+  grantId: string;
+  /** The lender's own account the credential was provisioned from. */
+  accountLabel: string;
+  lastObservation?: ProxyShareAuditObservation;
+  /** Running lifetime total of lender-served requests on the account, kept so
+   *  the next observation's delta can be computed. */
+  lenderRequestsTotal?: number;
+  /** Consecutive heartbeats where the account moved but nothing was reported. */
+  driftStreak: number;
+  lastDriftAt?: number;
+  lastDriftDetail?: string;
+  /** Set once the streak crossed the tolerance and the grant was paused. */
+  autoPausedAt?: number;
+};
+
+export type ProxyShareAuditFile = {
+  schemaVersion: 1;
+  records: Record<string, ProxyShareAuditRecord>;
+};
+
+/** The verdict of comparing one heartbeat against the account's real movement. */
+export type ProxyShareDriftVerdict =
+  | { drifted: false; reason: "no_baseline" | "attributable" | "quiet" }
+  | {
+      drifted: true;
+      /** How much of a window moved without being accounted for. */
+      unexplainedSessionPct: number;
+      unexplainedWeeklyPct: number;
+      detail: string;
+    };
+
+/** The handover artifact a lender gives a complete-share borrower. */
+export type ProxyShareProvisioningBundle = {
+  schemaVersion: 1;
+  grantId: string;
+  lenderName: string;
+  lenderUrl: string;
+  accountLabel: string;
+  leaseSecret: string;
+  lease: ProxyShareLease;
+  tokens: {
+    accessToken: string;
+    refreshToken?: string;
+    expiresAt?: number;
+  };
+};
+
+/** Log correlation retained independently of the current async context. */
+export type ProxyLogTraceContext = {
+  traceId: string;
+  spanId: string;
+  traceFlags: number;
+};
+
+/** OTel-only captures waiting for bounded worker capacity. */
+type ProxyBodyCaptureWaitingSnapshot = {
+  waiting: number;
+  waitingBytes: number;
+  maxWaiting: number;
+  maxWaitingBytes: number;
+  highWaterWaiting: number;
+  highWaterWaitingBytes: number;
+  admissionWaits: number;
+  admissionTimeouts: number;
+};
+
+/** Immutable package selection used by the proxy launcher, never by global npm. */
+export type ProxyPackageSelection = {
+  version: string;
+  entryScript: string;
+  nodePath: string;
+};
+
+/** Atomically published active and rollback package selections. */
+export type ProxyPackageSelectionState = {
+  schemaVersion: 1;
+  active: ProxyPackageSelection | null;
+  previous: ProxyPackageSelection | null;
+};
+
+/** Bounded asynchronous package installation with injectable subprocesses. */
+export type ProxyStagedInstallOptions = {
+  version: string;
+  packagesDir: string;
+  installer: Pick<GlobalInstallerProbe, "kind" | "bin">;
+  idleTimeoutMs?: number;
+  maxDurationMs?: number;
+  killGraceMs?: number;
+  spawn?: typeof import("node:child_process").spawn;
+  execFileSync?: GlobalInstallerExecFile;
+  onProgress?: (progress: { elapsedMs: number; outputBytes: number }) => void;
+};
+
+/** Original proxy runtime files retained before any local compatibility edits. */
+export type ProxyPackageBaseline = {
+  schemaVersion: 1;
+  version: string;
+  manifest: string;
+  entryRelative: string;
+  files: Record<string, string>;
+};
+
+/** A candidate carries only local diff hunks that its release still needs. */
+export type ProxyPackagePolyfillReport = {
+  applied: string[];
+  alreadyIncluded: string[];
+};
+
+/** Staged upgrade that reconciles recorded local edits before publication. */
+export type ProxyPackageUpgradeOptions = ProxyStagedInstallOptions & {
+  activePackage: ProxyPackageSelection;
+  isCurrentOwner?: () => boolean;
+  onPolyfills?: (report: ProxyPackagePolyfillReport) => void;
+};
+
+/** Why a build in the package store was left alone by a retention pass. */
+export type ProxyPackagePruneRetention = "selected" | "in-use" | "recent";
+
+/** Retention pass over the immutable package store, with injectable process listing. */
+export type ProxyPackagePruneOptions = {
+  packagesDir: string;
+  /** Entry script of the calling process; its build is never removed. */
+  currentEntryScript?: string;
+  /** Builds written more recently than this are left for a later pass. */
+  minAgeMs?: number;
+  now?: number;
+  /** Report what would be removed without touching the store. */
+  dryRun?: boolean;
+  /** Checked before each removal; the pass stops as soon as it returns false. */
+  isCurrentOwner?: () => boolean;
+  /** Command lines of live processes, or null when they cannot be listed. */
+  listProcessCommandLines?: () => Promise<string[] | null>;
+};
+
+export type ProxyPackagePruneResult = {
+  /** Set when the pass declined to remove anything or stopped early, with the reason. */
+  skipped?: string;
+  removed: string[];
+  retained: { name: string; reason: ProxyPackagePruneRetention }[];
+  failed: { name: string; message: string }[];
+};
+
+/** Capture a trusted baseline for a locally patched package without activation. */
+export type ProxyPolyfillArgs = {
+  action: "capture";
+  base: string;
+  patched: string;
+  format: "text" | "json";
+};
+
+/** Saved launchd settings retained when installing the service again. */
+export type ProxyServiceInstallSettings = {
+  envFile?: string;
+  configFile?: string;
+  host?: string;
+  port?: number;
+  environment: Record<string, string>;
+};
+
+/** Where a native Claude-to-Vertex passthrough is addressed. */
+export type VertexAnthropicPassthroughTarget = {
+  projectId: string;
+  location: string;
+  model: string;
+  stream: boolean;
+};
+
+/** One native Claude-to-Vertex passthrough dispatch. */
+export type VertexAnthropicPassthroughRequest = {
+  body: Readonly<Record<string, unknown>>;
+  projectId: string;
+  location: string;
+  model: string;
+  signal?: AbortSignal;
+};
+
+/** How a Claude-on-Vertex passthrough ended, so the hop can be finalized once. */
+export type VertexPassthroughTerminal = {
+  usage: UsageContext;
+  /** 200 served, 499 client cancelled, 502 upstream stream failure. */
+  status: number;
+  errorMessage?: string;
+};

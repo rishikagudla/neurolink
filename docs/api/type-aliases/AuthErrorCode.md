@@ -1,0 +1,11 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / AuthErrorCode
+
+# Type Alias: AuthErrorCode
+
+> **AuthErrorCode** = `"AUTH-001"` \| `"AUTH-002"` \| `"AUTH-003"` \| `"AUTH-004"` \| `"AUTH-005"` \| `"AUTH-006"` \| `"AUTH-007"` \| `"AUTH-008"` \| `"AUTH-009"` \| `"AUTH-010"` \| `"AUTH-011"` \| `"AUTH-012"` \| `"AUTH-013"` \| `"AUTH-014"` \| `"AUTH-015"` \| `"AUTH-016"` \| `"AUTH-017"` \| `"AUTH-018"` \| `"AUTH-019"` \| `"AUTH-020"`
+
+Auth error codes

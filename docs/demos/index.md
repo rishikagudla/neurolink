@@ -1,3 +1,7 @@
+---
+description: Experience NeuroLink through comprehensive visual demonstrations, screenshots, and interactive examples.
+---
+
 # Visual Demos
 
 Experience NeuroLink through comprehensive visual demonstrations, screenshots, and interactive examples.
@@ -6,27 +10,9 @@ Experience NeuroLink through comprehensive visual demonstrations, screenshots, a
 
 This section showcases NeuroLink's capabilities through visual content, making it easy to understand features before implementation.
 
-<div class="grid cards" markdown>
-
-- :material-camera: **[Screenshots](screenshots.md)**
-
-  ***
-
-  High-quality screenshots of CLI commands, web interfaces, and development workflows.
-
-- :material-play-circle: **[Videos](videos.md)**
-
-  ***
-
-  Video demonstrations of NeuroLink features, from basic usage to advanced integrations.
-
-- :material-web: **[Interactive Demo](interactive.md)**
-
-  ***
-
-  Live web demonstration with all 9 providers and real AI generation capabilities.
-
-</div>
+- **[Screenshots](screenshots.md)** — High-quality screenshots of CLI commands, web interfaces, and development workflows.
+- **[Videos](videos.md)** — Video demonstrations of NeuroLink features, from basic usage to advanced integrations.
+- **[Interactive Demo](interactive.md)** — Live web demonstration with real AI generation across any provider you've configured.
 
 ## 🚀 Quick Preview
 
@@ -62,7 +48,7 @@ The interactive web demo showcases all features with live AI generation across m
 
     ![MCP Tools](../assets/images/mcp-tools.png)
 
-    Built-in tools working seamlessly across all providers.
+    Built-in tools working seamlessly across providers you've configured.
 
 ### Web Applications
 
@@ -123,15 +109,16 @@ _Production deployment, monitoring, and business automation examples_
 
 Experience NeuroLink live without installation:
 
-!!! tip "Live Demo Available"
+:::tip[Live Demo Available]
+Visit our [Interactive Demo](https://neurolink-demo.vercel.app) to try NeuroLink with real AI providers.
 
-    Visit our [Interactive Demo](https://neurolink-demo.vercel.app) to try NeuroLink with real AI providers.
+Features:
 
-    Features:
-    - ✅ **Live AI Generation** - All 9 providers functional
-    - ✅ **Real-time Analytics** - See costs and performance
-    - ✅ **Built-in Tools** - Experience MCP integration
-    - ✅ **Multiple Use Cases** - Business, creative, and technical examples
+- **Live AI Generation** - Works with any provider you've configured
+- **Real-time Analytics** - See costs and performance
+- **Built-in Tools** - Experience MCP integration
+- **Multiple Use Cases** - Business, creative, and technical examples
+  :::
 
 ### Demo Highlights
 
@@ -176,7 +163,7 @@ All visual content is organized and optimized for:
 ### Documentation Embedding
 
 ```markdown
-![NeuroLink CLI Demo](../assets/images/cli-demo.png)
+![NeuroLink CLI Demo](../assets/images/cli-help-demo.png)
 _NeuroLink CLI with provider status and text generation_
 ```
 

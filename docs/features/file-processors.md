@@ -1,10 +1,25 @@
+---
+title: "File Processors Guide"
+description: Comprehensive file processing system supporting 20+ file types with intelligent content extraction, security sanitization, and provider-agnostic formatting
+keywords:
+  [
+    file-processors,
+    multimodal,
+    content-extraction,
+    file-types,
+    processor-registry,
+    document-processing,
+    security-sanitization,
+  ]
+---
+
 # File Processors Guide
 
-NeuroLink includes a comprehensive file processing system that supports 17+ file types with intelligent content extraction, security sanitization, and provider-agnostic formatting. This system enables seamless multimodal AI interactions across all 13 supported providers.
+NeuroLink includes a comprehensive file processing system that supports 20+ file types with intelligent content extraction, security sanitization, and provider-agnostic formatting. This system enables seamless multimodal AI interactions across NeuroLink's multimodal-capable providers.
 
 ## Overview
 
-The file processor system consists of **52 TypeScript files** organized into a modular architecture:
+The file processor system is organized into a modular architecture:
 
 ```
 src/lib/processors/
@@ -13,11 +28,30 @@ src/lib/processors/
 ├── config/         # MIME types, extensions, language maps, size limits
 ├── errors/         # FileErrorCode enum and error helpers
 ├── document/       # Excel, Word, RTF, OpenDocument processors
+├── media/          # Video and Audio processors (metadata extraction)
+├── archive/        # ZIP, TAR, GZ archive processors (file listing + content extraction)
 ├── markup/         # SVG, HTML, Markdown, Text processors
 ├── code/           # SourceCode, Config processors
 ├── data/           # JSON, YAML, XML processors
 ├── integration/    # FileProcessorIntegration for registry usage
 └── cli/            # CLI helpers for file processing
+```
+
+## Quick Start
+
+```typescript
+import { NeuroLink } from "@juspay/neurolink";
+
+const neurolink = new NeuroLink();
+
+const result = await neurolink.generate({
+  input: {
+    text: "Summarize this document",
+    files: ["./report.pdf"],
+  },
+});
+
+console.log(result.content);
 ```
 
 ## Supported File Types
@@ -78,6 +112,56 @@ src/lib/processors/
 | **TOML**        | `.toml`          | `ConfigProcessor` | Cargo.toml, pyproject.toml support |
 | **Properties**  | `.properties`    | `ConfigProcessor` | Java properties format             |
 
+### Media Files
+
+| Type      | Extensions                                              | Processor        | Features                                                                         |
+| --------- | ------------------------------------------------------- | ---------------- | -------------------------------------------------------------------------------- |
+| **Video** | `.mp4`, `.mkv`, `.webm`, `.avi`, `.mov`, `.m4v`         | `VideoProcessor` | Duration, resolution, codec, frame rate, bitrate extraction via `music-metadata` |
+| **Audio** | `.mp3`, `.wav`, `.ogg`, `.flac`, `.aac`, `.m4a`, `.wma` | `AudioProcessor` | Codec, bitrate, sample rate, channels, duration extraction via `music-metadata`  |
+
+For most providers, audio and video files are not sent as binary. Instead, the processor extracts structured metadata and returns it as formatted text, keeping token usage minimal (~50-200 tokens per file). Video files produce that same metadata text and also bring timestamped keyframes and any embedded subtitles. The Gemini providers additionally receive the audio file itself and the video clip itself (a clip qualifies up to 14 MB of source bytes for the whole request); see the [Video Analysis guide](../features/video-analysis.md).
+
+**Example video output:**
+
+```
+Video File: presentation.mp4
+Duration: 13s | Resolution: 640x360 | Video Codec: h264
+Frame Rate: 29.97 fps | Bitrate: 345 kbps
+Audio: aac, 48000 Hz, 2 channels
+```
+
+**Example audio output:**
+
+```
+Audio File: recording.mp3
+Codec: MPEG 1 Layer 3 | Bitrate: 128 kbps
+Sample Rate: 44100 Hz | Channels: 2 (Stereo) | Duration: 1:46
+```
+
+### Archives
+
+| Type    | Extensions               | Processor          | Features                                                               |
+| ------- | ------------------------ | ------------------ | ---------------------------------------------------------------------- |
+| **ZIP** | `.zip`                   | `ArchiveProcessor` | File listing with sizes, nested content extraction, ZIP bomb detection |
+| **TAR** | `.tar`                   | `ArchiveProcessor` | File listing with sizes                                                |
+| **GZ**  | `.gz`, `.tar.gz`, `.tgz` | `ArchiveProcessor` | Gzip decompression, tar content listing                                |
+
+Archive files return a structured listing of their contents with file sizes and optionally extract text from contained files (routing through existing processors).
+
+**Example archive output:**
+
+```
+Archive: project.tar.gz
+Total entries: 6
+
+Files:
+- code/sample.json (60 B)
+- code/sample.py (195 B)
+- document/sample.txt (607 B)
+```
+
+**Security:** Archive processing includes ZIP bomb detection (compression ratio limits), path traversal prevention, symlink blocking, entry count limits, and aggregate decompression size limits.
+
 ## Usage
 
 ### SDK Usage
@@ -129,15 +213,17 @@ neurolink generate "Explain this codebase" \
 
 ```typescript
 // Streaming with file processing
-const stream = await neurolink.stream({
+const result = await neurolink.stream({
   input: {
     text: "Walk me through this code step by step",
     files: ["./src/algorithm.py"],
   },
 });
 
-for await (const chunk of stream.textStream) {
-  process.stdout.write(chunk);
+for await (const chunk of result.stream) {
+  if ("content" in chunk) {
+    process.stdout.write(chunk.content);
+  }
 }
 ```
 
@@ -268,23 +354,15 @@ const result = await neurolink.generate({
 
 Default size limits prevent denial-of-service attacks:
 
-| Category     | Default Limit | Configurable |
-| ------------ | ------------- | ------------ |
-| Documents    | 50 MB         | Yes          |
-| Data files   | 10 MB         | Yes          |
-| Code files   | 5 MB          | Yes          |
-| Config files | 1 MB          | Yes          |
-| Images       | 20 MB         | Yes          |
+| Category     | Default Limit | Configurable     |
+| ------------ | ------------- | ---------------- |
+| Documents    | 50 MB         | Yes              |
+| Data files   | 10 MB         | Yes              |
+| Code files   | 5 MB          | Yes              |
+| Config files | 1 MB          | Yes              |
+| Images       | 10 MB         | No — fixed limit |
 
-```typescript
-import { ProcessorConfig } from "@juspay/neurolink";
-
-// Configure size limits
-ProcessorConfig.setLimits({
-  maxDocumentSize: 100 * 1024 * 1024, // 100 MB
-  maxCodeSize: 10 * 1024 * 1024, // 10 MB
-});
-```
+The **image** limit (`SIZE_LIMITS_BYTES.IMAGE_MAX`, 10 MB) is enforced: an oversized image buffer, file, or download throws a descriptive error before any base64 conversion, so a large image can no longer exhaust process memory. This applies to both entry points — images passed via `generate({ files })` (routed through `FileDetector` → `ImageProcessor`) and via `generate({ images })` (routed through the message builder). The internal image helpers that convert buffers/files/URLs accept an optional size override, but it is not exposed through `generate()` or any other public API — the 10 MB limit is fixed for SDK callers.
 
 ## Error Handling
 
@@ -319,7 +397,7 @@ try {
 
 ## Provider Compatibility
 
-All file processors work across all 13 AI providers. The processed content is formatted as text that any provider can understand:
+All file processors work across NeuroLink's text- and multimodal-capable providers. The processed content is formatted as text that any such provider can understand:
 
 | Provider          | Documents | Data | Markup | Code | Config |
 | ----------------- | --------- | ---- | ------ | ---- | ------ |

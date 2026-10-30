@@ -14,7 +14,7 @@ import type {
   KeywordExtractorConfig,
   QuestionExtractorConfig,
   CustomSchemaExtractorConfig,
-} from "../types.js";
+} from "../../types/index.js";
 import { ProviderFactory } from "../../factories/providerFactory.js";
 import { logger } from "../../utils/logger.js";
 
@@ -154,10 +154,12 @@ export class LLMMetadataExtractor {
 
     for (const chunk of chunks) {
       const docId = chunk.metadata.documentId;
-      if (!groups.has(docId)) {
-        groups.set(docId, []);
+      const group = groups.get(docId);
+      if (group) {
+        group.push(chunk);
+      } else {
+        groups.set(docId, [chunk]);
       }
-      groups.get(docId)!.push(chunk);
     }
 
     return groups;

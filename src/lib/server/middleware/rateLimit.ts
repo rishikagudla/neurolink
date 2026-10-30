@@ -3,77 +3,16 @@
  * Provides configurable rate limiting for server adapters
  */
 
-import type { MiddlewareDefinition, ServerContext } from "../types.js";
+import type {
+  FixedWindowRateLimitConfig,
+  MiddlewareDefinition,
+  RateLimitEntry,
+  RateLimitMiddlewareConfig,
+  RateLimitStore,
+  ServerContext,
+} from "../../types/index.js";
+import { logger } from "../../utils/logger.js";
 import { RateLimitError as ServerRateLimitError } from "../errors.js";
-
-/**
- * Rate limit middleware configuration
- */
-export type RateLimitMiddlewareConfig = {
-  /** Maximum requests per window */
-  maxRequests: number;
-
-  /** Time window in milliseconds */
-  windowMs: number;
-
-  /** Custom error message */
-  message?: string;
-
-  /** Skip rate limiting for certain paths */
-  skipPaths?: string[];
-
-  /**
-   * Custom key generator for identifying clients
-   * Default: IP address
-   */
-  keyGenerator?: (ctx: ServerContext) => string;
-
-  /**
-   * Custom response handler for rate limit exceeded
-   */
-  onRateLimitExceeded?: (ctx: ServerContext, retryAfter: number) => unknown;
-
-  /**
-   * Custom rate limit store
-   * Default: in-memory store
-   */
-  store?: RateLimitStore;
-};
-
-/**
- * Rate limit entry
- */
-export type RateLimitEntry = {
-  count: number;
-  resetAt: number;
-};
-
-/**
- * Rate limit store interface
- * Implement this for custom storage (Redis, etc.)
- */
-export interface RateLimitStore {
-  /**
-   * Get the current entry for a key
-   */
-  get(key: string): Promise<RateLimitEntry | undefined>;
-
-  /**
-   * Set an entry for a key
-   */
-  set(key: string, entry: RateLimitEntry): Promise<void>;
-
-  /**
-   * Increment the counter for a key
-   * Returns the current count and reset time
-   */
-  increment(key: string, windowMs: number): Promise<RateLimitEntry>;
-
-  /**
-   * Reset the counter for a key
-   */
-  reset(key: string): Promise<void>;
-}
 
 /**
  * In-memory rate limit store
@@ -181,6 +120,9 @@ export function createRateLimitMiddleware(
     excludePaths: skipPaths,
     handler: async (ctx, next) => {
       const key = keyGenerator(ctx);
+      if (!key) {
+        return next(); // Nothing to attribute the request to: see defaultKeyGenerator.
+      }
       const { count, resetAt } = await store.increment(key, windowMs);
 
       // Set rate limit headers in responseHeaders (adapters read from here)
@@ -217,20 +159,31 @@ export function createRateLimitMiddleware(
 }
 
 /**
- * Default key generator using IP address
+ * Default key: the TCP peer the adapter recorded on the context. Never a
+ * header, which the client writes: keyed on `X-Forwarded-For`, one shared
+ * bucket served every direct client and a rotating header escaped the limit.
+ * Behind a reverse proxy, pass a `keyGenerator` that reads the proxy's header
+ * (see `resolveClientAddress`). An empty key means "do not count".
  */
 function defaultKeyGenerator(ctx: ServerContext): string {
-  return (
-    ctx.headers["x-forwarded-for"]?.split(",")[0].trim() ||
-    ctx.headers["x-real-ip"] ||
-    "unknown"
-  );
+  const address = ctx.remoteAddress?.trim();
+  if (!address) {
+    warnNoAddressOnce();
+    return "";
+  }
+  return address;
 }
 
-/**
- * Re-export RateLimitError from errors for convenience
- */
-export { RateLimitError } from "../errors.js";
+let warnedNoAddress = false;
+function warnNoAddressOnce(): void {
+  if (warnedNoAddress) {
+    return;
+  }
+  warnedNoAddress = true;
+  logger.alwaysStderr(
+    "[rateLimit] A request carried no peer address (ctx.remoteAddress), so the rate limiter let it through uncounted; pass a keyGenerator to limit by another key.",
+  );
+}
 
 /**
  * Create a sliding window rate limiter
@@ -275,6 +228,9 @@ export function createSlidingWindowRateLimitMiddleware(
     excludePaths: skipPaths,
     handler: async (ctx, next) => {
       const key = keyGenerator(ctx);
+      if (!key) {
+        return next();
+      }
       const now = Date.now();
 
       // Get existing timestamps and filter old ones
@@ -331,24 +287,6 @@ export function createSlidingWindowRateLimitMiddleware(
 export { InMemoryRateLimitStore as MemoryRateLimitStore };
 
 /**
- * Fixed window rate limit configuration (for standalone signature)
- */
-export type FixedWindowRateLimitConfig = {
-  /** Maximum requests per window */
-  maxRequests: number;
-  /** Time window in milliseconds */
-  windowMs: number;
-  /** Custom error message */
-  message?: string;
-  /** Skip rate limiting for certain paths */
-  skipPaths?: string[];
-  /** Custom key generator */
-  keyGenerator?: (ctx: ServerContext) => string;
-  /** Custom rate limit exceeded handler */
-  onRateLimitExceeded?: (ctx: ServerContext, retryAfter: number) => unknown;
-};
-
-/**
  * Create fixed window rate limit middleware
  *
  * Accepts config and optional store as separate parameters for compatibility.
@@ -384,6 +322,9 @@ export function createFixedWindowRateLimitMiddleware(
     excludePaths: skipPaths,
     handler: async (ctx, next) => {
       const key = keyGenerator(ctx);
+      if (!key) {
+        return next();
+      }
       const { count, resetAt } = await rateLimitStore.increment(key, windowMs);
 
       // Set rate limit headers in responseHeaders (adapters read from here)

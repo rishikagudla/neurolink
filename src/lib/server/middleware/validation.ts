@@ -3,90 +3,14 @@
  * Provides schema-based request validation for server adapters
  */
 
-import type { MiddlewareDefinition, ServerContext } from "../types.js";
+import type {
+  ExtendedValidationSchema,
+  MiddlewareDefinition,
+  MiddlewareRequestSchema,
+  PropertySchema,
+  ValidationConfig,
+} from "../../types/index.js";
 import { ValidationError as ServerValidationError } from "../errors.js";
-
-/**
- * Validation configuration
- */
-export type ValidationConfig = {
-  /** Schema for validating request body */
-  bodySchema?: ValidationSchema;
-
-  /** Schema for validating query parameters */
-  querySchema?: ValidationSchema;
-
-  /** Schema for validating path parameters */
-  paramsSchema?: ValidationSchema;
-
-  /** Schema for validating headers */
-  headersSchema?: ValidationSchema;
-
-  /**
-   * Custom validation function
-   * Throw ValidationError for invalid requests
-   */
-  customValidator?: (ctx: ServerContext) => Promise<void>;
-
-  /** Skip validation for certain paths */
-  skipPaths?: string[];
-
-  /** Custom error formatter */
-  errorFormatter?: (errors: ServerValidationError[]) => unknown;
-};
-
-/**
- * Simple validation schema
- * Can be extended with JSON Schema or Zod integration
- */
-export type ValidationSchema = {
-  /** Required fields */
-  required?: string[];
-
-  /** Field type definitions */
-  properties?: Record<string, PropertySchema>;
-
-  /** Allow additional properties */
-  additionalProperties?: boolean;
-};
-
-/**
- * Property schema definition
- */
-export type PropertySchema = {
-  /** Property type */
-  type: "string" | "number" | "boolean" | "object" | "array";
-
-  /** Minimum value (for numbers) or length (for strings/arrays) */
-  minimum?: number;
-
-  /** Maximum value (for numbers) or length (for strings/arrays) */
-  maximum?: number;
-
-  /** Minimum length for strings (alias for minimum) */
-  minLength?: number;
-
-  /** Maximum length for strings (alias for maximum) */
-  maxLength?: number;
-
-  /** Minimum items for arrays */
-  minItems?: number;
-
-  /** Maximum items for arrays */
-  maxItems?: number;
-
-  /** Pattern for string validation (regex) */
-  pattern?: string;
-
-  /** Enum of allowed values */
-  enum?: unknown[];
-
-  /** Default value */
-  default?: unknown;
-
-  /** Custom validation function */
-  validate?: (value: unknown) => boolean | string;
-};
 
 /**
  * Re-export ValidationError from errors for convenience
@@ -186,7 +110,8 @@ export function createRequestValidationMiddleware(
         );
         const error = new ServerValidationError(errors, ctx.requestId);
         // Attach formatted response to error
-        (error as unknown as { response: unknown }).response = formattedError;
+        (error as ServerValidationError & { response: unknown }).response =
+          formattedError;
         throw error;
       }
 
@@ -200,7 +125,7 @@ export function createRequestValidationMiddleware(
  */
 function validateObject(
   obj: Record<string, unknown>,
-  schema: ValidationSchema,
+  schema: MiddlewareRequestSchema,
   prefix: string,
 ): Array<{ field: string; message: string }> {
   const errors: Array<{ field: string; message: string }> = [];
@@ -414,7 +339,7 @@ export function createFieldValidator(
  * ```
  */
 export function createBodyValidationMiddleware(
-  schema: ValidationSchema,
+  schema: MiddlewareRequestSchema,
 ): MiddlewareDefinition {
   return createRequestValidationMiddleware({ bodySchema: schema });
 }
@@ -433,7 +358,7 @@ export function createBodyValidationMiddleware(
  * ```
  */
 export function createQueryValidationMiddleware(
-  schema: ValidationSchema,
+  schema: MiddlewareRequestSchema,
 ): MiddlewareDefinition {
   return createRequestValidationMiddleware({ querySchema: schema });
 }
@@ -447,24 +372,6 @@ export const createValidationMiddleware = createRequestValidationMiddleware;
 // ============================================
 // Common Schemas
 // ============================================
-
-/**
- * Extended property schema for common schemas
- */
-export type ExtendedPropertySchema = PropertySchema & {
-  format?: string;
-};
-
-/**
- * Extended validation schema for common schemas
- */
-export type ExtendedValidationSchema = {
-  type?: string;
-  format?: string;
-  required?: string[];
-  properties?: Record<string, ExtendedPropertySchema>;
-  additionalProperties?: boolean;
-};
 
 /**
  * Common validation schemas for reuse

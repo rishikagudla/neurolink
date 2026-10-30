@@ -1,8 +1,24 @@
 /**
- * Provider Health Checking System
- * Prevents 500 errors by validating provider availability and configuration
+ * Provider health checking with captured native diagnostics for Ollama.
+ * Configuration/model availability and transport failures remain separate.
  */
-
+import {
+  beginOllamaDiagnostic,
+  captureOllamaDiagnosticContext,
+  clearOllamaDiagnostics,
+  completeOllamaDiagnostic,
+  getOllamaDiagnosticErrorMessage,
+  getOllamaDiagnosticSnapshot,
+  getOllamaHealthCacheKey,
+  getValidatedProviderFailureThreshold,
+  OllamaProtocolError,
+  readOllamaTagsModels,
+  resolveOllamaNativeTagsUrl,
+} from "./ollamaDiagnostics.js";
+import type {
+  OllamaDiagnosticContext,
+  OllamaDiagnosticOutcome,
+} from "../types/index.js";
 import { logger } from "./logger.js";
 import {
   AIProviderName,
@@ -11,13 +27,17 @@ import {
   AnthropicModels,
   BedrockModels,
 } from "../constants/enums.js";
-import { API_KEY_LENGTHS, PROJECT_ID_FORMAT } from "./providerConfig.js";
+import { PROJECT_ID_FORMAT, satisfiesFallbacks } from "./providerConfig.js";
 import { basename } from "path";
 import { createProxyFetch } from "../proxy/proxyFetch.js";
 import type {
   ProviderHealthCheckOptions,
   ProviderHealthStatusOptions,
-} from "$lib/types/providers.js";
+  ProviderRuntimeProbeOutcome,
+} from "../types/index.js";
+import { DEFAULT_OLLAMA_MODEL } from "../providers/ollama/constants.js";
+import { ProviderFactory } from "../factories/providerFactory.js";
+import { PROVIDER_DESCRIPTORS } from "../factories/providerDescriptors.js";
 
 export class ProviderHealthChecker {
   private static healthCache = new Map<
@@ -25,37 +45,72 @@ export class ProviderHealthChecker {
     {
       status: ProviderHealthStatusOptions;
       timestamp: number;
+      ollamaRevision?: number;
+      ollamaGeneration?: number;
     }
   >();
   private static readonly DEFAULT_TIMEOUT = 5000; // 5 seconds
   private static readonly DEFAULT_CACHE_AGE = 300000; // 5 minutes
+  /**
+   * Fixed backoff for the existing non-Ollama provider breaker. Ollama uses
+   * the same fixed window in ollamaDiagnostics, shared by every native caller.
+   * Neither window depends on a caller's maxCacheAge: expiring a health cache
+   * must not silently erase a transport backoff owned by another caller.
+   */
+  private static readonly CIRCUIT_BREAKER_RESET_MS = 300000; // 5 minutes
   private static readonly CONSECUTIVE_FAILURE_THRESHOLD =
     ProviderHealthChecker.getValidatedFailureThreshold();
-  private static consecutiveFailures = new Map<string, number>();
+  /**
+   * Non-Ollama circuit breaker state, keyed by provider. Ollama's separate
+   * native policy captures the actual endpoint and records aggregate outcomes.
+   *
+   * `count` is a count of consecutive failed CONNECTIVITY PROBES (plus the
+   * rare case of the check itself throwing) — never of "the provider is
+   * unconfigured". Those are different facts and only one of them is worth
+   * backing off from. A missing credential is a free, local, determinate
+   * answer that costs nothing to re-derive and flips the instant an env var
+   * is set; treating it as a failure is what let a sweep of ~38 providers
+   * (issue #1305 grew it from 8) blacklist every provider the machine
+   * happens not to have credentials for, after which the sweep reported
+   * `isConfigured: false` and no `responseTime` for a provider that was
+   * merely unconfigured — and kept reporting it after the key was supplied.
+   *
+   * `lastFailureAt` bounds how long a run of failures is held against a
+   * provider; see `checkProviderHealth`.
+   */
+  private static consecutiveFailures = new Map<
+    string,
+    { count: number; lastFailureAt: number }
+  >();
+  /**
+   * Hard cap on simultaneous per-provider checks inside
+   * `checkAllProvidersHealth`. Issue #1305: the sweep used to cover only 8
+   * of ~38 registered providers; now every non-opted-out descriptor is
+   * included (see `excludeFromHealthSweep`). Firing all ~38 at once via a
+   * single `Promise.allSettled` would be harmless by default
+   * (`includeConnectivityTest` defaults to false, so most calls never
+   * leave the process), but a caller who opts into
+   * `includeConnectivityTest: true` would otherwise open up to ~38
+   * concurrent outbound HTTP connections to that many different vendors in
+   * one burst. A worker pool keeps that bounded without reducing coverage
+   * — every provider is still checked, just not all in the same instant,
+   * and without the latency a fixed batch would add (see
+   * `checkAllProvidersHealth`).
+   */
+  private static readonly MAX_CONCURRENT_HEALTH_CHECKS = 8;
 
   /**
-   * Validate and return a safe failure threshold value
+   * Preserve the validated threshold's original first-use initialization.
    */
   private static getValidatedFailureThreshold(): number {
-    const envValue = process.env.PROVIDER_FAILURE_THRESHOLD;
-
-    if (!envValue) {
-      return 3; // default
-    }
-
-    const parsed = Number(envValue);
-    if (isNaN(parsed) || parsed <= 0 || parsed > 10) {
-      logger.warn(
-        `Invalid PROVIDER_FAILURE_THRESHOLD: ${envValue} (must be between 1 and 10), using default: 3`,
-      );
-      return 3;
-    }
-
-    return parsed;
+    return getValidatedProviderFailureThreshold();
   }
 
   /**
-   * Comprehensive health check for a provider
+   * Check configuration and optional connectivity/model availability.
+   * Ollama captures its endpoint/model once and records only probes that run;
+   * a cache hit or missing configured model does not invent a transport failure.
+   * Its cached result must match the current diagnostic revision/generation.
    */
   static async checkProviderHealth(
     providerName: AIProviderName,
@@ -69,36 +124,82 @@ export class ProviderHealthChecker {
       maxCacheAge = this.DEFAULT_CACHE_AGE,
     } = options;
 
-    // Check cache first
-    if (cacheResults) {
-      const cached = this.getCachedHealth(providerName, maxCacheAge);
+    const isOllama = providerName === AIProviderName.OLLAMA;
+    let ollamaContext: OllamaDiagnosticContext | undefined;
+    if (isOllama) {
+      try {
+        ollamaContext = captureOllamaDiagnosticContext();
+      } catch {
+        // The local configuration path below reports the invalid URL without
+        // fabricating an outbound transport failure or reusing old cached health.
+      }
+    }
+    let ollamaProbeRan = false;
+    let ollamaProbeFailed = false;
+
+    // Cache hits remain observations: they neither begin nor complete a probe.
+    if (cacheResults && (!isOllama || ollamaContext)) {
+      const cached = this.getCachedHealth(
+        providerName,
+        maxCacheAge,
+        ollamaContext,
+      );
       if (cached) {
         logger.debug(`Using cached health status for ${providerName}`);
         return cached;
       }
     }
 
-    // Check if provider has consecutive failures (blacklisting)
-    const failureCount = this.consecutiveFailures.get(providerName) || 0;
-    if (failureCount >= this.CONSECUTIVE_FAILURE_THRESHOLD) {
-      const healthStatus: ProviderHealthStatusOptions = {
-        provider: providerName,
-        isHealthy: false,
-        isConfigured: false,
-        hasApiKey: false,
-        lastChecked: new Date(),
-        error: `Provider blacklisted after ${failureCount} consecutive failures`,
-        warning: "Provider will be retried after cache TTL expires",
-        configurationIssues: [
-          `Blacklisted due to ${failureCount} consecutive failures`,
-        ],
-        recommendations: ["Check provider status and configuration"],
-      };
+    // Circuit breaker. It suppresses outbound PROBES, not the whole check:
+    // for most providers the step-1 configuration audit is local and free,
+    // so skipping it bought nothing and cost the caller a status object of
+    // a different shape — no `responseTime`, and a fabricated
+    // `isConfigured: false` for a provider nothing had looked at.
+    //
+    // LiteLLM and Ollama are the exception: their step-1 check
+    // (checkLiteLLMConfig/checkOllamaConfig) makes a real outbound request,
+    // because for a local runtime "configured" only means something if it
+    // means "reachable" — both providers have zero required env vars
+    // (`credentialsResolvedExternally` / no `apiKey`), so with no request at
+    // all every install would read as configured. Auto-select
+    // (`NeuroLink.hasProviderEnvVars`) depends on that: it always calls with
+    // `includeConnectivityTest: false`, so gating this probe on that flag
+    // instead of the breaker would make a dead local proxy look configured
+    // and win auto-select over a real, working cloud provider. So this
+    // probe still runs in shallow mode, but — like the step-3 connectivity
+    // probe — it is governed by the SAME breaker below (`allowRuntimeProbe`
+    // passed into checkEnvironmentConfiguration): skipped while blacklisted,
+    // and its outcome folded into `anyProbeFailed`/`anyProbeRan` further
+    // down, so a dead local proxy still gets backed off instead of eating a
+    // full timeout on every call forever.
+    //
+    // Ollama consults its captured endpoint policy; other providers retain
+    // their existing provider-keyed map. Both expire at the fixed reset window,
+    // independently of this caller's health-cache TTL.
+    const breaker = this.consecutiveFailures.get(providerName);
+    if (
+      !isOllama &&
+      breaker !== undefined &&
+      Date.now() - breaker.lastFailureAt >= this.CIRCUIT_BREAKER_RESET_MS
+    ) {
+      this.consecutiveFailures.delete(providerName);
+    }
+    const ollamaGate = ollamaContext
+      ? beginOllamaDiagnostic(ollamaContext)
+      : undefined;
+    const failureCount = isOllama
+      ? ollamaContext
+        ? getOllamaDiagnosticSnapshot(ollamaContext).count
+        : 0
+      : (this.consecutiveFailures.get(providerName)?.count ?? 0);
+    const blacklisted = isOllama
+      ? ollamaGate?.kind === "suppressed"
+      : failureCount >= this.CONSECUTIVE_FAILURE_THRESHOLD;
+    if (blacklisted) {
       logger.warn(
         `Provider ${providerName} blacklisted due to consecutive failures`,
         { failureCount },
       );
-      return healthStatus;
     }
 
     const startTime = Date.now();
@@ -113,20 +214,61 @@ export class ProviderHealthChecker {
     };
 
     try {
-      // 1. Check environment configuration
-      await this.checkEnvironmentConfiguration(providerName, healthStatus);
+      // 1. Check environment configuration. For LiteLLM/Ollama this
+      // includes a breaker-governed runtime probe — see the comment on
+      // `blacklisted` above.
+      const runtimeProbe = await this.checkEnvironmentConfiguration(
+        providerName,
+        healthStatus,
+        timeout,
+        !blacklisted,
+        ollamaContext,
+      );
+      ollamaProbeRan = runtimeProbe.ran;
+      ollamaProbeFailed = runtimeProbe.failed;
 
       // 2. Check API key validity (basic format validation)
       await this.checkApiKeyValidity(providerName, healthStatus);
 
-      // 3. Optional: Connectivity test
-      if (includeConnectivityTest) {
-        await this.checkConnectivity(providerName, healthStatus, timeout);
+      // 3. Optional: Connectivity test. Also governed by the breaker.
+      const issuesBeforeProbe = healthStatus.configurationIssues.length;
+      const probed = includeConnectivityTest && !blacklisted;
+      if (probed) {
+        await this.checkConnectivity(
+          providerName,
+          healthStatus,
+          timeout,
+          ollamaContext,
+        );
       }
+      const probeFailed =
+        probed && healthStatus.configurationIssues.length > issuesBeforeProbe;
+
+      // Fold the step-1 runtime probe (if this provider has one) together
+      // with the step-3 connectivity probe into one pair of breaker
+      // signals, so a call where BOTH run and fail still counts as exactly
+      // ONE failure (the breaker steps consecutive calls, not consecutive
+      // requests).
+      const anyProbeRan = probed || runtimeProbe.ran;
+      const anyProbeFailed = probeFailed || runtimeProbe.failed;
+      ollamaProbeRan = anyProbeRan;
+      ollamaProbeFailed = anyProbeFailed;
 
       // 4. Optional: Model validation
       if (includeModelValidation) {
         await this.checkModelAvailability(providerName, healthStatus);
+      }
+
+      if (blacklisted) {
+        healthStatus.error = `Provider blacklisted after ${failureCount} consecutive failures`;
+        healthStatus.warning =
+          "Provider will be retried after cache TTL expires";
+        healthStatus.configurationIssues.push(
+          `Blacklisted due to ${failureCount} consecutive failures`,
+        );
+        healthStatus.recommendations.push(
+          "Check provider status and configuration",
+        );
       }
 
       // 5. Determine overall health
@@ -138,20 +280,49 @@ export class ProviderHealthChecker {
       healthStatus.responseTime = Date.now() - startTime;
 
       // Cache results
-      if (cacheResults) {
+      if (cacheResults && !isOllama) {
         this.healthCache.set(providerName, {
           status: healthStatus,
           timestamp: Date.now(),
         });
       }
 
-      // Reset failure count on success
-      if (healthStatus.isHealthy) {
-        this.consecutiveFailures.delete(providerName);
+      // Only a probe that actually ran moves the breaker. A check that
+      // issued no request is not evidence either way: it neither proves the
+      // provider is failing nor that it has recovered.
+      if (isOllama) {
+        if (ollamaGate?.kind === "allowed") {
+          completeOllamaDiagnostic(
+            ollamaGate,
+            anyProbeFailed
+              ? "transport-failure"
+              : anyProbeRan
+                ? "success"
+                : "not-run",
+          );
+        }
+        if (cacheResults && ollamaContext) {
+          const snapshot = getOllamaDiagnosticSnapshot(ollamaContext);
+          if (ollamaGate && snapshot.generation === ollamaGate.generation) {
+            // Bind the FINAL recorded revision, never the pre-request revision.
+            // Clearing also invalidates a suppressed call's pending cache write.
+            this.healthCache.set(getOllamaHealthCacheKey(ollamaContext), {
+              status: healthStatus,
+              timestamp: Date.now(),
+              ollamaRevision: snapshot.revision,
+              ollamaGeneration: snapshot.generation,
+            });
+          }
+        }
       } else {
-        // Track consecutive failures
-        const currentFailures = this.consecutiveFailures.get(providerName) || 0;
-        this.consecutiveFailures.set(providerName, currentFailures + 1);
+        if (anyProbeFailed) {
+          this.consecutiveFailures.set(providerName, {
+            count: failureCount + 1,
+            lastFailureAt: Date.now(),
+          });
+        } else if (anyProbeRan) {
+          this.consecutiveFailures.delete(providerName);
+        }
       }
 
       logger.debug(`Health check completed for ${providerName}`, {
@@ -160,21 +331,44 @@ export class ProviderHealthChecker {
         issues: healthStatus.configurationIssues.length,
       });
     } catch (error) {
-      const errorMessage =
-        error instanceof Error ? error.message : String(error);
+      const errorMessage = isOllama
+        ? getOllamaDiagnosticErrorMessage(error)
+        : error instanceof Error
+          ? error.message
+          : String(error);
       healthStatus.error = errorMessage;
       healthStatus.configurationIssues.push(
         `Health check failed: ${errorMessage}`,
       );
       healthStatus.responseTime = Date.now() - startTime;
 
-      // Track consecutive failures
-      const currentFailures = this.consecutiveFailures.get(providerName) || 0;
-      this.consecutiveFailures.set(providerName, currentFailures + 1);
+      // Keep legacy error accounting for other providers. Ollama records only
+      // probes that actually ran, so a local exception cannot invent an outage.
+      if (isOllama) {
+        if (ollamaGate?.kind === "allowed") {
+          completeOllamaDiagnostic(
+            ollamaGate,
+            ollamaProbeFailed
+              ? "transport-failure"
+              : ollamaProbeRan
+                ? "success"
+                : "not-run",
+          );
+        }
+      } else {
+        this.consecutiveFailures.set(providerName, {
+          count: failureCount + 1,
+          lastFailureAt: Date.now(),
+        });
+      }
 
       logger.warn(`Health check failed for ${providerName}`, {
         error: errorMessage,
-        consecutiveFailures: currentFailures + 1,
+        consecutiveFailures: isOllama
+          ? ollamaContext
+            ? getOllamaDiagnosticSnapshot(ollamaContext).count
+            : 0
+          : failureCount + 1,
       });
     }
 
@@ -187,7 +381,10 @@ export class ProviderHealthChecker {
   private static async checkEnvironmentConfiguration(
     providerName: AIProviderName,
     healthStatus: ProviderHealthStatusOptions,
-  ): Promise<void> {
+    timeout: number,
+    allowRuntimeProbe: boolean,
+    ollamaContext?: OllamaDiagnosticContext,
+  ): Promise<ProviderRuntimeProbeOutcome> {
     const requiredEnvVars = this.getRequiredEnvironmentVariables(providerName);
 
     logger.debug(
@@ -237,7 +434,13 @@ export class ProviderHealthChecker {
     }
 
     // Provider-specific configuration checks
-    await this.checkProviderSpecificConfig(providerName, healthStatus);
+    return this.checkProviderSpecificConfig(
+      providerName,
+      healthStatus,
+      timeout,
+      allowRuntimeProbe,
+      ollamaContext,
+    );
   }
 
   /**
@@ -253,62 +456,41 @@ export class ProviderHealthChecker {
         providerName,
       });
 
-      // Method 1: Check GOOGLE_APPLICATION_CREDENTIALS (file-based)
-      const credentialsFile = process.env.GOOGLE_APPLICATION_CREDENTIALS;
-      let fileBasedAuthValid = false;
+      // Derive auth-var acceptance from the vertex descriptor instead of a
+      // hand-maintained var list, so this stays in sync with the real
+      // gating logic (hasGoogleCredentials() in googleVertex/client.ts and
+      // googleVertex/utils.ts): extraRequired.every(...) ||
+      // extraRequiredFallbacks.some(...), the same pattern used by
+      // hasProviderEnvVars() (providerUtils.ts), setup.ts, and
+      // environmentManager.ts. The old two-method check here only
+      // recognized GOOGLE_APPLICATION_CREDENTIALS or the
+      // GOOGLE_AUTH_CLIENT_EMAIL + GOOGLE_AUTH_PRIVATE_KEY pair — missing
+      // GOOGLE_SERVICE_ACCOUNT_KEY and, most importantly,
+      // GOOGLE_APPLICATION_CREDENTIALS_NEUROLINK, the descriptor's
+      // documented first-priority fallback. A user configured via that
+      // var alone had a fully working Vertex provider but was reported
+      // unhealthy here. Note: this is a presence-only check — it no
+      // longer verifies the GOOGLE_APPLICATION_CREDENTIALS file actually
+      // exists on disk (the old file-based method did via fs.access),
+      // matching the presence-only semantics already used by the other
+      // three callers of this pattern.
+      const descriptor = ProviderFactory.getDescriptor(AIProviderName.VERTEX);
+      const { extraRequired, extraRequiredFallbacks } =
+        descriptor?.envVars ?? {};
 
-      if (credentialsFile) {
-        logger.debug("Checking GOOGLE_APPLICATION_CREDENTIALS file");
+      const hasValidAuth =
+        (extraRequired ?? []).every((v) => !!process.env[v]) ||
+        satisfiesFallbacks(extraRequiredFallbacks, process.env);
 
-        try {
-          const { promises: fs } = await import("fs");
-          try {
-            await fs.access(credentialsFile);
-            fileBasedAuthValid = true;
-          } catch {
-            fileBasedAuthValid = false;
-          }
-          logger.debug("File auth check result", {
-            fileExists: fileBasedAuthValid,
-          });
-        } catch (error) {
-          logger.debug("File auth check error", {
-            error: String(error),
-          });
-          fileBasedAuthValid = false;
-        }
-      }
-
-      // Method 2: Check individual environment variables
-      const hasIndividualAuth = !!(
-        process.env.GOOGLE_AUTH_CLIENT_EMAIL &&
-        process.env.GOOGLE_AUTH_PRIVATE_KEY
-      );
-
-      logger.debug("Individual auth check", {
-        hasClientEmail: !!process.env.GOOGLE_AUTH_CLIENT_EMAIL,
-        hasPrivateKey: !!process.env.GOOGLE_AUTH_PRIVATE_KEY,
-        hasIndividualAuth,
-      });
-
-      // Vertex is valid if EITHER auth method works
-      const hasValidAuth = fileBasedAuthValid || hasIndividualAuth;
-
-      logger.debug("Vertex auth final result", {
-        fileBasedAuthValid,
-        hasIndividualAuth,
-        hasValidAuth,
-      });
+      logger.debug("Vertex auth final result", { hasValidAuth });
 
       if (hasValidAuth) {
         healthStatus.hasApiKey = true;
-        logger.debug("Vertex auth SUCCESS", {
-          authMethod: fileBasedAuthValid ? "file-based" : "individual-env-vars",
-        });
+        logger.debug("Vertex auth SUCCESS");
       } else {
         healthStatus.hasApiKey = false;
         healthStatus.configurationIssues.push(
-          `Vertex AI authentication not found: neither GOOGLE_APPLICATION_CREDENTIALS file nor individual credentials (GOOGLE_AUTH_CLIENT_EMAIL + GOOGLE_AUTH_PRIVATE_KEY) are properly configured`,
+          "Vertex AI authentication not found: set GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_APPLICATION_CREDENTIALS_NEUROLINK, GOOGLE_SERVICE_ACCOUNT_KEY, or both GOOGLE_AUTH_CLIENT_EMAIL and GOOGLE_AUTH_PRIVATE_KEY",
         );
         logger.debug("Vertex auth FAILED", {
           reason: "No valid auth method found",
@@ -317,10 +499,19 @@ export class ProviderHealthChecker {
       return;
     }
 
+    // A descriptor with no apiKey variable at all (LM Studio, llama.cpp) would
+    // otherwise read process.env[""] below and report a missing key named by
+    // nothing; hasProviderEnvVars already treats these as usable with defaults.
+    const providerDescriptor = ProviderFactory.getDescriptor(providerName);
+
     // Providers that don't use API keys directly
     if (
       providerName === AIProviderName.OLLAMA ||
-      providerName === AIProviderName.BEDROCK
+      providerName === AIProviderName.BEDROCK ||
+      providerName === AIProviderName.LITELLM ||
+      providerDescriptor?.localRuntime === true ||
+      (providerDescriptor?.envVars.optional === true &&
+        !providerDescriptor.envVars.apiKey)
     ) {
       healthStatus.hasApiKey = true;
       return;
@@ -361,44 +552,51 @@ export class ProviderHealthChecker {
     providerName: AIProviderName,
     healthStatus: ProviderHealthStatusOptions,
     timeout: number,
+    ollamaContext?: OllamaDiagnosticContext,
   ): Promise<void> {
-    const endpoint = this.getProviderHealthEndpoint(providerName);
+    const endpoint =
+      providerName === AIProviderName.OLLAMA
+        ? (ollamaContext?.url ?? null)
+        : this.getProviderHealthEndpoint(providerName);
 
     if (!endpoint) {
       healthStatus.warning = "No connectivity test available for this provider";
       return;
     }
 
+    const headers = {
+      "User-Agent": "NeuroLink-HealthCheck/1.0",
+      ...this.getConnectivityHeaders(providerName),
+    };
+
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), timeout);
 
-      const proxyFetch = createProxyFetch();
-      let response = await proxyFetch(endpoint, {
-        method: "HEAD",
-        signal: controller.signal,
-        headers: {
-          "User-Agent": "NeuroLink-HealthCheck/1.0",
-        },
-      });
-
-      // Fallback to GET if HEAD returns 405 (Method Not Allowed) for restrictive gateways
-      if (response.status === 405) {
-        response = await proxyFetch(endpoint, {
-          method: "GET",
+      try {
+        const proxyFetch = createProxyFetch();
+        let response = await proxyFetch(endpoint, {
+          method: "HEAD",
           signal: controller.signal,
-          headers: {
-            "User-Agent": "NeuroLink-HealthCheck/1.0",
-          },
+          headers,
         });
-      }
 
-      clearTimeout(timeoutId);
+        // Fallback to GET if HEAD returns 405 (Method Not Allowed) for restrictive gateways
+        if (response.status === 405) {
+          response = await proxyFetch(endpoint, {
+            method: "GET",
+            signal: controller.signal,
+            headers,
+          });
+        }
 
-      if (!response.ok) {
-        healthStatus.configurationIssues.push(
-          `Connectivity test failed: HTTP ${response.status}`,
-        );
+        if (!response.ok) {
+          healthStatus.configurationIssues.push(
+            `Connectivity test failed: HTTP ${response.status}`,
+          );
+        }
+      } finally {
+        clearTimeout(timeoutId);
       }
     } catch (error) {
       const errorMessage =
@@ -451,6 +649,18 @@ export class ProviderHealthChecker {
     }
   }
 
+  private static getConnectivityHeaders(
+    providerName: AIProviderName,
+  ): Record<string, string> {
+    if (providerName === AIProviderName.LITELLM) {
+      return {
+        Authorization: `Bearer ${process.env.LITELLM_API_KEY || "sk-anything"}`,
+      };
+    }
+
+    return {};
+  }
+
   /**
    * Check model availability (if possible without making API calls)
    */
@@ -468,12 +678,12 @@ export class ProviderHealthChecker {
           `Available models for ${providerName} (using dual provider architecture):\n` +
             `  Google Models (via vertex provider):\n` +
             `    • gemini-2.5-pro, gemini-2.5-flash, gemini-2.5-flash-lite\n` +
-            `    • gemini-2.0-flash-001, gemini-1.5-pro, gemini-1.5-flash\n` +
+            `    • gemini-2.0-flash-001, gemini-2.0-flash-lite\n` +
             `  Anthropic Models (via vertexAnthropic provider):\n` +
             `    • claude-sonnet-4@20250514, claude-opus-4@20250514\n` +
             `    • claude-3-5-sonnet-20241022, claude-3-5-haiku-20241022\n` +
             `    • claude-3-sonnet-20240229, claude-3-haiku-20240307, claude-3-opus-20240229\n` +
-            `  Implementation: Uses @ai-sdk/google-vertex with dual provider setup\n` +
+            `  Implementation: Uses native SDKs (@google/genai for Gemini, @anthropic-ai/vertex-sdk for Claude)\n` +
             `  Authentication: Requires Google Cloud project with Vertex AI API enabled\n` +
             `  Note: Anthropic models require Anthropic integration in your Google Cloud project`,
         );
@@ -486,115 +696,115 @@ export class ProviderHealthChecker {
   }
 
   /**
-   * Get required environment variables for a provider
+   * Get required environment variables for a provider.
+   *
+   * Returns `[]` for providers with `descriptor.credentialsResolvedExternally
+   * === true` (Vertex, Bedrock, LiteLLM) — the check in
+   * checkEnvironmentConfiguration() below ANDs every entry in the returned
+   * list together, which can't express Vertex's file-OR-individual-creds-
+   * OR-service-account auth, Bedrock's AWS SDK default provider chain
+   * (profile / IAM role, no env vars at all), or LiteLLM's documented
+   * zero-config local proxy. Their real requirement is validated by
+   * checkProviderSpecificConfig()'s dedicated per-provider checks instead.
+   * Naively deriving [apiKey, ...extraRequired] from the descriptor for
+   * these three (as for the other providers) would make
+   * checkEnvironmentConfiguration() push a false "missing environment
+   * variables" issue — and therefore isHealthy=false — for legitimate
+   * fallback-based Vertex auth, AWS_PROFILE/IAM-role Bedrock auth, and
+   * unauthenticated local LiteLLM proxies. See hasProviderEnvVars() in
+   * providerUtils.ts for the equivalent OR-aware check used for
+   * auto-select gating. See `ProviderDescriptor.credentialsResolvedExternally`
+   * (types/providers.ts) for the field's full documentation.
    */
-  private static getRequiredEnvironmentVariables(
-    providerName: AIProviderName,
-  ): string[] {
-    switch (providerName) {
-      case AIProviderName.ANTHROPIC:
-        return ["ANTHROPIC_API_KEY"];
-      case AIProviderName.OPENAI:
-        return ["OPENAI_API_KEY"];
-      case AIProviderName.VERTEX:
-        // Vertex AI requires authentication, but not via a single environment variable.
-        // Authentication can be provided via a credential file or individual credentials + project.
-        // The required authentication is checked in checkProviderSpecificConfig instead of here.
-        // Returning an empty array here does NOT mean authentication is not required.
-        return [];
-      case AIProviderName.GOOGLE_AI:
-        return ["GOOGLE_AI_API_KEY"];
-      case AIProviderName.BEDROCK:
-        // Bedrock credentials are resolved via AWS SDK default provider chain.
-        // Region/auth validated in provider-specific checks.
-        return [];
-      case AIProviderName.AZURE:
-        return ["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"];
-      case AIProviderName.OLLAMA:
-        return []; // Ollama typically doesn't require API keys
-      default:
-        return [];
+  static getRequiredEnvironmentVariables(providerName: string): string[] {
+    // Resolve the descriptor FIRST so the field check below is keyed on
+    // the canonical, alias-resolved `descriptor.credentialsResolvedExternally`
+    // — not the raw, possibly-aliased `providerName` argument. Checking the
+    // raw input here would let documented aliases (e.g. "googleVertex" for
+    // vertex, "aws" for bedrock) skip the delegation and fall through to
+    // the naive [apiKey, ...extraRequired] derivation below, reproducing
+    // the exact false "missing environment variables" regression this
+    // field exists to prevent.
+    const descriptor = ProviderFactory.getDescriptor(providerName);
+    if (!descriptor) {
+      return [];
     }
+    if (descriptor.credentialsResolvedExternally) {
+      return [];
+    }
+    const { apiKey, extraRequired } = descriptor.envVars;
+    return [...(apiKey ? [apiKey] : []), ...(extraRequired ?? [])];
   }
 
   /**
-   * Get API key environment variable for a provider
+   * Get API key environment variable for a provider.
+   *
+   * Dead code at its sole call site today (checkApiKeyValidity() early-
+   * returns for VERTEX/OLLAMA/BEDROCK/LITELLM before reaching this), but
+   * now `static` (public) so a future direct caller is plausible — hence
+   * the two intentional diffs from the original hand-written switch are
+   * documented here rather than left silent:
+   *   - vertex: old switch returned "GOOGLE_APPLICATION_CREDENTIALS"
+   *     (one of several valid auth vars); the descriptor's `envVars.apiKey`
+   *     is "GOOGLE_CLOUD_PROJECT_ID" instead — the actual identity var for
+   *     the provider, not one specific credential-supply mechanism.
+   *   - ollama: old switch returned "OLLAMA_BASE_URL"; the descriptor has
+   *     no `envVars.apiKey` for ollama (it's a local, unauthenticated
+   *     runtime), so this now returns "".
+   * Both are kept deliberately (semantically truer identity vars) rather
+   * than reproduced byte-for-byte from the old switch.
    */
-  private static getApiKeyEnvironmentVariable(
-    providerName: AIProviderName,
-  ): string {
-    switch (providerName) {
-      case AIProviderName.ANTHROPIC:
-        return "ANTHROPIC_API_KEY";
-      case AIProviderName.OPENAI:
-        return "OPENAI_API_KEY";
-      case AIProviderName.VERTEX:
-        return "GOOGLE_APPLICATION_CREDENTIALS";
-      case AIProviderName.GOOGLE_AI:
-        return "GOOGLE_AI_API_KEY";
-      case AIProviderName.BEDROCK:
-        return "AWS_ACCESS_KEY_ID";
-      case AIProviderName.AZURE:
-        return "AZURE_OPENAI_API_KEY";
-      case AIProviderName.OLLAMA:
-        return "OLLAMA_API_BASE";
-      default:
-        return "";
-    }
+  static getApiKeyEnvironmentVariable(providerName: string): string {
+    return ProviderFactory.getDescriptor(providerName)?.envVars.apiKey ?? "";
   }
 
   /**
    * Validate API key format for a provider
    */
-  private static validateApiKeyFormat(
-    providerName: AIProviderName,
-    apiKey: string,
-  ): boolean {
-    switch (providerName) {
-      case AIProviderName.ANTHROPIC:
-        return (
-          apiKey.startsWith("sk-ant-") &&
-          apiKey.length >= API_KEY_LENGTHS.ANTHROPIC_MIN
-        );
-      case AIProviderName.OPENAI:
-        return (
-          apiKey.startsWith("sk-") &&
-          apiKey.length >= API_KEY_LENGTHS.OPENAI_MIN
-        );
-      case AIProviderName.GOOGLE_AI:
-        return apiKey.length >= API_KEY_LENGTHS.GOOGLE_AI_EXACT; // Basic length check
-      case AIProviderName.VERTEX:
-        return apiKey.endsWith(".json") || apiKey.includes("type"); // JSON key format
-      case AIProviderName.BEDROCK:
-        return apiKey.length >= API_KEY_LENGTHS.AWS_ACCESS_KEY; // AWS access key length
-      case AIProviderName.AZURE:
-        return apiKey.length >= API_KEY_LENGTHS.AZURE_MIN; // Azure OpenAI API key length
-      case AIProviderName.OLLAMA:
-        return true; // Ollama usually doesn't require specific format
-      default:
-        return true; // Default to true for unknown providers
+  static validateApiKeyFormat(providerName: string, apiKey: string): boolean {
+    // Vertex's "API key" is really a credentials file path (or an inline
+    // JSON blob via GOOGLE_SERVICE_ACCOUNT_KEY) — never governed by the
+    // shared API_KEY_FORMATS regexes. Preserved exactly from the original
+    // switch even though checkApiKeyValidity() early-returns before ever
+    // reaching this call for Vertex today; kept correct for any other/
+    // future caller.
+    if (providerName === AIProviderName.VERTEX) {
+      return apiKey.endsWith(".json") || apiKey.includes("type");
     }
+    const descriptor = ProviderFactory.getDescriptor(providerName);
+    if (!descriptor?.apiKeyFormatPattern) {
+      // Providers with no documented format (or local runtimes / providers
+      // usable with zero configuration) are accepted as-is — matches the
+      // old switch's per-provider `default: true`/no-format-check branches
+      // (ollama, litellm).
+      if (descriptor?.localRuntime || descriptor?.envVars.optional) {
+        return true;
+      }
+      return apiKey.length > 0;
+    }
+    return descriptor.apiKeyFormatPattern.test(apiKey);
   }
 
   /**
    * Get health check endpoint for connectivity testing
    */
-  private static getProviderHealthEndpoint(
-    providerName: AIProviderName,
-  ): string | null {
-    switch (providerName) {
-      case AIProviderName.ANTHROPIC:
-        return null; // Anthropic doesn't have a public health endpoint
+  static getProviderHealthEndpoint(providerName: string): string | null {
+    const descriptor = ProviderFactory.getDescriptor(providerName);
+    if (descriptor?.healthCheck !== "models-probe") {
+      return null;
+    }
+    // OpenAI/LiteLLM/Ollama each need a provider-specific URL builder that
+    // isn't pure descriptor data (LiteLLM/Ollama depend on the configured
+    // base URL) — keep the existing per-provider dispatch for the 3
+    // models-probe providers, now gated on the descriptor instead of a
+    // hardcoded name list.
+    switch (descriptor.name) {
       case AIProviderName.OPENAI:
         return "https://api.openai.com/v1/models";
-      case AIProviderName.GOOGLE_AI:
-        return null; // No public health endpoint
-      case AIProviderName.VERTEX:
-        return null; // Complex authentication required
-      case AIProviderName.BEDROCK:
-        return null; // AWS endpoints vary by region
+      case AIProviderName.LITELLM:
+        return this.getLiteLLMModelsUrl();
       case AIProviderName.OLLAMA:
-        return "http://localhost:11434/api/version";
+        return this.getOllamaTagsUrl();
       default:
         return null;
     }
@@ -606,7 +816,10 @@ export class ProviderHealthChecker {
   private static async checkProviderSpecificConfig(
     providerName: AIProviderName,
     healthStatus: ProviderHealthStatusOptions,
-  ): Promise<void> {
+    timeout: number,
+    allowRuntimeProbe: boolean,
+    ollamaContext?: OllamaDiagnosticContext,
+  ): Promise<ProviderRuntimeProbeOutcome> {
     switch (providerName) {
       case AIProviderName.VERTEX:
         await this.checkVertexAIConfig(healthStatus);
@@ -617,10 +830,23 @@ export class ProviderHealthChecker {
       case AIProviderName.AZURE:
         await this.checkAzureConfig(healthStatus);
         break;
+      case AIProviderName.LITELLM:
+        return this.checkLiteLLMConfig(
+          healthStatus,
+          timeout,
+          allowRuntimeProbe,
+        );
       case AIProviderName.OLLAMA:
-        await this.checkOllamaConfig(healthStatus);
-        break;
+        return this.checkOllamaConfig(
+          healthStatus,
+          timeout,
+          allowRuntimeProbe,
+          ollamaContext,
+        );
     }
+    // Every other provider's config check above is local (env vars, file
+    // existence) — never a network request, so there is no probe to report.
+    return { ran: false, failed: false };
   }
 
   /**
@@ -675,7 +901,7 @@ export class ProviderHealthChecker {
     }
 
     if (!hasValidAuth) {
-      hasValidAuth = this.checkIndividualGoogleCredentials(healthStatus);
+      hasValidAuth = this.checkExtraRequiredFallbackCredentials(healthStatus);
     }
 
     if (!hasValidAuth) {
@@ -683,7 +909,7 @@ export class ProviderHealthChecker {
         "Google Cloud authentication not configured or credentials file missing",
       );
       healthStatus.recommendations.push(
-        "Set either GOOGLE_APPLICATION_CREDENTIALS (valid file path), GOOGLE_SERVICE_ACCOUNT_KEY (base64), or both GOOGLE_AUTH_CLIENT_EMAIL and GOOGLE_AUTH_PRIVATE_KEY",
+        "Set either GOOGLE_APPLICATION_CREDENTIALS (valid file path), GOOGLE_APPLICATION_CREDENTIALS_NEUROLINK, GOOGLE_SERVICE_ACCOUNT_KEY (base64), or both GOOGLE_AUTH_CLIENT_EMAIL and GOOGLE_AUTH_PRIVATE_KEY",
       );
     }
 
@@ -723,18 +949,26 @@ export class ProviderHealthChecker {
   }
 
   /**
-   * Check individual Google credentials
+   * Check Vertex's non-file auth fallbacks (GOOGLE_APPLICATION_CREDENTIALS_
+   * NEUROLINK, GOOGLE_SERVICE_ACCOUNT_KEY, or the GOOGLE_AUTH_CLIENT_EMAIL +
+   * GOOGLE_AUTH_PRIVATE_KEY pair) via the descriptor's extraRequiredFallbacks
+   * instead of a hand-maintained env-var list, so this stays in sync with
+   * the real gating logic (hasGoogleCredentials()) the same way
+   * checkApiKeyValidity()'s vertex branch does. The previous hand-rolled
+   * version only recognized GOOGLE_SERVICE_ACCOUNT_KEY or the email+key
+   * pair — missing GOOGLE_APPLICATION_CREDENTIALS_NEUROLINK, the
+   * descriptor's documented first-priority fallback.
    */
-  private static checkIndividualGoogleCredentials(
+  private static checkExtraRequiredFallbackCredentials(
     healthStatus: ProviderHealthStatusOptions,
   ): boolean {
-    const hasServiceAccountKey = !!process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
-    const hasIndividualCredentials = !!(
-      process.env.GOOGLE_AUTH_CLIENT_EMAIL &&
-      process.env.GOOGLE_AUTH_PRIVATE_KEY
+    const descriptor = ProviderFactory.getDescriptor(AIProviderName.VERTEX);
+    const hasValidAuth = satisfiesFallbacks(
+      descriptor?.envVars.extraRequiredFallbacks,
+      process.env,
     );
 
-    if (hasServiceAccountKey || hasIndividualCredentials) {
+    if (hasValidAuth) {
       healthStatus.hasApiKey = true;
       return true;
     }
@@ -892,19 +1126,377 @@ export class ProviderHealthChecker {
     }
   }
 
+  private static getLiteLLMBaseUrl(): string {
+    return process.env.LITELLM_BASE_URL || "http://localhost:4000";
+  }
+
+  private static getLiteLLMModelsUrl(): string {
+    return new URL("/v1/models", this.getLiteLLMBaseUrl()).toString();
+  }
+
+  private static getConfiguredLiteLLMModel(): string {
+    return process.env.LITELLM_MODEL || "openai/gpt-5.4-mini";
+  }
+
+  private static getOllamaBaseUrl(): string {
+    return (
+      process.env.OLLAMA_BASE_URL ||
+      process.env.OLLAMA_API_BASE ||
+      "http://localhost:11434"
+    );
+  }
+
+  /** Resolve the shared native tags URL rather than the compatible models URL. */
+  private static getOllamaTagsUrl(): string {
+    return resolveOllamaNativeTagsUrl();
+  }
+
+  private static getConfiguredOllamaModel(): string {
+    return process.env.OLLAMA_MODEL || DEFAULT_OLLAMA_MODEL;
+  }
+
+  private static async fetchJsonWithTimeout(
+    url: string,
+    options: {
+      timeout?: number;
+      headers?: Record<string, string>;
+    } = {},
+  ): Promise<unknown> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(
+      () => controller.abort(),
+      options.timeout ?? this.DEFAULT_TIMEOUT,
+    );
+
+    try {
+      const proxyFetch = createProxyFetch();
+      const response = await proxyFetch(url, {
+        method: "GET",
+        headers: options.headers,
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      return await response.json();
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  private static normalizeModelList(models: unknown[]): string[] {
+    return models
+      .map((entry) => {
+        if (typeof entry === "string") {
+          return entry;
+        }
+        if (
+          entry &&
+          typeof entry === "object" &&
+          "id" in entry &&
+          typeof (entry as { id?: unknown }).id === "string"
+        ) {
+          return (entry as { id: string }).id;
+        }
+        if (
+          entry &&
+          typeof entry === "object" &&
+          "name" in entry &&
+          typeof (entry as { name?: unknown }).name === "string"
+        ) {
+          return (entry as { name: string }).name;
+        }
+        return null;
+      })
+      .filter((model): model is string => typeof model === "string");
+  }
+
+  private static hasRequestedModel(
+    availableModels: string[],
+    requestedModel: string,
+  ): boolean {
+    const normalizedRequestedModel = requestedModel.trim();
+    const requiresExactMatch = /@/.test(normalizedRequestedModel);
+
+    return availableModels.some(
+      (model) =>
+        model === normalizedRequestedModel ||
+        (!requiresExactMatch &&
+          (model.startsWith(`${normalizedRequestedModel}:`) ||
+            model.startsWith(`${normalizedRequestedModel}@`))),
+    );
+  }
+
   /**
-   * Check Ollama configuration
+   * Fetch native tags from the captured endpoint and normalize its models.
+   * A malformed envelope rejects; a valid empty list remains an empty result.
+   */
+  private static async getOllamaAvailableModels(
+    timeout: number = 2000,
+    endpoint: string = this.getOllamaTagsUrl(),
+  ): Promise<string[]> {
+    const payload = await this.fetchJsonWithTimeout(endpoint, { timeout });
+    return this.normalizeModelList(readOllamaTagsModels(payload));
+  }
+
+  private static async getLiteLLMAvailableModels(
+    timeout: number = 2000,
+  ): Promise<string[]> {
+    const payload = (await this.fetchJsonWithTimeout(
+      this.getLiteLLMModelsUrl(),
+      {
+        timeout,
+        headers: {
+          Authorization: `Bearer ${process.env.LITELLM_API_KEY || "sk-anything"}`,
+          "Content-Type": "application/json",
+        },
+      },
+    )) as { data?: unknown[] };
+    return this.normalizeModelList(payload.data ?? []);
+  }
+
+  /**
+   * Check a requested model against native tags while keeping diagnostic outcome
+   * separate from model availability. An answered valid list is diagnostic
+   * success even if that model is absent; malformed JSON/envelopes are protocol
+   * failures. A caller recording an aggregate health probe disables recording
+   * here so its admitted permit is completed only once at the outer boundary.
+   */
+  private static async checkOllamaAvailability(options: {
+    model: string;
+    timeout?: number;
+    context?: OllamaDiagnosticContext;
+    recordDiagnostic?: boolean;
+  }): Promise<{
+    available: boolean;
+    reason?: string;
+    models: string[];
+    diagnosticOutcome:
+      | OllamaDiagnosticOutcome
+      | "suppressed"
+      | "configuration-failure";
+  }> {
+    let context: OllamaDiagnosticContext;
+    try {
+      context =
+        options.context ?? captureOllamaDiagnosticContext(options.model);
+    } catch (error) {
+      return {
+        available: false,
+        reason: getOllamaDiagnosticErrorMessage(error),
+        models: [],
+        diagnosticOutcome: "configuration-failure",
+      };
+    }
+    const gate =
+      options.recordDiagnostic === false
+        ? undefined
+        : beginOllamaDiagnostic(context);
+    if (gate?.kind === "suppressed") {
+      return {
+        available: false,
+        reason: gate.reason,
+        models: [],
+        diagnosticOutcome: "suppressed",
+      };
+    }
+    let outcome: OllamaDiagnosticOutcome | undefined;
+    try {
+      const models = await this.getOllamaAvailableModels(
+        options.timeout,
+        context.url,
+      );
+      outcome = "success";
+      if (!this.hasRequestedModel(models, options.model)) {
+        return {
+          available: false,
+          reason: `Configured Ollama model '${options.model}' is not installed`,
+          models,
+          diagnosticOutcome: outcome,
+        };
+      }
+      return { available: true, models, diagnosticOutcome: outcome };
+    } catch (error) {
+      outcome =
+        error instanceof OllamaProtocolError || error instanceof SyntaxError
+          ? "protocol-failure"
+          : "transport-failure";
+      return {
+        available: false,
+        reason: getOllamaDiagnosticErrorMessage(error),
+        models: [],
+        diagnosticOutcome: outcome,
+      };
+    } finally {
+      if (gate?.kind === "allowed") {
+        completeOllamaDiagnostic(gate, outcome ?? "not-run");
+      }
+    }
+  }
+
+  private static async checkLiteLLMAvailability(options: {
+    model: string;
+    timeout?: number;
+  }): Promise<{ available: boolean; reason?: string; models: string[] }> {
+    try {
+      const models = await this.getLiteLLMAvailableModels(options.timeout);
+      if (models.length === 0) {
+        return {
+          available: false,
+          reason: "LiteLLM returned an empty model list",
+          models,
+        };
+      }
+
+      if (!this.hasRequestedModel(models, options.model)) {
+        return {
+          available: false,
+          reason: `Configured LiteLLM model '${options.model}' is not exposed by the proxy`,
+          models,
+        };
+      }
+
+      return { available: true, models };
+    } catch (error) {
+      return {
+        available: false,
+        reason: error instanceof Error ? error.message : String(error),
+        models: [],
+      };
+    }
+  }
+
+  private static async checkLiteLLMConfig(
+    healthStatus: ProviderHealthStatusOptions,
+    timeout: number = this.DEFAULT_TIMEOUT,
+    allowRuntimeProbe: boolean = true,
+  ): Promise<ProviderRuntimeProbeOutcome> {
+    const liteLLMBase = this.getLiteLLMBaseUrl();
+    if (!liteLLMBase.startsWith("http")) {
+      healthStatus.isConfigured = false;
+      healthStatus.configurationIssues.push("Invalid LITELLM_BASE_URL format");
+      healthStatus.recommendations.push(
+        "Set LITELLM_BASE_URL to a valid URL (e.g., http://localhost:4000)",
+      );
+      return { ran: false, failed: false };
+    }
+
+    if (!allowRuntimeProbe) {
+      // Blacklisted: don't issue the request. A repeatedly unreachable
+      // local provider is not usable, which is what auto-select needs —
+      // but the caller's blacklist block (checkProviderHealth) already adds
+      // the error/warning/configurationIssue for this, so nothing is
+      // duplicated here.
+      healthStatus.isConfigured = false;
+      return { ran: false, failed: false };
+    }
+
+    // Only pin the availability check to a specific model when the user
+    // explicitly configured one. The fallback default ("openai/gpt-5.4-mini")
+    // is a guess, not configuration — proxies that serve a different model
+    // set (every self-hosted gateway) were reported "Not configured" here
+    // while generate/stream against them worked fine with explicit models.
+    const configuredModel = process.env.LITELLM_MODEL;
+    let failureReason: string | undefined;
+    if (configuredModel) {
+      const availability = await this.checkLiteLLMAvailability({
+        model: configuredModel,
+        timeout,
+      });
+      if (!availability.available) {
+        failureReason = availability.reason ?? "unknown error";
+      }
+    } else {
+      // No configured model: a reachable proxy with any models counts.
+      try {
+        const models = await this.getLiteLLMAvailableModels(timeout);
+        if (models.length === 0) {
+          failureReason = "LiteLLM returned an empty model list";
+        }
+      } catch (error) {
+        failureReason = error instanceof Error ? error.message : String(error);
+      }
+    }
+
+    if (failureReason !== undefined) {
+      healthStatus.isConfigured = false;
+      healthStatus.configurationIssues.push(
+        `LiteLLM runtime check failed: ${failureReason}`,
+      );
+      healthStatus.recommendations.push(
+        "Start the LiteLLM proxy and ensure the configured model is available from /v1/models",
+      );
+      return { ran: true, failed: true };
+    }
+
+    healthStatus.isConfigured = true;
+    return { ran: true, failed: false };
+  }
+
+  /**
+   * Report Ollama configuration and model availability using the captured context.
+   * Backoff can suppress native work; a missing installed model is a configuration
+   * issue after a successful probe. Return actual probe activity/failure for the
+   * enclosing health check to record, without completing a second policy permit.
    */
   private static async checkOllamaConfig(
     healthStatus: ProviderHealthStatusOptions,
-  ): Promise<void> {
-    const ollamaBase = process.env.OLLAMA_API_BASE || "http://localhost:11434";
+    timeout: number = this.DEFAULT_TIMEOUT,
+    allowRuntimeProbe: boolean = true,
+    ollamaContext?: OllamaDiagnosticContext,
+  ): Promise<ProviderRuntimeProbeOutcome> {
+    const ollamaBase = ollamaContext?.url ?? this.getOllamaBaseUrl();
     if (!ollamaBase.startsWith("http")) {
-      healthStatus.configurationIssues.push("Invalid OLLAMA_API_BASE format");
-      healthStatus.recommendations.push(
-        "Set OLLAMA_API_BASE to a valid URL (e.g., http://localhost:11434)",
+      healthStatus.isConfigured = false;
+      healthStatus.configurationIssues.push(
+        "Invalid OLLAMA_BASE_URL format (OLLAMA_API_BASE is still accepted as a legacy alias)",
       );
+      healthStatus.recommendations.push(
+        "Set OLLAMA_BASE_URL to a valid URL (e.g., http://localhost:11434). OLLAMA_API_BASE remains supported as a legacy alias.",
+      );
+      return { ran: false, failed: false };
     }
+
+    if (!allowRuntimeProbe) {
+      // Blacklisted: don't issue the request. A repeatedly unreachable
+      // local provider is not usable, which is what auto-select needs —
+      // but the caller's blacklist block (checkProviderHealth) already adds
+      // the error/warning/configurationIssue for this, so nothing is
+      // duplicated here.
+      healthStatus.isConfigured = false;
+      return { ran: false, failed: false };
+    }
+
+    const availability = await this.checkOllamaAvailability({
+      model: ollamaContext?.model ?? this.getConfiguredOllamaModel(),
+      timeout,
+      context: ollamaContext,
+      recordDiagnostic: false,
+    });
+
+    if (!availability.available) {
+      healthStatus.isConfigured = false;
+      healthStatus.configurationIssues.push(
+        `Ollama runtime check failed: ${availability.reason ?? "unknown error"}`,
+      );
+      healthStatus.recommendations.push(
+        "Start Ollama and install the configured model before using Ollama as a fallback provider",
+      );
+      return {
+        ran:
+          availability.diagnosticOutcome === "success" ||
+          availability.diagnosticOutcome === "transport-failure" ||
+          availability.diagnosticOutcome === "protocol-failure",
+        failed:
+          availability.diagnosticOutcome === "transport-failure" ||
+          availability.diagnosticOutcome === "protocol-failure",
+      };
+    }
+
+    healthStatus.isConfigured = true;
+    return { ran: true, failed: false };
   }
 
   /**
@@ -922,15 +1514,17 @@ export class ProviderHealthChecker {
         ];
       case AIProviderName.OPENAI:
         return [
-          OpenAIModels.GPT_4O,
+          OpenAIModels.GPT_5_4,
+          OpenAIModels.GPT_5_4_MINI,
           OpenAIModels.GPT_4O_MINI,
+          OpenAIModels.GPT_4O,
           OpenAIModels.GPT_3_5_TURBO,
         ];
       case AIProviderName.GOOGLE_AI:
         return [
-          GoogleAIModels.GEMINI_1_5_PRO,
-          GoogleAIModels.GEMINI_1_5_FLASH,
           GoogleAIModels.GEMINI_2_5_PRO,
+          GoogleAIModels.GEMINI_2_5_FLASH,
+          GoogleAIModels.GEMINI_2_0_FLASH_001,
         ];
       case AIProviderName.VERTEX:
         return [
@@ -939,8 +1533,6 @@ export class ProviderHealthChecker {
           GoogleAIModels.GEMINI_2_5_FLASH,
           GoogleAIModels.GEMINI_2_5_FLASH_LITE,
           GoogleAIModels.GEMINI_2_0_FLASH_001,
-          GoogleAIModels.GEMINI_1_5_PRO,
-          GoogleAIModels.GEMINI_1_5_FLASH,
           // Anthropic models (via vertexAnthropic provider)
           "claude-sonnet-4@20250514",
           "claude-opus-4@20250514",
@@ -954,30 +1546,59 @@ export class ProviderHealthChecker {
         return [BedrockModels.CLAUDE_3_SONNET, BedrockModels.CLAUDE_3_HAIKU];
       case AIProviderName.AZURE:
         return [OpenAIModels.GPT_4O, OpenAIModels.GPT_4O_MINI, "gpt-35-turbo"];
-      case AIProviderName.OLLAMA:
-        return ["llama3.2:latest", "llama3.1:latest", "mistral:latest"];
+      case AIProviderName.LITELLM:
+        return [
+          "openai/gpt-5.4-mini",
+          "anthropic/claude-haiku-4-5-20251001",
+          "google/gemini-2.5-flash",
+        ];
+      case AIProviderName.OLLAMA: {
+        const envModel = process.env.OLLAMA_MODEL;
+        const defaults = [
+          "llama3.2:latest",
+          "llama3.1:latest",
+          "mistral:latest",
+        ];
+        return envModel ? [envModel, ...defaults] : defaults;
+      }
       default:
         return [];
     }
   }
 
   /**
-   * Get cached health status if still valid
+   * Return health within the caller's TTL and, for Ollama, the captured identity.
+   * Ollama revision/generation changes invalidate cached status; reading the
+   * snapshot may apply timed expiry but never records a probe outcome.
    */
   private static getCachedHealth(
     providerName: AIProviderName,
     maxAge: number,
+    ollamaContext?: OllamaDiagnosticContext,
   ): ProviderHealthStatusOptions | null {
-    const cached = this.healthCache.get(providerName);
+    const key = ollamaContext
+      ? getOllamaHealthCacheKey(ollamaContext)
+      : providerName;
+    const cached = this.healthCache.get(key);
 
     if (!cached) {
       return null;
     }
 
+    if (ollamaContext) {
+      const snapshot = getOllamaDiagnosticSnapshot(ollamaContext);
+      if (
+        cached.ollamaRevision !== snapshot.revision ||
+        cached.ollamaGeneration !== snapshot.generation
+      ) {
+        this.healthCache.delete(key);
+        return null;
+      }
+    }
     const age = Date.now() - cached.timestamp;
 
     if (age > maxAge) {
-      this.healthCache.delete(providerName);
+      this.healthCache.delete(key);
       return null;
     }
 
@@ -1057,20 +1678,18 @@ export class ProviderHealthChecker {
 
     try {
       // 1. Check SDK module availability
-      logger.debug(
-        "Checking @ai-sdk/google-vertex/anthropic module availability",
-      );
-      const anthropicModule = await import("@ai-sdk/google-vertex/anthropic");
+      logger.debug("Checking @anthropic-ai/vertex-sdk module availability");
+      const anthropicModule = await import("@anthropic-ai/vertex-sdk");
 
       result.hasCreateVertexAnthropic =
-        typeof anthropicModule.createVertexAnthropic === "function";
-      result.hasCorrectTypes = true; // Types are bundled with the function
+        typeof anthropicModule.AnthropicVertex === "function";
+      result.hasCorrectTypes = true; // Types are bundled with the class
 
       if (!result.hasCreateVertexAnthropic) {
         result.troubleshooting.push(
-          "📦 Update @ai-sdk/google-vertex to latest version with Anthropic support",
-          "🔄 Run: npm install @ai-sdk/google-vertex@latest",
-          "📖 See: https://sdk.vercel.ai/providers/ai-sdk-providers/google-vertex#anthropic-models",
+          "📦 Install @anthropic-ai/vertex-sdk for Claude on Vertex AI support",
+          "🔄 Run: npm install @anthropic-ai/vertex-sdk",
+          "📖 See: https://docs.anthropic.com/en/api/claude-on-vertex-ai",
         );
         return result;
       }
@@ -1245,7 +1864,7 @@ export class ProviderHealthChecker {
         `🐛 Error: ${error instanceof Error ? error.message : String(error)}`,
         "",
         "🔧 Troubleshooting steps:",
-        "1. Update @ai-sdk/google-vertex to latest version",
+        "1. Verify @google-cloud/vertexai and @anthropic-ai/vertex-sdk are properly installed",
         "2. Verify Google Cloud authentication setup",
         "3. Check project ID and region configuration",
         "4. Enable Vertex AI API in Google Cloud Console",
@@ -1578,15 +2197,74 @@ export class ProviderHealthChecker {
   }
 
   /**
-   * Clear health cache for a provider or all providers
+   * Clear cached health and failure state for one provider or every provider.
+   * Clearing Ollama removes all endpoint/model cache entries and explicitly
+   * advances diagnostic generation so older in-flight permits cannot commit.
    */
   static clearHealthCache(providerName?: AIProviderName): void {
     if (providerName) {
-      this.healthCache.delete(providerName);
+      if (providerName === AIProviderName.OLLAMA) {
+        for (const [key, cached] of this.healthCache) {
+          if (cached.status.provider === providerName) {
+            this.healthCache.delete(key);
+          }
+        }
+        clearOllamaDiagnostics();
+      } else {
+        this.healthCache.delete(providerName);
+      }
       this.consecutiveFailures.delete(providerName);
     } else {
       this.healthCache.clear();
       this.consecutiveFailures.clear();
+      clearOllamaDiagnostics();
+    }
+  }
+
+  static async checkFallbackProviderAvailability(
+    providerName: string,
+    model: string,
+  ): Promise<{ available: boolean; reason?: string }> {
+    const provider = providerName as AIProviderName;
+
+    if (provider === AIProviderName.OLLAMA) {
+      const availability = await this.checkOllamaAvailability({
+        model,
+        timeout: 2000,
+      });
+      return {
+        available: availability.available,
+        reason: availability.reason,
+      };
+    }
+
+    if (provider === AIProviderName.LITELLM) {
+      const availability = await this.checkLiteLLMAvailability({
+        model,
+        timeout: 2000,
+      });
+      return {
+        available: availability.available,
+        reason: availability.reason,
+      };
+    }
+
+    try {
+      const health = await this.checkProviderHealth(provider, {
+        includeConnectivityTest: false,
+        cacheResults: true,
+        maxCacheAge: 15_000,
+        timeout: 2000,
+      });
+      return {
+        available: health.isHealthy,
+        reason: health.error || health.configurationIssues[0] || health.warning,
+      };
+    } catch (error) {
+      return {
+        available: false,
+        reason: error instanceof Error ? error.message : String(error),
+      };
     }
   }
 
@@ -1596,14 +2274,16 @@ export class ProviderHealthChecker {
    * Uses fast, cached health checks to avoid blocking initialization
    */
   static async getBestHealthyProvider(
-    preferredProviders: string[] = [
-      "openai",
-      "anthropic",
-      "vertex",
-      "bedrock",
-      "azure",
-      "google-ai",
-    ],
+    // Auto-select preference comes from the descriptors too — a SEPARATE
+    // ordering from the sweep (local/cheap runtimes first), carried by
+    // autoSelectPreference rather than defaultHealthSweepPriority.
+    preferredProviders: string[] = PROVIDER_DESCRIPTORS.filter(
+      (d) => d.autoSelectPreference !== undefined,
+    )
+      .sort(
+        (a, b) => (a.autoSelectPreference ?? 0) - (b.autoSelectPreference ?? 0),
+      )
+      .map((d) => d.name as string),
   ): Promise<string | null> {
     const healthStatuses = await this.checkAllProvidersHealth({
       includeConnectivityTest: false, // Quick config check only
@@ -1620,8 +2300,20 @@ export class ProviderHealthChecker {
       }
     }
 
-    // Fallback to first healthy provider
-    const firstHealthyProvider = healthStatuses.find((h) => h.isHealthy);
+    // Fallback to first healthy provider. A local runtime that nothing probes
+    // (LM Studio, llama.cpp) is "healthy" only in that it needs no
+    // configuration, which says nothing about whether it is running, so it
+    // must not outrank a provider the caller actually configured.
+    const firstHealthyProvider = healthStatuses.find((h) => {
+      if (!h.isHealthy) {
+        return false;
+      }
+      const descriptor = ProviderFactory.getDescriptor(h.provider);
+      return !(
+        descriptor?.localRuntime === true &&
+        descriptor.healthCheck === "env-only"
+      );
+    });
     if (firstHealthyProvider) {
       logger.info(
         `Using fallback healthy provider: ${firstHealthyProvider.provider}`,
@@ -1643,26 +2335,77 @@ export class ProviderHealthChecker {
   }
 
   /**
-   * Get health status for all registered providers
+   * Get health status for all registered providers.
+   *
+   * Membership: every descriptor in PROVIDER_DESCRIPTORS EXCEPT those that
+   * explicitly opt out via `excludeFromHealthSweep` (none currently do).
+   * Before issue #1305's fix, membership was implicit opt-IN via
+   * `defaultHealthSweepPriority`, which only 8 of ~38 descriptors carried —
+   * every other registered provider was silently invisible to this sweep,
+   * including anything a caller had actually configured and could use.
+   *
+   * Order: `defaultHealthSweepPriority` still decides ORDER for the
+   * providers that set it (lower = first — order is behaviour for
+   * first-healthy-wins callers like `getBestHealthyProvider`); everything
+   * else sorts after them, in PROVIDER_DESCRIPTORS's own declaration order
+   * (Array.prototype.sort is stable, so ties never reshuffle).
+   *
+   * Checks run through a worker pool of at most
+   * MAX_CONCURRENT_HEALTH_CHECKS, so a full sweep of every provider can't
+   * fire dozens of concurrent requests at once when a caller opts into
+   * `includeConnectivityTest`, and no check waits on a slower one beside
+   * it.
    */
   static async checkAllProvidersHealth(
     options: ProviderHealthCheckOptions = {},
   ): Promise<ProviderHealthStatusOptions[]> {
-    const providers: AIProviderName[] = [
-      AIProviderName.VERTEX,
-      AIProviderName.GOOGLE_AI,
-      AIProviderName.ANTHROPIC,
-      AIProviderName.OPENAI,
-      AIProviderName.BEDROCK,
-      AIProviderName.AZURE,
-      AIProviderName.OLLAMA,
-    ];
+    const providers: AIProviderName[] = PROVIDER_DESCRIPTORS.filter(
+      (d) => d.excludeFromHealthSweep !== true,
+    )
+      .sort(
+        (a, b) =>
+          (a.defaultHealthSweepPriority ?? Number.MAX_SAFE_INTEGER) -
+          (b.defaultHealthSweepPriority ?? Number.MAX_SAFE_INTEGER),
+      )
+      .map((d) => d.name);
 
-    const healthChecks = providers.map((provider) =>
-      this.checkProviderHealth(provider, options),
+    // A fixed pool of workers pulling from a shared cursor, NOT
+    // chunk-and-await. Both bound concurrency to the same number, but
+    // chunking also makes every batch wait for its slowest member before
+    // the next one starts, so a sweep costs the SUM of the per-batch
+    // maxima. With `includeConnectivityTest` each check can burn the whole
+    // `timeout`, which turned a ~1x worst case into ~ceil(n/cap)x. Here a
+    // slot freed by a fast check immediately takes the next provider, so
+    // the bound costs nothing in latency.
+    const results: PromiseSettledResult<ProviderHealthStatusOptions>[] =
+      new Array(providers.length);
+    let cursor = 0;
+    const runWorker = async (): Promise<void> => {
+      // `cursor++` is atomic here: there is no await between reading and
+      // incrementing, so two workers can never claim the same provider.
+      for (let index = cursor++; index < providers.length; index = cursor++) {
+        try {
+          results[index] = {
+            status: "fulfilled",
+            value: await this.checkProviderHealth(providers[index], options),
+          };
+        } catch (reason) {
+          results[index] = { status: "rejected", reason };
+        }
+      }
+    };
+    // Writing by index keeps results in provider order regardless of the
+    // order they complete in, which the rejected-case fallback below
+    // depends on. Zero providers means zero workers and an immediate
+    // return.
+    await Promise.all(
+      Array.from(
+        {
+          length: Math.min(this.MAX_CONCURRENT_HEALTH_CHECKS, providers.length),
+        },
+        () => runWorker(),
+      ),
     );
-
-    const results = await Promise.allSettled(healthChecks);
 
     return results.map((result, index) => {
       if (result.status === "fulfilled") {

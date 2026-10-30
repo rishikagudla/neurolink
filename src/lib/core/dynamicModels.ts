@@ -1,33 +1,10 @@
-import { z } from "zod";
+import { isAbortError } from "../utils/errorHandling.js";
 import { logger } from "../utils/logger.js";
-import type {
-  DynamicModelConfig as ModelConfig,
-  ModelRegistry,
+import {
+  ModelRegistrySchema,
+  type DynamicModelConfig as ModelConfig,
+  type ModelRegistry,
 } from "../types/index.js";
-
-/**
- * Model configuration schema for validation
- */
-const ModelConfigSchema = z.object({
-  id: z.string(),
-  displayName: z.string(),
-  capabilities: z.array(z.string()),
-  deprecated: z.boolean(),
-  pricing: z.object({
-    input: z.number(),
-    output: z.number(),
-  }),
-  contextWindow: z.number(),
-  releaseDate: z.string(),
-});
-
-const ModelRegistrySchema = z.object({
-  version: z.string(),
-  lastUpdated: z.string(),
-  models: z.record(z.record(ModelConfigSchema)),
-  aliases: z.record(z.string()).optional(),
-  defaults: z.record(z.string()).optional(),
-});
 
 /**
  * Dynamic Model Provider
@@ -167,8 +144,10 @@ export class DynamicModelProvider {
       } catch (error) {
         clearTimeout(timeoutId);
 
-        if (error instanceof Error && error.name === "AbortError") {
-          throw new Error(`Request timeout after ${timeoutMs}ms`);
+        if (isAbortError(error)) {
+          throw new Error(`Request timeout after ${timeoutMs}ms`, {
+            cause: error,
+          });
         }
 
         throw error;
@@ -232,15 +211,18 @@ export class DynamicModelProvider {
     } catch (error) {
       clearTimeout(timeoutId);
 
-      if (error instanceof Error && error.name === "AbortError") {
+      if (isAbortError(error)) {
         throw new Error(
           `Localhost health check timeout - server may not be running`,
+          { cause: error },
         );
       }
 
       // For connection refused, throw a more specific error
       if (error instanceof Error && error.message.includes("ECONNREFUSED")) {
-        throw new Error(`Localhost server not running at ${url}`);
+        throw new Error(`Localhost server not running at ${url}`, {
+          cause: error,
+        });
       }
 
       // For other errors, let the main request handle them

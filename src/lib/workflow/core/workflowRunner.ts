@@ -12,88 +12,39 @@
  * @module workflow/core/workflowRunner
  */
 
+import { SpanStatusCode, type Span } from "@opentelemetry/api";
 import { logger } from "../../utils/logger.js";
-import type { JsonValue } from "../../types/common.js";
+import {
+  SpanSerializer,
+  SpanType,
+  SpanStatus,
+  getMetricsAggregator,
+} from "../../observability/index.js";
+import { observe } from "../../telemetry/observation.js";
+import { withSpan } from "../../telemetry/withSpan.js";
+import { tracers } from "../../telemetry/tracers.js";
+import type {
+  EnsembleExecutionResult,
+  EnsembleResponse,
+  ExecutionConfig,
+  JudgeScoreResult,
+  JudgeScores,
+  MultiJudgeScores,
+  RunWorkflowOptions,
+  WorkflowConfig,
+  WorkflowResult,
+  WorkflowStreamChunk,
+} from "../../types/index.js";
 import {
   getModelGroups,
   PLACEHOLDER_MODEL,
   PLACEHOLDER_PROVIDER,
   usesModelGroups,
 } from "../config.js";
-import type {
-  EnsembleResponse,
-  ExecutionConfig,
-  JudgeScores,
-  MultiJudgeScores,
-  WorkflowConfig,
-  WorkflowResult,
-} from "../types.js";
 import { validateWorkflow } from "../utils/workflowValidation.js";
 import { executeEnsemble, executeModelGroups } from "./ensembleExecutor.js";
 import { scoreEnsemble } from "./judgeScorer.js";
 import { conditionResponse } from "./responseConditioner.js";
-import type { EnsembleExecutionResult } from "./types/ensembleTypes.js";
-import type { ScoreResult } from "./types/judgeTypes.js";
-
-/**
- * Progressive workflow response for streaming
- */
-export type WorkflowStreamChunk = {
-  /**
-   * Type of response chunk
-   */
-  type: "preliminary" | "final";
-
-  /**
-   * Response content
-   */
-  content: string;
-
-  /**
-   * Partial workflow result (only ensemble data for preliminary)
-   */
-  partialResult?: Partial<WorkflowResult>;
-};
-
-/**
- * Options for workflow execution
- */
-export type RunWorkflowOptions = {
-  /**
-   * The user's prompt/query to send to models
-   */
-  prompt: string;
-
-  /**
-   * Optional conversation history for context
-   */
-  conversationHistory?: Array<{ role: "user" | "assistant"; content: string }>;
-
-  /**
-   * Override default timeout (ms) for this execution
-   */
-  timeout?: number;
-
-  /**
-   * Override default parallelism for this execution
-   */
-  parallelism?: number;
-
-  /**
-   * Enable verbose logging for debugging
-   */
-  verbose?: boolean;
-
-  /**
-   * Optional context/metadata to pass through
-   */
-  metadata?: Record<string, JsonValue>;
-
-  /**
-   * Enable progressive streaming (yield preliminary response)
-   */
-  streaming?: boolean;
-};
 
 /**
  * Execute a complete workflow
@@ -125,197 +76,252 @@ export async function runWorkflow(
   config: WorkflowConfig,
   options: RunWorkflowOptions,
 ): Promise<WorkflowResult> {
-  const startTime = Date.now();
-
-  // Validate configuration
-  const validation = validateWorkflow(config);
-  if (!validation.valid) {
-    throw new Error(
-      `Invalid workflow configuration: ${validation.errors.map((err) => err.message).join(", ")}`,
-    );
-  }
-
-  if (options.verbose) {
-    logger.debug(`[WorkflowRunner] Starting workflow: ${config.name}`);
-    logger.debug(`[WorkflowRunner] Type: ${config.type}`);
-    logger.debug(
-      `[WorkflowRunner] Uses layer-based execution: ${usesModelGroups(config)}`,
-    );
-  }
-
-  try {
-    // Step 1: Execute models (layer-based or flat)
-    const ensembleResult = await executeModels(config, options);
-
-    if (options.verbose) {
-      logger.debug(
-        `[WorkflowRunner] Received ${ensembleResult.responses.length} model responses`,
-      );
-      logger.debug(
-        `[WorkflowRunner] Successful: ${ensembleResult.successCount}`,
-      );
-    }
-
-    // Step 2: Score responses with judge(s)
-    const scoreResult = await scoreResponses(
-      config,
-      ensembleResult.responses,
-      options,
-    );
-
-    if (options.verbose) {
-      logger.debug(`[WorkflowRunner] Scoring complete`);
-      logger.debug(`[WorkflowRunner] Scores:`, scoreResult.scores);
-    }
-
-    // Step 3: Select best response
-    const bestResponse = selectBestResponse(
-      ensembleResult.responses,
-      scoreResult.scores,
-    );
-
-    if (options.verbose) {
-      logger.debug(`[WorkflowRunner] Best response: ${bestResponse.model}`);
-      const bestScore = extractScore(
-        scoreResult.scores,
-        bestResponse,
-        ensembleResult.responses,
-      );
-      logger.debug(`[WorkflowRunner] Best score: ${bestScore}`);
-    }
-
-    // CRITICAL: Store original content BEFORE any processing
-    const originalContent = bestResponse.content;
-
-    // Step 4: Get processed content
-    // Priority: Judge-synthesized > Separate conditioning > Original
-    let processedContent: string;
-    let conditioningTime = 0;
-
-    const judgeScores = isJudgeScores(scoreResult.scores)
-      ? scoreResult.scores
-      : convertToJudgeScores(scoreResult.scores);
-
-    if (judgeScores.synthesizedResponse) {
-      // Judge already synthesized improved response
-      processedContent = judgeScores.synthesizedResponse;
-      logger.debug(`[WorkflowRunner] Using judge-synthesized response`);
-    } else if (config.conditioning) {
-      // Fall back to separate conditioning if configured
-      const conditionedContent = await conditionFinalResponse(
-        bestResponse,
-        scoreResult.scores,
-        config,
-        options,
-        ensembleResult.responses,
-      );
-      processedContent = conditionedContent.content;
-      conditioningTime = conditionedContent.conditioningTime;
-      logger.debug(`[WorkflowRunner] Using separate conditioning`);
-    } else {
-      // No processing, use original
-      processedContent = originalContent;
-      logger.debug(`[WorkflowRunner] No conditioning applied`);
-    }
-
-    // Step 5: Calculate execution metrics
-    const executionTime = Date.now() - startTime;
-    const ensembleTime = ensembleResult.totalTime;
-    const judgeTime = scoreResult.judgeTime;
-
-    // Step 6: Assemble complete result
-    const result: WorkflowResult = {
-      // Primary output (processed version)
-      content: processedContent,
-
-      // IMPORTANT: Store original unmodified response separately
-      originalContent: originalContent,
-
-      // Evaluation metrics (0-100 scale)
-      score: extractScore(
-        scoreResult.scores,
-        bestResponse,
-        ensembleResult.responses,
-      ),
-      reasoning: extractReasoning(scoreResult.scores),
-
-      // Ensemble data
-      ensembleResponses: ensembleResult.responses,
-
-      // Judge data
-      judgeScores: judgeScores,
-      selectedResponse: bestResponse,
-
-      // Quality metrics
-      confidence: extractConfidence(scoreResult.scores),
-      consensus: extractConsensus(scoreResult.scores),
-
-      // Performance metrics
-      totalTime: executionTime,
-      ensembleTime,
-      judgeTime,
-      conditioningTime: conditioningTime,
-
-      // Workflow metadata
-      workflow: config.id,
-      workflowName: config.name,
-      workflowVersion: config.version,
-
-      // Resource usage
-      usage: {
-        totalInputTokens: calculateInputTokens(ensembleResult.responses),
-        totalOutputTokens: calculateOutputTokens(ensembleResult.responses),
-        totalTokens: calculateTotalTokens(ensembleResult.responses),
-        byModel: [], // TODO: Populate per-model breakdown
+  return withSpan(
+    {
+      name: "neurolink.workflow.run",
+      tracer: tracers.sdk,
+      observationType: "span",
+      attributes: {
+        "workflow.name": config.name,
+        "workflow.type": config.type,
+        "workflow.id": config.id ?? "unknown",
       },
-
-      // Additional metadata
-      metadata: options.metadata,
-      timestamp: new Date().toISOString(),
-    };
-
-    if (options.verbose) {
-      logger.debug(`[WorkflowRunner] Workflow complete in ${executionTime}ms`);
-      logger.debug(
-        `[WorkflowRunner] Total tokens: ${result.usage?.totalTokens || 0}`,
+    },
+    async (otelSpan) => {
+      const startTime = Date.now();
+      const span = SpanSerializer.createSpan(
+        SpanType.WORKFLOW,
+        "workflow.run",
+        {
+          "workflow.operation": "run",
+          "workflow.name": config.name,
+          "workflow.type": config.type,
+          "workflow.id": config.id,
+        },
       );
-    }
 
-    return result;
-  } catch (error) {
-    const executionTime = Date.now() - startTime;
-    const errorMessage = error instanceof Error ? error.message : String(error);
+      // Validate configuration
+      const validation = validateWorkflow(config);
+      if (!validation.valid) {
+        span.durationMs = Date.now() - startTime;
+        const endedSpan = SpanSerializer.endSpan(
+          span,
+          SpanStatus.ERROR,
+          `Invalid workflow configuration: ${validation.errors.map((err) => err.message).join(", ")}`,
+        );
+        getMetricsAggregator().recordSpan(endedSpan);
+        throw new Error(
+          `Invalid workflow configuration: ${validation.errors.map((err) => err.message).join(", ")}`,
+        );
+      }
 
-    if (options.verbose) {
-      logger.error(`[WorkflowRunner] Workflow failed:`, errorMessage);
-    }
+      if (options.verbose) {
+        logger.debug(`[WorkflowRunner] Starting workflow: ${config.name}`);
+        logger.debug(`[WorkflowRunner] Type: ${config.type}`);
+        logger.debug(
+          `[WorkflowRunner] Uses layer-based execution: ${usesModelGroups(config)}`,
+        );
+      }
 
-    // Return error result with dummy data
-    const dummyResponse: EnsembleResponse = {
-      provider: PLACEHOLDER_PROVIDER,
-      model: PLACEHOLDER_MODEL,
-      content: "",
-      responseTime: 0,
-      status: "failure",
-      error: errorMessage,
-      timestamp: new Date().toISOString(),
-    };
+      try {
+        // Step 1: Execute models (layer-based or flat)
+        const ensembleResult = await executeModels(config, options);
 
-    return {
-      content: "",
-      score: 0,
-      reasoning: `Workflow execution failed: ${errorMessage}`,
-      ensembleResponses: [dummyResponse],
-      confidence: 0,
-      totalTime: executionTime,
-      ensembleTime: 0,
-      workflow: config.id,
-      workflowName: config.name,
-      workflowVersion: config.version,
-      metadata: options.metadata,
-      timestamp: new Date().toISOString(),
-    };
-  }
+        if (options.verbose) {
+          logger.debug(
+            `[WorkflowRunner] Received ${ensembleResult.responses.length} model responses`,
+          );
+          logger.debug(
+            `[WorkflowRunner] Successful: ${ensembleResult.successCount}`,
+          );
+        }
+
+        // Step 2: Score responses with judge(s)
+        const scoreResult = await scoreResponses(
+          config,
+          ensembleResult.responses,
+          options,
+        );
+
+        if (options.verbose) {
+          logger.debug(`[WorkflowRunner] Scoring complete`);
+          logger.debug(`[WorkflowRunner] Scores:`, scoreResult.scores);
+        }
+
+        // Step 3: Select best response
+        const bestResponse = selectBestResponse(
+          ensembleResult.responses,
+          scoreResult.scores,
+        );
+
+        if (options.verbose) {
+          logger.debug(`[WorkflowRunner] Best response: ${bestResponse.model}`);
+          const bestScore = extractScore(
+            scoreResult.scores,
+            bestResponse,
+            ensembleResult.responses,
+          );
+          logger.debug(`[WorkflowRunner] Best score: ${bestScore}`);
+        }
+
+        // CRITICAL: Store original content BEFORE any processing
+        const originalContent = bestResponse.content;
+
+        // Step 4: Get processed content
+        // Priority: Judge-synthesized > Separate conditioning > Original
+        let processedContent: string;
+        let conditioningTime = 0;
+
+        const judgeScores = isJudgeScores(scoreResult.scores)
+          ? scoreResult.scores
+          : convertToJudgeScores(scoreResult.scores);
+
+        if (judgeScores.synthesizedResponse) {
+          // Judge already synthesized improved response
+          processedContent = judgeScores.synthesizedResponse;
+          logger.debug(`[WorkflowRunner] Using judge-synthesized response`);
+        } else if (config.conditioning) {
+          // Fall back to separate conditioning if configured
+          const conditionedContent = await conditionFinalResponse(
+            bestResponse,
+            scoreResult.scores,
+            config,
+            options,
+            ensembleResult.responses,
+          );
+          processedContent = conditionedContent.content;
+          conditioningTime = conditionedContent.conditioningTime;
+          logger.debug(`[WorkflowRunner] Using separate conditioning`);
+        } else {
+          // No processing, use original
+          processedContent = originalContent;
+          logger.debug(`[WorkflowRunner] No conditioning applied`);
+        }
+
+        // Step 5: Calculate execution metrics
+        const executionTime = Date.now() - startTime;
+        const ensembleTime = ensembleResult.totalTime;
+        const judgeTime = scoreResult.judgeTime;
+
+        // Step 6: Assemble complete result
+        const result: WorkflowResult = {
+          // Primary output (processed version)
+          content: processedContent,
+
+          // IMPORTANT: Store original unmodified response separately
+          originalContent: originalContent,
+
+          // Evaluation metrics (0-100 scale)
+          score: extractScore(
+            scoreResult.scores,
+            bestResponse,
+            ensembleResult.responses,
+          ),
+          reasoning: extractReasoning(scoreResult.scores),
+
+          // Ensemble data
+          ensembleResponses: ensembleResult.responses,
+
+          // Judge data
+          judgeScores: judgeScores,
+          selectedResponse: bestResponse,
+
+          // Quality metrics
+          confidence: extractConfidence(scoreResult.scores),
+          consensus: extractConsensus(scoreResult.scores),
+
+          // Performance metrics
+          totalTime: executionTime,
+          ensembleTime,
+          judgeTime,
+          conditioningTime: conditioningTime,
+
+          // Workflow metadata
+          workflow: config.id,
+          workflowName: config.name,
+          workflowVersion: config.version,
+
+          // Resource usage
+          usage: {
+            totalInputTokens: calculateInputTokens(ensembleResult.responses),
+            totalOutputTokens: calculateOutputTokens(ensembleResult.responses),
+            totalTokens: calculateTotalTokens(ensembleResult.responses),
+            byModel: [], // Placeholder — not populated yet
+          },
+
+          // Additional metadata
+          metadata: options.metadata,
+          timestamp: new Date().toISOString(),
+        };
+
+        if (options.verbose) {
+          logger.debug(
+            `[WorkflowRunner] Workflow complete in ${executionTime}ms`,
+          );
+          logger.debug(
+            `[WorkflowRunner] Total tokens: ${result.usage?.totalTokens || 0}`,
+          );
+        }
+
+        span.durationMs = executionTime;
+        const endedSpan = SpanSerializer.endSpan(span, SpanStatus.OK);
+        getMetricsAggregator().recordSpan(endedSpan);
+
+        return result;
+      } catch (error) {
+        const executionTime = Date.now() - startTime;
+        const errorMessage =
+          error instanceof Error ? error.message : String(error);
+
+        if (options.verbose) {
+          logger.error(`[WorkflowRunner] Workflow failed:`, errorMessage);
+        }
+
+        span.durationMs = executionTime;
+        const endedSpan = SpanSerializer.endSpan(
+          span,
+          SpanStatus.ERROR,
+          errorMessage,
+        );
+        getMetricsAggregator().recordSpan(endedSpan);
+
+        // Mark outer OTel span as ERROR since we return instead of rethrowing
+        otelSpan.recordException(
+          error instanceof Error ? error : new Error(errorMessage),
+        );
+        otelSpan.setStatus({
+          code: SpanStatusCode.ERROR,
+          message: errorMessage,
+        });
+
+        // Return error result with dummy data
+        const dummyResponse: EnsembleResponse = {
+          provider: PLACEHOLDER_PROVIDER,
+          model: PLACEHOLDER_MODEL,
+          content: "",
+          responseTime: 0,
+          status: "failure",
+          error: errorMessage,
+          timestamp: new Date().toISOString(),
+        };
+
+        return {
+          content: "",
+          score: 0,
+          reasoning: `Workflow execution failed: ${errorMessage}`,
+          ensembleResponses: [dummyResponse],
+          confidence: 0,
+          totalTime: executionTime,
+          ensembleTime: 0,
+          workflow: config.id,
+          workflowName: config.name,
+          workflowVersion: config.version,
+          metadata: options.metadata,
+          timestamp: new Date().toISOString(),
+        };
+      }
+    },
+  ); // end withSpan
 }
 
 /**
@@ -373,7 +379,7 @@ async function scoreResponses(
   config: WorkflowConfig,
   responses: EnsembleResponse[],
   options: RunWorkflowOptions,
-): Promise<ScoreResult> {
+): Promise<JudgeScoreResult> {
   // Use judges array if defined, otherwise use single judge
   const judges =
     config.judges && config.judges.length > 0
@@ -661,14 +667,54 @@ export async function* runWorkflowWithStreaming(
   config: WorkflowConfig,
   options: RunWorkflowOptions,
 ): AsyncGenerator<WorkflowStreamChunk, void, undefined> {
+  // Wrap the generator in an active OTel span so Pipeline A captures the
+  // streaming workflow end-to-end and Pipeline B (below) inherits its traceId.
+  const generator = tracers.workflow.startActiveSpan(
+    "neurolink.workflow.run.streaming",
+    {
+      attributes: {
+        "workflow.name": config.name,
+        "workflow.type": config.type,
+        "workflow.id": config.id ?? "unknown",
+      },
+    },
+    (otelSpan) => {
+      observe(otelSpan, "span", {});
+      return runWorkflowStreamingInner(config, options, otelSpan);
+    },
+  );
+  yield* generator;
+}
+
+async function* runWorkflowStreamingInner(
+  config: WorkflowConfig,
+  options: RunWorkflowOptions,
+  otelSpan: Span,
+): AsyncGenerator<WorkflowStreamChunk, void, undefined> {
   const startTime = Date.now();
+  const span = SpanSerializer.createSpan(
+    SpanType.WORKFLOW,
+    "workflow.run.streaming",
+    {
+      "workflow.operation": "run.streaming",
+      "workflow.name": config.name,
+      "workflow.type": config.type,
+      "workflow.id": config.id,
+    },
+  );
 
   // Validate configuration
   const validation = validateWorkflow(config);
   if (!validation.valid) {
-    throw new Error(
-      `Invalid workflow configuration: ${validation.errors.map((err) => err.message).join(", ")}`,
-    );
+    const errMsg = `Invalid workflow configuration: ${validation.errors.map((err) => err.message).join(", ")}`;
+    span.durationMs = Date.now() - startTime;
+    const endedSpan = SpanSerializer.endSpan(span, SpanStatus.ERROR, errMsg);
+    getMetricsAggregator().recordSpan(endedSpan);
+    const err = new Error(errMsg);
+    otelSpan.recordException(err);
+    otelSpan.setStatus({ code: SpanStatusCode.ERROR, message: errMsg });
+    otelSpan.end();
+    throw err;
   }
 
   if (options.verbose) {
@@ -677,6 +723,8 @@ export async function* runWorkflowWithStreaming(
     );
   }
 
+  // eslint-disable-next-line no-useless-assignment -- read in finally block
+  let spanEnded = false;
   try {
     // Step 1: Execute models
     const ensembleResult = await executeModels(config, options);
@@ -803,10 +851,42 @@ export async function* runWorkflowWithStreaming(
         timestamp: new Date().toISOString(),
       },
     };
+
+    span.durationMs = executionTime;
+    const endedSpan = SpanSerializer.endSpan(span, SpanStatus.OK);
+    getMetricsAggregator().recordSpan(endedSpan);
+    spanEnded = true;
+    otelSpan.setStatus({ code: SpanStatusCode.OK });
+    otelSpan.end();
   } catch (error) {
+    spanEnded = true;
+    const executionTime = Date.now() - startTime;
+    const errorMessage = error instanceof Error ? error.message : String(error);
+
+    span.durationMs = executionTime;
+    const endedSpan = SpanSerializer.endSpan(
+      span,
+      SpanStatus.ERROR,
+      errorMessage,
+    );
+    getMetricsAggregator().recordSpan(endedSpan);
+
+    if (error instanceof Error) {
+      otelSpan.recordException(error);
+    }
+    otelSpan.setStatus({ code: SpanStatusCode.ERROR, message: errorMessage });
+    otelSpan.end();
+
     logger.error(`[WorkflowRunner] Streaming workflow failed`, {
-      error: error instanceof Error ? error.message : String(error),
+      error: errorMessage,
     });
     throw error;
+  } finally {
+    // Guard against span leak when the consumer breaks out of the async
+    // generator early (neither try-success nor catch fires in that case).
+    if (!spanEnded) {
+      otelSpan.setStatus({ code: SpanStatusCode.OK });
+      otelSpan.end();
+    }
   }
 }

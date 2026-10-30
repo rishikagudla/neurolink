@@ -1,7 +1,7 @@
 ---
 title: AI Provider Guides
-description: Complete setup guides for all 12 supported AI providers with configuration examples
-keywords: providers, setup, configuration, API keys, authentication
+description: Complete setup guides for all supported AI providers with configuration examples
+keywords: providers, setup, configuration, API keys, authentication, anthropic, claude, openai
 ---
 
 # AI Provider Guides
@@ -35,6 +35,34 @@ Start with zero cost using these free-tier options:
 - 💰 Pay-as-you-go option
 
 [Setup Guide →](google-ai.md)
+
+---
+
+## 🤖 Direct AI Providers
+
+Access leading AI models directly from their creators:
+
+### [OpenAI](/docs/getting-started/providers/openai)
+
+**GPT-5.4, GPT-5, GPT-4o, and o-series reasoning models**
+
+- 🧠 GPT-5.4 and GPT-5 series flagships with up to 1.05M context
+- 👁️ GPT-4o multimodal (vision) and o3 / o3-pro / o4-mini reasoning models
+- 🔧 Full tool/function calling and embeddings support
+- 🔑 Auth: API Key (`OPENAI_API_KEY`)
+
+[Setup Guide →](/docs/getting-started/providers/openai)
+
+### [Anthropic](anthropic.md)
+
+**Claude models with API key or OAuth authentication**
+
+- 🧠 Claude 4.5 Opus/Sonnet/Haiku, Claude 4.0 Opus/Sonnet
+- 🔐 API key or OAuth (Pro/Max subscription)
+- 💭 Extended thinking for deep reasoning
+- 📄 200K context window, multimodal support
+
+[Setup Guide →](anthropic.md)
 
 ---
 
@@ -75,6 +103,17 @@ Production-grade providers for enterprise deployments:
 
 [Setup Guide →](aws-bedrock.md)
 
+### [AWS SageMaker](/docs/getting-started/providers/sagemaker)
+
+**Custom model endpoints on AWS SageMaker infrastructure**
+
+- 🎯 Deploy fine-tuned, Hugging Face, or JumpStart models
+- 🔐 IAM, VPC, PrivateLink, KMS encryption
+- ⚠️ `generate()` only — streaming is not implemented
+- 💰 Full control over instance types and autoscaling
+
+[Setup Guide →](/docs/getting-started/providers/sagemaker)
+
 ---
 
 ## 🌍 Compliance-Focused
@@ -94,6 +133,284 @@ Providers with specific compliance certifications:
 
 ---
 
+## 🧑‍💻 Hosted Inference Providers
+
+Access frontier models via hosted cloud inference APIs:
+
+### [DeepSeek](../../getting-started/provider-setup.md#deepseek)
+
+**deepseek-chat (V3) and deepseek-reasoner (R1)**
+
+- 🧠 deepseek-chat — high-quality general chat at low cost
+- 💭 deepseek-reasoner — R1 chain-of-thought reasoning model
+- 🔑 API key from [platform.deepseek.com](https://platform.deepseek.com/api_keys)
+- 🔄 Aliases: `ds`
+
+[Setup Guide →](../../getting-started/provider-setup.md#deepseek)
+
+### [NVIDIA NIM](../../getting-started/provider-setup.md#nvidia-nim)
+
+**400+ models via NVIDIA's hosted and self-hosted inference platform**
+
+- 🚀 Llama 3.3 70B Instruct (default), Mistral, Nemotron, and 400+ catalog models
+- 🔧 NIM-specific extras: top_k, min_p, repetition_penalty, reasoning_budget
+- 🔑 API key from [build.nvidia.com](https://build.nvidia.com/settings/api-keys)
+- 🖥️ Also supports self-hosted NIM endpoints via `NVIDIA_NIM_BASE_URL`
+- 🔄 Aliases: `nim`, `nvidia`
+
+[Setup Guide →](../../getting-started/provider-setup.md#nvidia-nim)
+
+### [xAI Grok](xai.md)
+
+**Grok 3 / 3 Mini / 2 / 2 Vision via api.x.ai**
+
+- 🧠 Grok 3 — flagship reasoning + coding
+- ⚡ Grok 3 Mini — faster + cheaper
+- 👁️ Grok 2 Vision — multimodal text + images
+- 🔑 API key from [console.x.ai](https://console.x.ai/)
+- 🔄 Aliases: `grok`
+
+[Setup Guide →](xai.md)
+
+### [Groq](groq.md)
+
+**Sub-100ms inference via LPU acceleration**
+
+- ⚡ <100ms TTFT — fastest hosted inference available
+- 🦙 Llama 3.3 70B Versatile (default), Llama 3.1 8B Instant, Mixtral, Gemma 2
+- 👁️ Llama 3.2 vision-preview variants for multimodal
+- 🔑 API key from [console.groq.com/keys](https://console.groq.com/keys)
+
+[Setup Guide →](groq.md)
+
+### [Cerebras](cerebras.md)
+
+**Wafer-scale inference at ~3000 tokens/s**
+
+- 🚀 Fastest generation speed of any hosted provider (WSE hardware)
+- 🤖 GPT-OSS 120B (default), Gemma 4 31B — roster live-verified 2026-08-27
+- 💳 Free $5 credit requires a saved payment method
+- 🔑 API key from [cloud.cerebras.ai](https://cloud.cerebras.ai)
+
+[Setup Guide →](cerebras.md)
+
+### [SambaNova](sambanova.md)
+
+**RDU-accelerated open-weight flagships**
+
+- 🧠 Llama 3.3 70B (default), GPT-OSS 120B, DeepSeek V3.x, MiniMax, Gemma 4
+- 👁️ Vision on gemma-4-31B-it (image+video) and MiniMax-M3
+- 💳 No free allowance — credits required before first call
+- 🔑 API key from [cloud.sambanova.ai/apis](https://cloud.sambanova.ai/apis)
+
+[Setup Guide →](sambanova.md)
+
+### [Together AI](together-ai.md)
+
+**Hosted open-model gateway**
+
+- 📚 Llama 3.3 / 3.1 (8B–405B), Mixtral, Qwen 2.5, DeepSeek R1/V3, WizardLM
+- ⚡ Turbo variants for low latency
+- 🔑 API key from [api.together.xyz/settings/api-keys](https://api.together.xyz/settings/api-keys)
+- 🔄 Aliases: `together`
+
+### Fireworks AI
+
+**Fast open-model serving**
+
+- 🔥 Llama v3.1 70B/405B, Mixtral 8x22B, Qwen 2.5 Coder, DeepSeek V3
+- 👁️ Phi-3-Vision and Llama 3.2 vision variants
+- 🔑 API key from [fireworks.ai/account/api-keys](https://fireworks.ai/account/api-keys)
+
+### Perplexity
+
+**Sonar models with built-in web grounding**
+
+- 🌐 sonar / sonar-pro / sonar-reasoning / sonar-deep-research
+- 📚 Built-in web search + citations
+- 🔑 API key from [perplexity.ai/settings/api](https://www.perplexity.ai/settings/api)
+- 🔄 Aliases: `pplx`
+
+### Cloudflare Workers AI
+
+**Edge-served open models**
+
+- 🌍 Lowest cost tier — bills per "neuron" not token
+- 🦙 Llama 3.3 70B FP8, Llama 3.1, Mistral, Qwen, Gemma
+- 🔑 Token from [dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens) (Workers AI Read+Write)
+- ⚠️ Requires both `CLOUDFLARE_API_KEY` AND `CLOUDFLARE_ACCOUNT_ID`
+- 🔄 Aliases: `workers-ai`, `cf-ai`
+
+### Cohere
+
+**Command R / R+ chat + Embed v3 / Rerank v3 (RAG-essential)**
+
+- 💬 Command R+ flagship + Command R + Command R7B
+- 🔍 Embed v3 (English / multilingual) + Rerank v3 — top-tier RAG
+- 🔑 API key from [dashboard.cohere.com/api-keys](https://dashboard.cohere.com/api-keys)
+
+### Baseten
+
+**Hosted open-model inference**
+
+- 🤖 Default model: `zai-org/GLM-5.3-Flash`
+- 🔑 `BASETEN_API_KEY` — no dedicated setup guide yet
+
+### GMI Cloud
+
+**Hosted open-model inference**
+
+- 🤖 Default model: `MiniMaxAI/MiniMax-M3`
+- 🔑 `GMICLOUD_API_KEY` — no dedicated setup guide yet
+
+### Inception Labs
+
+**Diffusion LLMs**
+
+- 🤖 Default model: `mercury-2`
+- 🔑 `INCEPTION_LABS_API_KEY` — no dedicated setup guide yet
+
+### io.net Intelligence
+
+**Decentralized GPU inference**
+
+- 🤖 Default model: `meta-llama/Llama-3.3-70B-Instruct`
+- 🔑 `IO_INTELLIGENCE_API_KEY` — no dedicated setup guide yet
+
+### Mancer
+
+**Hosted open-model inference**
+
+- 🤖 Default model: `deepseek-v4-flash`
+- 🔑 `MANCER_API_KEY` — no dedicated setup guide yet
+
+### Upstage
+
+**Solar models**
+
+- 🤖 Default model: `solar-pro4`
+- 🔑 `UPSTAGE_API_KEY` — no dedicated setup guide yet
+
+### API Route
+
+**OpenAI-compatible passthrough**
+
+- 🤖 Default model: `claude-sonnet-4-6`
+- 🔑 `API_ROUTE_API_KEY` — no dedicated setup guide yet
+
+### [Replicate](replicate.md)
+
+**Multi-modal gateway — LLM + image + video + avatar + music in one auth**
+
+- 🎯 One `REPLICATE_API_TOKEN` for 5 modalities
+- 📚 Llama 3.1 70B/405B, Mistral, Mixtral
+- 🎨 FLUX 1.1 Pro, SDXL, Stable Diffusion 3.5
+- 🎬 Wan-Alpha video, MuseTalk avatar, MusicGen music
+- 🔑 Token from [replicate.com/account/api-tokens](https://replicate.com/account/api-tokens)
+
+[Setup Guide →](replicate.md)
+
+---
+
+## 🔍 Embedding-Only Providers
+
+Specialised embedding providers for RAG / retrieval pipelines (no chat):
+
+### [Voyage AI](voyage.md)
+
+**Top-tier RAG embeddings**
+
+- 📊 voyage-4-large newest flagship; voyage-3.5 default; voyage-code-3 / voyage-code-4 for code
+- 🌍 voyage-multilingual-2 + domain-tuned (finance, law)
+- 🔑 API key from [dash.voyageai.com/api-keys](https://dash.voyageai.com/api-keys)
+
+[Setup Guide →](voyage.md)
+
+### Jina AI
+
+**Embeddings + reranking**
+
+- 📊 jina-embeddings-v3 multilingual flagship
+- 🔄 jina-reranker-v2 for retrieval reranking
+- 🔍 jina-colbert-v2 late-interaction retrieval
+- 🔑 API key from [jina.ai](https://jina.ai/?sui=apikey)
+
+---
+
+## 🎨 Direct Image Generation
+
+Specialised image-gen providers (in addition to Vertex Imagen / OpenAI DALL-E / Anthropic / Bedrock):
+
+### [Stability AI](stability.md)
+
+**Stable Image Ultra/Core + SD 3.5 family**
+
+- 🎨 Stable Image Ultra (flagship), Core (fast), SD 3.5 Large/Large-Turbo/Medium
+- 🖼️ PNG output, aspect-ratio + negative-prompt + seed support
+- 🔑 API key from [platform.stability.ai/account/keys](https://platform.stability.ai/account/keys)
+- 🔄 Aliases: `stability-ai`, `sd`
+
+[Setup Guide →](stability.md)
+
+### Ideogram
+
+**Strong typography + design-focused image generation**
+
+- 📝 V3 default; V2/V2-Turbo/V1 also supported
+- 🎨 magic_prompt + style + aspect_ratio controls
+- 🔑 API key from [developer.ideogram.ai](https://developer.ideogram.ai/)
+
+### Recraft
+
+**Vector / illustration-focused image generation**
+
+- 🎨 recraftv3 (raster), recraftv3-svg (vector), recraftv2
+- 📐 OpenAI-compat shape + style + size controls
+- 🔑 API token from [recraft.ai/api](https://www.recraft.ai/api)
+
+---
+
+## 💻 Local Providers
+
+Run models entirely on your own hardware — no API key or internet required for inference:
+
+### [Ollama](ollama.md)
+
+**Run open-source models locally with full privacy**
+
+- 🖥️ 100% local inference — no data leaves your machine
+- 🦙 70+ models: Llama, Mistral, Qwen, DeepSeek, Gemma, Phi, CodeLlama
+- 🌐 Native Ollama API and OpenAI-compatible mode
+- 🆓 No API key required
+
+[Setup Guide →](ollama.md)
+
+### [LM Studio](../../getting-started/provider-setup.md#lm-studio)
+
+**Run any supported model locally with a GUI app**
+
+- 🖥️ Download and run models via the LM Studio desktop application
+- 🔍 Auto-discovers the loaded model from `/v1/models` (no model name required)
+- 🌐 OpenAI-compatible API at `http://localhost:1234/v1` by default
+- 🆓 No API key needed for local use (key optional for reverse-proxy setups)
+- 🔄 Aliases: `lmstudio`, `lms`
+
+[Setup Guide →](../../getting-started/provider-setup.md#lm-studio)
+
+### [llama.cpp](../../getting-started/provider-setup.md#llamacpp)
+
+**High-performance local inference via llama-server**
+
+- ⚡ Run GGUF models with llama-server at `http://localhost:8080/v1` by default
+- 🔍 Auto-discovers the loaded model from `/v1/models`
+- 🛠️ Tool support requires `--jinja` flag when starting llama-server
+- 🆓 No API key needed for local use (key optional for reverse-proxy setups)
+- 🔄 Aliases: `llama.cpp`
+
+[Setup Guide →](../../getting-started/provider-setup.md#llamacpp)
+
+---
+
 ## 🔌 Aggregators & Proxies
 
 Access multiple providers through unified interfaces:
@@ -102,7 +419,7 @@ Access multiple providers through unified interfaces:
 
 **300+ models from 60+ providers**
 
-- 🌐 Single API for all major providers (Anthropic, OpenAI, Google, Meta, etc.)
+- 🌐 Single API across many AI providers (Anthropic, OpenAI, Google, Meta, etc.)
 - ⚡ Automatic failover and routing
 - 💰 Competitive pricing with cost optimization
 - 🎯 Zero lock-in - switch models instantly
@@ -135,19 +452,477 @@ Access multiple providers through unified interfaces:
 
 ---
 
+## 🧠 Decision-Only Providers {#decision-only-providers}
+
+The providers that serve `decide` rather than `generate`/`stream`:
+[TypeSafe](typesafe.md), [Laya](laya.md), [XOR](xor.md),
+[SubQ](subq.md), [Perplexity](perplexity-decider.md), [Cloudflare Clef](cloudflare-clef.md),
+[OpenAI Decisions](openai-decisions.md) and [ScaleDown](scaledown.md). Each returns typed `boolean`/`choice`/`score`
+answers and emits no text, so none appears in generation fallback chains or the
+health sweep.
+
+### [TypeSafe (Jev)](typesafe.md)
+
+**Typed, calibrated judgments instead of text**
+
+- 🎯 `boolean` / `choice` / `score` answers, each with a calibrated confidence
+- ⚡ Latency flat in question count — 1 question ~393 ms, 400 questions ~465 ms
+- 💰 ~$0.00002 per decision (~$0.042/M input, output billed at zero)
+- 🔌 Two transports: TypeSafe direct, or the Vercel AI Gateway
+- 🛡️ Fails open — with no decision provider configured, every consumer behaves exactly as before
+- 🔑 API key from [console.typesafe.ai/keys](https://console.typesafe.ai/keys)
+- 🔄 Aliases: `jev`, `typesafe-ai`
+
+[Setup Guide →](typesafe.md)
+
+### [Laya](laya.md)
+
+**Open-weights decision provider** — the same typed `boolean`/`choice`/`score` answers as Jev, from Convai Innovations' Apache-2.0 checkpoints, at a Laya server or LiteLLM proxy route you configure
+
+- 🧭 Serves `decide` only; built-in features use it when its key and base URL are set and neither `TYPESAFE_API_KEY` nor `AI_GATEWAY_API_KEY` is
+- 📏 Refuses more than ~768 tokens of state (320 on `english`) before any network call, since its encoders read only 1,024 (512)
+- 🔌 No built-in endpoint: `LAYA_BASE_URL` (or `credentials.laya.baseURL`) names a Laya server or a LiteLLM pass-through route to one
+- 🔑 `LAYA_API_KEY` is the key that endpoint accepts; on LiteLLM, the route must be in the key's Allowed Routes
+
+[Setup Guide →](laya.md)
+
+### [XOR](xor.md)
+
+**Open-weights decision provider** — the same typed `boolean`/`choice`/`score` answers as Jev, plus `value` extraction, from `xor-latest` (text) and `xor-omni` (an image and audio), Juspay's Apache-2.0 model, at a deployment or LiteLLM proxy route you configure
+
+- 🧭 Serves `decide` only; built-in features use it when its key and base URL are set and no TypeSafe key, no `AI_GATEWAY_API_KEY` and no Laya key and base URL is
+- 🖼️ Takes one image and one audio clip (the first 30 seconds are heard) with a decision on `xor-omni`, as a Buffer, a local file path or a `data:` URL; a video is refused, because XOR's gateway drops it
+- 📏 Refuses more than 120,000 estimated tokens of state on `xor-latest` (28,000 on `xor-omni`) or more than 128 questions before any network call
+- 🔌 No built-in endpoint: `XOR_BASE_URL` (or `credentials.xor.baseURL`) is the origin of a deployment or of a LiteLLM route to one; requests go to `<base URL>/v1/decisions`
+- 🔑 `XOR_API_KEY` is the key that endpoint accepts; on LiteLLM, the key's team must allow `xor-latest` (and `xor-omni` for media)
+- 📦 Weights and setup: [huggingface.co/juspay/xor](https://huggingface.co/juspay/xor)
+
+[Setup Guide →](xor.md)
+
+### [SubQ](subq.md)
+
+**Hosted decision provider** — the same typed `boolean`/`choice`/`score` answers as Jev, from Subquadratic's `subq-snap-preview` (public preview), at `https://api.subq.ai`
+
+- 🧭 Serves `decide` only (provider id `subq`; the aliases `subquadratic` and `subq-snap` work too); built-in features use it when it is configured and none of TypeSafe, Laya or XOR is — it comes ahead of Perplexity and Cloudflare Clef, because its key is shared with no other provider
+- 🔑 `SUBQ_API_KEY` alone configures it (keys come from console.subq.ai, shown once); `SUBQ_MODEL` is optional
+- 🖼️ No image or video input yet: SubQ's image format is not one the decide catalog can describe, so images are refused before any request
+- 📏 NeuroLink reports an advisory state window (376,000 estimated tokens; SubQ's own 400 response states a maximum model length of 393,216) and enforces none; no question cap is declared
+- 🔌 Hosted endpoint, so no base URL is needed; `SUBQ_BASE_URL` (or `credentials.subq.baseURL`) can name another origin
+
+[Setup Guide →](subq.md)
+
+### [Perplexity Decisions](perplexity-decider.md)
+
+**Hosted decision provider** — the same typed `boolean`/`choice`/`score` answers as Jev, from Perplexity's `pplx-decider-v1-27b`, at `https://api.perplexity.ai`
+
+- 🧭 Serves `decide` only (provider id `perplexity-decider`, not the Sonar text provider `perplexity`); built-in features use it when it is configured and no TypeSafe key, no `AI_GATEWAY_API_KEY`, no Laya key and base URL, no XOR key and base URL and no `SUBQ_API_KEY` is
+- 🔑 `PERPLEXITY_API_KEY` alone configures it, and it is the same key the Perplexity text provider reads, so a key set for Sonar also lets built-in features use it when none of TypeSafe, Laya, XOR or SubQ is configured; the guide lists what each consumer then sends
+- 🖼️ Takes up to 8 PNG, JPEG or WebP images with a decision; no video
+- 💰 $0.04 per million input tokens (image tokens included), output free, as Perplexity documents it
+- 📏 Refuses more than about 100,000 estimated tokens of state (NeuroLink's own window; the server's ceiling is 262,144 input tokens), or more than 128 questions in a `decide()` call (`tryDecide()` splits them), before any network call. The 128-question cap, the server's token ceiling and the latency were measured on a real account in October 2026
+- 🔌 Hosted endpoint, so no base URL is needed; `PERPLEXITY_DECIDER_BASE_URL` (or `credentials.perplexityDecider.baseURL`) can name another origin
+
+[Setup Guide →](perplexity-decider.md)
+
+### [Cloudflare Clef](cloudflare-clef.md)
+
+**Hosted decision provider on Workers AI** — the same typed `boolean`/`choice`/`score` answers as Jev, from Cloudflare's `clef` (27B) and `clef-flash` (9B), at `https://api.cloudflare.com/client/v4`
+
+- 🧭 Serves `decide` only (provider id `cloudflare-clef`, not the Workers AI text provider `cloudflare`); built-in features use it only when it is configured and none of TypeSafe, Laya, XOR, SubQ or Perplexity is — it comes after those five
+- 🔑 `CLOUDFLARE_API_KEY` (Workers AI permission) and `CLOUDFLARE_ACCOUNT_ID` configure it, and they are the same two variables the Cloudflare text provider reads, so a pair set for that provider also lets built-in features use it when none of TypeSafe, Laya, XOR, SubQ or Perplexity is configured
+- 🖼️ Takes up to 4 PNG, JPEG or WebP images with a decision; no video
+- 💰 $0.24 per million input tokens for `clef`, $0.09 for `clef-flash`; no output price is listed on Cloudflare's pricing page
+- 📏 **The state window changed in October 2026** (hosted service or model: unknown): until 2026-10-04 the endpoint ignored text past about 2,048 tokens without an error, and on 2026-10-07 it read states of at least 190,153 tokens (`clef-flash`) and 52,154 (`clef`); NeuroLink refuses more than 16,000 estimated tokens (digits count a token each, punctuation 0.75, emoji 3), more than 64 questions in a `decide()` call (`tryDecide()` splits them) and a request over 256,000 bytes, base64 image data included, before any network call. The state cut and the request ceiling were measured on a real account in October 2026, with the follow-up text cuts and API limits checked on both models; see the guide for the tested shapes and dates
+- 🔌 Hosted endpoint, so no base URL is needed; `CLOUDFLARE_CLEF_BASE_URL` (or `credentials.cloudflareClef.baseURL`) can name another base
+
+[Setup Guide →](cloudflare-clef.md)
+
+### [OpenAI Decisions](openai-decisions.md)
+
+**Hosted decision provider (public beta)** — the same typed `boolean`/`choice`/`score` answers as Jev, from OpenAI's Decisions API (`gpt-6-luna`), at `https://api.openai.com/v1/decisions`
+
+- 🧭 Serves `decide` only (provider id `openai-decisions`, not the OpenAI chat provider `openai`); built-in features use it only when it is configured and none of TypeSafe, Laya, XOR, SubQ, Perplexity or Cloudflare Clef is — it comes seventh, ahead of only ScaleDown
+- 🔑 `OPENAI_API_KEY` alone configures it, and it is the same key the OpenAI chat provider reads, so a key set for chat also lets built-in features (and a transcription dictionary's correction check) use it, and make paid decision calls, when none of the six providers ahead of it is configured, unless `OPENAI_BASE_URL`, `OPENAI_API_BASE` or `credentials.openai.baseURL` names a host other than `https://api.openai.com` (the key is then taken to be a gateway's and is not used by default; a call that names the provider still uses it and sends it to `api.openai.com`); the guide lists what each consumer then sends
+- 🖼️ Takes up to 8 images as inline data URLs with a decision (NeuroLink's own allowance, not OpenAI's); no video
+- 💰 $0.10 per million input tokens, input only, per [OpenAI's Decisions guide](https://developers.openai.com/api/docs/guides/decisions) as read on 2026-10-07; regional and long-context multipliers are not modelled
+- 📏 Questions per request are capped at 200, the figure in OpenAI's Python SDK, and `tryDecide()` splits a longer set at it; going over 200 was not tried against the live endpoint, and option limits, image formats, rate limits and latency are not established (none measured). NeuroLink reports 922,000 state tokens as an advisory figure and never refuses on it
+- 🔌 Hosted endpoint, so no base URL is needed; `OPENAI_DECISIONS_BASE_URL` (or `credentials.openaiDecisions.baseURL`) can name another origin
+
+[Setup Guide →](openai-decisions.md)
+
+### [ScaleDown](scaledown.md)
+
+**Hosted decision provider** — the same typed `boolean`/`choice`/`score` answers as Jev, from ScaleDown's Classify models (`classify-1` by default), at `https://api.scaledown.xyz/v1/scaledown`
+
+- 🧭 Serves `decide` only (provider id `scaledown`; the alias `scaledown-classify` works too); built-in features use it only when it is configured and none of TypeSafe, Laya, XOR, SubQ, Perplexity, Cloudflare Clef or OpenAI Decisions is — it comes last, by choice and not because its key is shared
+- 🔑 `SCALEDOWN_API_KEY` alone configures it, and no other provider reads that variable; the key is sent in an `x-api-key` header, never as a Bearer token
+- 🖼️ Text only: images and video are refused before any request, and the state is always sent as a string (a string unchanged, anything else as its JSON text; a blank string is refused locally)
+- 💰 USD 0.05 per million input tokens, output not charged: a list price reported by the marketing session on 2026-10-15, not measured here. A `choice` question is scored once per option, so input tokens grow with options times state length
+- 📏 Context size, latency, rate limits and the option, question and level maximums are not measured; no state window is declared and nothing is refused on size
+- 🔌 Hosted endpoint, so no base URL is needed; `SCALEDOWN_BASE_URL` (or `credentials.scaledown.baseURL`) can name an origin or an origin with a path prefix
+
+[Setup Guide →](scaledown.md)
+
+## 🧩 Additional Catalog Providers
+
+Every provider below is a **Tier-2 catalog entry**. Provider-specific
+behavioural quirks may apply, so check the provider's catalog file. The whole
+integration is one JSON file under `src/lib/providers/catalog/`. Each page is
+generated from that file, which is also what the CI onboarding gate reads.
+
+### [API Route](api-route.md)
+
+**Claude Sonnet 4.6**
+
+- 🤖 8 models; default `claude-sonnet-4-6` (1M context)
+- 🛠️ Native tool calling + structured output together
+- 💳 Free tier available
+- ✅ Roster verified 2026-09-17 (authenticated GET /v1/models)
+- 🔑 API key from [api-route.com](https://api-route.com)
+- 🔄 Aliases: `apiroute`
+
+[Setup Guide →](api-route.md)
+
+### [Baseten](baseten.md)
+
+**GLM 5.3 Flash**
+
+- 🤖 16 models; default `zai-org/GLM-5.3-Flash` (1M context)
+- 🛠️ Native tool calling + structured output together
+- 💳 Free tier available
+- ✅ Roster verified 2026-09-03 (authenticated GET /v1/models)
+- 🔑 API key from [app.baseten.co](https://app.baseten.co/)
+
+[Setup Guide →](baseten.md)
+
+### [Friendli](friendli.md)
+
+**zai-org/GLM-5.3**
+
+- 🤖 7 models; default `zai-org/GLM-5.3` (1M context)
+- 🛠️ Native tool calling — not combined with structured output in one request (HTTP 422 if both are set)
+- 💳 Free tier available (rate limits are tight — pace requests 20s+ apart)
+- ✅ Roster verified 2026-09-06 (authenticated GET /serverless/v1/models)
+- 🔑 API key from [suite.friendli.ai](https://suite.friendli.ai/)
+
+[Setup Guide →](friendli.md)
+
+### [GMI Cloud](gmicloud.md)
+
+**MiniMaxAI/MiniMax-M3**
+
+- 🤖 1 model; default `MiniMaxAI/MiniMax-M3` (1M context)
+- 🛠️ Native tool calling + structured output together
+- 💳 Free tier available
+- ✅ Roster verified 2026-09-03 (authenticated GET /v1/models)
+- 🔑 API key from [console.gmicloud.ai](https://console.gmicloud.ai)
+- 🔄 Aliases: `gmi-cloud`
+
+[Setup Guide →](gmicloud.md)
+
+### [Inception Labs](inception-labs.md)
+
+**Mercury 2, Inception's enterprise diffusion LLM (dLLM)**
+
+- 🤖 1 model; default `mercury-2` (125K context)
+- 🛠️ Native tool calling + structured output together
+- 💳 Free tier available
+- ✅ Roster verified 2026-09-03 (authenticated GET /v1/models)
+- 🔑 API key from [platform.inceptionlabs.ai/dashboard/api-keys](https://platform.inceptionlabs.ai/dashboard/api-keys)
+- 🔄 Aliases: `inception`, `mercury`
+
+[Setup Guide →](inception-labs.md)
+
+### [io.net Intelligence](io-intelligence.md)
+
+**Meta: Llama 3.3 70B Instruct**
+
+- 🤖 34 models; default `meta-llama/Llama-3.3-70B-Instruct` (125K context)
+- 🛠️ Native tool calling + structured output together
+- 💳 Free tier available
+- ✅ Roster verified 2026-09-03 (authenticated GET /v1/models)
+- 🔑 API key from [ai.io.net](https://ai.io.net/)
+- 🔄 Aliases: `io-net`
+
+[Setup Guide →](io-intelligence.md)
+
+### [Mancer](mancer.md)
+
+**DeepSeek V4 Flash**
+
+- 🤖 10 models; default `deepseek-v4-flash` (1M context)
+- ⚠️ **No tool calling** — text generation and structured output only
+- 💳 Free tier available
+- ✅ Roster verified 2026-09-03 (authenticated GET /oai/v1/models; full response retained as evidence/mancer-roster-authenticated.json in the campaign scratchpad and every catalog price/limit machine-checked against it (Mancer re-prices — gpt-oss-120b input moved 0.024 → 0.022 within the day))
+- 🔑 API key from [mancer.tech/dashboard](https://mancer.tech/dashboard)
+- 🔄 Aliases: `mancer-tech`
+
+[Setup Guide →](mancer.md)
+
+### [Morph](morph.md)
+
+**Morph v3 Large**
+
+- 🤖 2 models; default `morph-v3-large` (262K context)
+- ⚠️ **No tool calling** — text generation and structured output only
+- 💳 Free tier requires a card on file (rate-limited to 5 req/min until added)
+- ✅ Roster verified 2026-09-05 (authenticated GET /v1/models)
+- 🔑 API key from [morphllm.com/dashboard](https://morphllm.com/dashboard)
+- 🔄 Aliases: `morphllm`
+
+[Setup Guide →](morph.md)
+
+### [Novita AI](novita.md)
+
+**zai-org/GLM-5.3 Flash**
+
+- 🤖 5 models; default `zai-org/glm-5.3-flash` (128K context)
+- 🛠️ Native tool calling + structured output together
+- 💳 Free tier available
+- ✅ Roster verified 2026-09-05 (authenticated GET /openai/v1/models)
+- 🔑 API key from [novita.ai/settings/key-management](https://novita.ai/settings/key-management)
+
+[Setup Guide →](novita.md)
+
+### [Upstage](upstage.md)
+
+**Solar Pro 4**
+
+- 🤖 10 models; default `solar-pro4` (512K context)
+- 🛠️ Native tool calling + structured output together
+- 💳 Free tier available
+- ✅ Roster verified 2026-09-03 (authenticated GET /v1/models)
+- 🔑 API key from [console.upstage.ai/api-keys](https://console.upstage.ai/api-keys)
+- 🔄 Aliases: `solar`
+
+[Setup Guide →](upstage.md)
+
+## 🎙️ Voice Providers {#voice-providers}
+
+Synthesize speech, transcribe audio, or run live voice sessions. Voice providers are separate from LLM providers — they handle audio I/O rather than text generation.
+
+### Text-to-Speech (TTS)
+
+#### [OpenAI TTS](./openai-tts.md)
+
+**Highest-quality text-to-speech**
+
+- 🎙️ Voices: alloy, echo, fable, onyx, nova, shimmer
+- 🎵 Models: tts-1 (fast) and tts-1-hd (high quality)
+- 🎼 Formats: MP3, WAV, OGG, Opus
+- 🔑 Auth: API Key (`OPENAI_API_KEY`)
+
+[Setup Guide →](./openai-tts.md)
+
+#### [ElevenLabs](./elevenlabs.md)
+
+**Best multilingual and voice-cloning TTS**
+
+- 🌍 Supports 30+ languages with natural prosody
+- 🎭 Custom voice cloning from short audio samples
+- 🎼 Formats: MP3, WAV (raw PCM, surfaced as `pcm16`), Opus (Ogg container)
+- 🔑 Auth: API Key (`ELEVENLABS_API_KEY`)
+
+[Setup Guide →](./elevenlabs.md)
+
+#### [Google TTS](../provider-setup.md)
+
+**1M characters/month free tier**
+
+- 💰 Generous free tier for standard voices
+- 🌍 380+ voices across 50+ languages
+- 🎼 Formats: MP3, WAV, OGG
+- 🔑 Auth: Service Account
+
+[Setup Guide →](../provider-setup.md)
+
+#### [Azure TTS](./azure-speech.md)
+
+**Enterprise TTS with full SSML support**
+
+- 🏢 Fine-grained prosody control via SSML
+- 🌍 400+ neural voices, 140+ languages
+- 🎼 Formats: MP3, WAV (PCM), Opus (Ogg container)
+- 🔑 Auth: API Key + Region
+
+[Setup Guide →](./azure-speech.md)
+
+#### [Fish Audio](./fish-audio.md)
+
+**Low-cost TTS with 15s voice cloning**
+
+- 💰 ~80% cheaper than ElevenLabs
+- 🎭 15-second reference audio → custom voice
+- 🌍 14 languages
+- 🎼 Formats: MP3, WAV, PCM16 (raw)
+- 🔑 Auth: API Key (`FISH_AUDIO_API_KEY`)
+
+[Setup Guide →](./fish-audio.md)
+
+#### [60db](./sixtydb.md)
+
+Workspace voice catalogs and HTTP text-to-speech.
+
+- WAV or raw PCM16 output at 24 kHz
+- Workspace API key and voice UUID
+- [Setup guide](./sixtydb.md)
+
+#### [Cartesia](./cartesia.md)
+
+**Low-latency Sonic models — synchronous + streaming**
+
+- ⚡ Sub-second turnaround on the synchronous `/tts/bytes` endpoint
+- 🌊 Separate WebSocket streaming flow via `CartesiaStream` (voice server)
+- 🎭 Voice cloning via dashboard upload
+- 🎼 Formats: MP3 (44.1 kHz), WAV (PCM s16le @ 44.1 kHz), PCM16 (raw @ 24 kHz)
+- 🔑 Auth: API Key (`CARTESIA_API_KEY`)
+
+[Setup Guide →](./cartesia.md)
+
+---
+
+### Speech-to-Text (STT)
+
+#### [Whisper (OpenAI)](../provider-setup.md#whisper)
+
+**Highest transcription accuracy**
+
+- 🎯 Best-in-class accuracy on diverse audio
+- 🌍 Multilingual with automatic language detection
+- 🎼 Formats: WAV, MP3, M4A, FLAC, OGG, OPUS, WEBM, MP4, MPEG, MPGA
+- 🔑 Auth: API Key (`OPENAI_API_KEY`)
+
+[Setup Guide →](../provider-setup.md#whisper)
+
+#### [Deepgram](./deepgram.md)
+
+**Real-time streaming transcription via WebSocket**
+
+- ⚡ Sub-300 ms word-level results over WebSocket
+- 🌊 REST batch and WebSocket streaming modes
+- 🎼 Formats: WAV, MP3, OGG, FLAC
+- 🔑 Auth: API Key (`DEEPGRAM_API_KEY`)
+
+[Setup Guide →](./deepgram.md)
+
+#### [Google STT](../provider-setup.md)
+
+**125+ languages with speaker diarization**
+
+- 🌍 Best fit for existing Google Cloud users
+- 👥 Speaker diarization and multi-channel audio
+- 🎼 Formats: WAV, FLAC, MP3, OGG
+- 🔑 Auth: API Key (`GOOGLE_AI_API_KEY` / `GEMINI_API_KEY`) **or** Service Account (`GOOGLE_APPLICATION_CREDENTIALS`)
+
+[Setup Guide →](../provider-setup.md)
+
+#### [Azure STT](./azure-speech.md)
+
+**Enterprise STT with custom model training**
+
+- 🏢 Batch transcription and custom model support
+- 🔒 Compliance controls for regulated industries
+- 🎼 Formats: WAV (PCM), Ogg/Opus — convert MP3 to WAV first
+- 🔑 Auth: API Key + Region
+
+[Setup Guide →](./azure-speech.md)
+
+---
+
+### Realtime Voice
+
+Realtime providers maintain a persistent bidirectional WebSocket connection, enabling low-latency spoken conversation with the AI model.
+
+#### [OpenAI Realtime](../provider-setup.md#openai-realtime)
+
+**Low-latency bidirectional voice over WebSocket**
+
+- ⚡ Full-duplex audio stream with GPT-4o
+- 🎵 Voice activity detection (VAD) built-in
+- 🎼 Formats: WAV, Opus
+- 🔑 Auth: API Key (`OPENAI_API_KEY`)
+
+[Setup Guide →](../provider-setup.md#openai-realtime)
+
+#### [Gemini Live](../provider-setup.md)
+
+**Google's native realtime voice API**
+
+- ⚡ Native multimodal realtime session with Gemini
+- 🎵 Supports audio + video input simultaneously
+- 🎼 Formats: WAV, Opus
+- 🔑 Auth: API Key (`GOOGLE_AI_API_KEY` or `GEMINI_API_KEY`)
+
+[Setup Guide →](../provider-setup.md)
+
+---
+
+## 🎬 Video Generation
+
+Image-to-video and text-to-video providers (use via `output: { mode: "video" }`):
+
+- **Vertex Veo 3.1** (default) — `--videoProvider vertex`
+- **Kling** (PiAPI) — `--videoProvider kling` ([details](../../provider-integration/19-adding-video-provider.md))
+- **Runway** (Gen-3 Alpha / Gen-4 Turbo) — `--videoProvider runway`
+- **Replicate** — Wan-Alpha + many others — `--videoProvider replicate` ([guide](replicate.md))
+
+See [Video Generation feature page](../../features/video-generation.md) for the full SDK / CLI surface.
+
+---
+
+## 👤 Avatar / Lip-Sync Generation
+
+Talking-head video synthesis from a portrait image + audio (use via `output: { mode: "avatar" }`):
+
+- **D-ID** — `--avatarProvider d-id` (text-driven via Microsoft voices, or audio-driven)
+- **HeyGen** — `--avatarProvider heygen` (HeyGen avatar catalog id required)
+- **Replicate (MuseTalk)** — `--avatarProvider replicate` or `musetalk` ([guide](replicate.md))
+
+See [`docs/provider-integration/21-adding-new-modality.md`](../../provider-integration/21-adding-new-modality.md) for the architectural pattern.
+
+---
+
+## 🎵 Music / Sound Generation
+
+Music + sound-effect generation (use via `output: { mode: "music" }`):
+
+- **Beatoven.ai** — `--musicProvider beatoven` (royalty-free background music)
+- **ElevenLabs Music** — `--musicProvider elevenlabs-music` (short SFX / loops up to 22s; same `ELEVENLABS_API_KEY` as TTS)
+- **Lyria 3 Pro** (Google) — `--musicProvider lyria`
+- **Replicate (MusicGen)** — `--musicProvider replicate` or `musicgen` ([guide](replicate.md))
+
+---
+
 ## Quick Comparison
 
-| Provider                                  | Free Tier | Enterprise | GDPR   | Latency | Best For                        |
-| ----------------------------------------- | --------- | ---------- | ------ | ------- | ------------------------------- |
-| [Hugging Face](huggingface.md)            | ✅        | ❌         | ✅     | Medium  | Open source, experimentation    |
-| [Google AI](google-ai.md)                 | ✅        | ✅         | ✅     | Low     | Free tier, Gemini               |
-| [Mistral AI](mistral.md)                  | ❌        | ✅         | ✅     | Low     | EU compliance, cost             |
-| [OpenRouter](openrouter.md)               | ✅        | ✅         | Varies | Low     | Multi-model, automatic failover |
-| [OpenAI Compatible](openai-compatible.md) | Varies    | ✅         | Varies | Varies  | Flexibility, local deployment   |
-| [LiteLLM](litellm.md)                     | ❌        | ✅         | Varies | Low     | Multi-provider, unified API     |
-| [Azure OpenAI](azure-openai.md)           | ❌        | ✅         | ✅     | Low     | Enterprise, Microsoft ecosystem |
-| [Vertex AI](google-vertex.md)             | ❌        | ✅         | ✅     | Low     | Enterprise, GCP ecosystem       |
-| [AWS Bedrock](aws-bedrock.md)             | ❌        | ✅         | ✅     | Low     | Enterprise, AWS ecosystem       |
+| Provider                                                         | Free Tier  | Enterprise | GDPR   | Latency | Best For                              |
+| ---------------------------------------------------------------- | ---------- | ---------- | ------ | ------- | ------------------------------------- |
+| [Anthropic](anthropic.md)                                        | Limited    | ✅         | ✅     | Low     | Reasoning, coding, Claude             |
+| [Hugging Face](huggingface.md)                                   | ✅         | ❌         | ✅     | Medium  | Open source, experimentation          |
+| [Google AI](google-ai.md)                                        | ✅         | ✅         | ✅     | Low     | Free tier, Gemini                     |
+| [Mistral AI](mistral.md)                                         | ❌         | ✅         | ✅     | Low     | EU compliance, cost                   |
+| [OpenRouter](openrouter.md)                                      | ✅         | ✅         | Varies | Low     | Multi-model, automatic failover       |
+| [OpenAI Compatible](openai-compatible.md)                        | Varies     | ✅         | Varies | Varies  | Flexibility, local deployment         |
+| [LiteLLM](litellm.md)                                            | ❌         | ✅         | Varies | Low     | Multi-provider, unified API           |
+| [Azure OpenAI](azure-openai.md)                                  | ❌         | ✅         | ✅     | Low     | Enterprise, Microsoft ecosystem       |
+| [Vertex AI](google-vertex.md)                                    | ❌         | ✅         | ✅     | Low     | Enterprise, GCP ecosystem             |
+| [AWS Bedrock](aws-bedrock.md)                                    | ❌         | ✅         | ✅     | Low     | Enterprise, AWS ecosystem             |
+| [DeepSeek](../../getting-started/provider-setup.md#deepseek)     | ❌         | ✅         | ❌     | Low     | Cost-effective reasoning, R1 model    |
+| [NVIDIA NIM](../../getting-started/provider-setup.md#nvidia-nim) | ❌         | ✅         | Varies | Low     | NVIDIA-hosted or self-hosted LLMs     |
+| [LM Studio](../../getting-started/provider-setup.md#lm-studio)   | ✅ (Local) | ❌         | ✅     | Varies  | Local GUI model management            |
+| [llama.cpp](../../getting-started/provider-setup.md#llamacpp)    | ✅ (Local) | ❌         | ✅     | Varies  | High-performance local GGUF inference |
+| [OpenAI TTS](./openai-tts.md)                                    | ❌         | ✅         | ✅     | Low     | High-quality TTS (tts-1-hd)           |
+| [ElevenLabs](./elevenlabs.md)                                    | ❌         | ✅         | Varies | Low     | Multilingual TTS, voice cloning       |
+| [Google TTS](../provider-setup.md)                               | ✅         | ✅         | ✅     | Low     | Cost-effective TTS, 1M chars free     |
+| [Azure TTS](./azure-speech.md)                                   | ❌         | ✅         | ✅     | Low     | Enterprise TTS, SSML support          |
+| [Fish Audio](./fish-audio.md)                                    | ❌         | ✅         | Varies | Low     | Low-cost TTS, voice cloning, 14 langs |
+| [Cartesia](./cartesia.md)                                        | ❌         | ✅         | Varies | Low     | Low-latency Sonic models              |
+| [Whisper](../provider-setup.md#whisper)                          | ❌         | ✅         | ✅     | Low     | Best STT accuracy                     |
+| [Deepgram](./deepgram.md)                                        | ❌         | ✅         | Varies | Low     | Real-time STT streaming (WebSocket)   |
+| [Google STT](../provider-setup.md)                               | ❌         | ✅         | ✅     | Low     | STT for GCP users, 125+ languages     |
+| [Azure STT](./azure-speech.md)                                   | ❌         | ✅         | ✅     | Low     | Enterprise STT, custom models         |
+| [OpenAI Realtime](../provider-setup.md#openai-realtime)          | ❌         | ✅         | ✅     | Low     | Realtime bidirectional voice          |
+| [Gemini Live](../provider-setup.md)                              | ❌         | ✅         | ✅     | Low     | Realtime voice + video (Gemini)       |
 
 ---
 
@@ -266,3 +1041,5 @@ const ai = new NeuroLink({
 - **[Cost Optimization](../../guides/enterprise/cost-optimization.md)** - Reduce costs by 80-95%
 - **[Compliance & Security](../../guides/enterprise/compliance.md)** - GDPR, SOC2, HIPAA
 - **[Load Balancing](../../guides/enterprise/load-balancing.md)** - Distribution strategies
+- **[Voice Providers Comparison](../../reference/provider-comparison.md#voice-providers)** - TTS, STT, and Realtime capability matrix
+- **[Voice Provider Selection](../../reference/provider-selection.md#text-to-speech-tts)** - Choosing the right voice provider

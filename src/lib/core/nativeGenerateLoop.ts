@@ -1,0 +1,1010 @@
+/**
+ * The multi-step tool loop that the ai package's `generateText` used to supply.
+ *
+ * It deliberately loops over a provider's own `doGenerate` rather than over any
+ * streaming machinery. That is the whole lesson of the reverted first attempt:
+ * `doGenerate` is where the JSON-versus-SSE wire choice lives, along with the
+ * 400 retry, the context-overflow refit and the provider's own structured-output
+ * handling. Looping around the streaming path instead silently changed
+ * generate() to send `stream: true` and broke ten providers against a
+ * non-streaming body.
+ *
+ * Every provider whose delegating model exposes a v3-shaped `doGenerate` can
+ * share this: the v3 result shape (`content` parts, `finishReason`, `usage`) is
+ * the same across Anthropic, the OpenAI-compatible family and SageMaker.
+ */
+
+import { observeGeneration } from "../telemetry/observation.js";
+import { StepSpans, withGeneration } from "../telemetry/withSpan.js";
+import { logger } from "../utils/logger.js";
+import { convertZodToJsonSchema } from "../utils/schemaConversion.js";
+import type {
+  FinishReason,
+  GenerationRecord,
+  NativeGenerateLoopArgs,
+  NativeGenerateLoopResult,
+  SpanContent,
+  StepResult,
+  StepToolChoiceInput,
+  Tool,
+  ToolExecutionSummaryInternal,
+} from "../types/index.js";
+import { guardToolExecutor } from "./toolExecutionGuards.js";
+import { resolveLiveTool } from "../tools/toolDiscovery.js";
+
+const DEFAULT_TOOL_CHOICE_STEPS = 1;
+
+/**
+ * A choice that compels a tool call: `"required"` or a named tool, in either
+ * the NeuroLink string/object shape or the v3 `{ type }` object shape.
+ * `"auto"` and `"none"` leave the model free (or forbidden) and are never
+ * time-limited.
+ */
+const isForcedToolChoice = (choice: unknown): boolean => {
+  if (choice === "required") {
+    return true;
+  }
+  if (typeof choice === "object" && choice !== null) {
+    const type = (choice as { type?: unknown }).type;
+    return type === "required" || type === "tool" || type === "any";
+  }
+  return false;
+};
+
+/**
+ * The tool a choice forces by name, when it forces one. Both wire mappers
+ * honour exactly `{ type: "tool", toolName }` with a non-empty name, so
+ * that is the only shape that names a function on the wire.
+ */
+const forcedToolName = (choice: unknown): string | undefined => {
+  if (typeof choice !== "object" || choice === null) {
+    return undefined;
+  }
+  const { type, toolName } = choice as { type?: unknown; toolName?: unknown };
+  return type === "tool" && typeof toolName === "string" && toolName !== ""
+    ? toolName
+    : undefined;
+};
+
+/**
+ * The name a choice forces when `declaredTools` is known and lacks it, else
+ * undefined. Own keys only: the live record may have a null prototype or be
+ * keyed by a name such as "constructor".
+ */
+const undeclaredForcedToolName = (
+  choice: unknown,
+  declaredTools: StepToolChoiceInput["declaredTools"],
+): string | undefined => {
+  if (!declaredTools) {
+    return undefined;
+  }
+  const name = forcedToolName(choice);
+  return name !== undefined && !Object.hasOwn(declaredTools, name)
+    ? name
+    : undefined;
+};
+
+/**
+ * A forced choice for a tool the request does not declare is dropped for the
+ * step rather than sent, so a stale hook or a platform-gated tool degrades
+ * the turn to the model's own choice instead of failing it with a 400.
+ */
+const warnUndeclaredForcedTool = (
+  toolName: string,
+  step: number,
+  source: "prepareStep" | "base",
+): void => {
+  logger.warn(
+    source === "prepareStep"
+      ? `prepareStep forced tool "${toolName}" at step ${step}, but the request does not declare it; ignoring the override for this step`
+      : `toolChoice forces tool "${toolName}" at step ${step}, but the request does not declare it; using "auto" for this step`,
+    { toolName, step, source },
+  );
+};
+
+/**
+ * The names this request actually carries, in the record shape
+ * `declaredTools` takes. `args.toolsRecord` can hold more than is declared
+ * (discovery hydrates into it), so only the sent declarations answer "is it
+ * offered".
+ * Null prototype: a tool may be named `__proto__` or `constructor`.
+ */
+const declaredToolRecord = (
+  tools: NativeGenerateLoopArgs["tools"],
+): Record<string, true> => {
+  const declared = Object.create(null) as Record<string, true>;
+  for (const tool of tools ?? []) {
+    if (typeof tool.name === "string") {
+      declared[tool.name] = true;
+    }
+  }
+  return declared;
+};
+
+/**
+ * `toolChoiceSteps` is a count of leading steps, so anything but a
+ * non-negative integer is meaningless. Fall back to the default with a WARN
+ * rather than throw: a bad knob should not fail a turn that would otherwise
+ * complete, but it must not be silent either.
+ */
+const normalizeToolChoiceSteps = (value: number | undefined): number => {
+  if (value === undefined) {
+    return DEFAULT_TOOL_CHOICE_STEPS;
+  }
+  if (Number.isInteger(value) && value >= 0) {
+    return value;
+  }
+  logger.warn(
+    `toolChoiceSteps must be a non-negative integer; got ${String(value)} — using ${DEFAULT_TOOL_CHOICE_STEPS}`,
+  );
+  return DEFAULT_TOOL_CHOICE_STEPS;
+};
+
+/**
+ * Fields of a `prepareStep` result that the former AI-SDK loop honoured and
+ * the native loops do not. Their presence is reported once per process: a
+ * hook written for the old loop that hides a destructive tool through
+ * `experimental_activeTools` would otherwise fail open in silence.
+ */
+const IGNORED_PREPARE_STEP_FIELDS = [
+  "model",
+  "activeTools",
+  "experimental_activeTools",
+] as const;
+let warnedIgnoredPrepareStepFields = false;
+
+const warnIgnoredPrepareStepFields = (prepared: unknown): void => {
+  if (
+    warnedIgnoredPrepareStepFields ||
+    !prepared ||
+    typeof prepared !== "object"
+  ) {
+    return;
+  }
+  const present = IGNORED_PREPARE_STEP_FIELDS.filter(
+    (field) => (prepared as Record<string, unknown>)[field] !== undefined,
+  );
+  if (present.length === 0) {
+    return;
+  }
+  warnedIgnoredPrepareStepFields = true;
+  logger.warn(
+    `prepareStep returned ${present.join(", ")}, which the native loops ignore — only toolChoice is honoured. Use toolFilter / excludeTools for tool visibility and set the model on the request. (reported once)`,
+  );
+};
+
+/**
+ * Await the caller's hook without letting it outlive the turn: a hook that
+ * stalls (a remote policy service that never answers) parked the loop past
+ * every deadline, because nothing observed the abort signal while the hook
+ * was pending. An abort rejects with the signal's reason so the loop's
+ * cancellation path handles it like any other abort.
+ */
+const awaitPrepareStep = <T>(
+  pending: PromiseLike<T>,
+  abortSignal: AbortSignal | undefined,
+): Promise<T> => {
+  if (!abortSignal) {
+    return Promise.resolve(pending);
+  }
+  if (abortSignal.aborted) {
+    // The hook has already been invoked. Its promise is abandoned here, so
+    // a rejection it settles with later must have a handler: without one it
+    // is an unhandled rejection, which terminates Node by default.
+    void Promise.resolve(pending).catch(() => undefined);
+    return Promise.reject(abortReason(abortSignal));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(abortReason(abortSignal));
+    abortSignal.addEventListener("abort", onAbort, { once: true });
+    // Both handlers stay attached after an abort wins the race, so a hook
+    // that rejects afterwards is observed (the second `reject` is a no-op).
+    Promise.resolve(pending).then(
+      (value) => {
+        abortSignal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        abortSignal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+};
+
+const abortReason = (signal: AbortSignal): unknown => {
+  if (signal.reason instanceof Error) {
+    return signal.reason;
+  }
+  const error = new Error(
+    typeof signal.reason === "string" ? signal.reason : "Request was aborted.",
+  );
+  error.name = "AbortError";
+  return error;
+};
+
+/**
+ * Decide the tool choice for ONE step of a multi-step loop.
+ *
+ * A forced choice held on every step compels a tool call on every step, so
+ * the loop could only end when `maxSteps` ran out — which is exactly what
+ * happened before this existed. The rule: a forced choice applies while
+ * `step < toolChoiceSteps` (default 1), after which the model chooses
+ * (`"auto"`). `"auto"` and `"none"` pass through unchanged on every step.
+ *
+ * A `prepareStep` hook, when supplied, runs first and its `toolChoice` wins
+ * for the step — including a forced choice past `toolChoiceSteps`, which is
+ * how a caller forces a tool on step 3 only. A hook that returns no
+ * `toolChoice` defers to the rule. Nothing else on the hook's result is read.
+ *
+ * A forced single-tool choice, from the hook or from the turn, that names a
+ * tool outside `declaredTools` is warned about and not sent. A hook's choice
+ * is then treated as "no override" and the rule decides; the turn's own
+ * choice becomes `"auto"`. Without `declaredTools` nothing is checked.
+ *
+ * A hook that THROWS is logged and treated as "no override": the steps
+ * already billed are kept and the rule decides. An abort of the turn while
+ * the hook is pending is not a hook failure and is re-thrown. The two are
+ * told apart by the LOOP's signal, never by the error's name: a hook that
+ * rejects with its own `AbortError` (its policy service timed out) has
+ * failed, and must not end a turn the caller never cancelled.
+ */
+export async function resolveStepToolChoice(
+  input: StepToolChoiceInput,
+): Promise<unknown> {
+  if (input.prepareStep) {
+    let prepared: Awaited<
+      ReturnType<NonNullable<StepToolChoiceInput["prepareStep"]>>
+    >;
+    try {
+      prepared = await awaitPrepareStep(
+        input.prepareStep({
+          steps: input.steps,
+          stepNumber: input.step,
+          maxSteps: input.maxSteps,
+          model: input.model,
+        }),
+        input.abortSignal,
+      );
+    } catch (hookError) {
+      if (input.abortSignal?.aborted) {
+        throw abortReason(input.abortSignal);
+      }
+      logger.warn(
+        `prepareStep threw at step ${input.step}; using the default tool choice for this step`,
+        {
+          error:
+            hookError instanceof Error ? hookError.message : String(hookError),
+        },
+      );
+      prepared = undefined;
+    }
+    warnIgnoredPrepareStepFields(prepared);
+    if (prepared?.toolChoice !== undefined) {
+      const undeclaredPrepared = undeclaredForcedToolName(
+        prepared.toolChoice,
+        input.declaredTools,
+      );
+      if (undeclaredPrepared === undefined) {
+        return prepared.toolChoice;
+      }
+      warnUndeclaredForcedTool(undeclaredPrepared, input.step, "prepareStep");
+    }
+  }
+  if (input.base === undefined) {
+    return undefined;
+  }
+  if (!isForcedToolChoice(input.base)) {
+    return input.base;
+  }
+  if (input.step >= normalizeToolChoiceSteps(input.toolChoiceSteps)) {
+    return "auto";
+  }
+  const undeclaredBase = undeclaredForcedToolName(
+    input.base,
+    input.declaredTools,
+  );
+  if (undeclaredBase === undefined) {
+    return input.base;
+  }
+  warnUndeclaredForcedTool(undeclaredBase, input.step, "base");
+  return "auto";
+}
+
+/**
+ * Translate a NeuroLink-shape tool choice (`"auto"` / `"none"` /
+ * `"required"` / `{ type: "tool", toolName }`) into the v3 call-option
+ * OBJECT every `doGenerate` converter switches on. The bare strings were
+ * being handed straight to `doGenerate`; Anthropic's converter normalises
+ * them, but the OpenAI-compatible one reads `.type` off the value and
+ * silently dropped every string form. An already-object value passes
+ * through untouched.
+ */
+export const toV3ToolChoice = (
+  choice: unknown,
+): Record<string, unknown> | undefined => {
+  if (choice === undefined || choice === null) {
+    return undefined;
+  }
+  if (typeof choice === "string") {
+    return choice === "auto" || choice === "none" || choice === "required"
+      ? { type: choice }
+      : undefined;
+  }
+  if (typeof choice === "object") {
+    return choice as Record<string, unknown>;
+  }
+  return undefined;
+};
+
+const KNOWN_FINISH_REASONS: ReadonlySet<string> = new Set([
+  "stop",
+  "length",
+  "content-filter",
+  "tool-calls",
+  "error",
+  "other",
+]);
+
+const toFinishReason = (value: string): FinishReason =>
+  KNOWN_FINISH_REASONS.has(value) ? (value as FinishReason) : "other";
+
+/**
+ * The record of one completed step that `prepareStep` receives in `steps`.
+ * Built the same way by every native loop so a hook sees one shape.
+ */
+export const toPrepareStepRecord = (step: {
+  stepNumber: number;
+  content: Array<Record<string, unknown>>;
+  text: string;
+  toolCalls: Array<{ toolName: string; toolCallId: string; input: unknown }>;
+  toolResults: Array<{
+    toolName: string;
+    toolCallId: string;
+    output: unknown;
+  }>;
+  finishReason: string;
+  inputTokens: number;
+  outputTokens: number;
+  /** Prompt-cache tokens for the step, when the provider reports them. */
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+}): StepResult<Record<string, Tool>> => {
+  const hasCacheDetail =
+    step.cacheReadTokens !== undefined || step.cacheWriteTokens !== undefined;
+  return {
+    stepNumber: step.stepNumber,
+    content: step.content as Array<{ type: string } & Record<string, unknown>>,
+    text: step.text,
+    toolCalls: step.toolCalls,
+    toolResults: step.toolResults,
+    finishReason: toFinishReason(step.finishReason),
+    usage: {
+      inputTokens: step.inputTokens,
+      outputTokens: step.outputTokens,
+      totalTokens: step.inputTokens + step.outputTokens,
+      ...(hasCacheDetail
+        ? {
+            inputTokenDetails: {
+              noCacheTokens: step.inputTokens,
+              cacheReadTokens: step.cacheReadTokens ?? 0,
+              cacheWriteTokens: step.cacheWriteTokens ?? 0,
+            },
+            cachedInputTokens: step.cacheReadTokens ?? 0,
+          }
+        : {}),
+    },
+  };
+};
+
+/**
+ * Narrow a model handle to the delegating shape this loop drives.
+ * `LanguageModel` is a union that includes a bare string id, and a double
+ * assertion through unknown is banned by Critical Rule 14.
+ */
+export const hasNativeDoGenerate = (
+  value: unknown,
+): value is {
+  doGenerate: (
+    options: Record<string, unknown>,
+  ) => Promise<Record<string, unknown>>;
+} =>
+  typeof value === "object" &&
+  value !== null &&
+  typeof (value as { doGenerate?: unknown }).doGenerate === "function";
+
+const asParts = (value: unknown): Array<Record<string, unknown>> =>
+  Array.isArray(value) ? (value as Array<Record<string, unknown>>) : [];
+
+const readTotal = (value: unknown): number =>
+  typeof value === "object" &&
+  value !== null &&
+  typeof (value as { total?: unknown }).total === "number"
+    ? (value as { total: number }).total
+    : 0;
+
+/**
+ * Parse a tool call's arguments, distinguishing "no arguments" from "the model
+ * emitted something that is not JSON". Silently substituting `{}` for the
+ * second case ran the tool with empty input and reported success, so a
+ * malformed call looked identical to a legitimate no-arg one.
+ */
+const parseToolInput = (raw: unknown): { input: unknown; error?: string } => {
+  if (typeof raw !== "string") {
+    return { input: raw ?? {} };
+  }
+  if (raw.trim() === "") {
+    return { input: {} };
+  }
+  try {
+    return { input: JSON.parse(raw) };
+  } catch {
+    return { input: {}, error: "arguments were not valid JSON" };
+  }
+};
+
+/** A tool's inputSchema with its lazy (function) form, if any, resolved. */
+export const resolveToolInputSchema = (
+  schema: Tool["inputSchema"],
+): Exclude<Tool["inputSchema"], (...args: never[]) => unknown> =>
+  typeof schema === "function" ? resolveToolInputSchema(schema()) : schema;
+
+/**
+ * The provider-neutral declaration of one tool: the shape every provider's
+ * `doGenerate` already converts to its own wire format. The loop uses it for
+ * the tools discovery loads mid-turn, and the providers that run the loop use
+ * it for their initial declarations, so a tool is declared the same way
+ * whether it is there at the start or joins later.
+ */
+export const toNativeToolDeclaration = (name: string, tool: Tool) => ({
+  type: "function" as const,
+  name,
+  description: tool.description ?? "",
+  inputSchema: declaredInputSchema(name, tool),
+});
+
+// A lazy schema that throws must not take the whole request down: SageMaker and
+// Anthropic declared any function-valued schema as the empty object schema
+// before the lazy form was resolved here, so a broken one falls back to that.
+function declaredInputSchema(name: string, tool: Tool): object {
+  const empty = { type: "object", properties: {} };
+  if (!tool.inputSchema) {
+    return empty;
+  }
+  try {
+    return convertZodToJsonSchema(resolveToolInputSchema(tool.inputSchema));
+  } catch (error) {
+    logger.warn(
+      `[nativeGenerateLoop] input schema of tool "${name}" could not be resolved; declaring it with an empty object schema`,
+      { error: error instanceof Error ? error.message : String(error) },
+    );
+    return empty;
+  }
+}
+
+/**
+ * Validate parsed input against the tool's own schema when it exposes one.
+ *
+ * `generateText` validated tool input before dispatch; the native loop did
+ * not, so a call whose shape the tool rejects reached `execute` and failed
+ * inside user code — or worse, did not fail. A Zod schema is detected by
+ * `safeParse`; anything else is passed through, since a JSON Schema needs a
+ * validator this loop has no business carrying.
+ */
+const validateToolInput = (
+  tool: Tool | undefined,
+  input: unknown,
+): string | undefined => {
+  const schema = tool?.inputSchema
+    ? resolveToolInputSchema(tool.inputSchema)
+    : undefined;
+  if (
+    !schema ||
+    typeof schema !== "object" ||
+    !("safeParse" in schema) ||
+    typeof schema.safeParse !== "function"
+  ) {
+    return undefined;
+  }
+  const result = schema.safeParse(input);
+  if (result.success) {
+    return undefined;
+  }
+  const detail =
+    result.error instanceof Error ? result.error.message : "schema mismatch";
+  return `input did not match the tool's schema: ${detail}`;
+};
+
+/**
+ * Spell a JSON Schema into the conversation's system turn.
+ *
+ * The structured-output fallback for vendors that reject or ignore
+ * `response_format`. Merged into an existing trailing system message rather
+ * than appended as a second one: several self-hosted OpenAI-compatible stacks
+ * honour only the first system message, so a second would be dropped and the
+ * fallback would silently do nothing.
+ */
+export const appendJsonSchemaInstruction = (
+  conversation: Array<Record<string, unknown>>,
+  schema: unknown,
+): Array<Record<string, unknown>> => {
+  // "value", not "object": a ValidationSchema also accepts array and scalar
+  // roots (z.array(...), z.string()), and demanding an object told a
+  // compliant model to emit something those roots can never satisfy — so the
+  // fallback silently produced nothing for them however well the model
+  // complied. The generate path's own re-ask prompt was corrected for this
+  // reason; this shared helper, used by both paths, was missed.
+  const instruction =
+    "When you give your final answer, respond with only a single JSON value " +
+    "that conforms to the following JSON Schema. No prose before or after it, " +
+    `and no markdown code fence. JSON Schema: ${JSON.stringify(schema)}`;
+  const lastSystemIndex = conversation.reduce(
+    (found, message, index) => (message.role === "system" ? index : found),
+    -1,
+  );
+  if (lastSystemIndex === -1) {
+    return [{ role: "system", content: instruction }, ...conversation];
+  }
+  const existing = conversation[lastSystemIndex];
+  const content =
+    typeof existing.content === "string"
+      ? `${existing.content}\n\n${instruction}`
+      : instruction;
+  return conversation.map((message, index) =>
+    index === lastSystemIndex ? { ...message, content } : message,
+  );
+};
+
+function describeV3Response(
+  res: Awaited<ReturnType<NativeGenerateLoopArgs["doGenerate"]>>,
+): GenerationRecord {
+  const parts = asParts(res.content);
+  const usage = res.usage as
+    | {
+        inputTokens?: {
+          total?: number;
+          noCache?: number;
+          cacheRead?: number;
+          cacheWrite?: number;
+        };
+        outputTokens?: { total?: number; reasoning?: number };
+      }
+    | undefined;
+  const finish = res.finishReason;
+  const response = res.response as { modelId?: string } | undefined;
+  const toolCalls = parts
+    .filter((p) => p.type === "tool-call")
+    .map((p) => ({
+      id: p.toolCallId as string,
+      name: p.toolName as string,
+      args: p.input as SpanContent,
+    }));
+  const reasoning = parts
+    .filter((p) => p.type === "reasoning" && typeof p.text === "string")
+    .map((p) => p.text as string)
+    .join("");
+  return {
+    responseModel:
+      typeof response?.modelId === "string" ? response.modelId : undefined,
+    output: {
+      text: parts
+        .filter((p) => p.type === "text" && typeof p.text === "string")
+        .map((p) => p.text as string)
+        .join(""),
+      ...(reasoning ? { reasoning } : {}),
+      ...(toolCalls.length > 0 ? { toolCalls } : {}),
+    },
+    usage: usage
+      ? {
+          inputTokens: usage.inputTokens?.noCache ?? usage.inputTokens?.total,
+          outputTokens: usage.outputTokens?.total,
+          cacheReadTokens: usage.inputTokens?.cacheRead,
+          cacheCreationTokens: usage.inputTokens?.cacheWrite,
+          reasoningTokens: usage.outputTokens?.reasoning,
+        }
+      : undefined,
+    finishReason:
+      typeof finish === "string"
+        ? finish
+        : (finish as { unified?: string } | undefined)?.unified,
+  };
+}
+
+function generateObservedStep(
+  args: NativeGenerateLoopArgs,
+  request: Parameters<NativeGenerateLoopArgs["doGenerate"]>[0],
+): ReturnType<NativeGenerateLoopArgs["doGenerate"]> {
+  return withGeneration(
+    {
+      provider: args.provider,
+      model: args.modelId,
+      modelParameters: {
+        temperature: args.temperature,
+        maxTokens: args.maxOutputTokens,
+      },
+      input: { messages: args.conversation },
+    },
+    async (span) => {
+      const res = await args.runStep(() => args.doGenerate(request));
+      observeGeneration(span, {
+        provider: args.provider,
+        model: args.modelId,
+        ...describeV3Response(res),
+        aborted: args.abortSignal?.aborted,
+      });
+      return res;
+    },
+  );
+}
+
+export async function runNativeGenerateLoop(
+  args: NativeGenerateLoopArgs,
+  toolExecutionSummaries: ToolExecutionSummaryInternal[],
+): Promise<NativeGenerateLoopResult> {
+  const stepSpans = new StepSpans("generate");
+  try {
+    return await runGenerateSteps(args, toolExecutionSummaries, stepSpans);
+  } finally {
+    stepSpans.end();
+  }
+}
+
+async function runGenerateSteps(
+  args: NativeGenerateLoopArgs,
+  toolExecutionSummaries: ToolExecutionSummaryInternal[],
+  stepSpans: StepSpans,
+): Promise<NativeGenerateLoopResult> {
+  const toolsUsed: string[] = [];
+  let text = "";
+  let reasoning = "";
+  let finishReason = "stop";
+  let rawFinishReason: string | undefined;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cacheReadTokens = 0;
+  let cacheWriteTokens = 0;
+  let steps = 0;
+  // One bounded recovery re-ask per turn; see the empty-tool-calls branch.
+  let reasked = false;
+  // True only while the NEXT step is the recovery re-ask. `reasked` stays set
+  // for the rest of the turn, so it cannot distinguish "this step is the
+  // re-ask" from "the re-ask already happened" — and degrading a later,
+  // unrelated failure would swallow a real error.
+  let reaskPending = false;
+  // The turn as it stood before the re-ask. The re-ask is a bonus request on
+  // top of a call that already produced a result, so if it fails the honest
+  // answer is that result — not a thrown turn.
+  let preReask:
+    | { text: string; finishReason: string; rawFinishReason?: string }
+    | undefined;
+  const hasTools = Boolean(args.tools && args.tools.length > 0);
+  // The declarations actually sent. It is the caller's own array and grows in
+  // place when a tool joins toolsRecord mid-turn (discovery loads tools into
+  // it), so anything the caller sized from it, such as the context guard's
+  // fixed-overhead estimate, counts the new tools too.
+  const liveTools = args.tools;
+  const declare = args.declareTool ?? toNativeToolDeclaration;
+  const declaredNames = declaredToolRecord(args.tools);
+  // Completed-step records for `prepareStep`; one per step that returned.
+  const stepRecords: StepResult<Record<string, Tool>>[] = [];
+
+  for (let step = 0; step < args.maxSteps; step++) {
+    steps = step + 1;
+    stepSpans.begin(steps);
+    if (liveTools) {
+      const loaded: string[] = [];
+      for (const name of Object.keys(args.toolsRecord)) {
+        if (!declaredNames[name]) {
+          liveTools.push(declare(name, args.toolsRecord[name]));
+          declaredNames[name] = true;
+          loaded.push(name);
+        }
+      }
+      if (loaded.length > 0) {
+        logger.debug(
+          `[nativeGenerateLoop] ${loaded.length} tool(s) hydrated mid-turn via discovery: ${loaded.join(", ")}`,
+        );
+      }
+    }
+    // The forced-choice window and the caller's hook are resolved BEFORE the
+    // re-ask override below: the re-ask has to win, since its whole point is
+    // a request with tools disabled.
+    // A request with no tools declares no tool_choice either: a hook that
+    // forces a tool on a tool-less request (the schema reformat pass starts
+    // every pass at step 0) would be a 400 on OpenAI-compatible backends.
+    const stepToolChoice = hasTools
+      ? await resolveStepToolChoice({
+          base: args.toolChoice,
+          step,
+          toolChoiceSteps: args.toolChoiceSteps,
+          prepareStep: args.prepareStep,
+          steps: stepRecords,
+          maxSteps: args.maxSteps,
+          model: args.modelId,
+          declaredTools: declaredToolRecord(liveTools),
+          ...(args.abortSignal ? { abortSignal: args.abortSignal } : {}),
+        })
+      : undefined;
+    const wireToolChoice = toV3ToolChoice(stepToolChoice);
+    // Per-step context reclaim. The pre-dispatch budget check runs ONCE and
+    // never sees the assistant turns and tool results this loop appends, which
+    // is how a long agentic run overflows the model window mid-loop and loses
+    // every completed step to a provider 400. The streaming paths have guarded
+    // this for a while; generate() did not, so the identical turn reclaimed on
+    // stream() and overflowed on generate().
+    //
+    // The provider supplies the guard because only it knows its wire shape.
+    // Returning undefined leaves the conversation byte-identical, so a turn
+    // that fits never pays a prompt-cache invalidation.
+    const guarded = args.guardConversation?.(args.conversation);
+    if (guarded) {
+      args.conversation.splice(0, args.conversation.length, ...guarded);
+    }
+    const runThisStep = () =>
+      generateObservedStep(args, {
+        prompt: args.conversation,
+        ...(liveTools && liveTools.length > 0 ? { tools: liveTools } : {}),
+        // The v3 call option is an OBJECT — `{ type: "none" }`. Passing the
+        // bare string "none" type-checks against `unknown` and is then
+        // dropped by every converter that switches on `choice.type`, so the
+        // re-ask silently went out unchanged. Caught by the stand-in asserting
+        // the wire body, not by any live provider. The same applied to the
+        // caller's own string-form choice, hence `toV3ToolChoice` above.
+        ...(reasked
+          ? { toolChoice: { type: "none" } }
+          : wireToolChoice !== undefined
+            ? { toolChoice: wireToolChoice }
+            : {}),
+        ...(args.responseFormat ? { responseFormat: args.responseFormat } : {}),
+        ...(args.providerOptions
+          ? { providerOptions: args.providerOptions }
+          : {}),
+        ...(args.maxOutputTokens
+          ? { maxOutputTokens: args.maxOutputTokens }
+          : {}),
+        ...(args.temperature !== undefined
+          ? { temperature: args.temperature }
+          : {}),
+        ...(args.abortSignal ? { abortSignal: args.abortSignal } : {}),
+      });
+
+    let res: Awaited<ReturnType<typeof args.doGenerate>>;
+    try {
+      res = await stepSpans.run(runThisStep);
+    } catch (stepError) {
+      // Ported from GenerationHandler.recoverEmptyToolCallsFinish's catch: a
+      // failed re-ask hands back the turn that already succeeded rather than
+      // turning a degraded turn into a thrown one. The native port made the
+      // re-ask a `continue`, so the failure surfaced from the NEXT step's
+      // doGenerate and propagated instead.
+      if (reaskPending && preReask) {
+        logger.warn(
+          "toolChoice: none re-ask failed; returning the original result",
+          {
+            error:
+              stepError instanceof Error
+                ? stepError.message
+                : String(stepError),
+          },
+        );
+        text = preReask.text;
+        finishReason = preReask.finishReason;
+        rawFinishReason = preReask.rawFinishReason;
+        break;
+      }
+      throw stepError;
+    }
+    reaskPending = false;
+
+    args.observeUsage?.(res.usage);
+
+    const parts = asParts(res.content);
+    // Each step REPLACES the text rather than appending: the final step's
+    // answer is the turn's answer, matching what generateText reported.
+    text = parts
+      .filter((p) => p.type === "text" && typeof p.text === "string")
+      .map((p) => p.text as string)
+      .join("");
+    // Reasoner models (DeepSeek `reasoning_content`, gateway `reasoning`,
+    // OpenAI o-series) emit reasoning as its own V3 content part.
+    //
+    // Unlike `text`, this ACCUMULATES across steps. Each step's answer
+    // supersedes the last, but each step's reasoning is its own thought:
+    // replacing meant a tool loop reported only whatever the final step
+    // happened to think, which is usually the shortest part and frequently
+    // empty once the model just answers from the tool result. Concatenating
+    // with nothing between them is what a stream() consumer accumulates from
+    // the per-step reasoning chunks, so both surfaces agree on the turn.
+    reasoning += parts
+      .filter((p) => p.type === "reasoning" && typeof p.text === "string")
+      .map((p) => p.text as string)
+      .join("");
+
+    const fr = res.finishReason;
+    if (typeof fr === "string") {
+      finishReason = fr;
+    } else if (typeof fr === "object" && fr !== null) {
+      const shaped = fr as { unified?: string; raw?: string };
+      finishReason = shaped.unified ?? finishReason;
+      rawFinishReason = shaped.raw ?? rawFinishReason;
+    }
+
+    const usage = res.usage as
+      | { inputTokens?: unknown; outputTokens?: unknown }
+      | undefined;
+    outputTokens += readTotal(usage?.outputTokens);
+    const inShaped = usage?.inputTokens as
+      | {
+          total?: number;
+          noCache?: number;
+          cacheRead?: number;
+          cacheWrite?: number;
+        }
+      | undefined;
+    // `total` on the shaped input-tokens object is cache-INCLUSIVE (noCache +
+    // cacheRead + cacheWrite). Accumulating it into `inputTokens` — while ALSO
+    // accumulating cacheRead/cacheWrite below — double-billed every cached
+    // token: once folded into `input`, once again as the flat cache fields
+    // `calculateCost` prices separately. `noCache` is the disjoint figure
+    // `calculateCost` expects; fall back to the inclusive total only when a
+    // provider hasn't populated `noCache` (i.e. it never reports cache usage).
+    inputTokens +=
+      typeof inShaped?.noCache === "number"
+        ? inShaped.noCache
+        : readTotal(usage?.inputTokens);
+    cacheReadTokens += inShaped?.cacheRead ?? 0;
+    cacheWriteTokens += inShaped?.cacheWrite ?? 0;
+
+    const calls = parts.filter((p) => p.type === "tool-call");
+    const stepInputTokens =
+      typeof inShaped?.noCache === "number"
+        ? inShaped.noCache
+        : readTotal(usage?.inputTokens);
+    const stepOutputTokens = readTotal(usage?.outputTokens);
+    // `input` is the PARSED object, as the stream loops record it: the v3
+    // part carries the raw JSON string, and a hook reading
+    // `steps.at(-1)?.toolCalls[0]?.input?.orderId` got undefined on
+    // generate() while the same hook worked on stream().
+    const stepToolCalls = calls.map((call) => ({
+      toolName: String(call.toolName ?? ""),
+      toolCallId: String(call.toolCallId ?? ""),
+      input: parseToolInput(call.input).input,
+    }));
+    // Pushed now with empty results and filled in below once the tools have
+    // run, so a hook consulted on the next step sees this step's outputs.
+    const stepRecord = toPrepareStepRecord({
+      stepNumber: step,
+      content: parts,
+      text,
+      toolCalls: stepToolCalls,
+      toolResults: [],
+      finishReason,
+      inputTokens: stepInputTokens,
+      outputTokens: stepOutputTokens,
+      ...(inShaped?.cacheRead !== undefined ||
+      inShaped?.cacheWrite !== undefined
+        ? {
+            cacheReadTokens: inShaped?.cacheRead ?? 0,
+            cacheWriteTokens: inShaped?.cacheWrite ?? 0,
+          }
+        : {}),
+    });
+    stepRecords.push(stepRecord);
+    if (calls.length === 0) {
+      // io.net's Llama endpoint ends a tool loop on `finish_reason:
+      // tool_calls` carrying neither a tool call nor any text: the model's
+      // JSON-shaped answer trips the vendor's tool-call parser, which drops it
+      // and reports `content: null` with no `tool_calls`. There is nothing to
+      // execute, so the loop would stop and hand the caller an empty turn even
+      // though the tool ran. Replaying the request once with
+      // `toolChoice: "none"` returns the answer.
+      //
+      // Ported from GenerationHandler.recoverEmptyToolCallsFinish, which runs
+      // this on the ai-package path. That path is unreachable for every
+      // provider driven by this loop — io.net among them, since it is a
+      // Tier-2 catalog provider on the OpenAI-compatible base — so without
+      // this the recovery would simply not happen for the provider it was
+      // written for.
+      const emptyToolCallsFinish =
+        finishReason === "tool-calls" &&
+        text.trim() === "" &&
+        hasTools &&
+        !reasked &&
+        step + 1 < args.maxSteps;
+      if (emptyToolCallsFinish) {
+        reasked = true;
+        reaskPending = true;
+        preReask = { text, finishReason, rawFinishReason };
+        args.conversation.push({ role: "assistant", content: parts });
+        continue;
+      }
+      break;
+    }
+
+    // Tool turns go back in the message-builder shape each provider's own
+    // conversion already round-trips: an assistant message of tool-call parts,
+    // then one tool message of tool-result parts.
+    args.conversation.push({ role: "assistant", content: parts });
+    const resultParts: Array<Record<string, unknown>> = [];
+    for (const call of calls) {
+      const name = String(call.toolName ?? "");
+      const id = String(call.toolCallId ?? "");
+      const startTime = new Date();
+      const parsed = parseToolInput(call.input);
+      const input = parsed.input;
+      // resolveLiveTool also loads a deferred tool the model called by its
+      // catalog name without searching first.
+      const tool = resolveLiveTool(args.toolsRecord, name);
+
+      let output: unknown;
+      let failure: string | undefined;
+      const rejection =
+        parsed.error ??
+        (typeof tool?.execute === "function"
+          ? validateToolInput(tool, input)
+          : undefined);
+      if (typeof tool?.execute !== "function") {
+        failure = `Tool not found: ${name}`;
+        output = { error: failure };
+        args.onRejectedToolCall?.(name, failure, id);
+      } else if (rejection) {
+        // An error tool-result rather than a throw: the model gets to see what
+        // was wrong and correct it on the next step, which is what the SDK's
+        // own validation did.
+        failure = `Tool ${name}: ${rejection}`;
+        output = { error: failure };
+        args.onRejectedToolCall?.(name, failure, id);
+      } else {
+        try {
+          // The turn's abort signal and the per-tool cap have to reach the
+          // tool, or a wedged tool parks the loop inside `await execute` and
+          // outlives the deadline that withTurnTimeout composed. Reuses the
+          // guard every other native loop already applies.
+          const guarded = guardToolExecutor(name, tool.execute, {
+            ...(args.abortSignal ? { abortSignal: args.abortSignal } : {}),
+            ...(args.toolTimeoutMs !== undefined
+              ? { toolTimeoutMs: args.toolTimeoutMs }
+              : {}),
+          });
+          output = await stepSpans.run(() =>
+            guarded(input as Record<string, unknown>, {
+              toolCallId: id,
+              messages: [],
+              ...(args.abortSignal ? { abortSignal: args.abortSignal } : {}),
+            }),
+          );
+          toolsUsed.push(name);
+        } catch (err) {
+          failure = err instanceof Error ? err.message : String(err);
+          output = { error: failure };
+        }
+      }
+
+      toolExecutionSummaries.push({
+        toolCallId: id,
+        toolName: name,
+        input,
+        ...(failure ? { error: failure } : { output }),
+        startTime,
+        endTime: new Date(),
+        stepIndex: step,
+      });
+      resultParts.push({ type: "tool-result", toolCallId: id, output });
+      stepRecord.toolResults.push({ toolName: name, toolCallId: id, output });
+    }
+    args.conversation.push({ role: "tool", content: resultParts });
+  }
+
+  return {
+    text,
+    ...(reasoning ? { reasoning } : {}),
+    finishReason,
+    ...(rawFinishReason ? { rawFinishReason } : {}),
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    toolsUsed,
+    steps,
+  };
+}

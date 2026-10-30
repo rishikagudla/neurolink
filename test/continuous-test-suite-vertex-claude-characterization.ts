@@ -1,0 +1,2058 @@
+#!/usr/bin/env tsx
+import "dotenv/config";
+
+/**
+ * Continuous Test Suite — Vertex + Claude native-loop characterization
+ * (Plan 08, Task 11).
+ *
+ * Pins the observable behaviour of the two hand-rolled loops in
+ * googleVertex/client.ts that drive Claude models —
+ * executeNativeAnthropicStream and executeNativeAnthropicGenerate — before
+ * they move onto `runAgenticLoop`.
+ *
+ * Reaching them at all needed a provider change, which is worth stating
+ * plainly. `@anthropic-ai/vertex-sdk` resolves Application Default Credentials
+ * in its constructor and awaits them on every request, so there was no
+ * supported way to point a Claude-on-Vertex turn at a local endpoint. Its
+ * `accessToken` option looks like the answer and is not — the client stores it
+ * and never reads it for auth. The option the SDK actually consults is
+ * `authClient`, so the provider now builds one from an express-style API key,
+ * exactly as the Gemini side already does. That makes these loops reachable
+ * here AND gives callers a gateway/API-key path that did not exist before.
+ *
+ * Everything drives the shipped surface: `new NeuroLink().stream()` and
+ * `.generate()` from `../dist/index.js`, answered by a local server speaking
+ * real Anthropic SSE framing so the SDK's own event parsing runs. No imports
+ * out of `src/`, nothing stubbed. No rule-15 exception.
+ *
+ * Assertion messages carry counts, never payloads: the harness downgrades a
+ * failure whose text matches `isExpectedProviderError()` to a SKIP, so quoting
+ * provider-ish content would turn a real regression green.
+ *
+ * Run: npx tsx test/continuous-test-suite-vertex-claude-characterization.ts
+ */
+
+import { createServer, type Server } from "node:http";
+import { z } from "zod";
+import { jsonSchema } from "../dist/index.js";
+import {
+  InMemorySpanExporter,
+  SimpleSpanProcessor,
+} from "@opentelemetry/sdk-trace-base";
+import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
+import { assert, defineSuite } from "./helpers/harness.js";
+import { assertDistFresh } from "./helpers/distFreshness.js";
+import type { Tool } from "../src/lib/types/index.js";
+
+assertDistFresh();
+
+// Registered BEFORE the dist import so NeuroLink adopts this provider instead
+// of initializing its own — the documented external-TracerProvider path. The
+// hydration-observability case reads its spans out of this exporter; the
+// other cases are unaffected (they pin calls and counters, not spans).
+const spanExporter = new InMemorySpanExporter();
+new NodeTracerProvider({
+  spanProcessors: [new SimpleSpanProcessor(spanExporter)],
+}).register();
+
+const { test, section, runSuite } = defineSuite(
+  "Vertex Claude loop characterization",
+  {
+    offline: true,
+  },
+);
+
+const { NeuroLink } = await import("../dist/index.js");
+
+const MODEL = "claude-3-5-sonnet-v2@20241022";
+
+const TOUCHED_ENV_VARS = [
+  "GOOGLE_CLOUD_PROJECT",
+  "GOOGLE_CLOUD_PROJECT_ID",
+  "VERTEX_PROJECT_ID",
+  "GOOGLE_VERTEX_PROJECT",
+  "GOOGLE_CLOUD_LOCATION",
+  "VERTEX_LOCATION",
+  "GOOGLE_VERTEX_LOCATION",
+  "GOOGLE_APPLICATION_CREDENTIALS",
+  "GOOGLE_VERTEX_API_KEY",
+  "GOOGLE_VERTEX_BASE_URL",
+  "GOOGLE_API_KEY",
+] as const;
+
+function withVertexEnv(): () => void {
+  const saved: Record<string, string | undefined> = {};
+  for (const key of TOUCHED_ENV_VARS) {
+    saved[key] = process.env[key];
+    delete process.env[key];
+  }
+  return () => {
+    for (const key of TOUCHED_ENV_VARS) {
+      const prior = saved[key];
+      if (prior === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = prior;
+      }
+    }
+  };
+}
+
+function sse(event: string, payload: Record<string, unknown>): string {
+  return `event: ${event}\ndata: ${JSON.stringify({ type: event, ...payload })}\n\n`;
+}
+
+/** A turn that emits text and stops. */
+function textTurn(text: string): string[] {
+  return [
+    // The FULL message shape, not the trimmed one. `MessageStream` builds its
+    // snapshot from this event and then pushes each content block onto
+    // `snapshot.content`; without `content: []` (and the sibling fields it
+    // reads alongside) the accumulator dies on "Cannot read properties of
+    // undefined (reading 'push')" before a single delta is delivered.
+    sse("message_start", {
+      message: {
+        id: "msg_1",
+        type: "message",
+        role: "assistant",
+        model: MODEL,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 5, output_tokens: 0 },
+      },
+    }),
+    sse("content_block_start", {
+      index: 0,
+      content_block: { type: "text", text: "" },
+    }),
+    sse("content_block_delta", {
+      index: 0,
+      delta: { type: "text_delta", text },
+    }),
+    sse("content_block_stop", { index: 0 }),
+    sse("message_delta", {
+      delta: { stop_reason: "end_turn" },
+      usage: { output_tokens: 4 },
+    }),
+    sse("message_stop", {}),
+  ];
+}
+
+/** A turn that asks for one tool call. */
+function toolTurn(
+  name: string,
+  input: Record<string, unknown>,
+  id = "toolu_1",
+  leadingText?: string,
+): string[] {
+  const frames: string[] = [
+    // The FULL message shape, not the trimmed one. `MessageStream` builds its
+    // snapshot from this event and then pushes each content block onto
+    // `snapshot.content`; without `content: []` (and the sibling fields it
+    // reads alongside) the accumulator dies on "Cannot read properties of
+    // undefined (reading 'push')" before a single delta is delivered.
+    sse("message_start", {
+      message: {
+        id: "msg_1",
+        type: "message",
+        role: "assistant",
+        model: MODEL,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 5, output_tokens: 0 },
+      },
+    }),
+  ];
+  let index = 0;
+  if (leadingText !== undefined) {
+    frames.push(
+      sse("content_block_start", {
+        index,
+        content_block: { type: "text", text: "" },
+      }),
+      sse("content_block_delta", {
+        index,
+        delta: { type: "text_delta", text: leadingText },
+      }),
+      sse("content_block_stop", { index }),
+    );
+    index++;
+  }
+  frames.push(
+    sse("content_block_start", {
+      index,
+      content_block: { type: "tool_use", id, name, input: {} },
+    }),
+    sse("content_block_delta", {
+      index,
+      delta: { type: "input_json_delta", partial_json: JSON.stringify(input) },
+    }),
+    sse("content_block_stop", { index }),
+    sse("message_delta", {
+      delta: { stop_reason: "tool_use" },
+      usage: { output_tokens: 6 },
+    }),
+    sse("message_stop", {}),
+  );
+  return frames;
+}
+
+/**
+ * A turn that asks for MULTIPLE tool calls in one response. `toolTurn` only
+ * models a single tool_use content block, which cannot represent a batch an
+ * abort can land in the MIDDLE of — this emits N content blocks (one per
+ * entry, in order) before the shared message_delta/message_stop close the
+ * turn, exactly as Anthropic does for a genuine multi-tool-call turn.
+ */
+function multiToolTurn(
+  calls: Array<{ name: string; input: Record<string, unknown>; id: string }>,
+): string[] {
+  const frames: string[] = [
+    sse("message_start", {
+      message: {
+        id: "msg_1",
+        type: "message",
+        role: "assistant",
+        model: MODEL,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 5, output_tokens: 0 },
+      },
+    }),
+  ];
+  calls.forEach((call, index) => {
+    frames.push(
+      sse("content_block_start", {
+        index,
+        content_block: {
+          type: "tool_use",
+          id: call.id,
+          name: call.name,
+          input: {},
+        },
+      }),
+      sse("content_block_delta", {
+        index,
+        delta: {
+          type: "input_json_delta",
+          partial_json: JSON.stringify(call.input),
+        },
+      }),
+      sse("content_block_stop", { index }),
+    );
+  });
+  frames.push(
+    sse("message_delta", {
+      delta: { stop_reason: "tool_use" },
+      usage: { output_tokens: 6 },
+    }),
+    sse("message_stop", {}),
+  );
+  return frames;
+}
+
+type StandInCall = {
+  body: Record<string, unknown>;
+  /** Recorded so a case can prove which credentials actually went out. */
+  authorization: string | undefined;
+};
+
+type StandIn = {
+  calls: StandInCall[];
+  port: number;
+  close: () => Promise<void>;
+};
+
+/** Tool names declared to the model on a given request. */
+function declaredToolNames(call: StandInCall | undefined): string[] {
+  const tools = (call?.body?.tools ?? []) as Array<{ name?: string }>;
+  return tools
+    .map((t) => t.name)
+    .filter((n): n is string => typeof n === "string");
+}
+
+/**
+ * Flat, single-level record equality (key set + primitive values) — enough
+ * for the tool-call `args` fixtures in this suite, which are never nested.
+ * Order-independent, unlike a JSON.stringify comparison.
+ */
+function shallowEqualRecord(
+  actual: Record<string, unknown> | undefined,
+  expected: Record<string, unknown>,
+): boolean {
+  if (!actual) {
+    return false;
+  }
+  const actualKeys = Object.keys(actual).sort();
+  const expectedKeys = Object.keys(expected).sort();
+  if (actualKeys.length !== expectedKeys.length) {
+    return false;
+  }
+  return actualKeys.every(
+    (key, i) => key === expectedKeys[i] && actual[key] === expected[key],
+  );
+}
+
+/** tool_result blocks carried back to the model on a given request. */
+function toolResults(
+  call: StandInCall | undefined,
+): Array<{ is_error?: boolean; content?: unknown }> {
+  const messages = (call?.body?.messages ?? []) as Array<{
+    content?: unknown;
+  }>;
+  const blocks: Array<{ is_error?: boolean; content?: unknown }> = [];
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) {
+      continue;
+    }
+    for (const block of message.content as Array<Record<string, unknown>>) {
+      if (block?.type === "tool_result") {
+        blocks.push(block as { is_error?: boolean; content?: unknown });
+      }
+    }
+  }
+  return blocks;
+}
+
+/**
+ * Fold the SSE frames a case declares into the single message body the
+ * non-streaming endpoint returns, so every case states its intent once and
+ * both wire modes are served from it.
+ */
+function messageFromFrames(frames: string[]): Record<string, unknown> {
+  const events = frames.map(
+    (frame) =>
+      JSON.parse(frame.slice(frame.indexOf("data: ") + 6).trim()) as Record<
+        string,
+        unknown
+      >,
+  );
+  const start = events.find((e) => e.type === "message_start") as
+    | { message?: Record<string, unknown> }
+    | undefined;
+  const message: Record<string, unknown> = { ...(start?.message ?? {}) };
+  const content: Array<Record<string, unknown>> = [];
+  for (const event of events) {
+    if (event.type === "content_block_start") {
+      content.push({
+        ...((event.content_block as Record<string, unknown>) ?? {}),
+      });
+    }
+    if (event.type === "content_block_delta") {
+      const delta = (event.delta ?? {}) as Record<string, unknown>;
+      const block = content[content.length - 1];
+      if (!block) {
+        continue;
+      }
+      if (typeof delta.text === "string") {
+        block.text = `${block.text ?? ""}${delta.text}`;
+      }
+      if (typeof delta.partial_json === "string") {
+        block.input = JSON.parse(delta.partial_json) as Record<string, unknown>;
+      }
+    }
+    if (event.type === "message_delta") {
+      Object.assign(message, (event.delta ?? {}) as Record<string, unknown>);
+    }
+  }
+  message.content = content;
+  return message;
+}
+
+async function startStandIn(
+  reply: (callIndex: number) => string[],
+): Promise<StandIn> {
+  const calls: StandInCall[] = [];
+  const server: Server = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => chunks.push(c));
+    req.on("end", () => {
+      const parseBody = (): Record<string, unknown> => {
+        try {
+          return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+        } catch {
+          return {};
+        }
+      };
+      const body = parseBody();
+      calls.push({
+        body,
+        authorization: req.headers.authorization,
+      });
+      const frames = reply(calls.length - 1);
+      // The two loops speak DIFFERENT wire modes, and answering both is the
+      // only way to reach them from one stand-in: the streaming loop calls
+      // `client.messages.stream` and gets SSE, while the generate loop calls
+      // `client.messages.create` and expects a single JSON message. A stand-in
+      // that only spoke SSE left the generate path unable to parse anything,
+      // which reads like a broken loop rather than a mismatched fixture.
+      if (body.stream === true) {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        for (const frame of frames) {
+          res.write(frame);
+        }
+        res.end();
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(messageFromFrames(frames)));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  return {
+    calls,
+    port: typeof address === "object" && address ? address.port : 0,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.close(() => resolve());
+      }),
+  };
+}
+
+function credentialsFor(port: number) {
+  return {
+    vertex: {
+      apiKey: "express-key",
+      baseURL: `http://127.0.0.1:${port}`,
+    },
+  };
+}
+
+function customTool(
+  counter: { calls: number; lastArgs?: unknown },
+  result: unknown = { found: true },
+): Record<string, Tool> {
+  return {
+    lookup: {
+      description: "look a value up",
+      inputSchema: jsonSchema({
+        type: "object",
+        properties: {},
+        additionalProperties: true,
+      }),
+      execute: async (args) => {
+        counter.calls++;
+        counter.lastArgs = args;
+        return result;
+      },
+    },
+  };
+}
+
+section("reachability");
+
+await test("a Claude-on-Vertex turn can be answered by a local endpoint", async () => {
+  // The enabler itself. Before the authClient wiring this could not run at
+  // all: the SDK resolved Application Default Credentials in its constructor
+  // and awaited them on every request, so a turn either reached Google or
+  // failed on credentials. Nothing else in this file is reachable if this is
+  // not.
+  //
+  // The turn is wrapped rather than left to throw, and that is deliberate.
+  // The harness downgrades a failure whose text matches
+  // `isExpectedProviderError()` to a SKIP, and "could not be resolved from
+  // credentials" matches — so an unreachable provider reported this case as
+  // PASSED WITH A SKIP while nothing had run. Asserting on the stand-in's own
+  // call count instead cannot be downgraded that way: a count is not provider
+  // wording.
+  const server = await startStandIn(() => textTurn("hello from the stand-in"));
+  const restore = withVertexEnv();
+  let text = "";
+  let failure = "";
+  let nl: InstanceType<typeof NeuroLink> | undefined;
+  try {
+    nl = new NeuroLink();
+    const result = await nl.stream({
+      input: { text: "say hello" },
+      provider: "vertex",
+      model: MODEL,
+      maxTokens: 32,
+      disableTools: true,
+      disableInternalFallback: true,
+      credentials: credentialsFor(server.port),
+    });
+    for await (const chunk of result.stream) {
+      const content = (chunk as { content?: string })?.content;
+      if (content) {
+        text += content;
+      }
+    }
+  } catch (error) {
+    // Logged, never asserted on: console output is not subject to the
+    // harness skip matching, so quoting the provider here is safe.
+    failure =
+      error instanceof Error ? error.message.slice(0, 160) : String(error);
+  } finally {
+    await nl?.shutdown();
+    restore();
+    await server.close();
+  }
+  console.log(
+    `    [diagnostic] vertex-claude reachability: calls=${server.calls.length} chars=${text.length} outcome=${failure || "ok"}`,
+  );
+  assert(
+    server.calls.length === 1,
+    `the provider made ${server.calls.length} requests to the stand-in, not the 1 a text-only turn takes`,
+  );
+  assert(text.length > 0, "the turn delivered no text to the consumer");
+  // The header, not just the fact that a request arrived. Without this the
+  // case passes on a runner that happens to have ambient Application Default
+  // Credentials — the very path the authClient wiring exists to replace — so
+  // a regression in that wiring would look like success.
+  assert(
+    server.calls[0]?.authorization === "Bearer express-key",
+    "the request did not carry the express key as its bearer credential",
+  );
+});
+
+await test("the generate path reaches the same endpoint with the same credential", async () => {
+  // Both loops share this auth wiring, and they do NOT share a wire mode:
+  // executeNativeAnthropicGenerate calls client.messages.create and gets a
+  // single JSON message, where the streaming loop gets SSE. Covering only the
+  // streamed path would leave a regression in the create() path invisible.
+  const server = await startStandIn(() => textTurn("generated answer"));
+  const restore = withVertexEnv();
+  let content = "";
+  let failure = "";
+  let nl: InstanceType<typeof NeuroLink> | undefined;
+  try {
+    nl = new NeuroLink();
+    const result = await nl.generate({
+      input: { text: "say hello" },
+      provider: "vertex",
+      model: MODEL,
+      maxTokens: 32,
+      disableTools: true,
+      credentials: credentialsFor(server.port),
+    });
+    content = (result as { content?: string })?.content ?? "";
+  } catch (error) {
+    failure =
+      error instanceof Error ? error.message.slice(0, 160) : String(error);
+  } finally {
+    await nl?.shutdown();
+    restore();
+    await server.close();
+  }
+  console.log(
+    `    [diagnostic] vertex-claude generate reachability: calls=${server.calls.length} chars=${content.length} outcome=${failure || "ok"}`,
+  );
+  assert(
+    server.calls.length === 1,
+    `the generate path made ${server.calls.length} requests to the stand-in, not the 1 a text-only turn takes`,
+  );
+  assert(content.length > 0, "the generate path returned no content");
+  assert(
+    server.calls[0]?.authorization === "Bearer express-key",
+    "the generate request did not carry the express key as its bearer credential",
+  );
+});
+
+section("caller-supplied tools");
+
+await test("a caller's tool is declared, executed, and its result returns to the model", async () => {
+  const server = await startStandIn((i) =>
+    i === 0 ? toolTurn("lookup", { q: "x" }) : textTurn("done"),
+  );
+  const restore = withVertexEnv();
+  const counter = { calls: 0 };
+  let text = "";
+  let nl: InstanceType<typeof NeuroLink> | undefined;
+  try {
+    nl = new NeuroLink();
+    const result = await nl.stream({
+      input: { text: "look something up" },
+      provider: "vertex",
+      model: MODEL,
+      maxTokens: 32,
+      maxSteps: 3,
+      disableTools: false,
+      disableInternalFallback: true,
+      tools: customTool(counter),
+      credentials: credentialsFor(server.port),
+    });
+    for await (const chunk of result.stream) {
+      text += (chunk as { content?: string })?.content ?? "";
+    }
+  } catch {
+    // Counts are what is pinned, not the outcome.
+  } finally {
+    await nl?.shutdown();
+    restore();
+    await server.close();
+  }
+  console.log(
+    `    [diagnostic] vertex-claude caller tools: calls=${server.calls.length} executed=${counter.calls} chars=${text.length}`,
+  );
+  assert(
+    declaredToolNames(server.calls[0]).includes("lookup"),
+    "the caller's tool was not declared to the model",
+  );
+  assert(
+    server.calls.length === 2,
+    `a tool round trip should take exactly two calls, took ${server.calls.length}`,
+  );
+  assert(counter.calls === 1, "the caller's tool did not execute once");
+  assert(
+    toolResults(server.calls[1]).length === 1,
+    "the tool result was not carried back to the model",
+  );
+});
+
+section("step cap");
+
+await test("a model that never stops calling tools is bounded by maxSteps", async () => {
+  const server = await startStandIn(() => toolTurn("lookup", { q: "x" }));
+  const restore = withVertexEnv();
+  const counter = { calls: 0 };
+  let nl: InstanceType<typeof NeuroLink> | undefined;
+  try {
+    nl = new NeuroLink();
+    const result = await nl.stream({
+      input: { text: "loop forever" },
+      provider: "vertex",
+      model: MODEL,
+      maxTokens: 32,
+      maxSteps: 3,
+      disableTools: false,
+      disableInternalFallback: true,
+      tools: customTool(counter),
+      credentials: credentialsFor(server.port),
+    });
+    for await (const chunk of result.stream) {
+      void chunk;
+    }
+  } catch {
+    // The dispatch count is what is pinned.
+  } finally {
+    await nl?.shutdown();
+    restore();
+    await server.close();
+  }
+  console.log(
+    `    [diagnostic] vertex-claude step cap: calls=${server.calls.length} executed=${counter.calls}`,
+  );
+  // Bounded, and bounded BY THE CAP: a model that always asks for a tool
+  // cannot drive more requests than the budget allows.
+  assert(
+    server.calls.length <= 4,
+    `the loop issued ${server.calls.length} requests against a 3-step budget`,
+  );
+  assert(
+    counter.calls > 0,
+    "the tool never ran, so the cap was not reached by looping",
+  );
+});
+
+section("repeatedly failing tool");
+
+await test("a tool that always throws is dispatched a bounded number of times", async () => {
+  const server = await startStandIn(() => toolTurn("flaky", {}));
+  const restore = withVertexEnv();
+  let attempts = 0;
+  let nl: InstanceType<typeof NeuroLink> | undefined;
+  try {
+    nl = new NeuroLink();
+    const result = await nl.stream({
+      input: { text: "keep trying" },
+      provider: "vertex",
+      model: MODEL,
+      maxTokens: 32,
+      maxSteps: 5,
+      disableTools: false,
+      disableInternalFallback: true,
+      tools: {
+        flaky: {
+          description: "always fails",
+          inputSchema: jsonSchema({
+            type: "object",
+            properties: {},
+            additionalProperties: true,
+          }),
+          execute: async () => {
+            attempts++;
+            throw new Error("synthetic tool failure");
+          },
+        },
+      },
+      credentials: credentialsFor(server.port),
+    });
+    for await (const chunk of result.stream) {
+      void chunk;
+    }
+  } catch {
+    // The dispatch count is what is pinned.
+  } finally {
+    await nl?.shutdown();
+    restore();
+    await server.close();
+  }
+  console.log(
+    `    [diagnostic] vertex-claude failing tool: attempts=${attempts} calls=${server.calls.length}`,
+  );
+  assert(
+    attempts === 2,
+    `the failing tool was dispatched ${attempts} times, not the 2 this loop performs`,
+  );
+});
+
+section("reserved finalization step");
+
+await test("a structured turn that never calls final_result is forced to", async () => {
+  // The behaviour that distinguishes this loop from the Gemini ones. When a
+  // schema is in play the loop reserves a step: if the model reaches the cap
+  // without calling final_result, ONE more request goes out with tool_choice
+  // pinned to it, because Anthropic guarantees a tool_use for a pinned tool.
+  // Without that reservation a structured turn can end with no structured
+  // output at all.
+  const server = await startStandIn(() => toolTurn("lookup", { q: "x" }));
+  const restore = withVertexEnv();
+  const counter = { calls: 0 };
+  let reservedFailure = "";
+  let nl: InstanceType<typeof NeuroLink> | undefined;
+  try {
+    nl = new NeuroLink();
+    const result = await nl.stream({
+      input: { text: "answer with structure" },
+      provider: "vertex",
+      model: MODEL,
+      maxTokens: 32,
+      maxSteps: 2,
+      disableTools: false,
+      disableInternalFallback: true,
+      schema: z.object({ answer: z.string() }),
+      tools: customTool(counter),
+      credentials: credentialsFor(server.port),
+    });
+    for await (const chunk of result.stream) {
+      void chunk;
+    }
+  } catch (error) {
+    reservedFailure =
+      error instanceof Error ? error.message.slice(0, 200) : String(error);
+  } finally {
+    await nl?.shutdown();
+    restore();
+    await server.close();
+  }
+  const pinned = server.calls.filter((call) => {
+    const choice = call.body?.tool_choice as { name?: string } | undefined;
+    return choice?.name === "final_result";
+  });
+  console.log(
+    `    [diagnostic] vertex-claude reserved step: calls=${server.calls.length} pinned=${pinned.length} outcome=${reservedFailure || "ok"}`,
+  );
+  assert(
+    pinned.length === 1,
+    `the loop pinned final_result on ${pinned.length} requests, not the single reserved one`,
+  );
+  // And it is the LAST request, not one of the ordinary loop steps.
+  assert(
+    server.calls[server.calls.length - 1] === pinned[0],
+    "the pinned finalization was not the turn's final request",
+  );
+});
+
+// Claude 5.5 / 5.1 answer a forced tool_choice with a 400 (probed live on
+// Vertex 2026-09-29), so for them schema mode stays on auto, steered by the
+// final_result instruction, and keeps the caller's thinking, which was only
+// dropped because a forced choice cannot be combined with it.
+for (const path of ["stream", "generate"] as const) {
+  await test(`a ${path} schema turn on Sonnet 5.5 never forces tool_choice`, async () => {
+    const server = await startStandIn(() => toolTurn("lookup", { q: "x" }));
+    const restore = withVertexEnv();
+    const counter = { calls: 0 };
+    let nl: InstanceType<typeof NeuroLink> | undefined;
+    try {
+      nl = new NeuroLink();
+      const options = {
+        input: { text: "answer with structure" },
+        provider: "vertex",
+        model: "claude-sonnet-5-5",
+        maxTokens: 8192,
+        maxSteps: 2,
+        disableTools: false,
+        disableInternalFallback: true,
+        schema: z.object({ answer: z.string() }),
+        tools: customTool(counter),
+        thinkingConfig: { enabled: true, budgetTokens: 2048 },
+        credentials: credentialsFor(server.port),
+      };
+      if (path === "stream") {
+        const result = await nl.stream(options);
+        for await (const chunk of result.stream) {
+          void chunk;
+        }
+      } else {
+        await nl.generate(options);
+      }
+    } catch {
+      // The stand-in never answers final_result; only the requests matter.
+    } finally {
+      await nl?.shutdown();
+      restore();
+      await server.close();
+    }
+    const forced = server.calls.filter((call) => {
+      const choice = call.body?.tool_choice as { type?: string } | undefined;
+      return choice?.type === "any" || choice?.type === "tool";
+    });
+    assert(
+      server.calls.length > 1,
+      `precondition failed: only ${server.calls.length} requests reached the stand-in`,
+    );
+    assert(
+      forced.length === 0,
+      `${forced.length} of ${server.calls.length} requests forced tool_choice`,
+    );
+    assert(
+      server.calls[0]?.body?.thinking !== undefined,
+      "the caller's thinking was dropped from the first request",
+    );
+  });
+}
+
+// Unforced, the reserved finalization step can come back as text rather than
+// a final_result call. That text is the model's answer and must reach the
+// caller, not be replaced with the step-cap notice.
+for (const path of ["stream", "generate"] as const) {
+  await test(`a ${path} Sonnet 5.5 finalization that answers in text keeps that text`, async () => {
+    const marker = "finalization-text-answer";
+    const server = await startStandIn((callIndex) =>
+      callIndex === 0 ? toolTurn("lookup", { q: "x" }) : textTurn(marker),
+    );
+    const restore = withVertexEnv();
+    const counter = { calls: 0 };
+    let nl: InstanceType<typeof NeuroLink> | undefined;
+    let answer = "";
+    try {
+      nl = new NeuroLink();
+      const options = {
+        input: { text: "answer with structure" },
+        provider: "vertex",
+        model: "claude-sonnet-5-5",
+        maxTokens: 64,
+        maxSteps: 2,
+        disableTools: false,
+        disableInternalFallback: true,
+        schema: z.object({ answer: z.string() }),
+        tools: customTool(counter),
+        credentials: credentialsFor(server.port),
+      };
+      if (path === "stream") {
+        const result = await nl.stream(options);
+        for await (const chunk of result.stream) {
+          if ("content" in chunk && typeof chunk.content === "string") {
+            answer += chunk.content;
+          }
+        }
+      } else {
+        const result = await nl.generate(options);
+        answer = result.content ?? "";
+      }
+    } finally {
+      await nl?.shutdown();
+      restore();
+      await server.close();
+    }
+    assert(
+      server.calls.length === 2,
+      `precondition failed: expected a loop step and a finalization, saw ${server.calls.length} requests`,
+    );
+    assert(
+      answer.includes(marker),
+      "the finalization's text answer was replaced by another message",
+    );
+  });
+}
+
+// Text that leads into another tool call is preamble, not an answer, so an
+// unforced finalization that still asks for a tool must not end the turn
+// with that text.
+for (const path of ["stream", "generate"] as const) {
+  await test(`a ${path} Sonnet 5.5 finalization that still calls a tool is not taken as the answer`, async () => {
+    const marker = "finalization-preamble";
+    const server = await startStandIn((callIndex) =>
+      callIndex === 0
+        ? toolTurn("lookup", { q: "x" })
+        : toolTurn("lookup", { q: "y" }, "toolu_2", marker),
+    );
+    const restore = withVertexEnv();
+    let nl: InstanceType<typeof NeuroLink> | undefined;
+    let answer = "";
+    try {
+      nl = new NeuroLink();
+      const options = {
+        input: { text: "answer with structure" },
+        provider: "vertex",
+        model: "claude-sonnet-5-5",
+        maxTokens: 64,
+        maxSteps: 2,
+        disableTools: false,
+        disableInternalFallback: true,
+        schema: z.object({ answer: z.string() }),
+        tools: customTool({ calls: 0 }),
+        credentials: credentialsFor(server.port),
+      };
+      if (path === "stream") {
+        const result = await nl.stream(options);
+        for await (const chunk of result.stream) {
+          if ("content" in chunk && typeof chunk.content === "string") {
+            answer += chunk.content;
+          }
+        }
+      } else {
+        const result = await nl.generate(options);
+        answer = result.content ?? "";
+      }
+    } finally {
+      await nl?.shutdown();
+      restore();
+      await server.close();
+    }
+    assert(
+      server.calls.length === 2,
+      `precondition failed: expected a loop step and a finalization, saw ${server.calls.length} requests`,
+    );
+    assert(
+      !answer.includes(marker),
+      "preamble before a pending tool call was reported as the answer",
+    );
+  });
+}
+
+// The finalization step's max_tokens shrinks when the context is nearly
+// full. A thinking budget sized for the original limit would then meet or
+// exceed it, which Anthropic rejects, so the step resizes its own budget.
+// Generate only: the stand-in cannot steer the stream loop into a
+// context-guard finalization (it ends on the reply's text first), and both
+// paths resize through the same buildClaudeThinkingParam call.
+await test("a generate Sonnet 5.5 finalization sizes thinking for its own max_tokens", async () => {
+  const nearlyFull = (frames: string[]) =>
+    frames.map((frame) =>
+      frame
+        .replace('"input_tokens":5', '"input_tokens":998000')
+        .replace(
+          '"usage":{"output_tokens":6}',
+          '"usage":{"input_tokens":998000,"output_tokens":6}',
+        ),
+    );
+  const server = await startStandIn((callIndex) =>
+    callIndex === 0
+      ? nearlyFull(toolTurn("lookup", { q: "x" }))
+      : textTurn("done"),
+  );
+  const restore = withVertexEnv();
+  let nl: InstanceType<typeof NeuroLink> | undefined;
+  try {
+    nl = new NeuroLink();
+    const options = {
+      input: { text: "answer with structure" },
+      provider: "vertex",
+      model: "claude-sonnet-5-5",
+      maxTokens: 8192,
+      maxSteps: 4,
+      disableTools: false,
+      disableInternalFallback: true,
+      schema: z.object({ answer: z.string() }),
+      tools: customTool({ calls: 0 }),
+      thinkingConfig: { enabled: true, budgetTokens: 2048 },
+      credentials: credentialsFor(server.port),
+    };
+    await nl.generate(options);
+  } catch {
+    // Only the outgoing requests matter here.
+  } finally {
+    await nl?.shutdown();
+    restore();
+    await server.close();
+  }
+  const first = server.calls[0]?.body;
+  const last = server.calls[server.calls.length - 1]?.body;
+  const lastMax = Number(last?.max_tokens);
+  assert(
+    server.calls.length >= 2 && first?.thinking !== undefined,
+    `precondition failed: ${server.calls.length} requests, first thinking ${first?.thinking === undefined ? "absent" : "present"}`,
+  );
+  assert(
+    lastMax < 8192,
+    `precondition failed: the finalization kept max_tokens ${lastMax}`,
+  );
+  const budget = (last?.thinking as { budget_tokens?: number } | undefined)
+    ?.budget_tokens;
+  assert(
+    budget === undefined || budget < lastMax,
+    `the finalization's thinking budget ${budget} does not fit under max_tokens ${lastMax}`,
+  );
+});
+
+section("generate path");
+
+await test("the generate path declares and executes a caller's tools", async () => {
+  // A second, near-duplicate hand-rolled loop lives inside generate(). Pinning
+  // it separately matters because the migration touches both.
+  //
+  // { q: "x" } is deliberately non-empty: an empty-args fixture can't tell a
+  // regression that drops or overwrites toolCall.args from one that
+  // preserves it — both look identical against {}.
+  const LOOKUP_ARGS = { q: "x" };
+  const server = await startStandIn((i) =>
+    i === 0 ? toolTurn("lookup", LOOKUP_ARGS) : textTurn("generated answer"),
+  );
+  const restore = withVertexEnv();
+  const counter = { calls: 0 };
+  let content = "";
+  let toolsUsed: string[] = [];
+  let toolCalls: Array<{
+    toolCallId?: string;
+    toolName: string;
+    args?: Record<string, unknown>;
+  }> = [];
+  let nl: InstanceType<typeof NeuroLink> | undefined;
+  try {
+    nl = new NeuroLink();
+    const result = await nl.generate({
+      input: { text: "look something up" },
+      provider: "vertex",
+      model: MODEL,
+      maxTokens: 32,
+      maxSteps: 3,
+      disableTools: false,
+      tools: customTool(counter),
+      credentials: credentialsFor(server.port),
+    });
+    content = (result as { content?: string })?.content ?? "";
+    toolsUsed = result?.toolsUsed ?? [];
+    toolCalls = result?.toolCalls ?? [];
+  } catch {
+    // Counts are what is pinned.
+  } finally {
+    await nl?.shutdown();
+    restore();
+    await server.close();
+  }
+  console.log(
+    `    [diagnostic] vertex-claude generate: calls=${server.calls.length} executed=${counter.calls} chars=${content.length} results=${server.calls.map((c) => toolResults(c).length).join(",")}`,
+  );
+  assert(
+    server.calls.length === 2,
+    `the generate path took ${server.calls.length} calls, not the 2 a tool round trip needs`,
+  );
+  assert(
+    counter.calls === 1,
+    "the generate path did not execute the tool once",
+  );
+  assert(
+    content.includes("generated answer"),
+    "the generate path did not return the final turn's text",
+  );
+  // The internally-executed tool must be visible on the public result, not
+  // just on the wire (asserted above via server.calls/counter.calls).
+  assert(
+    toolsUsed.includes("lookup"),
+    "toolsUsed did not record the internally-executed tool",
+  );
+  const toolCall = toolCalls.find((call) => call.toolName === "lookup");
+  assert(
+    toolCall !== undefined,
+    "toolCalls did not record the internally-executed tool",
+  );
+  assert(
+    typeof toolCall?.toolCallId === "string" && toolCall.toolCallId.length > 0,
+    "the recorded tool call did not carry a toolCallId",
+  );
+  // Precondition: the equality assertion below is only meaningful once the
+  // call was actually found above — otherwise `.args` is read off
+  // `undefined` and the comparison would fail for the wrong reason.
+  assert(
+    toolCall !== undefined,
+    "no matching tool call was found to check args against",
+  );
+  assert(
+    shallowEqualRecord(toolCall?.args, LOOKUP_ARGS),
+    "the recorded tool call's args did not match what the model sent",
+  );
+});
+
+section("abort mid-batch");
+
+await test("the generate path preserves a tool call that finished before an abort cut its batch short", async () => {
+  // Precondition-proving scenario: ONE step asks for TWO tool calls, and the
+  // abort fires from INSIDE the first tool's own execute() — after it has
+  // already run, before the second is ever dispatched. dispatchStepTools
+  // (loopEngine.ts) checks the turn's abort signal BETWEEN calls in a batch,
+  // so this is exactly the abortedMidBatch path: a batch cut short by a
+  // genuine caller abort, not a step that simply never asked for a second
+  // tool. Under the pre-fix code, buildToolResultMessages — the only place
+  // the provider's local allToolCalls accumulator was populated — is skipped
+  // entirely for a step abortedMidBatch cuts short, so result.toolCalls
+  // would be empty even though the first tool genuinely ran.
+  const server = await startStandIn((i) =>
+    i === 0
+      ? multiToolTurn([
+          { name: "first", input: { step: "one" }, id: "toolu_first" },
+          { name: "second", input: { step: "two" }, id: "toolu_second" },
+        ])
+      : textTurn("should never be reached"),
+  );
+  const restore = withVertexEnv();
+  const controller = new AbortController();
+  const firstCounter = { calls: 0 };
+  const secondCounter = { calls: 0 };
+  let toolCalls: Array<{
+    toolCallId?: string;
+    toolName: string;
+    args?: Record<string, unknown>;
+  }> = [];
+  let generateFailure = "";
+  let nl: InstanceType<typeof NeuroLink> | undefined;
+  try {
+    nl = new NeuroLink();
+    const result = await nl.generate({
+      input: { text: "call both tools" },
+      provider: "vertex",
+      model: MODEL,
+      maxTokens: 32,
+      maxSteps: 2,
+      disableTools: false,
+      abortSignal: controller.signal,
+      tools: {
+        first: {
+          description: "runs once, then cancels the whole turn",
+          inputSchema: jsonSchema({
+            type: "object",
+            properties: { step: { type: "string" } },
+            additionalProperties: true,
+          }),
+          execute: async () => {
+            firstCounter.calls++;
+            controller.abort();
+            return { done: true };
+          },
+        },
+        second: {
+          description: "must never be dispatched once the batch is cut short",
+          inputSchema: jsonSchema({
+            type: "object",
+            properties: { step: { type: "string" } },
+            additionalProperties: true,
+          }),
+          execute: async () => {
+            secondCounter.calls++;
+            return { done: true };
+          },
+        },
+      },
+      credentials: credentialsFor(server.port),
+    });
+    toolCalls = result?.toolCalls ?? [];
+  } catch (error) {
+    generateFailure =
+      error instanceof Error ? error.message.slice(0, 200) : String(error);
+  } finally {
+    await nl?.shutdown();
+    restore();
+    await server.close();
+  }
+  console.log(
+    `    [diagnostic] vertex-claude abort-mid-batch: calls=${server.calls.length} first=${firstCounter.calls} second=${secondCounter.calls} toolCalls=${JSON.stringify(toolCalls)} outcome=${generateFailure || "ok"}`,
+  );
+  // Precondition 1: the first tool genuinely ran.
+  assert(
+    firstCounter.calls === 1,
+    "the first tool did not execute exactly once",
+  );
+  // Precondition 2: the second tool genuinely never ran — proving the abort
+  // cut the batch short between the two calls of the same step, rather than
+  // both tools simply completing normally.
+  assert(
+    secondCounter.calls === 0,
+    "the second tool executed despite the mid-batch abort, so the scenario under test did not occur",
+  );
+  // Only now, having proven the abort genuinely cut the batch short between
+  // the two calls, does the actual regression assertion mean anything.
+  const firstCall = toolCalls.find((call) => call.toolName === "first");
+  assert(
+    firstCall !== undefined,
+    "toolCalls did not record the tool that finished executing before the abort cut the batch short",
+  );
+});
+
+section("schema + tools together (buildFinalResultTool)");
+
+// Both native loops now build the synthetic `final_result` tool through one
+// shared helper instead of each hand-rolling an identical object from its
+// own schema variable. These two cases (stream, generate) pin that the
+// dedup changed nothing observable: `final_result`'s wire schema still
+// carries the caller's fields, it is still declared alongside a caller's
+// own tool, and a natural call to it still resolves the turn into structured
+// output on the surface each entry point actually exposes to callers —
+// `structuredData` for generate(), and JSON-decodable stream text for
+// stream() (StreamResult carries no `structuredData`/`jsonTruncated`; the
+// provider's own `structuredOutput` getter is not among the fields
+// NeuroLink.stream()'s wrapper copies onto the object it hands back).
+
+await test("a stream turn with a caller tool AND a schema declares both and returns structured JSON", async () => {
+  const server = await startStandIn((i) =>
+    i === 0
+      ? toolTurn("lookup", { q: "x" })
+      : toolTurn("final_result", { answer: "42" }, "toolu_final"),
+  );
+  const restore = withVertexEnv();
+  const counter = { calls: 0 };
+  let aggregated = "";
+  let streamFailure = "";
+  let nl: InstanceType<typeof NeuroLink> | undefined;
+  try {
+    nl = new NeuroLink();
+    const result = await nl.stream({
+      input: { text: "look it up, then answer with structure" },
+      provider: "vertex",
+      model: MODEL,
+      maxTokens: 64,
+      maxSteps: 4,
+      disableTools: false,
+      disableInternalFallback: true,
+      schema: z.object({ answer: z.string() }),
+      tools: customTool(counter),
+      credentials: credentialsFor(server.port),
+    });
+    for await (const chunk of result.stream) {
+      if ("content" in chunk && typeof chunk.content === "string") {
+        aggregated += chunk.content;
+      }
+    }
+  } catch (error) {
+    streamFailure =
+      error instanceof Error ? error.message.slice(0, 200) : String(error);
+  } finally {
+    await nl?.shutdown();
+    restore();
+    await server.close();
+  }
+
+  const finalResultCall = server.calls.find((call) =>
+    declaredToolNames(call).includes("final_result"),
+  );
+  const finalResultDecl = (
+    (finalResultCall?.body?.tools ?? []) as Array<{
+      name?: string;
+      input_schema?: { properties?: Record<string, unknown> };
+    }>
+  ).find((t) => t.name === "final_result");
+
+  console.log(
+    `    [diagnostic] vertex-claude schema+tools stream: calls=${server.calls.length} executed=${counter.calls} aggregatedLen=${aggregated.length} outcome=${streamFailure || "ok"} aggregated=${JSON.stringify(aggregated)}`,
+  );
+  assert(
+    !!finalResultDecl?.input_schema?.properties?.answer,
+    "the final_result tool's declared schema did not carry the caller's 'answer' field",
+  );
+  assert(
+    declaredToolNames(finalResultCall).includes("lookup"),
+    "the caller's own tool was not declared alongside final_result",
+  );
+  assert(
+    counter.calls === 1,
+    "the caller's tool was not executed once before finalization",
+  );
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(aggregated);
+  } catch {
+    parsed = undefined;
+  }
+  assert(
+    !!parsed && (parsed as { answer?: string }).answer === "42",
+    "the streamed text did not JSON-decode to the model's final_result payload",
+  );
+});
+
+await test("a generate turn with a caller tool AND a schema declares both and returns structuredData", async () => {
+  const server = await startStandIn((i) =>
+    i === 0
+      ? toolTurn("lookup", { q: "x" })
+      : toolTurn("final_result", { answer: "42" }, "toolu_final"),
+  );
+  const restore = withVertexEnv();
+  const counter = { calls: 0 };
+  let structuredData: unknown;
+  let jsonTruncated: unknown;
+  let generateFailure = "";
+  let nl: InstanceType<typeof NeuroLink> | undefined;
+  try {
+    nl = new NeuroLink();
+    const result = await nl.generate({
+      input: { text: "look it up, then answer with structure" },
+      provider: "vertex",
+      model: MODEL,
+      maxTokens: 64,
+      maxSteps: 4,
+      disableTools: false,
+      disableInternalFallback: true,
+      schema: z.object({ answer: z.string() }),
+      tools: customTool(counter),
+      credentials: credentialsFor(server.port),
+    });
+    structuredData = result.structuredData;
+    jsonTruncated = result.jsonTruncated;
+  } catch (error) {
+    generateFailure =
+      error instanceof Error ? error.message.slice(0, 200) : String(error);
+  } finally {
+    await nl?.shutdown();
+    restore();
+    await server.close();
+  }
+
+  const finalResultCall = server.calls.find((call) =>
+    declaredToolNames(call).includes("final_result"),
+  );
+  const finalResultDecl = (
+    (finalResultCall?.body?.tools ?? []) as Array<{
+      name?: string;
+      input_schema?: { properties?: Record<string, unknown> };
+    }>
+  ).find((t) => t.name === "final_result");
+
+  console.log(
+    `    [diagnostic] vertex-claude schema+tools generate: calls=${server.calls.length} executed=${counter.calls} structuredData=${JSON.stringify(structuredData)} outcome=${generateFailure || "ok"}`,
+  );
+  assert(
+    !!finalResultDecl?.input_schema?.properties?.answer,
+    "the final_result tool's declared schema did not carry the caller's 'answer' field",
+  );
+  assert(
+    declaredToolNames(finalResultCall).includes("lookup"),
+    "the caller's own tool was not declared alongside final_result",
+  );
+  assert(
+    counter.calls === 1,
+    "the caller's tool was not executed once before finalization",
+  );
+  assert(
+    (structuredData as { answer?: string } | undefined)?.answer === "42",
+    "generate() did not return the model's final_result payload as structuredData",
+  );
+  assert(
+    !jsonTruncated,
+    "generate() reported jsonTruncated for a clean, complete final_result response",
+  );
+});
+
+section("mid-turn tool hydration observability");
+
+/**
+ * A minimal streamable-HTTP MCP server carrying one tool. Discovery only
+ * defers EXTERNAL MCP tools, so reaching the deferred-hydration path needs a
+ * real registered server — caller-supplied tools always stay hot.
+ */
+async function startMockMcpServer(): Promise<{
+  url: string;
+  toolCalls: number[];
+  close: () => Promise<void>;
+}> {
+  const toolCalls: number[] = [];
+  const handle = (msg: {
+    method?: string;
+    id?: number | string | null;
+  }): Record<string, unknown> | null => {
+    if (msg.method === "initialize") {
+      return {
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: {
+          protocolVersion: "2025-03-26",
+          capabilities: { tools: {} },
+          serverInfo: { name: "mock-late-server", version: "1.0.0" },
+        },
+      };
+    }
+    if (msg.method === "tools/list") {
+      return {
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: {
+          tools: [
+            {
+              name: "late_probe",
+              description: "a tool that is deferred behind search_tools",
+              inputSchema: { type: "object" as const, properties: {} },
+            },
+          ],
+        },
+      };
+    }
+    if (msg.method === "tools/call") {
+      toolCalls.push(Date.now());
+      return {
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: { content: [{ type: "text", text: "probe ok" }] },
+      };
+    }
+    if (msg.method?.startsWith("notifications/")) {
+      return null;
+    }
+    return {
+      jsonrpc: "2.0",
+      id: msg.id ?? null,
+      error: { code: -32601, message: "method not found" },
+    };
+  };
+  const server: Server = createServer((req, res) => {
+    if (req.method !== "POST") {
+      res.writeHead(req.method === "DELETE" ? 200 : 405);
+      res.end();
+      return;
+    }
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => chunks.push(c));
+    req.on("end", () => {
+      try {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as
+          | Record<string, unknown>
+          | Array<Record<string, unknown>>;
+        const messages = Array.isArray(body) ? body : [body];
+        const responses = messages
+          .map((m) => handle(m as { method?: string; id?: number }))
+          .filter((r): r is Record<string, unknown> => r !== null);
+        res.writeHead(200, {
+          "content-type": "application/json",
+          "mcp-session-id": "late-session",
+        });
+        res.end(
+          responses.length === 1
+            ? JSON.stringify(responses[0])
+            : responses.length > 1
+              ? JSON.stringify(responses)
+              : undefined,
+        );
+      } catch {
+        res.writeHead(400);
+        res.end();
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const port = typeof address === "object" && address ? address.port : 0;
+  return {
+    url: `http://127.0.0.1:${port}/mcp`,
+    toolCalls,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.close(() => resolve());
+      }),
+  };
+}
+
+await test("a deferred tool hydrated mid-turn is executed and observed with a tool span", async () => {
+  // The engine's tool record is snapshotted before the turn starts, and a
+  // deferred external tool is not an enumerable entry of the live record, so
+  // calling it always dispatches through resolveToolOnMiss — auto-hydration
+  // from the deferred catalog. This pins that the hydrated execution carries
+  // the same tool observation as an up-front one: the hand-rolled loop
+  // opened the span after the executor lookup, so a hydrated call was never
+  // the one unobserved execution in a turn.
+  let deferredName = "";
+  const server = await startStandIn((i) =>
+    i === 0 ? toolTurn(deferredName, { q: "x" }, "toolu_h1") : textTurn("done"),
+  );
+  const mcp = await startMockMcpServer();
+  const restore = withVertexEnv();
+  let externalToolCount = 0;
+  let nl: InstanceType<typeof NeuroLink> | undefined;
+  try {
+    nl = new NeuroLink({ tools: { discovery: true } });
+    await nl.addExternalMCPServer("late-server", {
+      id: "late-server",
+      name: "late-server",
+      description: "mock server whose tool is deferred",
+      transport: "http",
+      url: mcp.url,
+      status: "initializing",
+      tools: [],
+      command: "",
+      args: [],
+    });
+    // The advertised name is whatever the registry exposes — read it rather
+    // than guessing the namespacing, and hand it to the stand-in script.
+    const externalTools = nl.getExternalMCPTools();
+    externalToolCount = externalTools.length;
+    deferredName = externalTools[0]?.name ?? "late_probe";
+    spanExporter.reset();
+    const result = await nl.stream({
+      input: { text: "call the late tool" },
+      provider: "vertex",
+      model: MODEL,
+      maxTokens: 32,
+      maxSteps: 3,
+      disableTools: false,
+      disableInternalFallback: true,
+      credentials: credentialsFor(server.port),
+    });
+    for await (const chunk of result.stream) {
+      void chunk;
+    }
+  } catch {
+    // Counts and spans are what is pinned, not the outcome.
+  } finally {
+    await nl?.shutdown();
+    restore();
+    await server.close();
+    await mcp.close();
+  }
+  const toolSpanNames = spanExporter
+    .getFinishedSpans()
+    .filter((s) => s.attributes["tool.name"] !== undefined)
+    .map((s) => s.name);
+  console.log(
+    `    [diagnostic] vertex-claude hydration spans: externalTools=${externalToolCount} standInCalls=${server.calls.length} mcpToolCalls=${mcp.toolCalls.length} toolSpans=${toolSpanNames.length}`,
+  );
+  assert(
+    externalToolCount === 1,
+    "the mock MCP server's tool was not registered as an external tool",
+  );
+  assert(
+    !declaredToolNames(server.calls[0]).includes(deferredName),
+    "the deferred tool was declared up front, so no hydration was exercised",
+  );
+  assert(
+    mcp.toolCalls.length === 1,
+    "the hydrated tool did not execute exactly once",
+  );
+  assert(
+    toolSpanNames.filter((n) => n === deferredName).length === 1,
+    "the hydrated tool's execution was not observed with a tool span",
+  );
+});
+
+// E1b — appended as its own section/function, deliberately placed after every
+// other section in this file rather than folded into "caller-supplied tools"
+// above, so it does not collide with open PR #1843's edits to this same file
+// (and to continuous-test-suite-vertex-loop-characterization.ts).
+section("toolCalls reflects the drained stream (E1b)");
+
+await test("stream().toolCalls includes the executed tool after the caller drains the stream", async () => {
+  // Regression coverage for the shared streamState snapshot bug (E1b, see
+  // src/lib/neurolink.ts's runStandardStreamRequest). It used to copy
+  // mcpStreamOutcome.toolCalls into streamState.toolCalls synchronously,
+  // immediately after createMCPStream returns and BEFORE the caller ever
+  // pulls a chunk from the stream. For a background-loop provider — this
+  // one: Claude-on-Vertex's native Anthropic SDK loop only fills
+  // `allToolCalls` (exposed through a `toolCalls` getter) as the stream is
+  // drained — that snapshot was taken while the loop had not run yet, so it
+  // froze at an empty array for good; only a cross-provider fallback branch
+  // ever reassigned it, and this case never takes that branch. `toolCalls`
+  // is read below only AFTER the for-await loop has fully drained the
+  // stream — exactly the read a real caller performs, and exactly the one
+  // the bug served empty even though the tool really did execute.
+  const server = await startStandIn((i) =>
+    i === 0 ? toolTurn("lookup", { q: "e1b" }) : textTurn("done"),
+  );
+  const restore = withVertexEnv();
+  const counter = { calls: 0 };
+  let nl: InstanceType<typeof NeuroLink> | undefined;
+  let toolCallCountAfterDrain = -1;
+  let toolCallNamesAfterDrain: string[] = [];
+  try {
+    nl = new NeuroLink();
+    const result = await nl.stream({
+      input: { text: "look something up" },
+      provider: "vertex",
+      model: MODEL,
+      maxTokens: 32,
+      maxSteps: 3,
+      disableTools: false,
+      disableInternalFallback: true,
+      tools: customTool(counter),
+      credentials: credentialsFor(server.port),
+    });
+    for await (const chunk of result.stream) {
+      void chunk;
+    }
+    // The read that matters: after the stream is fully drained, not before.
+    toolCallCountAfterDrain = result.toolCalls?.length ?? -1;
+    toolCallNamesAfterDrain = (result.toolCalls ?? []).map((t) => t.toolName);
+  } catch {
+    // The post-drain toolCalls read is what is pinned, not the outcome.
+  } finally {
+    await nl?.shutdown();
+    restore();
+    await server.close();
+  }
+  console.log(
+    `    [diagnostic] vertex-claude post-drain toolCalls: standInCalls=${server.calls.length} executed=${counter.calls} toolCallCount=${toolCallCountAfterDrain}`,
+  );
+  // Precondition: the tool must actually have executed, or a passing
+  // toolCallCountAfterDrain assertion below would prove nothing about the
+  // snapshot bug — it also has to be true that there is a real tool call to
+  // observe.
+  assert(
+    counter.calls === 1,
+    "the caller's tool did not execute once, so this run cannot discriminate the snapshot bug",
+  );
+  assert(
+    toolCallCountAfterDrain === 1,
+    "result.toolCalls read after the stream fully drained did not contain the executed tool call",
+  );
+  assert(
+    toolCallNamesAfterDrain.includes("lookup"),
+    "result.toolCalls read after draining did not name the executed tool",
+  );
+});
+
+section("toolCalls after a stream fallback (#1819)");
+
+for (const finalText of ["done", ""]) {
+  await test(`stream fallback exposes the tool calls the fallback ran after draining (${finalText ? "text" : "tool-only"})`, async () => {
+    // The primary answers with an empty turn, so the stream has zero real
+    // chunks and handleStreamFallback re-runs the request on the fallback route
+    // (the same Vertex stand-in here, which is enough to exercise the path).
+    // The fallback here is native Claude-on-Vertex, whose `toolCalls` is a live
+    // getter over a background loop: at the instant the fallback's stream() call
+    // returns it is still empty, and it fills as the stream is drained. A
+    // snapshot taken only before the drain leaves the primary's empty array in
+    // place, so a caller who reads `toolCalls` afterwards is told that no tool
+    // ran although the fallback executed one.
+    const server = await startStandIn((i) => {
+      if (i === 0) {
+        return [
+          sse("message_start", {
+            message: {
+              id: "msg_empty",
+              type: "message",
+              role: "assistant",
+              model: MODEL,
+              content: [],
+              stop_reason: null,
+              stop_sequence: null,
+              usage: { input_tokens: 5, output_tokens: 0 },
+            },
+          }),
+          sse("message_delta", {
+            delta: { stop_reason: "end_turn" },
+            usage: { output_tokens: 0 },
+          }),
+          sse("message_stop", {}),
+        ];
+      }
+      return i === 1
+        ? toolTurn("lookup", { q: "fallback" })
+        : textTurn(finalText);
+    });
+    const restore = withVertexEnv();
+    const counter = { calls: 0 };
+    let nl: InstanceType<typeof NeuroLink> | undefined;
+    let toolCallNamesAfterDrain: string[] = [];
+    let text = "";
+    let toolResultCount = -1;
+    let completed = false;
+    try {
+      nl = new NeuroLink();
+      const result = await nl.stream({
+        input: { text: "look something up" },
+        provider: "vertex",
+        model: MODEL,
+        fallbackProvider: "vertex",
+        fallbackModel: MODEL,
+        maxTokens: 32,
+        maxSteps: 3,
+        disableTools: false,
+        tools: customTool(counter),
+        credentials: credentialsFor(server.port),
+      });
+      for await (const chunk of result.stream) {
+        text += (chunk as { content?: string })?.content ?? "";
+      }
+      toolCallNamesAfterDrain = (result.toolCalls ?? []).map((t) => t.toolName);
+      toolResultCount = result.toolResults?.length ?? 0;
+      completed = true;
+    } catch {
+      // Assert below without echoing provider errors that the harness could skip.
+    } finally {
+      await nl?.shutdown();
+      restore();
+      await server.close();
+    }
+    console.log(
+      `    [diagnostic] vertex-claude fallback toolCalls: standInCalls=${server.calls.length} executed=${counter.calls} chars=${text.length} names=${toolCallNamesAfterDrain.length} toolResults=${toolResultCount}`,
+    );
+    // result.toolResults is not asserted: the native Vertex+Claude stream
+    // result defines no toolResults accessor, so it stays empty either way.
+    assert(completed, "the fallback stream did not complete successfully");
+    // A non-empty final turn is returned as is. For the empty one the loop
+    // answers with its own step-limit note, so no text is pinned there, and
+    // the 0-output gate is not what this case exercises: the post-drain
+    // toolCalls read below is what separates fixed from unfixed.
+    assert(
+      finalText === "" || text === finalText,
+      "the fallback stream returned unexpected text",
+    );
+    // Preconditions: the fallback ran and its tool executed. Without both, an
+    // empty toolCalls below would prove nothing about the post-drain read.
+    assert(
+      server.calls.length >= 2,
+      `the empty primary turn did not trigger a fallback request (${server.calls.length} stand-in requests)`,
+    );
+    assert(
+      counter.calls === 1,
+      "the fallback's tool did not execute once, so this run cannot discriminate the pre-drain snapshot",
+    );
+    assert(
+      toolCallNamesAfterDrain.includes("lookup"),
+      "result.toolCalls read after draining did not name the tool the fallback executed",
+    );
+  });
+}
+
+section("evaluation evidence on spans");
+
+// One tool round trip whose spans a judge must be able to read back: what the
+// tool was asked, which model call asked it, the user's question, and how the
+// turn ended.
+async function runObservedToolTurn(options: {
+  systemPrompt?: string;
+  maxSteps?: number;
+  question?: string;
+  neverAnswers?: boolean;
+  toolArgs?: Record<string, unknown>;
+  toolResult?: unknown;
+}) {
+  const server = await startStandIn((i) =>
+    i === 0 || options.neverAnswers
+      ? toolTurn(
+          "lookup",
+          options.toolArgs ?? { q: "needle-argument" },
+          `toolu_eval_${i + 1}`,
+        )
+      : textTurn("done"),
+  );
+  const restore = withVertexEnv();
+  const counter: { calls: number; lastArgs?: unknown } = { calls: 0 };
+  let nl: InstanceType<typeof NeuroLink> | undefined;
+  try {
+    nl = new NeuroLink();
+    spanExporter.reset();
+    const result = await nl.stream({
+      input: {
+        text: options.question ?? "QUESTION-MARKER which value matches?",
+      },
+      ...(options.systemPrompt ? { systemPrompt: options.systemPrompt } : {}),
+      provider: "vertex",
+      model: MODEL,
+      maxTokens: 32,
+      maxSteps: options.maxSteps ?? 3,
+      disableTools: false,
+      disableInternalFallback: true,
+      tools: customTool(counter, options.toolResult),
+      credentials: credentialsFor(server.port),
+    });
+    for await (const chunk of result.stream) {
+      void chunk;
+    }
+  } catch {
+    // Spans are what is pinned, not the outcome.
+  } finally {
+    await nl?.shutdown();
+    restore();
+    await server.close();
+  }
+  return { spans: spanExporter.getFinishedSpans(), counter };
+}
+
+await test("a tool span records the call's arguments and id", async () => {
+  const { spans, counter } = await runObservedToolTurn({});
+  const toolSpan = spans.find((s) => s.name === "lookup");
+  assert(counter.calls === 1, "the tool did not execute once");
+  assert(toolSpan !== undefined, "no tool span was recorded for the call");
+  assert(
+    String(toolSpan?.attributes["langfuse.observation.input"] ?? "").includes(
+      "needle-argument",
+    ),
+    "the tool span does not carry the call's arguments",
+  );
+  assert(
+    String(toolSpan?.attributes["langfuse.observation.input"] ?? "").includes(
+      "needle-argument",
+    ),
+    "the tool observation has no input",
+  );
+  assert(
+    toolSpan?.attributes["toolCallId"] === "toolu_eval_1",
+    "the tool span does not carry the model's tool call id",
+  );
+});
+
+await test("the question survives a system prompt larger than the attribute cap", async () => {
+  const { spans } = await runObservedToolTurn({
+    systemPrompt: "S".repeat(60_000),
+  });
+  const turnSpan = spans.find((s) => s.name === "anthropic.vertex.stream");
+  const traceInput = String(
+    turnSpan?.attributes["langfuse.observation.input"] ?? "",
+  );
+  let parsed: ChatInput | undefined;
+  try {
+    parsed = JSON.parse(traceInput) as ChatInput;
+  } catch {
+    parsed = undefined;
+  }
+  const stepSpans = spans.filter(
+    (s) => s.attributes["langfuse.observation.type"] === "generation",
+  );
+  assert(turnSpan !== undefined, "no turn span was recorded");
+  assert(traceInput.length <= 40_000, "the trace input exceeds the cap");
+  assert(parsed !== undefined, "the trace input is not valid JSON");
+  assert(
+    JSON.stringify(parsed ?? []).includes("QUESTION-MARKER"),
+    "the user's question was cut from the trace input",
+  );
+  assert(stepSpans.length === 2, "a tool round trip should record two steps");
+  assert(
+    stepSpans.every((s) =>
+      String(s.attributes["langfuse.observation.input"] ?? "").includes(
+        "QUESTION-MARKER",
+      ),
+    ),
+    "a model step's input lost the user's question",
+  );
+});
+
+await test("the answering step's input holds this turn's tool call and result", async () => {
+  const { spans } = await runObservedToolTurn({});
+  const stepSpans = spans
+    .filter((s) => s.attributes["langfuse.observation.type"] === "generation")
+    .sort(
+      (a, b) =>
+        a.startTime[0] - b.startTime[0] || a.startTime[1] - b.startTime[1],
+    );
+  assert(stepSpans.length === 2, "a tool round trip should record two steps");
+  const [askingStep, answeringStep] = stepSpans;
+  const askingInput = String(
+    askingStep.attributes["langfuse.observation.input"] ?? "",
+  );
+  const answeringInput = String(
+    answeringStep.attributes["langfuse.observation.input"] ?? "",
+  );
+  assert(
+    !askingInput.includes("toolu_eval_1"),
+    "the first step's input already holds the call it had not made yet",
+  );
+  assert(
+    answeringInput.includes("toolu_eval_1") &&
+      answeringInput.includes("needle-argument") &&
+      answeringInput.includes("found"),
+    "the answering step's input lacks this turn's tool call or result",
+  );
+  assert(
+    answeringInput.includes("QUESTION-MARKER"),
+    "the answering step's input lost the user's question",
+  );
+});
+
+await test("a step that called a tool records the call, and every step its finish reason at the default level", async () => {
+  const { spans } = await runObservedToolTurn({});
+  const stepSpans = spans
+    .filter((s) => s.attributes["langfuse.observation.type"] === "generation")
+    .sort(
+      (a, b) =>
+        a.startTime[0] - b.startTime[0] || a.startTime[1] - b.startTime[1],
+    );
+  const [askingStep, answeringStep] = stepSpans;
+  assert(
+    String(askingStep.attributes["langfuse.observation.output"] ?? "").includes(
+      "needle-argument",
+    ),
+    "the asking step's output does not record the tool call it made",
+  );
+  assert(
+    [askingStep, answeringStep].every(
+      (s) => s.attributes["langfuse.observation.level"] === undefined,
+    ),
+    "a step that stopped normally was flagged above the default level",
+  );
+  assert(
+    askingStep.attributes["langfuse.observation.metadata.finishReason"] ===
+      "tool_use",
+    "the asking step does not record why it stopped",
+  );
+  assert(
+    answeringStep.attributes["langfuse.observation.metadata.finishReason"] ===
+      "end_turn",
+    "the answering step does not record why it stopped",
+  );
+  assert(
+    !String(
+      answeringStep.attributes["langfuse.observation.output"] ?? "",
+    ).includes("toolCalls"),
+    "a step with no tool call should not carry an empty toolCalls list",
+  );
+});
+
+await test("credentials in the question, tool arguments and tool result never reach a span", async () => {
+  const { spans, counter } = await runObservedToolTurn({
+    question:
+      "QUESTION-MARKER which value matches? password=QSECRET-cccc3333 Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345",
+    toolArgs: { q: "needle-argument", access_token: "ARGSECRET-aaaa1111" },
+    toolResult: {
+      found: true,
+      refresh_token: "RESULTSECRET-bbbb2222",
+      input_tokens: 17,
+      note: '{"client_secret":"NESTEDSECRET-dddd4444","kept":"visible-value"}',
+    },
+  });
+  const everything = spans.map((s) => JSON.stringify(s.attributes)).join("\n");
+  for (const secret of [
+    "ARGSECRET-aaaa1111",
+    "RESULTSECRET-bbbb2222",
+    "NESTEDSECRET-dddd4444",
+    "QSECRET-cccc3333",
+    "abcdefghijklmnopqrstuvwxyz012345",
+  ]) {
+    assert(!everything.includes(secret), `a span carries ${secret}`);
+  }
+  assert(everything.includes("[REDACTED]"), "nothing was masked");
+  for (const kept of [
+    "needle-argument",
+    "QUESTION-MARKER",
+    "visible-value",
+    "toolu_eval_1",
+  ]) {
+    assert(everything.includes(kept), `redaction removed ${kept}`);
+  }
+  assert(
+    everything.includes("input_tokens") && everything.includes("17"),
+    "a token count was masked as if it were a credential",
+  );
+  assert(
+    JSON.stringify(counter.lastArgs).includes("ARGSECRET-aaaa1111"),
+    "the tool no longer receives its real arguments",
+  );
+});
+
+await test("a tool result over the cap stays valid JSON and keeps its structure", async () => {
+  const { spans } = await runObservedToolTurn({
+    toolResult: { id: "result-keep", text: "x".repeat(120_000) },
+  });
+  const toolSpan = spans.find((s) => s.name === "lookup");
+  const recorded = String(
+    toolSpan?.attributes["langfuse.observation.output"] ?? "",
+  );
+  let parsed: { id?: string; text?: string } | undefined;
+  try {
+    parsed = JSON.parse(recorded);
+  } catch {
+    parsed = undefined;
+  }
+  assert(recorded.length <= 40_000, "the recorded result exceeds the cap");
+  assert(parsed !== undefined, "the over-cap result is not valid JSON");
+  assert(
+    parsed?.id === "result-keep",
+    "trimming the text lost a sibling field",
+  );
+  assert(
+    String(parsed?.text ?? "").includes("[truncated"),
+    "the text does not say it was shortened",
+  );
+});
+
+await test("an oversized system prompt keeps its full opening beside the truncation note", async () => {
+  const { spans } = await runObservedToolTurn({
+    systemPrompt: "S".repeat(60_000),
+    question: "Q".repeat(60_000),
+  });
+  const stepSpan = spans.find(
+    (s) => s.attributes["langfuse.observation.type"] === "generation",
+  );
+  const parsed: ChatInput = JSON.parse(
+    String(stepSpan?.attributes["langfuse.observation.input"] ?? "[]"),
+  );
+  const system = systemOf(parsed);
+  const opening = system.match(/S+/)?.[0].length ?? 0;
+  assert(opening >= 2_000, `the system opening is ${opening} characters`);
+  assert(
+    system.includes("[truncated"),
+    "the system prompt does not say it was shortened",
+  );
+});
+
+type ChatInput = Array<{ role: string; content: string | object[] }>;
+
+function systemOf(input: ChatInput): string {
+  const content = input.find((entry) => entry.role === "system")?.content;
+  return typeof content === "string" ? content : "";
+}
+
+function turnObservationStopReason(
+  turnSpan: { attributes: Record<string, unknown> } | undefined,
+): unknown {
+  return turnSpan?.attributes["langfuse.observation.metadata.stopReason"];
+}
+
+await test("a completed turn marks its stop reason on the trace", async () => {
+  const { spans } = await runObservedToolTurn({});
+  const turnSpan = spans.find((s) => s.name === "anthropic.vertex.stream");
+  assert(
+    turnSpan?.attributes["langfuse.trace.metadata.stopReason"] === "completed",
+    "the completed turn is not marked completed",
+  );
+  assert(
+    turnObservationStopReason(turnSpan) === "completed",
+    "the turn's own observation does not record its stop reason",
+  );
+});
+
+await test("a turn cut off by its step cap is not marked completed", async () => {
+  // A stand-in that only ever asks for tools: the loop's forced final answer
+  // never arrives, which is what NeuroLink counts as a step-capped turn.
+  const { spans } = await runObservedToolTurn({
+    maxSteps: 1,
+    neverAnswers: true,
+  });
+  const turnSpan = spans.find((s) => s.name === "anthropic.vertex.stream");
+  const stopReason = turnSpan?.attributes["langfuse.trace.metadata.stopReason"];
+  assert(stopReason !== undefined, "the capped turn carries no stop reason");
+  assert(stopReason !== "completed", "the capped turn is marked completed");
+  assert(
+    turnObservationStopReason(turnSpan) === stopReason,
+    "the turn's own observation does not record its stop reason",
+  );
+});
+
+await test("a question larger than the cap keeps the system prompt's opening", async () => {
+  const { spans } = await runObservedToolTurn({
+    systemPrompt: `SYSTEM-OPENING ${"S".repeat(39_000)}`,
+    question: `QUESTION-MARKER ${"q".repeat(60_000)}`,
+  });
+  const turnSpan = spans.find((s) => s.name === "anthropic.vertex.stream");
+  let parsed: ChatInput | undefined;
+  try {
+    parsed = JSON.parse(
+      String(turnSpan?.attributes["langfuse.observation.input"] ?? ""),
+    ) as ChatInput;
+  } catch {
+    parsed = undefined;
+  }
+  const system = systemOf(parsed ?? []);
+  assert(parsed !== undefined, "the trace input is not valid JSON");
+  assert(
+    system.startsWith("SYSTEM-OPENING"),
+    "the system prompt's opening was dropped",
+  );
+  assert(
+    system.includes("[truncated"),
+    "a cut system prompt does not say it was cut",
+  );
+  assert(
+    JSON.stringify(parsed ?? []).includes("QUESTION-MARKER"),
+    "the start of the question was dropped",
+  );
+});
+
+await runSuite();

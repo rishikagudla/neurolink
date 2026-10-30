@@ -7,16 +7,16 @@
 
 import { z } from "zod";
 import { AIProviderName } from "../constants/enums.js";
-import type { JsonValue } from "../types/common.js";
 import type {
+  JsonValue,
   ConditioningConfig,
   ExecutionConfig,
   JudgeConfig,
-  ModelConfig,
+  WorkflowModelConfig,
   ModelGroup,
   WorkflowConfig,
-} from "./types.js";
-
+  WorkflowValidation,
+} from "../types/index.js";
 // ============================================================================
 // CONSTANTS
 // ============================================================================
@@ -56,7 +56,7 @@ const JsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
 /**
  * Provider name validation - accepts any AIProviderName enum value or string
  */
-const ProviderNameSchema = z
+const ProviderNameSchema: z.ZodType<AIProviderName> = z
   .union([z.nativeEnum(AIProviderName), z.string().min(1)])
   .transform((val) => val as AIProviderName);
 
@@ -185,10 +185,8 @@ const WorkflowConfigSchemaBase = z.object({
   updatedAt: z.string().optional(),
 });
 
-type WorkflowConfigSchemaType = z.infer<typeof WorkflowConfigSchemaBase>;
-
 export const WorkflowConfigSchema = WorkflowConfigSchemaBase.refine(
-  (data: WorkflowConfigSchemaType) => {
+  (data) => {
     // Cannot have both judge and judges
     if (data.judge && data.judges) {
       return false;
@@ -199,7 +197,7 @@ export const WorkflowConfigSchema = WorkflowConfigSchemaBase.refine(
     message: 'Cannot specify both "judge" and "judges" - use one or the other',
   },
 ).refine(
-  (data: WorkflowConfigSchemaType) => {
+  (data) => {
     // Ensemble and adaptive need at least 2 models
     // Check flat models array if modelGroups not provided
     if (data.type === "ensemble" || data.type === "adaptive") {
@@ -287,7 +285,7 @@ export function usesModelGroups(config: WorkflowConfig): boolean {
  * @param config - Workflow configuration
  * @returns Array of all model configs
  */
-export function getAllModels(config: WorkflowConfig): ModelConfig[] {
+export function getAllModels(config: WorkflowConfig): WorkflowModelConfig[] {
   if (usesModelGroups(config)) {
     return config.modelGroups?.flatMap((group) => group.models) ?? [];
   }
@@ -352,22 +350,13 @@ export function mergeWithDefaults(config: WorkflowConfig): WorkflowConfig {
 }
 
 /**
- * Validation result for workflow configuration
- */
-export interface WorkflowConfigValidationResult {
-  success: boolean;
-  data?: WorkflowConfig;
-  error?: z.ZodError;
-}
-
-/**
  * Validate workflow configuration
  * @param config - Partial workflow configuration to validate
  * @returns Validation result with parsed data or error details
  */
 export function validateWorkflowConfig(
   config: Partial<WorkflowConfig>,
-): WorkflowConfigValidationResult {
+): WorkflowValidation<WorkflowConfig> {
   const result = WorkflowConfigSchema.safeParse(config);
 
   if (result.success) {
@@ -404,37 +393,19 @@ export function createWorkflowConfig(
 }
 
 /**
- * Validation result for model configuration
- */
-export interface ModelConfigValidationResult {
-  success: boolean;
-  data?: ModelConfig;
-  error?: z.ZodError;
-}
-
-/**
  * Validate model configuration
  * @param config - Partial model configuration to validate
  * @returns Validation result with parsed data or error details
  */
 export function validateModelConfig(
-  config: Partial<ModelConfig>,
-): ModelConfigValidationResult {
+  config: Partial<WorkflowModelConfig>,
+): WorkflowValidation<WorkflowModelConfig> {
   const result = ModelConfigSchema.safeParse(config);
 
   if (result.success) {
-    return { success: true, data: result.data as ModelConfig };
+    return { success: true, data: result.data as WorkflowModelConfig };
   }
   return { success: false, error: result.error };
-}
-
-/**
- * Validation result for judge configuration
- */
-export interface JudgeConfigValidationResult {
-  success: boolean;
-  data?: JudgeConfig;
-  error?: z.ZodError;
 }
 
 /**
@@ -444,7 +415,7 @@ export interface JudgeConfigValidationResult {
  */
 export function validateJudgeConfig(
   config: Partial<JudgeConfig>,
-): JudgeConfigValidationResult {
+): WorkflowValidation<JudgeConfig> {
   const result = JudgeConfigSchema.safeParse(config);
 
   if (result.success) {
@@ -478,8 +449,8 @@ export function getAllJudges(config: WorkflowConfig): JudgeConfig[] {
 }
 
 /**
- * Calculate estimated workflow cost (placeholder)
- * TODO: Implement actual provider-specific pricing
+ * Calculate estimated workflow cost (placeholder). Provider-specific
+ * pricing is a possible future direction, not planned work.
  * @param config - Workflow configuration
  * @param estimatedTokens - Estimated number of tokens for the request
  * @returns Estimated cost in USD

@@ -1,0 +1,25 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / readAllLocalUsage
+
+# Function: readAllLocalUsage()
+
+> **readAllLocalUsage**(`options?`): `Promise`\<[`LocalUsageAggregateReport`](../type-aliases/LocalUsageAggregateReport.md)\>
+
+Scan every registered reader whose CLI is actually present on this machine.
+
+"Not installed" and "failed" are reported separately and deliberately: a CLI
+the user never installed is not an error, and collapsing the two would make
+a broken reader indistinguishable from an absent one.
+
+## Parameters
+
+### options?
+
+[`LocalUsageAggregateOptions`](../type-aliases/LocalUsageAggregateOptions.md)
+
+## Returns
+
+`Promise`\<[`LocalUsageAggregateReport`](../type-aliases/LocalUsageAggregateReport.md)\>

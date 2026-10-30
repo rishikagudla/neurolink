@@ -17,7 +17,7 @@ keywords:
 
 > **Since**: v8.44.0 | **Status**: Stable | **Availability**: SDK + CLI
 
-> **Provider Defaults:** When `--provider` (CLI) or `provider` (SDK) is not specified, NeuroLink defaults to **Vertex AI** with **gemini-2.5-flash**. Set the `NEUROLINK_PROVIDER` or `AI_PROVIDER` environment variable to change the default provider.
+> **Provider Defaults:** When `--provider` (CLI) or `provider` (SDK) is not specified, NeuroLink defaults to **Vertex AI** with **gemini-2.5-flash** (see `src/lib/rag/ragIntegration.ts`). Set the `NEUROLINK_PROVIDER` or `AI_PROVIDER` environment variable to change the default provider, or pass an explicit `embeddingModel` / `generationModel` config.
 
 ## Overview
 
@@ -64,8 +64,8 @@ console.log(chunks[0]);
 import { RAGPipeline, createRAGPipeline } from "@juspay/neurolink";
 
 const pipeline = new RAGPipeline({
-  embeddingModel: { provider: "vertex", modelName: "gemini-2.5-flash" },
-  generationModel: { provider: "vertex", modelName: "gemini-2.5-flash" },
+  embeddingModel: { provider: "vertex", modelName: "gemini-3-flash-preview" },
+  generationModel: { provider: "vertex", modelName: "gemini-3-flash-preview" },
 });
 
 // Ingest documents
@@ -107,10 +107,10 @@ const ragTool = createVectorQueryTool(
     id: "knowledge-search",
     description: "Search the knowledge base for relevant information",
     indexName: "knowledge-base",
-    embeddingModel: { provider: "vertex", modelName: "gemini-2.5-flash" },
+    embeddingModel: { provider: "vertex", modelName: "gemini-3-flash-preview" },
     topK: 5,
     reranker: {
-      model: { provider: "vertex", modelName: "gemini-2.5-flash" },
+      model: { provider: "vertex", modelName: "gemini-3-flash-preview" },
       topK: 3,
     },
   },
@@ -121,9 +121,9 @@ const ragTool = createVectorQueryTool(
 const neurolink = new NeuroLink();
 const result = await neurolink.generate({
   input: { text: "What are the key features of our product?" },
-  tools: [ragTool],
+  tools: { [ragTool.name]: ragTool },
   provider: "vertex",
-  model: "gemini-2.5-flash",
+  model: "gemini-3-flash-preview",
 });
 
 console.log(result.content);
@@ -134,18 +134,16 @@ console.log(result.toolExecutions); // See RAG tool results
 
 ```typescript
 // Same setup as above, then:
-const stream = await neurolink.stream({
+const result = await neurolink.stream({
   input: { text: "Explain our pricing model in detail" },
-  tools: [ragTool],
+  tools: { [ragTool.name]: ragTool },
   provider: "vertex",
-  model: "gemini-2.5-flash",
+  model: "gemini-3-flash-preview",
 });
 
-for await (const chunk of stream) {
-  if (chunk.type === "text") {
+for await (const chunk of result.stream) {
+  if ("content" in chunk) {
     process.stdout.write(chunk.content);
-  } else if (chunk.type === "tool_call") {
-    console.log("RAG tool called:", chunk.toolName);
   }
 }
 ```
@@ -178,7 +176,7 @@ const chunks = await chunker.chunk(doc.content);
 // Step 2: Extract metadata for better retrieval (optional)
 const extractor = await createMetadataExtractor("llm", {
   provider: "vertex",
-  modelName: "gemini-2.5-flash",
+  modelName: "gemini-3-flash-preview",
 });
 const enrichedChunks = await extractor.extract(chunks, {
   summary: true,
@@ -195,7 +193,7 @@ async function generateEmbeddings(texts: string[]): Promise<number[][]> {
     const result = await neurolink.generate({
       input: { text },
       provider: "vertex",
-      model: "gemini-2.5-flash",
+      model: "gemini-3-flash-preview",
     });
     // Extract embedding from result (provider-specific)
     embeddings.push(result.embedding || []);
@@ -227,11 +225,11 @@ const ragTool = createVectorQueryTool(
     id: "product-search",
     description: "Search product documentation for answers to user questions",
     indexName: "product-docs",
-    embeddingModel: { provider: "vertex", modelName: "gemini-2.5-flash" },
+    embeddingModel: { provider: "vertex", modelName: "gemini-3-flash-preview" },
     topK: 5,
     includeSources: true,
     reranker: {
-      model: { provider: "vertex", modelName: "gemini-2.5-flash" },
+      model: { provider: "vertex", modelName: "gemini-3-flash-preview" },
       topK: 3,
       weights: { semantic: 0.6, vector: 0.3, position: 0.1 },
     },
@@ -242,10 +240,10 @@ const ragTool = createVectorQueryTool(
 // Step 6: Use with generate()
 const response = await neurolink.generate({
   input: { text: "How do I configure the billing settings?" },
-  tools: [ragTool],
+  tools: { [ragTool.name]: ragTool },
   provider: "vertex",
-  model: "gemini-2.5-flash",
-  systemPrompt: `You are a helpful product assistant. Use the knowledge-search tool 
+  model: "gemini-3-flash-preview",
+  systemPrompt: `You are a helpful product assistant. Use the product-search tool
     to find relevant information before answering questions. Always cite your sources.`,
 });
 
@@ -286,13 +284,16 @@ Listen for tool events during RAG operations to monitor and debug:
 ```typescript
 const neurolink = new NeuroLink();
 
+// NeuroLink does not extend EventEmitter; events come from getEventEmitter()
+const emitter = neurolink.getEventEmitter();
+
 // Listen for tool execution events
-neurolink.on("tool:start", (event) => {
+emitter.on("tool:start", (event) => {
   console.log(`Tool started: ${event.toolName}`);
   console.log(`Parameters:`, event.parameters);
 });
 
-neurolink.on("tool:end", (event) => {
+emitter.on("tool:end", (event) => {
   console.log(`Tool completed: ${event.toolName}`);
   console.log(`Success: ${event.success}`);
   console.log(`Response time: ${event.responseTime}ms`);
@@ -305,11 +306,11 @@ neurolink.on("tool:end", (event) => {
 });
 
 // Listen for generation events
-neurolink.on("generation:start", (event) => {
+emitter.on("generation:start", (event) => {
   console.log(`Generation started with provider: ${event.provider}`);
 });
 
-neurolink.on("generation:end", (event) => {
+emitter.on("generation:end", (event) => {
   console.log(`Generation completed in ${event.responseTime}ms`);
   console.log(`Tools used: ${event.toolsUsed?.join(", ") || "none"}`);
 });
@@ -317,9 +318,9 @@ neurolink.on("generation:end", (event) => {
 // Execute RAG query with event monitoring
 const result = await neurolink.generate({
   input: { text: "What are the system requirements?" },
-  tools: [ragTool],
+  tools: { [ragTool.name]: ragTool },
   provider: "vertex",
-  model: "gemini-2.5-flash",
+  model: "gemini-3-flash-preview",
 });
 ```
 
@@ -333,7 +334,7 @@ const ragTool = createVectorQueryTool(
     id: "tenant-search",
     description: "Search tenant-specific knowledge base",
     indexName: "documents",
-    embeddingModel: { provider: "vertex", modelName: "gemini-2.5-flash" },
+    embeddingModel: { provider: "vertex", modelName: "gemini-3-flash-preview" },
     topK: 5,
   },
   (context) => {
@@ -346,7 +347,7 @@ const ragTool = createVectorQueryTool(
 // The context is passed from generate options
 const result = await neurolink.generate({
   input: { text: "Search query" },
-  tools: [ragTool],
+  tools: { [ragTool.name]: ragTool },
   context: { tenantId: "tenant-123", userId: "user-456" },
 });
 ```
@@ -361,7 +362,7 @@ const ragTool = createVectorQueryTool(
     id: "filtered-search",
     description: "Search with metadata filters",
     indexName: "knowledge-base",
-    embeddingModel: { provider: "vertex", modelName: "gemini-2.5-flash" },
+    embeddingModel: { provider: "vertex", modelName: "gemini-3-flash-preview" },
     enableFilter: true, // Enable filter parameter
     topK: 10,
   },
@@ -534,13 +535,13 @@ const results = await hybridSearch.search("neural network training", {
 ### BM25 Configuration
 
 ```typescript
-interface BM25Config {
+type BM25Config = {
   k1: number; // Term frequency saturation (default: 1.2)
   b: number; // Document length normalization (default: 0.75)
   lowercase: boolean; // Normalize to lowercase (default: true)
   stemming: boolean; // Apply stemming (default: false)
   stopwords: string[]; // Words to ignore (default: English stopwords)
-}
+};
 ```
 
 ## Reranking
@@ -576,7 +577,7 @@ const simpleReranker = await createReranker("simple", {
 // LLM reranker (requires model)
 const llmReranker = await createReranker("llm", {
   topK: 5,
-  model: "gemini-2.5-flash",
+  model: "gemini-3-flash-preview",
   temperature: 0.0,
   batchSize: 5,
 });
@@ -601,7 +602,7 @@ import { batchRerank } from "@juspay/neurolink";
 const reranked = await batchRerank(searchResults, query, {
   batchSize: 10,
   parallelBatches: 3,
-  model: "gemini-2.5-flash",
+  model: "gemini-3-flash-preview",
   topK: 20,
 });
 ```
@@ -632,7 +633,7 @@ import {
 // Using factory
 const extractor = await createMetadataExtractor("llm", {
   provider: "vertex",
-  modelName: "gemini-2.5-flash",
+  modelName: "gemini-3-flash-preview",
 });
 
 // Extract metadata from chunks
@@ -686,12 +687,12 @@ console.log(results[0]);
 
 ### Environment Variables
 
-| Variable            | Description                | Required |
-| ------------------- | -------------------------- | -------- |
-| `GOOGLE_API_KEY`    | For Vertex AI (default)    | Yes      |
-| `OPENAI_API_KEY`    | For OpenAI provider        | Optional |
-| `COHERE_API_KEY`    | For Cohere reranker        | Optional |
-| `ANTHROPIC_API_KEY` | For Claude-based reranking | Optional |
+| Variable                         | Description                               | Required |
+| -------------------------------- | ----------------------------------------- | -------- |
+| `GOOGLE_APPLICATION_CREDENTIALS` | For Vertex AI (service account JSON path) | Yes      |
+| `OPENAI_API_KEY`                 | For OpenAI provider                       | Optional |
+| `COHERE_API_KEY`                 | For Cohere reranker                       | Optional |
+| `ANTHROPIC_API_KEY`              | For Claude-based reranking                | Optional |
 
 ## Advanced Usage
 
@@ -895,16 +896,22 @@ for file in ./docs/*.md; do neurolink rag chunk "$file" --strategy markdown --fo
 
 ```bash
 # Build an index from a document
-neurolink rag index ./docs/guide.md --indexName my-docs --provider vertex --model gemini-2.5-flash
+neurolink rag index ./docs/guide.md --indexName my-docs --provider vertex --model gemini-3-flash-preview
 
 # Query an existing index
-neurolink rag query "What are the main features?" --indexName my-docs --topK 5 --provider vertex --model gemini-2.5-flash
+neurolink rag query "What are the main features?" --indexName my-docs --topK 5 --provider vertex --model gemini-3-flash-preview
 
 # Index with Graph RAG enabled
-neurolink rag index ./docs/guide.md --indexName my-docs --graph --provider vertex --model gemini-2.5-flash
+neurolink rag index ./docs/guide.md --indexName my-docs --graph --provider vertex --model gemini-3-flash-preview
 ```
 
 ## Simplified RAG API (`rag: { files }`)
+
+> **Security:** `rag.files` paths are read under the instance's
+> `attachments.allowedRoots` (a path outside them is skipped with a warning),
+> each file is capped at 50 MiB, and `WebLoader` fetches only HTTPS public
+> hosts unless its `attachmentPolicy` says otherwise. See
+> [Attachment Security](/docs/features/attachment-security).
 
 > **Since**: v9.2.0 | **Recommended** for most use cases
 
@@ -919,7 +926,7 @@ const neurolink = new NeuroLink();
 
 // Generate with RAG - just pass files
 const result = await neurolink.generate({
-  prompt: "What are the key features described in the docs?",
+  input: { text: "What are the key features described in the docs?" },
   rag: {
     files: ["./docs/guide.md", "./docs/api.md"],
     strategy: "markdown", // Optional: auto-detected from file extension
@@ -930,13 +937,15 @@ const result = await neurolink.generate({
 });
 
 // Stream with RAG - identical API
-const stream = await neurolink.stream({
-  prompt: "Summarize the architecture",
+const streamResult = await neurolink.stream({
+  input: { text: "Summarize the architecture" },
   rag: { files: ["./docs/architecture.md"] },
 });
 
-for await (const chunk of stream.stream) {
-  process.stdout.write(chunk);
+for await (const chunk of streamResult.stream) {
+  if ("content" in chunk) {
+    process.stdout.write(chunk.content);
+  }
 }
 ```
 
@@ -1042,12 +1051,12 @@ type RAGConfig = {
 
 ```bash
 # Enable verbose logging for RAG operations
-DEBUG=neurolink:rag:* npx tsx your-script.ts
+DEBUG=neurolink:rag:* pnpm exec tsx your-script.ts
 
 # Log specific components
-DEBUG=neurolink:rag:chunker npx tsx your-script.ts
-DEBUG=neurolink:rag:reranker npx tsx your-script.ts
-DEBUG=neurolink:rag:hybrid npx tsx your-script.ts
+DEBUG=neurolink:rag:chunker pnpm exec tsx your-script.ts
+DEBUG=neurolink:rag:reranker pnpm exec tsx your-script.ts
+DEBUG=neurolink:rag:hybrid pnpm exec tsx your-script.ts
 ```
 
 ## API Reference
@@ -1115,8 +1124,8 @@ DEBUG=neurolink:rag:hybrid npx tsx your-script.ts
 
 ## See Also
 
-- [RAG Configuration Guide](../rag/configuration) - Detailed configuration reference
-- [RAG Testing Guide](../rag/testing) - Testing RAG pipelines
+- [RAG Configuration Guide](../rag/CONFIGURATION.md) - Detailed configuration reference
+- [RAG Testing Guide](../rag/TESTING.md) - Testing RAG pipelines
 - [Observability Guide](./observability.md) - Tracing and monitoring
 - [Guardrails Guide](./guardrails.md) - Input/output validation
 - [Vector Store Integrations](../guides/vector-stores.md) - Production vector stores

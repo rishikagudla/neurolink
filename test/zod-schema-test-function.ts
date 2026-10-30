@@ -25,6 +25,11 @@ import { NeuroLink } from "../dist/index.js";
 import * as path from "path";
 import { fileURLToPath } from "url";
 
+import { assertDistFresh } from "./helpers/distFreshness.js";
+
+// Fail loudly rather than silently testing a stale build (see distFreshness.ts).
+assertDistFresh();
+
 // Test data file paths - ES module compatible
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -394,13 +399,18 @@ export async function testComplexZodSchemaMultiProvider(
   const providerName = providerOverride || "vertex";
   const modelName = modelOverride || undefined;
 
-  // Check if this is a Gemini MODEL - Gemini cannot use tools + JSON schema together
+  // Check if this is a Gemini MODEL - Gemini cannot use tools + JSON schema together.
   // This is a documented Gemini limitation, not a bug in the SDK.
-  // Note: provider name alone is not sufficient - Vertex can run Claude too.
+  // When an explicit model is provided, we check its name. When no model is given,
+  // google-ai, googleAiStudio, and vertex all default to a Gemini model, so we
+  // treat them as Gemini. If someone passes e.g. --provider=vertex --model=claude-*,
+  // the modelName check will NOT match "gemini" and the test will correctly run.
   const isGeminiModel =
     modelName?.toLowerCase().includes("gemini") ||
     (!modelName &&
-      (providerName === "google-ai" || providerName === "googleAiStudio"));
+      (providerName === "google-ai" ||
+        providerName === "googleAiStudio" ||
+        providerName === "vertex"));
 
   if (isGeminiModel) {
     logTest(
@@ -419,7 +429,7 @@ export async function testComplexZodSchemaMultiProvider(
   ];
   const results: {
     provider: string;
-    model: string;
+    model: string | undefined;
     success: boolean;
     error?: string;
   }[] = [];
@@ -491,7 +501,7 @@ DO NOT hallucinate data. ALL metrics, campaign IDs, and account information must
       );
 
       // Verify specific tools were called
-      const toolNames = result.toolExecutions.map((te) => te.name);
+      const toolNames = result.toolExecutions.map((te) => te.toolName);
       const hasReadFile = toolNames.includes("readFile");
       const hasGetCurrentTime = toolNames.includes("getCurrentTime");
 
@@ -509,10 +519,10 @@ DO NOT hallucinate data. ALL metrics, campaign IDs, and account information must
 
       // Verify tool usage: readFile should have been called at least twice
       const readFileCount =
-        result.toolExecutions?.filter((te) => te.name === "readFile").length ||
-        0;
+        result.toolExecutions?.filter((te) => te.toolName === "readFile")
+          .length || 0;
       const getCurrentTimeUsed =
-        result.toolExecutions?.some((te) => te.name === "getCurrentTime") ||
+        result.toolExecutions?.some((te) => te.toolName === "getCurrentTime") ||
         false;
 
       if (readFileCount < 2) {
@@ -557,6 +567,7 @@ DO NOT hallucinate data. ALL metrics, campaign IDs, and account information must
       } catch (parseError) {
         throw new Error(
           `Failed to parse JSON from result.content: ${parseError instanceof Error ? parseError.message : String(parseError)}`,
+          { cause: parseError },
         );
       }
 
@@ -564,8 +575,13 @@ DO NOT hallucinate data. ALL metrics, campaign IDs, and account information must
       const validation = MetaAdsAnalysisOutputSchema.safeParse(parsedOutput);
 
       if (!validation.success) {
-        const errorDetails = validation.error.errors
-          .map((e) => `${e.path.join(".")}: ${e.message}`)
+        type ZodIssue = { path?: Array<string | number>; message: string };
+        const zodError = validation.error as {
+          errors?: ZodIssue[];
+          issues?: ZodIssue[];
+        };
+        const errorDetails = (zodError.errors || zodError.issues || [])
+          .map((e: ZodIssue) => `${(e.path || []).join(".")}: ${e.message}`)
           .join("; ");
 
         logTest(

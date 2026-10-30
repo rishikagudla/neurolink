@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v8.32.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,34 +8,32 @@
 
 > **getLangfuseHealthStatus**(): `object`
 
-Defined in: [services/server/ai/observability/instrumentation.ts:208](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/services/server/ai/observability/instrumentation.ts#L208)
-
-Get health status for Langfuse observability
-
 ## Returns
 
 `object`
 
+`isHealthy` and `hasProcessor` are `true` only while a Langfuse exporter is registered, on NeuroLink's own provider or beside a host provider (where it still needs `createExporterSpanProcessor()` on the host provider to receive spans); `error` carries the message of a failed initialization.
+
 ### isHealthy
 
-> **isHealthy**: `boolean` \| `undefined`
+> **isHealthy**: `boolean`
 
 ### initialized
 
-> **initialized**: `boolean` = `isInitialized`
-
-### credentialsValid
-
-> **credentialsValid**: `boolean` = `isCredentialsValid`
-
-### enabled
-
-> **enabled**: `boolean`
+> **initialized**: `boolean`
 
 ### hasProcessor
 
 > **hasProcessor**: `boolean`
 
-### config
+### usingExternalProvider
 
-> **config**: \{ `baseUrl`: `string`; `environment`: `string`; `release`: `string`; \} \| `undefined`
+> **usingExternalProvider**: `boolean`
+
+### error?
+
+> `optional` **error?**: `string`
+
+## Description
+
+Summarizes the Langfuse export state for health checks.

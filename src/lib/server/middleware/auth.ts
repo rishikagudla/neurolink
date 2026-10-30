@@ -4,10 +4,15 @@
  */
 
 import type {
+  ApiKeyAuthOptions,
+  AuthResult,
+  AuthenticatedUser,
+  BearerAuthOptions,
   MiddlewareDefinition,
   ServerContext,
-  AuthenticatedUser,
-} from "../types.js";
+  ServerServerAuthConfig,
+  TokenValidator,
+} from "../../types/index.js";
 import {
   AuthenticationError,
   AuthorizationError,
@@ -18,12 +23,16 @@ import {
  * Check if request is from development playground.
  * Detects playground requests via special headers for development mode.
  *
+ * This only inspects the headers. `createAuthMiddleware` honours the result
+ * solely when `process.env.NODE_ENV` is exactly `"development"`, so a caller
+ * that acts on this on its own must apply that gate itself.
+ *
  * @param headers - Request headers to check
  * @returns True if request is from dev playground
  *
  * @example
  * ```typescript
- * if (isDevPlayground(ctx.headers)) {
+ * if (process.env.NODE_ENV === "development" && isDevPlayground(ctx.headers)) {
  *   // Skip authentication for playground
  * }
  * ```
@@ -48,65 +57,11 @@ export function isDevPlayground(
 export const DEV_PLAYGROUND_USER: AuthResult = {
   id: "playground",
   roles: ["developer"],
+  shared: true,
 };
-
-/**
- * Authentication configuration
- */
-export type AuthConfig = {
-  /** Authentication type */
-  type: "bearer" | "api-key" | "basic" | "custom";
-
-  /**
-   * Token validation function
-   * Returns user information if valid, throws or returns null if invalid
-   */
-  validate: (token: string, ctx: ServerContext) => Promise<AuthResult | null>;
-
-  /** Header name for token (default: "Authorization" for bearer, "X-API-Key" for api-key) */
-  headerName?: string;
-
-  /** Skip authentication for certain paths */
-  skipPaths?: string[];
-
-  /** Custom error message */
-  errorMessage?: string;
-
-  /**
-   * Optional token extractor for custom authentication schemes
-   * Only used when type is "custom"
-   */
-  extractToken?: (ctx: ServerContext) => string | null;
-
-  /**
-   * Skip authentication for dev playground requests in non-production.
-   * When true (default), requests with x-neurolink-dev-playground or
-   * x-neurolink-playground header set to "true" will bypass authentication
-   * and receive a default developer user context.
-   *
-   * Only applies when NODE_ENV is not "production".
-   *
-   * @default true
-   */
-  skipDevPlayground?: boolean;
-};
-
 /**
  * Authentication result
  */
-export type AuthResult = {
-  /** User ID */
-  id: string;
-
-  /** User email (optional) */
-  email?: string;
-
-  /** User roles (optional) */
-  roles?: string[];
-
-  /** Additional user data */
-  metadata?: Record<string, unknown>;
-};
 
 /**
  * Create authentication middleware
@@ -125,7 +80,9 @@ export type AuthResult = {
  * server.registerMiddleware(authMiddleware);
  * ```
  */
-export function createAuthMiddleware(config: AuthConfig): MiddlewareDefinition {
+export function createAuthMiddleware(
+  config: ServerServerAuthConfig,
+): MiddlewareDefinition {
   const {
     type,
     validate,
@@ -141,17 +98,22 @@ export function createAuthMiddleware(config: AuthConfig): MiddlewareDefinition {
     name: "authentication",
     order: 10, // Run early but after request ID
     excludePaths: skipPaths,
+    authenticates: true,
     handler: async (ctx, next) => {
-      // Skip auth for dev playground in non-production
+      // The playground header is a development convenience, so it is honoured
+      // only when NODE_ENV is exactly "development". An unset NODE_ENV (the
+      // default for most deployments), "test", "staging" or a misspelling must
+      // not let an unauthenticated caller claim the developer identity.
       if (
         skipDevPlayground &&
-        process.env.NODE_ENV !== "production" &&
+        process.env.NODE_ENV === "development" &&
         isDevPlayground(ctx.headers)
       ) {
         ctx.user = {
           id: DEV_PLAYGROUND_USER.id,
           email: DEV_PLAYGROUND_USER.email,
           roles: DEV_PLAYGROUND_USER.roles,
+          shared: DEV_PLAYGROUND_USER.shared,
         };
         return next();
       }
@@ -176,6 +138,7 @@ export function createAuthMiddleware(config: AuthConfig): MiddlewareDefinition {
           id: result.id,
           email: result.email,
           roles: result.roles,
+          shared: result.shared,
         };
 
         // Store additional metadata
@@ -202,7 +165,7 @@ export function createAuthMiddleware(config: AuthConfig): MiddlewareDefinition {
 /**
  * Get default header name for auth type
  */
-function getDefaultHeaderName(type: AuthConfig["type"]): string {
+function getDefaultHeaderName(type: ServerServerAuthConfig["type"]): string {
   switch (type) {
     case "bearer":
     case "basic":
@@ -221,7 +184,7 @@ function getDefaultHeaderName(type: AuthConfig["type"]): string {
  */
 function extractToken(
   ctx: ServerContext,
-  type: AuthConfig["type"],
+  type: ServerServerAuthConfig["type"],
   headerName: string,
   customExtractor?: (ctx: ServerContext) => string | null,
 ): string | null {
@@ -237,14 +200,18 @@ function extractToken(
 
   switch (type) {
     case "bearer": {
-      // Extract token from "Bearer <token>"
-      const match = headerValue.match(/^Bearer\s+(.+)$/i);
+      // Extract token from "Bearer <token>". The token must open with a
+      // non-whitespace character. With `\s+(.+)` the whitespace run and the
+      // token could both claim the same tabs, so a header that failed to match
+      // (a line terminator after a long run of tabs) was retried at every
+      // split, which is quadratic in the header length.
+      const match = headerValue.match(/^Bearer\s+(\S.*)$/i);
       return match ? match[1] : null;
     }
 
     case "basic": {
-      // Extract credentials from "Basic <base64>"
-      const match = headerValue.match(/^Basic\s+(.+)$/i);
+      // Extract credentials from "Basic <base64>" (same shape as above).
+      const match = headerValue.match(/^Basic\s+(\S.*)$/i);
       return match ? match[1] : null;
     }
 
@@ -385,21 +352,6 @@ export class ApiKeyStore {
 /**
  * Options for bearer auth middleware
  */
-export type BearerAuthOptions = {
-  /** Whether authentication is required (default: true) */
-  required?: boolean;
-  /** Header name (default: "authorization") */
-  headerName?: string;
-  /** Paths to skip authentication */
-  skipPaths?: string[];
-};
-
-/**
- * Token validation function type
- */
-export type TokenValidator = (
-  token: string,
-) => Promise<AuthenticatedUser | null> | AuthenticatedUser | null;
 
 /**
  * Create bearer token authentication middleware
@@ -429,13 +381,16 @@ export function createBearerAuthMiddleware(
     name: "bearer-auth",
     order: 10,
     excludePaths: skipPaths,
+    authenticates: true,
     handler: async (ctx, next) => {
       const authHeader = ctx.headers[headerName.toLowerCase()];
 
-      // Extract bearer token
+      // Extract bearer token. The token must open with a non-whitespace
+      // character, as in extractToken(): with `\s+(.+)` a header that failed
+      // to match was retried at every split, quadratic in its length.
       let token: string | null = null;
       if (authHeader) {
-        const match = authHeader.match(/^Bearer\s+(.+)$/i);
+        const match = authHeader.match(/^Bearer\s+(\S.*)$/i);
         token = match ? match[1] : null;
       }
 
@@ -467,12 +422,6 @@ export function createBearerAuthMiddleware(
 /**
  * Options for API key auth middleware
  */
-export type ApiKeyAuthOptions = {
-  /** Header name (default: "x-api-key") */
-  headerName?: string;
-  /** Paths to skip authentication */
-  skipPaths?: string[];
-};
 
 /**
  * Create API key authentication middleware

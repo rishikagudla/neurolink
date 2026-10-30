@@ -1,0 +1,1783 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / NeurolinkCredentials
+
+# Type Alias: NeurolinkCredentials
+
+> **NeurolinkCredentials** = `object`
+
+Per-provider credential overrides for generate() / stream() calls.
+
+When set on `NeurolinkConstructorConfig.credentials`, applies as the default
+for all calls from that NeuroLink instance. When set on
+`GenerateOptions.credentials` or `StreamOptions.credentials`, overrides the
+instance default for that single call.
+
+Unset providers fall through to environment variables (existing behaviour).
+
+## Properties
+
+### openai?
+
+> `optional` **openai?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### stt?
+
+> `optional` **stt?**: [`STTCredentials`](STTCredentials.md)
+
+Speech-to-text handlers (`transcribe()`, and `generate`/`stream` with
+`stt`). One slice per STT provider; see `STTCredentials`.
+
+---
+
+### anthropic?
+
+> `optional` **anthropic?**: `object`
+
+Anthropic. `baseURL` points the official SDK client at a gateway or proxy
+instead of `api.anthropic.com` (with or without a trailing `/v1`); it
+takes precedence over `ANTHROPIC_BASE_URL`, exactly as `apiKey` does over
+`ANTHROPIC_API_KEY`.
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### oauthToken?
+
+> `optional` **oauthToken?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### googleAiStudio?
+
+> `optional` **googleAiStudio?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### vertex?
+
+> `optional` **vertex?**: `object`
+
+#### projectId?
+
+> `optional` **projectId?**: `string`
+
+#### location?
+
+> `optional` **location?**: `string`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+Vertex Express Mode — simplified API-key auth
+
+#### serviceAccountKey?
+
+> `optional` **serviceAccountKey?**: `string`
+
+Full service-account JSON string
+
+#### clientEmail?
+
+> `optional` **clientEmail?**: `string`
+
+Inline service-account fields (alternative to serviceAccountKey)
+
+#### privateKey?
+
+> `optional` **privateKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+Overrides the Vertex API base URL, e.g. to reach a local stand-in. Used
+for Gemini and Claude models, in Express Mode and with a project and
+location. Takes precedence over `GOOGLE_VERTEX_BASE_URL`; a blank value
+counts as unset.
+
+---
+
+### bedrock?
+
+> `optional` **bedrock?**: `object`
+
+#### accessKeyId?
+
+> `optional` **accessKeyId?**: `string`
+
+#### secretAccessKey?
+
+> `optional` **secretAccessKey?**: `string`
+
+#### sessionToken?
+
+> `optional` **sessionToken?**: `string`
+
+#### region?
+
+> `optional` **region?**: `string`
+
+---
+
+### sagemaker?
+
+> `optional` **sagemaker?**: `object`
+
+#### accessKeyId?
+
+> `optional` **accessKeyId?**: `string`
+
+#### secretAccessKey?
+
+> `optional` **secretAccessKey?**: `string`
+
+#### sessionToken?
+
+> `optional` **sessionToken?**: `string`
+
+#### region?
+
+> `optional` **region?**: `string`
+
+#### endpoint?
+
+> `optional` **endpoint?**: `string`
+
+---
+
+### azure?
+
+> `optional` **azure?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### resourceName?
+
+> `optional` **resourceName?**: `string`
+
+#### deploymentName?
+
+> `optional` **deploymentName?**: `string`
+
+#### apiVersion?
+
+> `optional` **apiVersion?**: `string`
+
+#### useMaxCompletionTokens?
+
+> `optional` **useMaxCompletionTokens?**: `boolean`
+
+---
+
+### openrouter?
+
+> `optional` **openrouter?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### litellm?
+
+> `optional` **litellm?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### openaiCompatible?
+
+> `optional` **openaiCompatible?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### ollama?
+
+> `optional` **ollama?**: `object`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+---
+
+### nvidiaNim?
+
+> `optional` **nvidiaNim?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### lmStudio?
+
+> `optional` **lmStudio?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### llamacpp?
+
+> `optional` **llamacpp?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### a2agent?
+
+> `optional` **a2agent?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### abliteration?
+
+> `optional` **abliteration?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### aboveDev?
+
+> `optional` **aboveDev?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### ai21?
+
+> `optional` **ai21?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### aiand?
+
+> `optional` **aiand?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### aihubmix?
+
+> `optional` **aihubmix?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### aionlabs?
+
+> `optional` **aionlabs?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### ambient?
+
+> `optional` **ambient?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### apiRoute?
+
+> `optional` **apiRoute?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### arcee?
+
+> `optional` **arcee?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### atlasCloud?
+
+> `optional` **atlasCloud?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### avianIo?
+
+> `optional` **avianIo?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### baiduQianfan?
+
+> `optional` **baiduQianfan?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### baseten?
+
+> `optional` **baseten?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### beeHeossi?
+
+> `optional` **beeHeossi?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### byteplusModelark?
+
+> `optional` **byteplusModelark?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### bytez?
+
+> `optional` **bytez?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### cerebras?
+
+> `optional` **cerebras?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### charmHyper?
+
+> `optional` **charmHyper?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### chutes?
+
+> `optional` **chutes?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### cloudflare?
+
+> `optional` **cloudflare?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+#### accountId?
+
+> `optional` **accountId?**: `string`
+
+---
+
+### crusoe?
+
+> `optional` **crusoe?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### dashscope?
+
+> `optional` **dashscope?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### deepinfra?
+
+> `optional` **deepinfra?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### deepseek?
+
+> `optional` **deepseek?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### empiriolabs?
+
+> `optional` **empiriolabs?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### featherlessAi?
+
+> `optional` **featherlessAi?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### fireworks?
+
+> `optional` **fireworks?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### friendli?
+
+> `optional` **friendli?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### gmicloud?
+
+> `optional` **gmicloud?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### gradientai?
+
+> `optional` **gradientai?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### groq?
+
+> `optional` **groq?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### hetznerInference?
+
+> `optional` **hetznerInference?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### huggingFace?
+
+> `optional` **huggingFace?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### inceptionLabs?
+
+> `optional` **inceptionLabs?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### inceptron?
+
+> `optional` **inceptron?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### inco?
+
+> `optional` **inco?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### inferenceNet?
+
+> `optional` **inferenceNet?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### ioIntelligence?
+
+> `optional` **ioIntelligence?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### koscompute?
+
+> `optional` **koscompute?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### laya?
+
+> `optional` **laya?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### lemonfoxAi?
+
+> `optional` **lemonfoxAi?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### lilac?
+
+> `optional` **lilac?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### llmtech?
+
+> `optional` **llmtech?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### longcat?
+
+> `optional` **longcat?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### mancer?
+
+> `optional` **mancer?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### metaModelApi?
+
+> `optional` **metaModelApi?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### minimax?
+
+> `optional` **minimax?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### mistral?
+
+> `optional` **mistral?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### moark?
+
+> `optional` **moark?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### modelscope?
+
+> `optional` **modelscope?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### moonshotAi?
+
+> `optional` **moonshotAi?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### morph?
+
+> `optional` **morph?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### naverClovaStudio?
+
+> `optional` **naverClovaStudio?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### nebius?
+
+> `optional` **nebius?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### neuralwatt?
+
+> `optional` **neuralwatt?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### novita?
+
+> `optional` **novita?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### openaiDecisions?
+
+> `optional` **openaiDecisions?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### ovhcloud?
+
+> `optional` **ovhcloud?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### parasail?
+
+> `optional` **parasail?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### paretoInference?
+
+> `optional` **paretoInference?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### perplexity?
+
+> `optional` **perplexity?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### poolside?
+
+> `optional` **poolside?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### primeIntellect?
+
+> `optional` **primeIntellect?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### reka?
+
+> `optional` **reka?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### runinfra?
+
+> `optional` **runinfra?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### sakanaAi?
+
+> `optional` **sakanaAi?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### sambanova?
+
+> `optional` **sambanova?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### sarvam?
+
+> `optional` **sarvam?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### scaledown?
+
+> `optional` **scaledown?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### scaleway?
+
+> `optional` **scaleway?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### siliconflow?
+
+> `optional` **siliconflow?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### stackit?
+
+> `optional` **stackit?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### stepfun?
+
+> `optional` **stepfun?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### subconscious?
+
+> `optional` **subconscious?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### subq?
+
+> `optional` **subq?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### synthetic?
+
+> `optional` **synthetic?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### telnyx?
+
+> `optional` **telnyx?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### thinkingMachines?
+
+> `optional` **thinkingMachines?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### tinfoil?
+
+> `optional` **tinfoil?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### together?
+
+> `optional` **together?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### umansAi?
+
+> `optional` **umansAi?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### upstage?
+
+> `optional` **upstage?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### veniceAi?
+
+> `optional` **veniceAi?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### vispark?
+
+> `optional` **vispark?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### vultrInference?
+
+> `optional` **vultrInference?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### wafer?
+
+> `optional` **wafer?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### wandbInference?
+
+> `optional` **wandbInference?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### xai?
+
+> `optional` **xai?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### xiaomiMimo?
+
+> `optional` **xiaomiMimo?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### xor?
+
+> `optional` **xor?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### zAi?
+
+> `optional` **zAi?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### cohere?
+
+> `optional` **cohere?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### replicate?
+
+> `optional` **replicate?**: `object`
+
+#### apiToken?
+
+> `optional` **apiToken?**: `string`
+
+#### baseUrl?
+
+> `optional` **baseUrl?**: `string`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### voyage?
+
+> `optional` **voyage?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### jina?
+
+> `optional` **jina?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### stability?
+
+> `optional` **stability?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### ideogram?
+
+> `optional` **ideogram?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### recraft?
+
+> `optional` **recraft?**: `object`
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### typesafe?
+
+> `optional` **typesafe?**: `object`
+
+TypeSafe (Jev) — the `decide` inference type, not text generation.
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+#### transport?
+
+> `optional` **transport?**: `"direct"` \| `"gateway"`
+
+Which transport carries the decision request.
+
+- `"direct"` — TypeSafe's own API, `POST /v1/systemone`.
+- `"gateway"` — Vercel's AI Gateway evaluation-model endpoint, which
+  bills through an existing Vercel account instead of a TypeSafe one.
+
+Omitted resolves automatically: `gateway` when only a gateway key is
+present, `direct` otherwise. The two differ on the wire — the gateway
+already uses the neutral `boolean`/`probability` vocabulary, carries
+the model in a header rather than the body, and omits `confidence`
+entirely — but a caller sees the identical `DecisionResult` either way.
+
+#### gatewayApiKey?
+
+> `optional` **gatewayApiKey?**: `string`
+
+Vercel AI Gateway key. Defaults to `AI_GATEWAY_API_KEY`.
+
+#### gatewayURL?
+
+> `optional` **gatewayURL?**: `string`
+
+The gateway transport's evaluation-model route. Defaults to
+`TYPESAFE_GATEWAY_URL`, then Vercel's own route.
+
+---
+
+### perplexityDecider?
+
+> `optional` **perplexityDecider?**: `object`
+
+Perplexity Decisions API — the `decide` inference type. The key is the same
+`PERPLEXITY_API_KEY` the `perplexity` text provider reads, but this slice
+is separate so the two cannot be mixed up. `baseURL` is optional and
+defaults to `https://api.perplexity.ai`; requests go to
+`<baseURL>/v1/decisions`.
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+---
+
+### cloudflareClef?
+
+> `optional` **cloudflareClef?**: `object`
+
+Cloudflare Clef — the `decide` inference type, reached through Workers AI.
+The token and account id are the ones the `cloudflare` text provider reads
+(`CLOUDFLARE_API_KEY`, `CLOUDFLARE_ACCOUNT_ID`), but this slice is separate
+so the two cannot be mixed up. Both are required. `baseURL` is optional and
+defaults to `https://api.cloudflare.com/client/v4`; requests go to
+`<baseURL>/accounts/<accountId>/ai/run/@cf/cloudflare/<model>`.
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+#### accountId?
+
+> `optional` **accountId?**: `string`
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`

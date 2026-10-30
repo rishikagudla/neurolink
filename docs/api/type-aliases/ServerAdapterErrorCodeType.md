@@ -1,0 +1,9 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / ServerAdapterErrorCodeType
+
+# Type Alias: ServerAdapterErrorCodeType
+
+> **ServerAdapterErrorCodeType** = _typeof_ [`ServerAdapterErrorCode`](../variables/ServerAdapterErrorCode.md)\[keyof _typeof_ [`ServerAdapterErrorCode`](../variables/ServerAdapterErrorCode.md)\]

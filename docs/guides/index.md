@@ -17,7 +17,7 @@ Core guides for getting the most out of NeuroLink.
 | Guide                                                 | Description                                                            |
 | ----------------------------------------------------- | ---------------------------------------------------------------------- |
 | **[Provider Selection Guide](provider-selection.md)** | Interactive wizard to choose the best provider for your use case       |
-| **[GitHub Action Guide](github-action.md)**           | Run AI-powered workflows in GitHub Actions with 13 providers           |
+| **[GitHub Action Guide](github-action.md)**           | Run AI-powered workflows in GitHub Actions with broad provider support |
 | **[Troubleshooting](troubleshooting.md)**             | Common issues, debugging tips, and solutions for NeuroLink CLI and SDK |
 
 ---
@@ -75,19 +75,19 @@ See also: [MCP Tools Showcase](../features/mcp-tools-showcase.md) for detailed t
 
 ---
 
-## 🖥️ Server Adapters :material-new-box:{ .new-feature title="New in v8.42" }
+## Server Adapters
 
 Deploy NeuroLink as production-ready HTTP APIs.
 
 | Guide                                                      | Description                                                         |
 | ---------------------------------------------------------- | ------------------------------------------------------------------- |
-| **[Server Adapters Overview](/guides/server-adapters)**    | Quick start guide for exposing AI agents as HTTP APIs               |
-| **[Hono Adapter](/guides/server-adapters/hono)**           | Recommended lightweight adapter for serverless and edge deployments |
-| **[Express Adapter](/guides/server-adapters/express)**     | Integration with existing Express applications                      |
-| **[Fastify Adapter](/guides/server-adapters/fastify)**     | High-performance adapter with built-in schema validation            |
-| **[Koa Adapter](/guides/server-adapters/koa)**             | Modern, minimalist adapter with clean middleware composition        |
-| **[Security Guide](/guides/server-adapters/security)**     | Authentication, authorization, and security best practices          |
-| **[Deployment Guide](/guides/server-adapters/deployment)** | Production deployment patterns with Docker and Kubernetes           |
+| **[Server Adapters Overview](./server-adapters/index.md)** | Quick start guide for exposing AI agents as HTTP APIs               |
+| **[Hono Adapter](./server-adapters/hono.md)**              | Recommended lightweight adapter for serverless and edge deployments |
+| **[Express Adapter](./server-adapters/express.md)**        | Integration with existing Express applications                      |
+| **[Fastify Adapter](./server-adapters/fastify.md)**        | High-performance adapter with built-in schema validation            |
+| **[Koa Adapter](./server-adapters/koa.md)**                | Modern, minimalist adapter with clean middleware composition        |
+| **[Security Guide](./server-adapters/security.md)**        | Authentication, authorization, and security best practices          |
+| **[Deployment Guide](./server-adapters/deployment.md)**    | Production deployment patterns with Docker and Kubernetes           |
 
 ---
 

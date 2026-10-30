@@ -16,36 +16,20 @@ import ora from "ora";
 import { logger } from "../../lib/utils/logger.js";
 import { updateEnvFile as envUpdate } from "../utils/envManager.js";
 import { getTopModelChoices } from "../../lib/utils/modelChoices.js";
-import { AIProviderName } from "../../lib/types/index.js";
-
-interface BedrockSetupOptions {
-  checkOnly?: boolean;
-  interactive?: boolean;
-}
-
-interface BedrockSetupArgv {
-  check?: boolean;
-  nonInteractive?: boolean;
-}
-
-interface ConfigData {
-  accessKeyId?: string;
-  secretAccessKey?: string;
-  region?: string;
-  model?: string;
-}
-
-interface ConfigStatus {
-  hasAccessKey: boolean;
-  hasSecretKey: boolean;
-  hasRegion: boolean;
-}
+import {
+  AIProviderName,
+  type BedrockConfigData,
+  type BedrockConfigStatus,
+  type ProviderSetupArgv,
+  type ProviderSetupOptions,
+} from "../../lib/types/index.js";
+import { maskCredential } from "../utils/maskCredential.js";
 
 export async function handleBedrockSetup(
-  argv: BedrockSetupArgv,
+  argv: ProviderSetupArgv,
 ): Promise<void> {
   try {
-    const options: BedrockSetupOptions = {
+    const options: ProviderSetupOptions = {
       checkOnly: argv.check || false,
       interactive: !argv.nonInteractive,
     };
@@ -55,7 +39,7 @@ export async function handleBedrockSetup(
     );
 
     const configStatus = checkExistingConfiguration();
-    const config: ConfigData = {};
+    const config: BedrockConfigData = {};
 
     // Handle existing credentials
     if (configStatus.hasAccessKey && configStatus.hasSecretKey) {
@@ -208,7 +192,7 @@ async function detectAWSConfig(): Promise<{
   }
 }
 
-function checkExistingConfiguration(): ConfigStatus {
+function checkExistingConfiguration(): BedrockConfigStatus {
   return {
     hasAccessKey: !!process.env.AWS_ACCESS_KEY_ID,
     hasSecretKey: !!process.env.AWS_SECRET_ACCESS_KEY,
@@ -216,7 +200,7 @@ function checkExistingConfiguration(): ConfigStatus {
   };
 }
 
-function displayCurrentStatus(configStatus: ConfigStatus): void {
+function displayCurrentStatus(configStatus: BedrockConfigStatus): void {
   if (configStatus.hasAccessKey) {
     logger.always(chalk.green("✔ AWS_ACCESS_KEY_ID found in environment"));
   } else {
@@ -243,9 +227,9 @@ function displayCurrentStatus(configStatus: ConfigStatus): void {
 }
 
 async function handleExistingCredentials(
-  configStatus: ConfigStatus,
-  options: BedrockSetupOptions,
-  config: ConfigData,
+  configStatus: BedrockConfigStatus,
+  options: ProviderSetupOptions,
+  config: BedrockConfigData,
 ): Promise<{ shouldReturn: boolean }> {
   logger.always(chalk.green("✔ AWS_ACCESS_KEY_ID found in environment"));
   logger.always(chalk.green("✔ AWS_SECRET_ACCESS_KEY found in environment"));
@@ -294,8 +278,8 @@ async function handleExistingCredentials(
 }
 
 async function detectAndDisplayAWSConfig(
-  configStatus: ConfigStatus,
-  config: ConfigData,
+  configStatus: BedrockConfigStatus,
+  config: BedrockConfigData,
 ): Promise<void> {
   if (!configStatus.hasAccessKey || !configStatus.hasSecretKey) {
     logger.always(chalk.blue("🔍 Checking for AWS CLI configuration..."));
@@ -331,9 +315,9 @@ async function detectAndDisplayAWSConfig(
 }
 
 async function handleInteractiveCredentialSetup(
-  configStatus: ConfigStatus,
-  config: ConfigData,
-  _options: BedrockSetupOptions,
+  configStatus: BedrockConfigStatus,
+  config: BedrockConfigData,
+  _options: ProviderSetupOptions,
 ): Promise<{ shouldReturn: boolean }> {
   const isReconfiguring =
     configStatus.hasAccessKey && configStatus.hasSecretKey;
@@ -377,7 +361,7 @@ async function promptForSetupMethod(): Promise<string> {
 
   const { setupMethod } = await inquirer.prompt([
     {
-      type: "list",
+      type: "select",
       name: "setupMethod",
       message: "How would you like to provide your AWS credentials?",
       choices: [
@@ -425,8 +409,8 @@ function displayTerminalInstructions(): void {
 }
 
 async function promptForCredentials(
-  configStatus: ConfigStatus,
-  config: ConfigData,
+  configStatus: BedrockConfigStatus,
+  config: BedrockConfigData,
   isReconfiguring: boolean,
 ): Promise<void> {
   // Prompt for access key
@@ -506,7 +490,7 @@ async function promptForCredentials(
   }
 }
 
-async function handleModelSelection(config: ConfigData): Promise<void> {
+async function handleModelSelection(config: BedrockConfigData): Promise<void> {
   const hasModel = !!(
     process.env.BEDROCK_MODEL || process.env.BEDROCK_MODEL_ID
   );
@@ -525,7 +509,7 @@ async function handleModelSelection(config: ConfigData): Promise<void> {
   if (wantsCustomModel) {
     const { model } = await inquirer.prompt([
       {
-        type: "list",
+        type: "select",
         name: "model",
         message: "Select a Bedrock model:",
         choices: getTopModelChoices(AIProviderName.BEDROCK, 5),
@@ -554,8 +538,8 @@ async function handleModelSelection(config: ConfigData): Promise<void> {
 }
 
 async function finalizeSetup(
-  config: ConfigData,
-  options: BedrockSetupOptions,
+  config: BedrockConfigData,
+  options: ProviderSetupOptions,
 ): Promise<void> {
   if (
     config.accessKeyId ||
@@ -622,16 +606,4 @@ function displayUsageExample(): void {
   logger.always(
     chalk.cyan("   pnpm cli generate 'Hello from Bedrock!' --provider bedrock"),
   );
-}
-
-function maskCredential(credential: string): string {
-  if (!credential || credential.length < 8) {
-    return "****";
-  }
-
-  const start = credential.slice(0, 4);
-  const end = credential.slice(-4);
-  const middle = "*".repeat(Math.max(4, credential.length - 8));
-
-  return `${start}${middle}${end}`;
 }

@@ -1,0 +1,309 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / ProviderDescriptor
+
+# Type Alias: ProviderDescriptor
+
+> **ProviderDescriptor** = `object`
+
+Single source of truth for one AI provider's static identity: how it's
+addressed (name/aliases), how it's authenticated (credentialsKey/envVars),
+what it defaults to (defaultModel), and how the rest of the codebase
+should treat it (toolSupport/localRuntime/healthCheck/inferenceKinds).
+Every consumer
+that used to hand-maintain its own provider table (CLI choices,
+CREDENTIAL_KEY_MAP, env-var checks, health-check dispatch, auto-select
+priority, PROMPT_ONLY_TOOL_PROVIDERS) derives from PROVIDER_DESCRIPTORS
+instead. See src/lib/factories/providerDescriptors.ts for the data.
+
+## Properties
+
+### name
+
+> **name**: [`AIProviderName`](../enumerations/AIProviderName.md)
+
+Canonical identity — matches an AIProviderName enum member (never AUTO).
+
+---
+
+### aliases
+
+> **aliases**: readonly `string`[]
+
+Alternate spellings accepted by the CLI and the alias index (kebab-case, shorthand, legacy names). Does not include `name` itself.
+
+---
+
+### inferenceKinds?
+
+> `optional` **inferenceKinds?**: readonly [`InferenceKind`](InferenceKind.md)[]
+
+Which inference types this provider actually serves. Omitted means
+`["generate", "stream"]`, which is what every text provider is — so every
+existing descriptor keeps its meaning untouched.
+
+This is the one declarative statement of a provider's modality. Before it
+existed, modality was only implied (by `toolSupport`, `healthCheck` and
+the auto-select ranks), which is why embedding-only providers like Voyage
+and Jina have to implement `getAISDKModel()` as a throw: nothing could
+express that they are not text providers. Consumers that build a
+generation fallback chain, run the health sweep, or offer CLI model
+choices should filter on this rather than special-case a provider name.
+
+---
+
+### credentialsKey
+
+> **credentialsKey**: keyof [`NeurolinkCredentials`](NeurolinkCredentials.md)
+
+Key into NeurolinkCredentials for per-call/per-instance credential overrides.
+
+---
+
+### envVars
+
+> **envVars**: `object`
+
+Environment variables this provider reads at runtime.
+
+#### apiKey?
+
+> `optional` **apiKey?**: `string`
+
+Primary identity/secret env var. Absent for providers with no required credential (Ollama, LM Studio, llama.cpp) or that use extraRequired instead of a single key (Vertex).
+
+#### fallbacks?
+
+> `optional` **fallbacks?**: readonly `string`[]
+
+Alternate env vars accepted in place of apiKey, checked in order after apiKey.
+
+#### baseURL?
+
+> `optional` **baseURL?**: `string`
+
+#### baseURLFallbacks?
+
+> `optional` **baseURLFallbacks?**: readonly `string`[]
+
+Alternate env vars accepted in place of baseURL.
+
+#### model?
+
+> `optional` **model?**: `string`
+
+Env var that overrides the static defaultModel at runtime.
+
+#### modelFallbacks?
+
+> `optional` **modelFallbacks?**: readonly `string`[]
+
+Alternate env vars accepted in place of model, checked in order after model.
+
+#### extraRequired?
+
+> `optional` **extraRequired?**: readonly `string`[]
+
+Additional env vars required alongside apiKey (e.g. AWS secret key, Azure endpoint).
+
+#### extraRequiredFallbacks?
+
+> `optional` **extraRequiredFallbacks?**: readonly (`string` \| readonly `string`[])[]
+
+Alternate ways to satisfy extraRequired when it isn't a plain env-var list (e.g. Vertex's file-path-OR-individual-fields auth). Each entry is either a single env var name (satisfied alone) or a nested array of names that must ALL be present together (e.g. Vertex's GOOGLE_AUTH_CLIENT_EMAIL + GOOGLE_AUTH_PRIVATE_KEY pair, which is only valid as a pair). Evaluate with `satisfiesFallbacks()` (providerConfig.ts) rather than re-deriving this logic at each call site.
+
+#### extraRequiredCredentialFields?
+
+> `optional` **extraRequiredCredentialFields?**: `Readonly`\<`Record`\<`string`, `string`\>\>
+
+For an `extraRequired` name that can also be given in `credentials.<credentialsKey>`: the field of that slice that stands for it (e.g. `{ CLOUDFLARE_ACCOUNT_ID: "accountId" }`). A base URL needs no entry; it is matched through `baseURL` above.
+
+#### optional?
+
+> `optional` **optional?**: `boolean`
+
+True when the provider is usable with zero configuration (local runtime with a documented default URL, or a documented non-secret default like LiteLLM's "sk-anything").
+
+---
+
+### defaultModel
+
+> **defaultModel**: `string`
+
+Static fallback model. The empty string "" is a documented sentinel
+meaning "no static default — resolved at runtime via envVars.model or
+provider-side auto-discovery" (used by Bedrock, OpenAI-Compatible,
+LM Studio, llama.cpp, matching how providerRegistry.ts already passes
+`undefined` as their defaultModel argument today).
+
+---
+
+### toolSupport
+
+> **toolSupport**: `"native"` \| `"prompt-only"` \| `"none"` \| `"model-dependent"`
+
+---
+
+### localRuntime
+
+> **localRuntime**: `boolean`
+
+True only for providers that run entirely on the caller's machine with no cloud account (Ollama, LM Studio, llama.cpp). LiteLLM is a local proxy but commonly points at cloud models, so it is deliberately false.
+
+---
+
+### healthCheck
+
+> **healthCheck**: `"env-only"` \| `"models-probe"` \| `"live-generate"`
+
+How ProviderHealthChecker should verify this provider is reachable.
+
+---
+
+### defaultHealthSweepPriority?
+
+> `optional` **defaultHealthSweepPriority?**: `number`
+
+ORDER (not membership) in the default health sweep
+(`ProviderHealthChecker.checkAllProvidersHealth` with no explicit
+list). Lower number = checked and reported first; the sweep's array
+order is behaviour for its first-healthy fallback consumers. Absent =
+sorted after every explicitly-prioritized descriptor, in this file's
+declaration order (a stable sort, so ties never reorder). Originally
+this field ALSO controlled membership (absent = excluded), which
+silently dropped every provider added without it from the sweep —
+issue #1305, ~30 of ~38 registered providers, undocumented. Membership
+is now `excludeFromHealthSweep` below, which every new descriptor
+satisfies by default without needing this field at all.
+
+---
+
+### excludeFromHealthSweep?
+
+> `optional` **excludeFromHealthSweep?**: `true`
+
+Opt a provider OUT of `checkAllProvidersHealth`'s default sweep. Every
+registered descriptor participates by default — a newly added provider
+needs no action to be included, which is the fix for issue #1305
+(silent, undocumented exclusion of most providers). Set this only for a
+descriptor that genuinely should never appear in a health rollup; no
+current descriptor sets it. `checkProviderHealth()` for a single named
+provider is unaffected either way — this only gates the "all
+providers" sweep.
+
+---
+
+### autoSelectPreference?
+
+> `optional` **autoSelectPreference?**: `number`
+
+Preference rank for `getBestHealthyProvider`'s default auto-selection
+(lower = tried first). Deliberately a SEPARATE ordering from the sweep:
+auto-select prefers local/cheap runtimes (litellm, ollama) before cloud
+providers, while the sweep reports the majors first. Absent = not in
+the default preference list. Replaces the second hand-maintained array
+that lived inline as getBestHealthyProvider's default parameter.
+
+---
+
+### setupUrl?
+
+> `optional` **setupUrl?**: `string`
+
+---
+
+### timeouts?
+
+> `optional` **timeouts?**: `object`
+
+#### generateMs?
+
+> `optional` **generateMs?**: `number`
+
+#### streamMs?
+
+> `optional` **streamMs?**: `number`
+
+#### decideMs?
+
+> `optional` **decideMs?**: `number`
+
+#### decideMsPerKStateTokens?
+
+> `optional` **decideMsPerKStateTokens?**: `number`
+
+Added to `decideMs` per 1,000 estimated state tokens.
+
+---
+
+### decisionLimits?
+
+> `optional` **decisionLimits?**: [`DecisionLimits`](DecisionLimits.md)
+
+What a `decide` provider can read. Absent means the provider leaves size
+checks to its own server (TypeSafe). See [DecisionLimits](DecisionLimits.md).
+
+---
+
+### decideOrder?
+
+> `optional` **decideOrder?**: `number`
+
+Precedence among `decide` providers: lower runs first and no two decide
+descriptors share a value. resolveDefaultDecisionProvider() returns the
+first configured provider in this order, so changing a number changes which
+model routes for every host that configures several. Required on every
+descriptor that serves `decide`; checked when the descriptors load.
+
+---
+
+### ambientKeyGuard?
+
+> `optional` **ambientKeyGuard?**: [`DecideAmbientKeyGuard`](DecideAmbientKeyGuard.md)
+
+Skips this provider's environment key for default resolution while a
+listed base-URL variable names a host outside the trusted origins. Only a
+decide provider whose key is also another provider's can use it. See
+[DecideAmbientKeyGuard](DecideAmbientKeyGuard.md).
+
+---
+
+### autoSelectPriority?
+
+> `optional` **autoSelectPriority?**: `number`
+
+Ascending priority (1 = tried first) in the auto-select fallback chain
+used by getBestProvider(). Undefined = not part of the auto-select chain.
+
+Priorities favor local and self-hosted deployments first to avoid an
+external dependency during fallback, then cloud providers according to
+reliability, feature set and model coverage.
+
+---
+
+### apiKeyFormatPattern?
+
+> `optional` **apiKeyFormatPattern?**: `RegExp`
+
+Format-validation regex sourced from providerConfig.ts's API_KEY_FORMATS, when one exists for this provider.
+
+---
+
+### credentialsResolvedExternally?
+
+> `optional` **credentialsResolvedExternally?**: `boolean`
+
+True when this provider's credentials are resolved by an external chain
+or its own config validator rather than by plain env-var presence, so
+its required-env-vars can't be expressed as "every one of these exact
+names must be literally set". Examples: Vertex accepts a service-account
+file OR individual client-email/private-key fields OR a base64 key
+(an OR, not an AND, of auth paths); Bedrock falls back to the AWS SDK's
+own default credential chain (shared profile, IAM role) with no env
+vars required at all; LiteLLM is a documented zero-config local proxy.
+`ProviderHealthChecker.getRequiredEnvironmentVariables()` returns `[]`
+for these providers and defers to `checkProviderSpecificConfig()`'s
+dedicated per-provider check instead of deriving a flat AND-list from
+`envVars`.

@@ -1,0 +1,130 @@
+{
+  "$schema": "./provider-catalog.schema.json",
+  "id": "api-route",
+  "displayName": "API Route",
+  "aliases": ["apiroute"],
+  "tier": 2,
+  "wire": {
+    "baseURL": "https://global.api-route.com/v1"
+  },
+  "models": {
+    "default": "claude-sonnet-4-6",
+    "fallbacks": ["claude-haiku-4-5", "deepseek-v4-flash", "gemini-3.8-flash"],
+    "defaultContextWindow": 1000000,
+    "defaultMaxOutputTokens": 64000,
+    "catalog": {
+      "claude-sonnet-4-6": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 64000,
+        "vision": true,
+        "status": "production",
+        "description": "Claude Sonnet 4.6 — flagship model with 1M context, tool calling, and multimodal vision"
+      },
+      "claude-haiku-4-5": {
+        "contextWindow": 200000,
+        "maxOutputTokens": 32768,
+        "vision": true,
+        "status": "production",
+        "description": "Claude Haiku 4.5 — fast, high-efficiency model with 200K context, tool calling, and vision"
+      },
+      "deepseek-v4-flash": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 64000,
+        "vision": false,
+        "status": "production",
+        "description": "DeepSeek V4 Flash — fast, cost-effective reasoning model with 1M context"
+      },
+      "deepseek-v4-pro": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 64000,
+        "vision": false,
+        "status": "production",
+        "description": "DeepSeek V4 Pro — powerful reasoning model with 1M context"
+      },
+      "gemini-3.8-flash": {
+        "contextWindow": 1000000,
+        "maxOutputTokens": 64000,
+        "vision": true,
+        "status": "production",
+        "description": "Gemini 3.8 Flash — high-speed multimodal model supporting image input and streaming"
+      },
+      "qwen3.8-flash": {
+        "contextWindow": 128000,
+        "maxOutputTokens": 16384,
+        "vision": false,
+        "status": "production",
+        "description": "Qwen 3.8 Flash — versatile, fast model for general instruction and coding tasks"
+      },
+      "kimi-k2.7-code": {
+        "contextWindow": 256000,
+        "maxOutputTokens": 32768,
+        "vision": false,
+        "status": "production",
+        "description": "Kimi K2.7 Code — specialized for coding and multi-step reasoning"
+      },
+      "glm-5.3-flash": {
+        "contextWindow": 128000,
+        "maxOutputTokens": 16384,
+        "vision": false,
+        "status": "production",
+        "description": "GLM 5.3 Flash — lightweight, fast conversational and instruction-following model"
+      }
+    },
+    "visionModel": "claude-sonnet-4-6",
+    "topModels": [
+      "claude-sonnet-4-6",
+      "claude-haiku-4-5",
+      "deepseek-v4-flash",
+      "gemini-3.8-flash",
+      "qwen3.8-flash"
+    ]
+  },
+  "capabilities": {
+    "text": true,
+    "streaming": true,
+    "tools": true,
+    "toolsWithStreaming": true,
+    "structuredOutput": true,
+    "structuredOutputWithTools": false,
+    "embeddings": false,
+    "thinking": false
+  },
+  "errorRules": [
+    {
+      "pattern": "该分组下模型无可用渠道|model_not_found",
+      "class": "invalid-model",
+      "message": "Model '{model}' not found or has no available channels on API Route."
+    },
+    {
+      "pattern": "无效的令牌",
+      "class": "authentication",
+      "message": "Invalid API Route API key. Check {apiKeyEnvVar}."
+    }
+  ],
+  "setup": {
+    "url": "https://api-route.com",
+    "apiKeyFormat": null,
+    "billingPolicy": "free-tier",
+    "instructions": [
+      "1. Visit: https://api-route.com and create an account",
+      "2. Generate an API key in your console / dashboard",
+      "3. Set {apiKeyEnvVar} in your .env file"
+    ]
+  },
+  "evidence": {
+    "rosterVerified": {
+      "date": "2026-09-17",
+      "method": "authenticated GET /v1/models",
+      "status": 200
+    },
+    "authProbe": {
+      "date": "2026-09-17",
+      "status": 401
+    },
+    "liveMatrix": {
+      "date": "2026-09-17",
+      "result": "Verified live against https://global.api-route.com/v1: GET /v1/models returned 70 models. Chat completions, streaming, function calling, streamed function calling, and structured JSON output (json_object and json_schema) verified. Multimodal vision verified on claude-sonnet-4-6, claude-haiku-4-5, and gemini-3.8-flash. Invalid API key returns 401 (无效的令牌) and invalid model returns 503 (model_not_found). Tools and response_format were only probed SEPARATELY, never together in one request, so structuredOutputWithTools is corrected to false here pending a dedicated tools_plus_schema probe — the individual passes do not demonstrate the combined capability."
+    },
+    "addedInPR": "https://github.com/juspay/neurolink/pull/1725"
+  }
+}

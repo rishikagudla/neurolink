@@ -1,0 +1,186 @@
+/**
+ * NeuroLink Authentication Module
+ *
+ * Exports the full multi-provider authentication system including:
+ * - Anthropic OAuth 2.0 flow (PKCE, token storage, callback server)
+ * - AuthProviderFactory / AuthProviderRegistry for lazy-loaded provider
+ *   creation (Auth0, Clerk, Firebase, Supabase, Cognito, Keycloak, Better
+ *   Auth, WorkOS, JWT, OAuth2, Custom) — obtain instances through the
+ *   factory, not a direct class import; see the NOTE below
+ * - Auth middleware (token extraction, RBAC, rate limiting)
+ * - Session management (memory, Redis)
+ * - Auth context (AsyncLocalStorage-based request scoping)
+ */
+
+// =============================================================================
+// ANTHROPIC OAUTH - OAuth 2.0 Authentication
+// =============================================================================
+
+// OAuth Constants
+export {
+  ANTHROPIC_OAUTH_BASE_URL,
+  DEFAULT_SCOPES,
+  DEFAULT_REDIRECT_URI,
+  DEFAULT_CALLBACK_PORT,
+} from "./anthropicOAuth.js";
+
+// Main OAuth class
+export { AnthropicOAuth } from "./anthropicOAuth.js";
+
+// OAuth error classes (canonical definitions in types/errors.ts)
+export {
+  OAuthError,
+  OAuthConfigurationError,
+  OAuthTokenExchangeError,
+  OAuthTokenRefreshError,
+  OAuthTokenValidationError,
+  OAuthTokenRevocationError,
+  OAuthCallbackServerError,
+} from "../types/index.js";
+
+// OAuth helper functions
+export {
+  createAnthropicOAuth,
+  createAnthropicOAuthConfig,
+  hasAnthropicOAuthCredentials,
+  startCallbackServer,
+  stopCallbackServer,
+  performOAuthFlow,
+} from "./anthropicOAuth.js";
+
+// OAuth types (canonical definitions in types/subscriptionTypes.ts)
+
+// =============================================================================
+// CODEX (ChatGPT) OAUTH - subscription pool support
+// =============================================================================
+
+export {
+  CODEX_CLIENT_ID,
+  CODEX_AUTH_URL,
+  CODEX_TOKEN_URL,
+  CODEX_REDIRECT_URI,
+  CODEX_DEFAULT_SCOPES,
+  CODEX_BACKEND_BASE_URL,
+  CODEX_RESPONSES_URL,
+  CODEX_USAGE_URL,
+  CODEX_USER_AGENT,
+  CODEX_ORIGINATOR,
+  decodeCodexAccessToken,
+  decodeCodexEmail,
+  resolveCodexAccountId,
+  importCodexAuthFile,
+  refreshCodexToken,
+  codexTokenNeedsRefresh,
+} from "./codexOAuth.js";
+
+// =============================================================================
+// TOKEN STORE - Secure Token Storage
+// =============================================================================
+
+// Main TokenStore class and instances
+export { TokenStore, tokenStore, defaultTokenStore } from "./tokenStore.js";
+
+// Token store error class (canonical definition in types/errors.ts)
+export { TokenStoreError } from "../types/index.js";
+
+// Token store types (canonical location: types/authTypes.ts)
+
+// =============================================================================
+// UNIFIED AUTH INTERFACE (canonical definitions in types/subscriptionTypes.ts)
+// =============================================================================
+
+// =============================================================================
+// ACCOUNT POOL - Multi-account rotation with cooldowns
+// =============================================================================
+
+export { AccountPool } from "./accountPool.js";
+
+// =============================================================================
+// MULTI-PROVIDER AUTH SYSTEM
+// =============================================================================
+
+// Factory and Registry
+export {
+  AuthProviderFactory,
+  createAuthProvider,
+} from "./AuthProviderFactory.js";
+
+export { AuthProviderRegistry } from "./AuthProviderRegistry.js";
+
+// Unified error factory
+export { AuthError, AuthErrorCodes } from "./errors.js";
+
+// Base Provider
+export {
+  AuthProviderError,
+  BaseAuthProvider,
+  InMemorySessionStorage,
+} from "./providers/BaseAuthProvider.js";
+
+// Provider Implementations
+// NOTE: Concrete provider classes are NOT re-exported here to preserve lazy
+// loading via dynamic imports in AuthProviderFactory.  Obtain provider
+// instances through the factory instead:
+//   const provider = await AuthProviderFactory.createProvider("auth0", config);
+
+// Auth Middleware
+export {
+  AuthMiddlewareError,
+  AuthMiddlewareErrorCodes,
+  createAuthMiddleware,
+  createExpressAuthMiddleware,
+  createProtectedMiddleware,
+  createRBACMiddleware,
+  createRequestContext,
+  extractToken,
+} from "./middleware/AuthMiddleware.js";
+
+// Rate Limiting Middleware
+export {
+  createAuthenticatedRateLimitMiddleware,
+  createRateLimitByUserMiddleware,
+  createRateLimitStorage,
+  MemoryRateLimitStorage,
+  RedisRateLimitStorage,
+  UserRateLimiter,
+} from "./middleware/rateLimitByUser.js";
+
+// Session Management
+export {
+  createSessionStorage,
+  MemorySessionStorage,
+  RedisSessionStorage,
+  SessionManager,
+} from "./sessionManager.js";
+
+// Auth Context
+export {
+  AuthContextHolder,
+  createAuthenticatedContext,
+  getAuthContext,
+  getCurrentSession,
+  getCurrentUser,
+  globalAuthContext,
+  hasAllPermissions,
+  hasAnyRole,
+  hasPermission,
+  hasRole,
+  isAuthenticated,
+  requireAuth,
+  requirePermission,
+  requireRole,
+  requireUser,
+  runWithAuthContext,
+} from "./authContext.js";
+
+// Request Context
+export {
+  RequestContext,
+  NEUROLINK_RESOURCE_ID_KEY,
+  NEUROLINK_THREAD_ID_KEY,
+} from "./RequestContext.js";
+
+// Auth Types
+
+// Server Bridge
+export { createAuthValidatorFromProvider } from "./serverBridge.js";

@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v8.32.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -7,8 +7,6 @@
 # Type Alias: MCPServerInfo
 
 > **MCPServerInfo** = `object`
-
-Defined in: [types/mcpTypes.ts:77](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L77)
 
 Universal MCP Server - Unified configuration and runtime state
 MCP 2024-11-05 specification compliant
@@ -20,15 +18,11 @@ Replaces both MCPServerInfo and MCPServerConfig
 
 > **id**: `string`
 
-Defined in: [types/mcpTypes.ts:79](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L79)
-
 ---
 
 ### name
 
 > **name**: `string`
-
-Defined in: [types/mcpTypes.ts:80](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L80)
 
 ---
 
@@ -36,31 +30,23 @@ Defined in: [types/mcpTypes.ts:80](https://github.com/juspay/neurolink/blob/1be7
 
 > **description**: `string`
 
-Defined in: [types/mcpTypes.ts:81](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L81)
-
 ---
 
 ### transport
 
-> **transport**: `MCPTransportType`
-
-Defined in: [types/mcpTypes.ts:82](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L82)
+> **transport**: [`MCPTransportType`](MCPTransportType.md)
 
 ---
 
 ### status
 
-> **status**: `MCPServerConnectionStatus`
-
-Defined in: [types/mcpTypes.ts:83](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L83)
+> **status**: [`MCPServerConnectionStatus`](MCPServerConnectionStatus.md)
 
 ---
 
 ### tools
 
 > **tools**: `object`[]
-
-Defined in: [types/mcpTypes.ts:86](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L86)
 
 #### name
 
@@ -72,11 +58,11 @@ Defined in: [types/mcpTypes.ts:86](https://github.com/juspay/neurolink/blob/1be7
 
 #### inputSchema?
 
-> `optional` **inputSchema**: `object`
+> `optional` **inputSchema?**: `object`
 
-#### execute()?
+#### execute?
 
-> `optional` **execute**: (`params`, `context?`) => `Promise`\<`unknown`\> \| `unknown`
+> `optional` **execute?**: (`params`, `context?`) => `Promise`\<`unknown`\> \| `unknown`
 
 ##### Parameters
 
@@ -96,49 +82,47 @@ Defined in: [types/mcpTypes.ts:86](https://github.com/juspay/neurolink/blob/1be7
 
 ### command?
 
-> `optional` **command**: `string`
-
-Defined in: [types/mcpTypes.ts:97](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L97)
+> `optional` **command?**: `string`
 
 ---
 
 ### args?
 
-> `optional` **args**: `string`[]
-
-Defined in: [types/mcpTypes.ts:98](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L98)
+> `optional` **args?**: `string`[]
 
 ---
 
 ### env?
 
-> `optional` **env**: `Record`\<`string`, `string`\>
-
-Defined in: [types/mcpTypes.ts:99](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L99)
+> `optional` **env?**: `Record`\<`string`, `string`\>
 
 ---
 
 ### url?
 
-> `optional` **url**: `string`
-
-Defined in: [types/mcpTypes.ts:100](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L100)
+> `optional` **url?**: `string`
 
 ---
 
 ### headers?
 
-> `optional` **headers**: `Record`\<`string`, `string`\>
+> `optional` **headers?**: `Record`\<`string`, `string`\>
 
-Defined in: [types/mcpTypes.ts:101](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L101)
+---
+
+### fetch?
+
+> `optional` **fetch?**: _typeof_ `globalThis.fetch`
+
+Trusted host-provided fetch for HTTP and SSE, including reconnects and tool
+calls. Use a guarded, DNS-pinned dispatcher for untrusted server URLs.
+Programmatic only: functions cannot be persisted in JSON configuration.
 
 ---
 
 ### httpOptions?
 
-> `optional` **httpOptions**: `MCPHTTPTransportOptions`
-
-Defined in: [types/mcpTypes.ts:103](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L103)
+> `optional` **httpOptions?**: [`MCPHTTPTransportOptions`](MCPHTTPTransportOptions.md)
 
 HTTP transport-specific options
 
@@ -146,115 +130,137 @@ HTTP transport-specific options
 
 ### timeout?
 
-> `optional` **timeout**: `number`
-
-Defined in: [types/mcpTypes.ts:104](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L104)
+> `optional` **timeout?**: `number`
 
 ---
 
 ### retries?
 
-> `optional` **retries**: `number`
-
-Defined in: [types/mcpTypes.ts:105](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L105)
+> `optional` **retries?**: `number`
 
 ---
 
 ### error?
 
-> `optional` **error**: `string`
-
-Defined in: [types/mcpTypes.ts:106](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L106)
+> `optional` **error?**: `string`
 
 ---
 
 ### installed?
 
-> `optional` **installed**: `boolean`
-
-Defined in: [types/mcpTypes.ts:107](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L107)
+> `optional` **installed?**: `boolean`
 
 ---
 
 ### cwd?
 
-> `optional` **cwd**: `string`
-
-Defined in: [types/mcpTypes.ts:110](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L110)
+> `optional` **cwd?**: `string`
 
 ---
 
 ### autoRestart?
 
-> `optional` **autoRestart**: `boolean`
-
-Defined in: [types/mcpTypes.ts:111](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L111)
+> `optional` **autoRestart?**: `boolean`
 
 ---
 
 ### healthCheckInterval?
 
-> `optional` **healthCheckInterval**: `number`
+> `optional` **healthCheckInterval?**: `number`
 
-Defined in: [types/mcpTypes.ts:112](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L112)
+---
+
+### inheritParentEnv?
+
+> `optional` **inheritParentEnv?**: `boolean`
+
+stdio only. By default a spawned server receives the MCP SDK's minimal
+default environment (`HOME`, `PATH`, `SHELL`, `TERM`, `USER`, `LOGNAME`
+on POSIX) plus `env`; the parent's provider keys and tokens are not
+inherited. Set `true` to restore the previous behaviour of handing the
+server the whole parent `process.env`. Prefer explicit pass-through:
+`"env": { "OPENAI_API_KEY": "${OPENAI_API_KEY}" }`.
+
+---
+
+### allowPrivateNetwork?
+
+> `optional` **allowPrivateNetwork?**: `boolean`
+
+http / sse / websocket only. A transport URL must use `https:` or `wss:`
+unless its host is loopback, and its host must not resolve to a private,
+link-local, CGNAT or cloud-metadata address. Set `true` for a server on
+your own network: plaintext `http:` / `ws:` is then accepted for hosts
+that are (or resolve only to) private addresses. Public hosts still need
+TLS.
+
+---
+
+### minTools?
+
+> `optional` **minTools?**: `number`
+
+Minimum number of tools that must be discovered for this server's
+registration to be considered ready (default: 0 — no minimum, so a
+resource/prompt-only server that legitimately exposes zero tools still
+registers successfully). When discovery finds fewer tools than this
+floor, `ExternalServerManager.addServer` returns `success: false` with
+`metadata.readiness: "insufficient_tools"` instead of marking the
+server connected/healthy, and tears the connection back down.
 
 ---
 
 ### retryConfig?
 
-> `optional` **retryConfig**: `object`
-
-Defined in: [types/mcpTypes.ts:115](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L115)
+> `optional` **retryConfig?**: `object`
 
 Retry configuration for HTTP transport
 
 #### maxAttempts?
 
-> `optional` **maxAttempts**: `number`
+> `optional` **maxAttempts?**: `number`
 
 #### initialDelay?
 
-> `optional` **initialDelay**: `number`
+> `optional` **initialDelay?**: `number`
 
 #### maxDelay?
 
-> `optional` **maxDelay**: `number`
+> `optional` **maxDelay?**: `number`
 
 #### backoffMultiplier?
 
-> `optional` **backoffMultiplier**: `number`
+> `optional` **backoffMultiplier?**: `number`
 
 ---
 
 ### rateLimiting?
 
-> `optional` **rateLimiting**: `object`
-
-Defined in: [types/mcpTypes.ts:123](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L123)
+> `optional` **rateLimiting?**: `object`
 
 Rate limiting configuration for HTTP transport
 
 #### requestsPerMinute?
 
-> `optional` **requestsPerMinute**: `number`
+> `optional` **requestsPerMinute?**: `number`
 
 Maximum requests per minute (default: 60)
 
 #### requestsPerHour?
 
-> `optional` **requestsPerHour**: `number`
+> `optional` **requestsPerHour?**: `number`
 
 Maximum requests per hour (optional)
 
 #### maxBurst?
 
-> `optional` **maxBurst**: `number`
+> `optional` **maxBurst?**: `number`
 
 Maximum burst size for token bucket (default: 10)
 
 #### useTokenBucket?
 
-> `optional` **useTokenBucket**: `boolean`
+> `optional` **useTokenBucket?**: `boolean`
 
 Use token bucket algorithm (default: true)
 
@@ -262,17 +268,13 @@ Use token bucket algorithm (default: true)
 
 ### blockedTools?
 
-> `optional` **blockedTools**: `string`[]
-
-Defined in: [types/mcpTypes.ts:135](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L135)
+> `optional` **blockedTools?**: `string`[]
 
 ---
 
 ### auth?
 
-> `optional` **auth**: `object`
-
-Defined in: [types/mcpTypes.ts:138](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L138)
+> `optional` **auth?**: `object`
 
 Authentication configuration for HTTP/SSE/WebSocket transports
 
@@ -284,7 +286,7 @@ Authentication type
 
 #### oauth?
 
-> `optional` **oauth**: `object`
+> `optional` **oauth?**: `object`
 
 OAuth 2.1 configuration
 
@@ -296,7 +298,7 @@ OAuth client ID
 
 ##### oauth.clientSecret?
 
-> `optional` **clientSecret**: `string`
+> `optional` **clientSecret?**: `string`
 
 OAuth client secret (optional for public clients with PKCE)
 
@@ -320,31 +322,31 @@ Redirect URI for OAuth callback
 
 ##### oauth.scope?
 
-> `optional` **scope**: `string`
+> `optional` **scope?**: `string`
 
 OAuth scope (space-separated)
 
 ##### oauth.usePKCE?
 
-> `optional` **usePKCE**: `boolean`
+> `optional` **usePKCE?**: `boolean`
 
 Enable PKCE (Proof Key for Code Exchange) - recommended for OAuth 2.1
 
 #### token?
 
-> `optional` **token**: `string`
+> `optional` **token?**: `string`
 
 Bearer token for simple token authentication
 
 #### apiKey?
 
-> `optional` **apiKey**: `string`
+> `optional` **apiKey?**: `string`
 
 API key for API key authentication
 
 #### apiKeyHeader?
 
-> `optional` **apiKeyHeader**: `string`
+> `optional` **apiKeyHeader?**: `string`
 
 Header name for API key (default: "X-API-Key")
 
@@ -352,9 +354,7 @@ Header name for API key (default: "X-API-Key")
 
 ### metadata?
 
-> `optional` **metadata**: `object`
-
-Defined in: [types/mcpTypes.ts:167](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L167)
+> `optional` **metadata?**: `object`
 
 #### Index Signature
 
@@ -362,28 +362,28 @@ Defined in: [types/mcpTypes.ts:167](https://github.com/juspay/neurolink/blob/1be
 
 #### uptime?
 
-> `optional` **uptime**: `number`
+> `optional` **uptime?**: `number`
 
 #### toolCount?
 
-> `optional` **toolCount**: `number`
+> `optional` **toolCount?**: `number`
 
 #### category?
 
-> `optional` **category**: `MCPServerCategory`
+> `optional` **category?**: [`MCPServerCategory`](MCPServerCategory.md)
 
 #### provider?
 
-> `optional` **provider**: `string`
+> `optional` **provider?**: `string`
 
 #### version?
 
-> `optional` **version**: `string`
+> `optional` **version?**: `string`
 
 #### author?
 
-> `optional` **author**: `string`
+> `optional` **author?**: `string`
 
 #### tags?
 
-> `optional` **tags**: `string`[]
+> `optional` **tags?**: `string`[]

@@ -3,15 +3,15 @@
  * Metrics tracking and collection for workflow execution
  */
 
-import type { JsonValue } from "../../types/common.js";
-import { logger } from "../../utils/logger.js";
-import type { EnsembleResponse, WorkflowResult } from "../types.js";
 import type {
+  JsonValue,
+  EnsembleResponse,
+  WorkflowResult,
   SummaryStats,
   WorkflowComparison,
   WorkflowExecutionMetrics,
-} from "./types/index.js";
-
+} from "../../types/index.js";
+import { logger } from "../../utils/logger.js";
 const functionTag = "WorkflowMetrics";
 
 /**
@@ -197,8 +197,8 @@ export function calculateModelMetrics(
 
 /**
  * Calculate consensus level between responses
- * NOTE: Placeholder implementation - uses response length similarity
- * TODO: Implement semantic similarity in Phase 2
+ * NOTE: Placeholder implementation - uses response length similarity.
+ * Semantic similarity is a possible future direction, not planned work.
  */
 export function calculateConsensus(responses: EnsembleResponse[]): number {
   const successful = responses.filter((r) => r.status === "success");

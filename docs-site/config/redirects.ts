@@ -58,7 +58,8 @@ const sectionReorganizationRedirects: PluginOptions["redirects"] = [
   // Multimodal feature redirects
   { from: "/multimodal", to: "/docs/features/multimodal" },
   { from: "/docs/multimodal", to: "/docs/features/multimodal" },
-  { from: "/vision", to: "/docs/features/multimodal" },
+  { from: "/vision", to: "/docs/about/vision" },
+  { from: "/docs/vision", to: "/docs/about/vision" },
   { from: "/images", to: "/docs/features/multimodal" },
   { from: "/pdf", to: "/docs/features/pdf-support" },
   { from: "/docs/pdf", to: "/docs/features/pdf-support" },
@@ -86,12 +87,11 @@ const sectionReorganizationRedirects: PluginOptions["redirects"] = [
   { from: "/conversation", to: "/docs/features/conversation-history" },
   { from: "/conversation-history", to: "/docs/features/conversation-history" },
   { from: "/redis", to: "/docs/getting-started/redis-quickstart" },
-  { from: "/mem0", to: "/docs/memory/mem0" },
   { from: "/summarization", to: "/docs/memory/summarization" },
 
   // Streaming redirects
-  { from: "/streaming", to: "/docs/advanced/streaming" },
-  { from: "/docs/streaming", to: "/docs/advanced/streaming" },
+  { from: "/streaming", to: "/docs/features/regional-streaming" },
+  { from: "/docs/streaming", to: "/docs/features/regional-streaming" },
   { from: "/regional-streaming", to: "/docs/features/regional-streaming" },
 
   // Structured output redirects
@@ -103,14 +103,17 @@ const sectionReorganizationRedirects: PluginOptions["redirects"] = [
   { from: "/image-generation", to: "/docs/features/image-generation" },
   { from: "/video-generation", to: "/docs/features/video-generation" },
   { from: "/video", to: "/docs/features/video-generation" },
+  { from: "/ppt-generation", to: "/docs/features/ppt-generation" },
+  { from: "/ppt", to: "/docs/features/ppt-generation" },
+  { from: "/powerpoint", to: "/docs/features/ppt-generation" },
 
   // Enterprise features redirects
   { from: "/hitl", to: "/docs/features/hitl" },
   { from: "/human-in-the-loop", to: "/docs/features/hitl" },
   { from: "/guardrails", to: "/docs/features/guardrails" },
   { from: "/docs/guardrails", to: "/docs/features/guardrails" },
-  { from: "/enterprise", to: "/docs/advanced/enterprise" },
-  { from: "/docs/enterprise", to: "/docs/advanced/enterprise" },
+  { from: "/enterprise", to: "/docs/guides/enterprise/multi-region" },
+  { from: "/docs/enterprise", to: "/docs/guides/enterprise/multi-region" },
 
   // Thinking/reasoning redirects
   { from: "/thinking", to: "/docs/features/thinking-configuration" },
@@ -118,13 +121,12 @@ const sectionReorganizationRedirects: PluginOptions["redirects"] = [
   { from: "/extended-thinking", to: "/docs/features/thinking-configuration" },
 
   // Middleware redirects
-  { from: "/middleware", to: "/docs/advanced/middleware-architecture" },
-  { from: "/docs/middleware", to: "/docs/advanced/middleware-architecture" },
+  { from: "/middleware", to: "/docs/workflows/middleware" },
+  { from: "/docs/middleware", to: "/docs/workflows/middleware" },
 
   // Analytics/observability redirects (redirect to telemetry as main observability page)
   { from: "/analytics", to: "/docs/observability/telemetry" },
   { from: "/docs/analytics", to: "/docs/observability/telemetry" },
-  { from: "/docs/reference/analytics", to: "/docs/observability/telemetry" },
   { from: "/observability", to: "/docs/observability/telemetry" },
   { from: "/telemetry", to: "/docs/observability/telemetry" },
 
@@ -390,16 +392,6 @@ export const staticRedirects: PluginOptions["redirects"] = [
 // Dynamic Redirect Function
 // ============================================================================
 
-/**
- * Creates dynamic redirects for paths that don't start with /docs/
- * This ensures any legacy path automatically redirects to /docs/ equivalent
- *
- * Note: This function is called for each existing path in the build.
- * It returns an array of "from" paths that should redirect to the existing path.
- *
- * @param existingPath - The current path that exists in the build
- * @returns Array of from paths that should redirect to this path, or undefined
- */
 export function createRedirects(existingPath: string): string[] | undefined {
   // Only process paths that start with /docs/
   if (!existingPath.startsWith("/docs/")) {

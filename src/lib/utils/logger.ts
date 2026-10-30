@@ -14,7 +14,45 @@
  * - Tabular data display
  */
 
-import type { LogEntry, LogLevel } from "../types/utilities.js";
+import { AsyncLocalStorage } from "node:async_hooks";
+import type { LogEntry, LogEventEmitter, LogLevel } from "../types/index.js";
+import { isSensitiveLogKey, sanitizeForLog } from "./logSanitize.js";
+
+/**
+ * Identifies which NeuroLink instance is emitting, for the async operation
+ * currently on the stack. Populated by `runInInstanceScope()` — which the SDK
+ * entry points (`generate`, `stream`, `generateText`) wrap their bodies in —
+ * so a log call anywhere beneath them can be attributed without every call
+ * site threading an instance through.
+ *
+ * Empty for logs emitted outside any call (construction, background MCP
+ * reconnects, module init). Those stay unattributed rather than being charged
+ * to whichever instance happens to hold the global sink.
+ */
+const instanceLogScope = new AsyncLocalStorage<string>();
+
+// OTel trace context for log correlation (optional — gracefully no-ops if OTel not initialized)
+let traceApi: typeof import("@opentelemetry/api") | null = null;
+let traceApiPromise: Promise<
+  typeof import("@opentelemetry/api") | null
+> | null = null;
+
+async function getTraceApi(): Promise<
+  typeof import("@opentelemetry/api") | null
+> {
+  if (!traceApiPromise) {
+    traceApiPromise = import("@opentelemetry/api")
+      .then((mod) => {
+        traceApi = mod;
+        return mod;
+      })
+      .catch(() => null);
+  }
+  return traceApiPromise;
+}
+
+// Eagerly kick off the import so the cached value is available for synchronous callers
+void getTraceApi();
 
 // Pre-computed uppercase log levels for performance optimization
 const UPPERCASE_LOG_LEVELS: Record<LogLevel, string> = {
@@ -24,14 +62,164 @@ const UPPERCASE_LOG_LEVELS: Record<LogLevel, string> = {
   error: "ERROR",
 } as const;
 
+const FORMAT_FLAGS = ["--format", "-f", "--output-format"];
+
+/**
+ * True when the process was started with JSON output requested. Read from
+ * argv on every write, like the `--debug` check in `shouldLog`: modules log
+ * while they are still being imported, before the CLI middleware that calls
+ * `setDiagnosticsToStderr` has run.
+ */
+function argvRequestsJsonOutput(): boolean {
+  const argv = process.argv;
+  return argv.some(
+    (arg, index) =>
+      (FORMAT_FLAGS.includes(arg) && argv[index + 1] === "json") ||
+      FORMAT_FLAGS.some((flag) => arg === `${flag}=json`),
+  );
+}
+
+/**
+ * Best-effort isolated copy of a log call's `data` payload for one consumer.
+ * `NeuroLinkLogger.log()` hands the same call's data to every scoped emitter
+ * for the active instance plus the process-wide sink — a designed, supported
+ * multi-consumer configuration — so a copy per consumer is what keeps one
+ * consumer's in-place mutation (e.g. redacting a field before forwarding it)
+ * from silently corrupting what a sibling consumer, or stored log history,
+ * observes. Non-object values need no copy — they are already by-value.
+ * Values `structuredClone` cannot handle (functions, etc.) are handed through
+ * unchanged rather than dropped: isolation is not achievable for those
+ * without lossy serialization, so that narrow case keeps the old
+ * shared-reference behavior instead of losing the payload.
+ */
+function cloneLogData(data: unknown): unknown {
+  if (data === null || typeof data !== "object") {
+    return data;
+  }
+  try {
+    return structuredClone(data);
+  } catch {
+    return data;
+  }
+}
+
+/**
+ * Per-string cap for central redaction. Deliberately far above anything a
+ * debug payload carries, so this pass redacts without truncating — the
+ * logger's "zero truncation" promise for debug data stands.
+ */
+const REDACTION_STRING_CAP = 1_000_000;
+
+function isPlainObject(value: object): boolean {
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+/**
+ * Central redaction for `debug` / `info` payloads — the same key list and
+ * secret patterns as `sanitizeRecord`, applied to plain objects and arrays.
+ *
+ * `sanitizeRecord` itself is not used directly on the whole payload because
+ * its `Object.entries` walk flattens what debug data is full of: an `Error`
+ * becomes `{}` (message and stack gone), a `Buffer` becomes thousands of
+ * numeric keys, a `Date`/`Map`/`Set` becomes `{}`. Here binary data, dates
+ * and regexps are kept as they are, a `Map` or `Set` is copied with its
+ * entries redacted, and any other object is reduced to what `JSON.stringify`
+ * prints for it (its `toJSON()` result or its own fields) — the same fields
+ * the console and a `structuredClone` for a sink would expose. Sensitive keys
+ * are masked, strings scrubbed of bearer tokens and known key prefixes, an
+ * object reached by several paths is redacted once and its copy shared, a
+ * cycle becomes `"[Circular]"`, and an `Error` gets its message scrubbed in
+ * place of the instance.
+ *
+ * Cost: one pass over the objects a call site already chose to log, each
+ * redacted once, and only when `shouldLog(level)` was true. Nothing runs for
+ * the 99% of `logger.debug` calls that are filtered out.
+ */
+function redactLogData(
+  data: unknown,
+  redacted = new Map<object, unknown>(),
+): unknown {
+  if (data === null || data === undefined) {
+    return data;
+  }
+  if (typeof data === "string") {
+    return sanitizeForLog(data, REDACTION_STRING_CAP);
+  }
+  if (typeof data !== "object") {
+    return data;
+  }
+  if (data instanceof Error) {
+    const copy = new Error(sanitizeForLog(data.message, REDACTION_STRING_CAP));
+    copy.name = data.name;
+    copy.stack = data.stack
+      ? sanitizeForLog(data.stack, REDACTION_STRING_CAP)
+      : undefined;
+    return copy;
+  }
+  if (
+    ArrayBuffer.isView(data) ||
+    data instanceof ArrayBuffer ||
+    data instanceof Date ||
+    data instanceof RegExp
+  ) {
+    return data;
+  }
+  if (redacted.has(data)) {
+    return redacted.get(data);
+  }
+  // Until this object's copy is built, a reference back to it is a cycle.
+  redacted.set(data, "[Circular]");
+  const copy = redactContainer(data, (value) => redactLogData(value, redacted));
+  redacted.set(data, copy);
+  return copy;
+}
+
+/** One level of {@link redactLogData}, for an object it has not seen yet. */
+function redactContainer(
+  data: object,
+  walk: (value: unknown) => unknown,
+): unknown {
+  if (Array.isArray(data)) {
+    return data.map(walk);
+  }
+  if (data instanceof Map) {
+    return new Map(
+      Array.from(data, ([key, value]: [unknown, unknown]) => [
+        key,
+        typeof key === "string" && isSensitiveLogKey(key, value)
+          ? "***"
+          : walk(value),
+      ]),
+    );
+  }
+  if (data instanceof Set) {
+    return new Set(Array.from(data, walk));
+  }
+  if (
+    !isPlainObject(data) &&
+    "toJSON" in data &&
+    typeof data.toJSON === "function"
+  ) {
+    const json: unknown = data.toJSON();
+    return walk(json);
+  }
+  const entries: Array<[string, unknown]> = Object.entries(data);
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of entries) {
+    out[key] = isSensitiveLogKey(key, value) ? "***" : walk(value);
+  }
+  return out;
+}
+
 class NeuroLinkLogger {
   private logLevel: LogLevel = "info";
   private logs: LogEntry[] = [];
   private maxLogs = 1000;
   private isDebugMode: boolean;
-  private eventEmitter?: {
-    emit: (event: string, ...args: unknown[]) => boolean;
-  };
+  private diagnosticsToStderr = false;
+  private eventEmitter?: LogEventEmitter;
+  private readonly scopedEmitters = new Map<string, Set<LogEventEmitter>>();
 
   constructor() {
     // Cache debug mode check to avoid repeated array searches
@@ -53,18 +241,107 @@ class NeuroLinkLogger {
    *
    * @param emitter - The event emitter instance
    */
-  setEventEmitter(emitter: {
-    emit: (event: string, ...args: unknown[]) => boolean;
-  }): void {
+  setEventEmitter(emitter: LogEventEmitter): void {
     this.eventEmitter = emitter;
   }
 
   /**
-   * Clears the event emitter reference.
-   * Should be called when a NeuroLink instance is disposed to prevent memory leaks.
+   * The process-wide sink currently receiving log events, or undefined when
+   * none is set. Lets code that must construct an instance without changing
+   * the sink capture it beforehand and put it back afterwards.
    */
-  clearEventEmitter(): void {
+  getEventEmitter(): LogEventEmitter | undefined {
+    return this.eventEmitter;
+  }
+
+  /**
+   * Clears the event emitter reference.
+   * Should be called when a NeuroLink instance is disposed to prevent memory
+   * leaks. Pass the disposing instance's emitter so a short-lived instance
+   * (e.g. a worker sub-agent) only clears the bridge when it actually owns
+   * it — never yanking a host instance's live log bridge.
+   *
+   * @param ifEmitter - When provided, clear only if it is the current emitter
+   */
+  clearEventEmitter(ifEmitter?: LogEventEmitter): void {
+    if (ifEmitter !== undefined && this.eventEmitter !== ifEmitter) {
+      return;
+    }
     this.eventEmitter = undefined;
+  }
+
+  /**
+   * Runs `fn` with every log call beneath it attributed to `instanceId`.
+   *
+   * Nesting is safe and expected: a host turn that delegates to a worker ends
+   * up with the worker's id on top for the duration of the worker's call, and
+   * the host's id restored afterwards. Re-entering with the same id is a
+   * no-op in effect.
+   *
+   * @param instanceId - Identifier of the emitting NeuroLink instance
+   * @param fn - Work to run inside the scope
+   * @returns Whatever `fn` returns
+   */
+  runInInstanceScope<T>(instanceId: string, fn: () => T): T {
+    return instanceLogScope.run(instanceId, fn);
+  }
+
+  /**
+   * The instance id currently attributed, or undefined outside any scope.
+   */
+  getInstanceScope(): string | undefined {
+    return instanceLogScope.getStore();
+  }
+
+  /**
+   * Subscribes `emitter` to log events emitted by one instance only.
+   *
+   * Unlike {@link setEventEmitter} — a single process-wide sink that receives
+   * everything — a scoped emitter receives only events logged inside that
+   * instance's {@link runInInstanceScope}. Several emitters may share an id.
+   *
+   * @param instanceId - Instance whose events this emitter should receive
+   * @param emitter - The sink to subscribe
+   */
+  addScopedEventEmitter(instanceId: string, emitter: LogEventEmitter): void {
+    const existing = this.scopedEmitters.get(instanceId);
+    if (existing) {
+      existing.add(emitter);
+      return;
+    }
+    this.scopedEmitters.set(instanceId, new Set([emitter]));
+  }
+
+  /**
+   * Unsubscribes a scoped emitter. Must be called when the owning instance is
+   * disposed, or the emitter — and everything it closes over — is retained by
+   * the process-global logger for the lifetime of the process.
+   *
+   * @param instanceId - Instance the emitter was registered against
+   * @param emitter - The sink to unsubscribe
+   */
+  removeScopedEventEmitter(instanceId: string, emitter: LogEventEmitter): void {
+    const existing = this.scopedEmitters.get(instanceId);
+    if (!existing) {
+      return;
+    }
+    existing.delete(emitter);
+    if (existing.size === 0) {
+      this.scopedEmitters.delete(instanceId);
+    }
+  }
+
+  /**
+   * Drops every scoped emitter registered against an instance.
+   *
+   * Called from `NeuroLink.dispose()`: the registry lives on the
+   * process-global logger, so an instance that goes away without clearing its
+   * own entry would keep its sinks — and their closures — reachable forever.
+   *
+   * @param instanceId - Instance whose sinks should be dropped
+   */
+  clearScopedEventEmitters(instanceId: string): void {
+    this.scopedEmitters.delete(instanceId);
   }
 
   /**
@@ -75,6 +352,17 @@ class NeuroLinkLogger {
    */
   setLogLevel(level: LogLevel): void {
     this.logLevel = level;
+  }
+
+  /**
+   * Routes debug and info output to stderr instead of stdout. The CLI turns
+   * this on for `--format json`, where stdout carries the payload and any
+   * diagnostic line in it would make the output unparseable.
+   *
+   * @param enabled - True to send debug/info to stderr; false restores stdout
+   */
+  setDiagnosticsToStderr(enabled: boolean): void {
+    this.diagnosticsToStderr = enabled;
   }
 
   /**
@@ -116,7 +404,93 @@ class NeuroLinkLogger {
   }
 
   /**
+   * Extracts current OTel trace context (trace_id, span_id) if available.
+   * Returns empty object if OTel is not initialized or no active span exists.
+   */
+  private getTraceContext(): {
+    trace_id?: string;
+    span_id?: string;
+    trace_flags?: string;
+  } {
+    if (!traceApi) {
+      return {};
+    }
+    try {
+      const span = traceApi.trace.getSpan(traceApi.context.active());
+      if (!span) {
+        return {};
+      }
+      const spanContext = span.spanContext();
+      if (
+        !spanContext ||
+        spanContext.traceId === "00000000000000000000000000000000"
+      ) {
+        return {};
+      }
+      return {
+        trace_id: spanContext.traceId,
+        span_id: spanContext.spanId,
+        trace_flags: String(spanContext.traceFlags),
+      };
+    } catch {
+      return {};
+    }
+  }
+
+  /**
+   * Safely serialize data to fully expanded JSON string.
+   * Handles circular references and non-serializable values.
+   * Zero truncation — all nested objects and arrays are fully expanded.
+   */
+  private serializeData(data: unknown): string {
+    if (data === undefined || data === null) {
+      return String(data);
+    }
+    if (typeof data !== "object") {
+      return String(data);
+    }
+    try {
+      return JSON.stringify(data, (_key, value) => {
+        if (value instanceof Error) {
+          return {
+            name: value.name,
+            message: value.message,
+            stack: value.stack,
+          };
+        }
+        return value;
+      });
+    } catch {
+      // Handle circular references using a stack-based approach
+      // to avoid false "[Circular]" on diamond (shared) references
+      const ancestors: object[] = [];
+      try {
+        return JSON.stringify(data, function (_key, value) {
+          if (value instanceof Error) {
+            return {
+              name: value.name,
+              message: value.message,
+              stack: value.stack,
+            };
+          }
+          if (typeof value === "object" && value !== null) {
+            // Only flag actual circular (ancestor) references
+            if (ancestors.includes(value)) {
+              return "[Circular]";
+            }
+            ancestors.push(value);
+          }
+          return value;
+        });
+      } catch {
+        return "[Unserializable Object]";
+      }
+    }
+  }
+
+  /**
    * Outputs a log entry to the console based on the log level.
+   * Data is fully serialized to JSON — no [Object] or [Array] truncation.
    *
    * @param level - The log level (debug, info, warn, error).
    * @param prefix - The formatted log prefix.
@@ -129,16 +503,21 @@ class NeuroLinkLogger {
     message: string,
     data?: unknown,
   ): void {
+    const toStderr = this.diagnosticsToStderr || argvRequestsJsonOutput();
     const logMethod = {
-      debug: console.debug,
-      info: console.info,
+      debug: toStderr ? console.error : console.debug,
+      info: toStderr ? console.error : console.info,
       warn: console.warn,
       error: console.error,
     }[level];
+    const traceCtx = this.getTraceContext();
+    const tracePrefix = traceCtx.trace_id
+      ? ` [trace_id=${traceCtx.trace_id} span_id=${traceCtx.span_id}]`
+      : "";
     if (data !== undefined && data !== null) {
-      logMethod(prefix, message, data);
+      logMethod(prefix + tracePrefix, message, this.serializeData(data));
     } else {
-      logMethod(prefix, message);
+      logMethod(prefix + tracePrefix, message);
     }
   }
 
@@ -156,9 +535,32 @@ class NeuroLinkLogger {
    * @param message - The message text to log
    * @param data - Optional additional context data to include
    */
-  private log(level: LogLevel, message: string, data?: unknown): void {
+  private log(level: LogLevel, rawMessage: string, rawData?: unknown): void {
     if (!this.shouldLog(level)) {
       return;
+    }
+
+    // Central redaction: a `debug`/`info` payload is masked by key
+    // (`apiKey`, `authorization`, `credentials`, …), and it and the message
+    // are scrubbed of bearer/known-prefix tokens and JWTs before they are
+    // stored, emitted or printed, so the next `logger.debug("…", options)`
+    // cannot leak a credential into `getLogs()`, a `log-event` sink or the
+    // console. `warn`/`error` are left verbatim: they carry the diagnostics
+    // an operator is debugging with, and every credential-bearing path
+    // already redacts at source.
+    const redact = level === "debug" || level === "info";
+    const message = redact
+      ? sanitizeForLog(rawMessage, REDACTION_STRING_CAP)
+      : rawMessage;
+    let data = rawData;
+    if (redact) {
+      try {
+        data = redactLogData(rawData);
+      } catch {
+        // Too deep (a stack overflow) or a throwing getter: drop the payload
+        // rather than log it unredacted or throw into the caller.
+        data = "[unredactable log data]";
+      }
     }
 
     const entry: LogEntry = {
@@ -168,17 +570,49 @@ class NeuroLinkLogger {
       data,
     };
 
-    // Emit log event if emitter is configured
-    if (this.eventEmitter) {
-      try {
-        this.eventEmitter.emit("log-event", {
-          level,
-          message,
-          timestamp: new Date().getTime(),
-          data,
-        });
-      } catch {
-        // Silently ignore emitter errors to avoid disrupting logging
+    // Emit to the per-instance sinks for whichever instance is on the stack,
+    // then to the process-wide sink. The two are independent: a scoped sink
+    // never sees another instance's events, and the global sink still sees
+    // everything, so existing setEventEmitter() consumers are unaffected.
+    //
+    // Several emitters may be registered for the same instance id (see
+    // addScopedEventEmitter's own JSDoc), and the global sink always runs
+    // alongside them — so one call's `data` object is, by design, handed to
+    // more than one consumer. Each consumer below gets its OWN clone rather
+    // than the shared `data` reference, so an in-place mutation by one (e.g.
+    // a bridge redacting a field before forwarding it) cannot corrupt what a
+    // sibling consumer sees or what `entry` — which keeps the original,
+    // unmodified `data` — stores for `getLogs()`.
+    const scopeId = instanceLogScope.getStore();
+    const scoped =
+      scopeId === undefined ? undefined : this.scopedEmitters.get(scopeId);
+    if (scoped || this.eventEmitter) {
+      const timestampMs = entry.timestamp.getTime();
+      if (scoped) {
+        for (const emitter of scoped) {
+          try {
+            emitter.emit("log-event", {
+              level,
+              message,
+              timestamp: timestampMs,
+              data: cloneLogData(data),
+            });
+          } catch {
+            // Silently ignore emitter errors to avoid disrupting logging
+          }
+        }
+      }
+      if (this.eventEmitter) {
+        try {
+          this.eventEmitter.emit("log-event", {
+            level,
+            message,
+            timestamp: timestampMs,
+            data: cloneLogData(data),
+          });
+        } catch {
+          // Silently ignore emitter errors to avoid disrupting logging
+        }
       }
     }
 
@@ -284,6 +718,20 @@ class NeuroLinkLogger {
   }
 
   /**
+   * Logs messages unconditionally using `console.error` (stderr).
+   *
+   * Same semantics as `always()` — bypasses log level checks and debug mode
+   * gating — but targets stderr instead of stdout. Use this for output that
+   * must stay visible (safety warnings, notices) without risking corruption
+   * of machine-readable stdout (e.g. `--format json`).
+   *
+   * @param args - The arguments to log. These are passed directly to `console.error`.
+   */
+  alwaysStderr(...args: unknown[]): void {
+    console.error(...args);
+  }
+
+  /**
    * Displays tabular data unconditionally using `console.table`.
    *
    * Similar to the `always` method, this bypasses log level checks and
@@ -326,15 +774,19 @@ const neuroLinkLogger = new NeuroLinkLogger();
 function processLoggerArgs(
   args: unknown[],
   logMethod: (message: string, data?: unknown) => void,
+  redact = false,
 ): void {
   if (args.length === 0) {
     return;
   }
 
-  // Serialize the first argument robustly to handle complex objects
+  // Serialize the first argument robustly to handle complex objects. An
+  // object is masked by key first: once it is a string, keys can't be found.
   const message = (() => {
     try {
-      return typeof args[0] === "string" ? args[0] : JSON.stringify(args[0]);
+      return typeof args[0] === "string"
+        ? args[0]
+        : JSON.stringify(redact ? redactLogData(args[0]) : args[0]);
     } catch {
       return "[Unserializable Object]";
     }
@@ -358,15 +810,19 @@ function processLoggerArgs(
 export const logger = {
   debug: (...args: unknown[]) => {
     if (neuroLinkLogger.shouldLog("debug")) {
-      processLoggerArgs(args, (message, data) =>
-        neuroLinkLogger.debug(message, data),
+      processLoggerArgs(
+        args,
+        (message, data) => neuroLinkLogger.debug(message, data),
+        true,
       );
     }
   },
   info: (...args: unknown[]) => {
     if (neuroLinkLogger.shouldLog("info")) {
-      processLoggerArgs(args, (message, data) =>
-        neuroLinkLogger.info(message, data),
+      processLoggerArgs(
+        args,
+        (message, data) => neuroLinkLogger.info(message, data),
+        true,
       );
     }
   },
@@ -387,17 +843,35 @@ export const logger = {
   always: (...args: unknown[]) => {
     neuroLinkLogger.always(...args);
   },
+  alwaysStderr: (...args: unknown[]) => {
+    neuroLinkLogger.alwaysStderr(...args);
+  },
   table: (data: unknown) => {
     neuroLinkLogger.table(data);
   },
+  // Expose log-level check for gating expensive operations
+  shouldLog: (level: LogLevel) => neuroLinkLogger.shouldLog(level),
   // Expose structured logging methods
   setLogLevel: (level: LogLevel) => neuroLinkLogger.setLogLevel(level),
+  setDiagnosticsToStderr: (enabled: boolean) =>
+    neuroLinkLogger.setDiagnosticsToStderr(enabled),
   getLogs: (level?: LogLevel) => neuroLinkLogger.getLogs(level),
   clearLogs: () => neuroLinkLogger.clearLogs(),
-  setEventEmitter: (emitter: {
-    emit: (event: string, ...args: unknown[]) => boolean;
-  }) => neuroLinkLogger.setEventEmitter(emitter),
-  clearEventEmitter: () => neuroLinkLogger.clearEventEmitter(),
+  setEventEmitter: (emitter: LogEventEmitter) =>
+    neuroLinkLogger.setEventEmitter(emitter),
+  getEventEmitter: () => neuroLinkLogger.getEventEmitter(),
+  clearEventEmitter: (ifEmitter?: LogEventEmitter) =>
+    neuroLinkLogger.clearEventEmitter(ifEmitter),
+  // Per-instance routing (see NeuroLinkLogger.runInInstanceScope)
+  runInInstanceScope: <T>(instanceId: string, fn: () => T) =>
+    neuroLinkLogger.runInInstanceScope(instanceId, fn),
+  getInstanceScope: () => neuroLinkLogger.getInstanceScope(),
+  addScopedEventEmitter: (instanceId: string, emitter: LogEventEmitter) =>
+    neuroLinkLogger.addScopedEventEmitter(instanceId, emitter),
+  removeScopedEventEmitter: (instanceId: string, emitter: LogEventEmitter) =>
+    neuroLinkLogger.removeScopedEventEmitter(instanceId, emitter),
+  clearScopedEventEmitters: (instanceId: string) =>
+    neuroLinkLogger.clearScopedEventEmitters(instanceId),
 };
 
 /**

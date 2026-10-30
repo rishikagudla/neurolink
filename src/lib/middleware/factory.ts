@@ -1,5 +1,3 @@
-import { wrapLanguageModel } from "ai";
-import type { LanguageModelV1 } from "ai";
 import type {
   MiddlewareContext,
   MiddlewareConfig,
@@ -9,12 +7,17 @@ import type {
   MiddlewarePreset,
   NeuroLinkMiddleware,
   MiddlewareRegistrationOptions,
-} from "../types/middlewareTypes.js";
+} from "../types/index.js";
 import { MiddlewareRegistry } from "./registry.js";
+import { createBuiltInMiddlewarePresets } from "./presets.js";
 import { createAnalyticsMiddleware } from "./builtin/analytics.js";
 import { createGuardrailsMiddleware } from "./builtin/guardrails.js";
 import { createAutoEvaluationMiddleware } from "./builtin/autoEvaluation.js";
+import { createLifecycleMiddleware } from "./builtin/lifecycle.js";
 import { logger } from "../utils/logger.js";
+import { wrapLanguageModel } from "./wrapLanguageModel.js";
+import type { LanguageModel } from "../types/index.js";
+import type { LanguageModelV3 } from "../types/index.js";
 
 /**
  * Middleware factory for creating and applying middleware chains.
@@ -43,24 +46,13 @@ export class MiddlewareFactory {
       analytics: createAnalyticsMiddleware,
       guardrails: createGuardrailsMiddleware,
       autoEvaluation: createAutoEvaluationMiddleware,
+      lifecycle: createLifecycleMiddleware,
     };
 
     // Register built-in presets
-    this.registerPreset({
-      name: "default",
-      description: "Default preset with analytics enabled.",
-      config: { analytics: { enabled: true } },
-    });
-    this.registerPreset({
-      name: "all",
-      description: "Enables all available middleware.",
-      config: { analytics: { enabled: true }, guardrails: { enabled: true } },
-    });
-    this.registerPreset({
-      name: "security",
-      description: "Focuses on security with guardrails.",
-      config: { guardrails: { enabled: true } },
-    });
+    for (const preset of createBuiltInMiddlewarePresets()) {
+      this.registerPreset(preset);
+    }
 
     // Register custom middleware if provided
     logger.debug("Initializing MiddlewareFactory", { options });
@@ -111,10 +103,10 @@ export class MiddlewareFactory {
    * Apply middleware to a language model
    */
   public applyMiddleware(
-    model: LanguageModelV1,
+    model: LanguageModel,
     context: MiddlewareContext,
     options: MiddlewareFactoryOptions = {},
-  ): LanguageModelV1 {
+  ): LanguageModel {
     const startTime = Date.now();
 
     try {
@@ -159,9 +151,10 @@ export class MiddlewareFactory {
       });
 
       // Apply middleware using AI SDK's wrapLanguageModel
-      // Cast to the expected AI SDK middleware type
+      // wrapLanguageModel expects LanguageModelV3, narrow from LanguageModel union
+      const modelV3 = model as LanguageModelV3;
       const wrappedModel = wrapLanguageModel({
-        model,
+        model: modelV3,
         middleware: middlewareChain,
       });
 
@@ -192,6 +185,7 @@ export class MiddlewareFactory {
       analytics: createAnalyticsMiddleware,
       guardrails: createGuardrailsMiddleware,
       autoEvaluation: createAutoEvaluationMiddleware,
+      lifecycle: createLifecycleMiddleware,
     };
     logger.debug("Getting creator for middleware ID:", id);
     return builtInMiddlewareCreators[id];
@@ -414,13 +408,13 @@ export class MiddlewareFactory {
    * Create a middleware-enabled model factory function
    */
   public createModelFactory(
-    baseModelFactory: () => Promise<LanguageModelV1>,
+    baseModelFactory: () => Promise<LanguageModel>,
     defaultOptions: MiddlewareFactoryOptions = {},
   ) {
     return async (
       context: MiddlewareContext,
       options: MiddlewareFactoryOptions = {},
-    ): Promise<LanguageModelV1> => {
+    ): Promise<LanguageModel> => {
       // Get base model
       const baseModel = await baseModelFactory();
 

@@ -1,3 +1,14 @@
+import {
+  beginOllamaDiagnostic,
+  captureOllamaDiagnosticContext,
+  completeOllamaDiagnostic,
+  getOllamaDiagnosticErrorMessage,
+} from "./utils/ollamaDiagnostics.js";
+import type {
+  AttachmentPolicy,
+  OllamaDiagnosticOutcome,
+  OllamaDiagnosticPermit,
+} from "./types/index.js";
 /**
  * NeuroLink - Unified AI Interface with Real MCP Tool Integration
  *
@@ -6,25 +17,69 @@
  * Uses real MCP infrastructure for tool discovery and execution.
  */
 
-// Load environment variables from .env file (critical for SDK usage)
-import { config as dotenvConfig } from "dotenv";
+// The SDK no longer reads `<cwd>/.env` as a side effect of being imported:
+// a library loaded inside an untrusted checkout would pick up that
+// checkout's `*_BASE_URL` overrides and send the host's real keys wherever
+// they pointed. The CLI still loads `.env` at startup (it is interactive and
+// the directory is the user's); an SDK host that wants the same calls
+// `loadDotenv()` from the package root, or starts the process with
+// `NEUROLINK_DOTENV=1` in the real environment, which is honoured here.
+import {
+  isSdkDotenvOptIn,
+  loadProcessDotenv,
+} from "./utils/dotenvBootstrap.js";
+import { resolveProjectMcpConfigPath } from "./mcp/projectConfigTrust.js";
 
-try {
-  dotenvConfig(); // Load .env from current working directory
-} catch {
-  // Environment variables should be set externally in production
+if (isSdkDotenvOptIn()) {
+  await loadProcessDotenv({ caller: "sdk" });
 }
 
+import {
+  type Context,
+  type Span,
+  SpanKind,
+  SpanStatusCode,
+  context,
+  trace,
+} from "@opentelemetry/api";
+import { getPropagatedAttributesFromContext } from "@langfuse/core";
+import { LangfuseOtelSpanAttributes } from "@langfuse/tracing";
+import { AsyncLocalStorage } from "async_hooks";
 import { EventEmitter } from "events";
-import type {
-  TextGenerationOptions,
-  TextGenerationResult,
-  AnalyticsData,
-} from "./types/index.js";
-import { isNonNullObject } from "./utils/typeUtils.js";
-import type { MemoryClient } from "mem0ai";
 import pLimit from "p-limit";
 import type { AIProviderName } from "./constants/enums.js";
+import { ErrorCategory, ErrorSeverity } from "./constants/enums.js";
+// Multi-agent orchestration type imports
+import type {
+  ContextCompactorDeps,
+  ContextRelevanceOptions,
+  DecisionAfterEvent,
+  DecisionAnswer,
+  DecisionBeforeEvent,
+  DecisionCallerOptions,
+  DecisionHookContext,
+  DecisionHooks,
+  DecisionLimitsQuery,
+  DecisionLimitsReading,
+  DecisionOptions,
+  DecisionQuestion,
+  DecisionQuestionMap,
+  DecisionResult,
+  DecisionSiteContext,
+  DecisionState,
+  AgentDefinition,
+  AgentNetworkConfig,
+  AgentRunOptions,
+  AgentRunOutcome,
+  AgentToolRegistrationOptions,
+  IsolatedAgentDefinition,
+  LogEventEmitter,
+  NetworkExecutionInput,
+  NetworkExecutionOptions,
+  NetworkExecutionResult,
+  NetworkStreamChunk,
+  WorkerInstanceOptions,
+} from "./types/index.js";
 import {
   CIRCUIT_BREAKER,
   CIRCUIT_BREAKER_RESET_MS,
@@ -36,77 +91,337 @@ import {
   RETRY_DELAYS,
   TOOL_TIMEOUTS,
 } from "./constants/index.js";
-import { SYSTEM_LIMITS } from "./core/constants.js";
-import type { ConversationMemoryManager } from "./core/conversationMemoryManager.js";
-import { AIProviderFactory } from "./core/factory.js";
-import type { RedisConversationMemoryManager } from "./core/redisConversationMemoryManager.js";
-import { ProviderRegistry } from "./factories/providerRegistry.js";
-import { HITLManager } from "./hitl/hitlManager.js";
-import { ExternalServerManager } from "./mcp/externalServerManager.js";
-// Import direct tools server for automatic registration
-import { directToolsServer } from "./mcp/servers/agent/directToolsServer.js";
-import { MCPToolRegistry } from "./mcp/toolRegistry.js";
-import { initializeMem0, type Mem0Config } from "./memory/mem0Initializer.js";
 import {
-  flushOpenTelemetry,
-  getLangfuseHealthStatus,
-  initializeOpenTelemetry,
-  isOpenTelemetryInitialized,
-  setLangfuseContext,
-  shutdownOpenTelemetry,
-} from "./services/server/ai/observability/instrumentation.js";
+  checkContextBudget,
+  resolveHistoryBudget,
+} from "./context/budgetChecker.js";
+import { ContextCompactor } from "./context/contextCompactor.js";
+import {
+  InvalidToolInputError,
+  NoSuchToolError,
+} from "./utils/generationErrors.js";
 import type {
+  CompactionConfig,
+  CompactionResult,
+  ArtifactStore,
+  ArtifactStorageConfig,
+  McpOutputNormalizerConfig,
+  SpanData,
+  ConfirmationResponseEvent,
+  HITLConfig,
+  ExporterStatus,
+  ObservabilityConfig,
+  TaskManagerConfig,
+  WorkflowConfig,
+  ToolMiddleware,
+  MetricsSummary,
+  MCPServerTool,
+  MCPToolAnnotations,
+  TraceView,
+  AuthenticatedContext,
+  AuthProviderConfig,
+  AuthProviderType,
+  AuthProvider,
   JsonObject,
   JsonValue,
   NeuroLinkEvents,
+  StreamEventSequence,
   TypedEventEmitter,
-  UnknownRecord,
-} from "./types/common.js";
-import type { NeurolinkConstructorConfig } from "./types/configTypes.js";
-import type {
+  MCPEnhancementsConfig,
+  NeuroLinkAuthConfig,
+  NeurolinkConstructorConfig,
   ChatMessage,
   ConversationMemoryConfig,
+  ConversationSeedMessage,
+  ConversationSeedOptions,
   ProviderDetails,
-} from "./types/conversation.js";
-import type {
+  RecordConversationTurnOptions,
+  RecordConversationTurnResult,
   ExternalMCPOperationResult,
   ExternalMCPServerInstance,
+  ExternalMCPServerHealth,
   ExternalMCPToolInfo,
-} from "./types/externalMcp.js";
-// NEW: Generate function imports
-import type { GenerateOptions, GenerateResult } from "./types/generateTypes.js";
-import type {
-  ConfirmationResponseEvent,
-  HITLConfig,
-} from "./types/hitlTypes.js";
-import type {
+  AdditionalMemoryUser,
+  GenerateOptions,
+  GenerateResult,
+  AnalyticsData,
   EvaluationData,
+  NeurolinkCredentials,
+  OptionalValidationSchema,
+  ProviderDescriptor,
   ProviderStatus,
+  TextGenerationOptions,
+  TextGenerationResult,
   TokenUsage,
-} from "./types/index.js";
-import type {
+  ToolReplayMode,
   MCPExecutableTool,
   MCPServerCategory,
   MCPServerInfo,
   MCPStatus,
-} from "./types/mcpTypes.js";
-import type { ObservabilityConfig } from "./types/observability.js";
-import type {
-  AudioChunk,
+  ProviderStreamChunk,
   StreamOptions,
   StreamResult,
-  ToolCall,
-  ToolResult,
-} from "./types/streamTypes.js";
-import type {
+  StreamToolCall,
+  StreamToolResult,
   ToolExecutionContext,
   ToolExecutionSummary,
   ToolInfo,
-} from "./types/tools.js";
-import type {
+  ToolRegistrationOptions,
   BatchOperationResult,
-  ToolExecutionResult,
-} from "./types/typeAliases.js";
+  OrchestrationResult,
+  MCPTool,
+  RoutingDecision,
+  MetricsTraceContext,
+  StreamGenerationEndContext,
+  HITLExecutionState,
+  ToolRoutingConfig,
+  ToolRoutingDecision,
+  ToolRoutingServerDescriptor,
+  ToolDedupConfig,
+  ToolConfig,
+  MiddlewareFactoryOptions,
+  FileToolRootPolicy,
+  RequestRouter,
+  RouterInputContext,
+  KnowledgeEngineStatus,
+  KnowledgeGroundingOutcome,
+  KnowledgeGroundingCallOptions,
+  ChecklistState,
+  ArtifactPageRequest,
+  BankArtifactOptions,
+  BankedArtifactRef,
+  DelegateCollectRequest,
+  DelegateCollectResult,
+  DelegateHandle,
+  DelegateRegistrationOptions,
+  DelegateSpawnOptions,
+  BackgroundCommandHandle,
+  BackgroundCommandOptions,
+  BackgroundCommandOutputPage,
+  BackgroundCommandPageRequest,
+  BackgroundCommandPolicy,
+  BackgroundCommandStatus,
+  GitToolResult,
+  GitToolsetOptions,
+  ObservationAttributes,
+  ObservationLevel,
+} from "./types/index.js";
+import { emergencyContentTruncation } from "./context/emergencyTruncation.js";
+import {
+  getContextOverflowProvider,
+  isContextOverflowError,
+  parseProviderOverflowDetails,
+} from "./context/errorDetection.js";
+import { ContextBudgetExceededError } from "./context/errors.js";
+import { repairToolPairs } from "./context/toolPairRepair.js";
+import {
+  SYSTEM_LIMITS,
+  DEFAULT_TOOL_ROUTING_TIMEOUT_MS,
+  MIN_RECOVERY_TURN_BUDGET_MS,
+} from "./core/constants.js";
+import { ConversationMemoryManager } from "./core/conversationMemoryManager.js";
+import {
+  buildToolRoutingCatalog,
+  buildRoutingQueryFromHistory,
+  resolveToolRoutingExclusions,
+} from "./core/toolRouting.js";
+import { ToolRoutingCache } from "./core/toolRoutingCache.js";
+import {
+  DEFAULT_RECENT_TURNS,
+  KnowledgeGroundingEngine,
+} from "./knowledge/index.js";
+import { AIProviderFactory } from "./core/factory.js";
+import {
+  describeDecisionProviderKeys,
+  PROVIDER_ALIAS_INDEX,
+  PROVIDER_DESCRIPTORS_BY_NAME,
+  resolveDefaultDecisionProvider,
+} from "./factories/providerDescriptors.js";
+import {
+  describeSTTProviderKeys,
+  getSTTProviderDescriptor,
+  listConfiguredSTTProviders,
+  resolveCallSTTEndpoints,
+  resolveDefaultSTTProvider,
+  resolveSTTProviderName,
+} from "./factories/sttDescriptors.js";
+import {
+  MAX_PARALLEL_DECISION_BATCHES,
+  mergeDecisionResults,
+  splitDecisionRequest,
+} from "./utils/decisionBatches.js";
+import {
+  decisionKey,
+  HOST_DECISION_NAMESPACE,
+  isHostDecisionKey,
+  snapshotDecisionQuestion,
+  stripHostAnswers,
+} from "./utils/decisionAnswers.js";
+import {
+  resolveDecisionLimitsReading,
+  unsupportedDecisionQuestion,
+} from "./utils/decisionLimits.js";
+import type { RedisConversationMemoryManager } from "./core/redisConversationMemoryManager.js";
+import {
+  isDirectTTSRequest,
+  resolveRequestKind,
+} from "./core/resolveRequestKind.js";
+import { createToolEventPayload } from "./core/toolEvents.js";
+import { ProviderFactory } from "./factories/providerFactory.js";
+import { ProviderRegistry } from "./factories/providerRegistry.js";
+import { FileReferenceRegistry } from "./files/fileReferenceRegistry.js";
+import { resolveAttachmentPolicy } from "./utils/attachmentPolicy.js";
+import { createFileTools } from "./files/fileTools.js";
+import { HITLManager, DEFAULT_ALLOW_MODIFICATION } from "./hitl/hitlManager.js";
+import { ToolCallBatcher } from "./mcp/batching/index.js";
+// MCP Enhancement modules - wired into core execution path
+import { ToolResultCache } from "./mcp/caching/index.js";
+import { EnhancedToolDiscovery } from "./mcp/enhancedToolDiscovery.js";
+import { ExternalServerManager } from "./mcp/externalServerManager.js";
+import {
+  McpOutputNormalizer,
+  DEFAULT_MAX_MCP_OUTPUT_BYTES,
+  DEFAULT_WARN_MCP_OUTPUT_BYTES,
+} from "./mcp/mcpOutputNormalizer.js";
+import {
+  createArtifactStore,
+  resolveArtifactStorageType,
+} from "./artifacts/artifactStoreFactory.js";
+import {
+  bankArtifact as bankArtifactPayload,
+  readArtifact as readBankedArtifact,
+} from "./artifacts/artifactBanking.js";
+import { ToolRouter } from "./mcp/routing/index.js";
+// Import direct tools server for automatic registration
+import { directToolsServer } from "./mcp/servers/agent/directToolsServer.js";
+import { inferAnnotations, isSafeToRetry } from "./mcp/toolAnnotations.js";
+import { MCPToolRegistry } from "./mcp/toolRegistry.js";
+// Dynamic argument resolution imports
+import { resolveDynamicArgument } from "./dynamic/dynamicResolver.js";
+import type {
+  DynamicArgument,
+  DynamicOptions,
+  DynamicResolutionContext,
+  HippocampusConfig,
+  HippocampusLike,
+  HippocampusMemory,
+  HippocampusNeurolinkLike,
+  MemoryCallOptions,
+  MemoryTurn,
+  SkillsCallOptions,
+  SkillsConfig,
+} from "./types/index.js";
+import { initializeHippocampus } from "./memory/hippocampusInitializer.js";
+import { validateCondensationPrompt } from "./memory/condensationPrompt.js";
+import { createMemoryRetrievalTools } from "./memory/memoryRetrievalTools.js";
+import { isSkillVisibleInScope } from "./skills/skillMatcher.js";
+import { buildSkillActivationMessage } from "./skills/skillSessionTracker.js";
+import { SkillsManager } from "./skills/skillsManager.js";
+import { createSkillCallTools, createSkillTools } from "./skills/skillTools.js";
+import {
+  getMetricsAggregator,
+  MetricsAggregator,
+} from "./observability/metricsAggregator.js";
+import {
+  AnalyticsService,
+  calculateAdvancedCost,
+  parseAnalyticsQualityScore,
+} from "./analytics/index.js";
+import {
+  SpanStatus,
+  SpanType,
+  CircuitBreakerOpenError,
+  ConversationMemoryError,
+  DEFAULT_DECISION_HOOK_TIMEOUT_MS,
+  MAX_DECISION_HOOK_TIMEOUT_MS,
+  ModelAccessDeniedError,
+} from "./types/index.js";
+import type {
+  CostAnalysisOptions,
+  CostAnalysisResult,
+  ProviderMetricsOptions,
+  ProviderMetricsResult,
+  TeamAnalyticsOptions,
+  TeamAnalyticsResult,
+  TerminalAgentModeVersion,
+} from "./types/index.js";
+import { resolveTerminalAgentMode } from "./agent/prompts/terminalAgentPrompt.js";
+import { getExporterRegistry } from "./observability/exporterRegistry.js";
+import { SpanSerializer } from "./observability/utils/spanSerializer.js";
+import { endSpanWhenDropped, withSpan } from "./telemetry/withSpan.js";
+import { getActiveTraceContext } from "./telemetry/traceContext.js";
+import { calculateCost } from "./utils/pricing.js";
+import { createToolExecutionId } from "./utils/toolExecutionId.js";
+import {
+  acquireTelemetry,
+  ensureTelemetry,
+  flushOpenTelemetry,
+  getLangfuseHealthStatus,
+  isOpenTelemetryInitialized,
+  releaseTelemetry,
+  setLangfuseContext,
+  traceMetadataFromContext,
+} from "./services/server/ai/observability/instrumentation.js";
+import {
+  clearChecklistState,
+  createChecklistTools,
+  getChecklistState,
+  resolveChecklistSessionId,
+} from "./agent/taskChecklist.js";
+import {
+  cancelDelegates as cancelBackgroundDelegates,
+  collectDelegates as collectBackgroundDelegates,
+  configureDelegation,
+  createDelegationTools,
+  spawnDelegate as spawnBackgroundDelegate,
+} from "./agent/backgroundDelegation.js";
+import {
+  awaitBackgroundCommand as awaitCommand,
+  createBackgroundCommandTools,
+  getBackgroundCommandStatus as getCommandStatus,
+  killAllBackgroundCommands as killAllCommands,
+  killBackgroundCommand as killCommand,
+  readBackgroundCommandOutput as readCommandOutput,
+  setBackgroundCommandPolicy as setCommandPolicy,
+  startBackgroundCommand as startCommand,
+} from "./agent/backgroundCommands.js";
+import {
+  configureGitTools,
+  createGitTools,
+  runGitCommand as runGitArgs,
+} from "./agent/gitTools.js";
+import { TaskManager } from "./tasks/taskManager.js";
+import { createTaskTools } from "./tasks/tools/taskTools.js";
+import {
+  ATTR,
+  spanJsonAttribute,
+  spanModelRequestAttribute,
+} from "./telemetry/attributes.js";
+import { assistantMessages } from "./telemetry/chatMessages.js";
+import {
+  observationLevel,
+  observe,
+  observeTrace,
+  usageDetails,
+} from "./telemetry/observation.js";
+import { toolSpanName } from "./telemetry/observationNames.js";
+import { isNestedOperation, tracers } from "./telemetry/tracers.js";
+// Voice integration imports
+import type {
+  STTCredentials,
+  STTCorrectionDeps,
+  STTResult,
+  TranscribeDeps,
+  TranscribeOptions,
+  TranscribeResult,
+  TranscribeStreamEvent,
+  TranscribeStreamOptions,
+  TTSMetadata,
+  TTSResult,
+  TTSOptions,
+  SessionExport,
+  SessionListItem,
+} from "./types/index.js";
 import {
   getConversationMessages,
   storeConversationTurn,
@@ -114,13 +429,35 @@ import {
 // Enhanced error handling imports
 import {
   CircuitBreaker,
+  ERROR_CODES,
   ErrorFactory,
+  isAbortError,
   isRetriableError,
   logStructuredError,
   NeuroLinkError,
   withRetry,
   withTimeout,
 } from "./utils/errorHandling.js";
+import {
+  hasLifecycleErrorFired,
+  markLifecycleErrorFired,
+  markLifecycleStreamCallbacksOwnedByBaseProvider,
+} from "./utils/lifecycleCallbacks.js";
+import { interleaveTTSStream } from "./utils/ttsStream.js";
+import { resolveLifecycleTimeoutMs } from "./utils/lifecycleTimeout.js";
+import { cloneOptionsForCallIsolation } from "./utils/cloneOptions.js";
+import {
+  getGlobalMiddleware,
+  readEnvMiddlewarePreset,
+  resolveMiddlewareOptions,
+  snapshotMiddlewareOptions,
+} from "./middleware/defaults.js";
+import { preserveLiveStreamAccessors } from "./utils/streamResultAccessors.js";
+import {
+  coerceJsonToSchema,
+  recoverScalarRoot,
+  schemaAccepts,
+} from "./utils/json/coerce.js";
 // Factory processing imports
 import {
   createCleanStreamOptions,
@@ -131,13 +468,37 @@ import {
 } from "./utils/factoryProcessing.js";
 import { logger, mcpLogger } from "./utils/logger.js";
 import {
+  redactUrlCredentials,
+  safeDebugSerialize,
+  sanitizeRecord,
+  stringifyContentSafe,
+} from "./utils/logSanitize.js";
+import { extractMcpErrorText } from "./utils/mcpErrorText.js";
+import {
   createCustomToolServerInfo,
   detectCategory,
 } from "./utils/mcpDefaults.js";
+import {
+  ExternalMcpToolNotFoundError,
+  rankToolNameCandidates,
+  resolveToolName,
+} from "./utils/toolCallRepair.js";
+import { resolveModel } from "./utils/modelAliasResolver.js";
 // Import orchestration components
 import { ModelRouter } from "./utils/modelRouter.js";
 import { getBestProvider } from "./utils/providerUtils.js";
-import { isZodSchema } from "./utils/schemaConversion.js";
+import {
+  isZodSchema,
+  convertZodToJsonSchema,
+} from "./utils/schemaConversion.js";
+import { resolveToolPolicy } from "./tools/toolPolicy.js";
+import { applyToolGate } from "./tools/toolGate.js";
+import { directAgentTools } from "./agent/directTools.js";
+import {
+  bindFileToolRoots,
+  boundFileToolRoots,
+  resolveFileToolRootPolicy,
+} from "./utils/fileToolRoots.js";
 import { BinaryTaskClassifier } from "./utils/taskClassifier.js";
 // Tool detection and execution imports
 // Transformation utilities
@@ -146,24 +507,141 @@ import {
   optimizeToolForCollection,
   transformAvailableTools,
   transformParamsForLogging,
-  transformToolExecutions,
   transformToolExecutionsForMCP,
   transformToolsForMCP,
   transformToolsToDescriptions,
   transformToolsToExpectedFormat,
 } from "./utils/transformationUtils.js";
-import type { WorkflowConfig } from "./workflow/types.js";
-import { runWorkflow } from "./workflow/core/workflowRunner.js";
+import { toToolExecutionRecords } from "./core/toolExecutionRecorder.js";
+import { isNonNullObject } from "./utils/typeUtils.js";
 import { getWorkflow } from "./workflow/core/workflowRegistry.js";
+import { runWorkflow } from "./workflow/core/workflowRunner.js";
+import { ModelPool, classifyProviderError } from "./routing/index.js";
+import { ClassifierRouter } from "./routing/classifierRouter.js";
+import {
+  looksLikeModelAccessDenied as sharedLooksLikeModelAccessDenied,
+  looksLikeModelNotFound as sharedLooksLikeModelNotFound,
+  isNonRetryableProviderError as sharedIsNonRetryableProviderError,
+  isNonRetryableForPool as sharedIsNonRetryableForPool,
+} from "./utils/providerErrorClassification.js";
+import { getErrorStatusCode } from "./utils/providerRetry.js";
+import { detectAndRedactPII } from "./utils/piiDetector.js";
+import { validateResponse } from "./utils/responseValidator.js";
 
-// Core types imported from core/types.js
+/**
+ * NL-002: Classify MCP error messages into categories for AI disambiguation.
+ * Returns a human-readable error category based on error message content.
+ */
+function classifyMcpErrorMessage(
+  text: string,
+):
+  | "not_found"
+  | "permission_denied"
+  | "timeout"
+  | "rate_limited"
+  | "validation_error"
+  | "unknown" {
+  const lower = text.toLowerCase();
+  if (
+    lower.includes("not found") ||
+    lower.includes("404") ||
+    lower.includes("does not exist") ||
+    lower.includes("no such")
+  ) {
+    return "not_found";
+  }
+  if (
+    lower.includes("permission") ||
+    lower.includes("forbidden") ||
+    lower.includes("403") ||
+    lower.includes("unauthorized") ||
+    lower.includes("401") ||
+    lower.includes("access denied")
+  ) {
+    return "permission_denied";
+  }
+  if (
+    lower.includes("timeout") ||
+    lower.includes("timed out") ||
+    lower.includes("deadline exceeded")
+  ) {
+    return "timeout";
+  }
+  if (
+    lower.includes("rate limit") ||
+    lower.includes("429") ||
+    lower.includes("too many requests") ||
+    lower.includes("throttl")
+  ) {
+    return "rate_limited";
+  }
+  if (
+    lower.includes("invalid") ||
+    lower.includes("validation") ||
+    lower.includes("bad request") ||
+    lower.includes("400")
+  ) {
+    return "validation_error";
+  }
+  return "unknown";
+}
+
+function mcpCategoryToErrorCategory(
+  mcpCategory: ReturnType<typeof classifyMcpErrorMessage>,
+): ErrorCategory {
+  switch (mcpCategory) {
+    case "not_found":
+      return ErrorCategory.VALIDATION;
+    case "permission_denied":
+      return ErrorCategory.PERMISSION;
+    case "timeout":
+      return ErrorCategory.TIMEOUT;
+    case "rate_limited":
+      return ErrorCategory.RESOURCE;
+    case "validation_error":
+      return ErrorCategory.VALIDATION;
+    case "unknown":
+      return ErrorCategory.EXECUTION;
+  }
+}
+
+/**
+ * Check if an error is a non-retryable provider error that should immediately
+ * stop the retry/fallback chain. These errors represent permanent failures
+ * (e.g., model not found, authentication failed) where retrying with the
+ * same configuration will never succeed.
+ *
+ * This prevents wasting tokens and latency on guaranteed-to-fail retries.
+ * For example, a NOT_FOUND error for a model causes 6 retries of a 418KB
+ * message, wasting ~628,000 tokens and adding 10+ seconds of latency.
+ *
+ * Delegates to the shared utility in utils/providerErrorClassification.ts so
+ * that modelPool.ts (classifyProviderError) and this function stay in sync.
+ */
+const looksLikeModelAccessDenied = sharedLooksLikeModelAccessDenied;
+const isNonRetryableProviderError = sharedIsNonRetryableProviderError;
+/**
+ * Pool-scoped variant: model-not-found is a fact about one member's model, not
+ * about the request, so it must not stop the whole pool. Used only at the two
+ * ModelPool catch sites; every other path keeps the general contract.
+ */
+const isNonRetryableForPool = sharedIsNonRetryableForPool;
+
+/**
+ * Ceiling on one background memory write (`Promise.all` of its `add()`
+ * calls), and therefore on how long `shutdown()` / `dispose()` wait for the
+ * writes already scheduled before releasing the condenser.
+ */
+const MEMORY_WRITE_TIMEOUT_MS = 30_000;
+
+/** Native tags share the health check's endpoint precedence and origin. */
 
 /**
  * NeuroLink - Universal AI Development Platform
  *
- * Main SDK class providing unified access to 13+ AI providers with enterprise features:
+ * Main SDK class providing unified access to many AI providers with enterprise features:
  * - Multi-provider support (OpenAI, Anthropic, Google AI Studio, Google Vertex, AWS Bedrock, etc.)
- * - MCP (Model Context Protocol) tool integration with 58+ external servers
+ * - MCP (Model Context Protocol) tool integration — connect any MCP-compliant server
  * - Human-in-the-Loop (HITL) security workflows for regulated industries
  * - Redis-based conversation memory and persistence
  * - Enterprise middleware system for monitoring and control
@@ -182,7 +660,7 @@ import { getWorkflow } from "./workflow/core/workflowRegistry.js";
  * const result = await neurolink.generate({
  *   input: { text: 'Explain quantum computing' },
  *   provider: 'vertex',
- *   model: 'gemini-3-flash'
+ *   model: 'gemini-3-flash-preview'
  * });
  *
  * console.log(result.content);
@@ -190,12 +668,36 @@ import { getWorkflow } from "./workflow/core/workflowRegistry.js";
  *
  * @example With HITL security
  * ```typescript
+ * import type {
+ *   ConfirmationRequestEvent,
+ *   ConfirmationResponseEvent,
+ * } from '@juspay/neurolink';
+ *
  * const neurolink = new NeuroLink({
  *   hitl: {
  *     enabled: true,
- *     requireApproval: ['writeFile', 'executeCode'],
- *     confidenceThreshold: 0.85
+ *     dangerousActions: ['writeFile', 'executeCode'],
+ *     timeout: 30000
  *   }
+ * });
+ *
+ * // Approval is event-based; answer each request with the matching id
+ * const emitter = neurolink.getEventEmitter();
+ * emitter.on('hitl:confirmation-request', async (event) => {
+ *   const receivedAt = Date.now();
+ *   const { payload } = event as ConfirmationRequestEvent; // listeners are typed unknown
+ *   const approved = await askUser(payload); // your approval UI
+ *   emitter.emit('hitl:confirmation-response', {
+ *     type: 'hitl:confirmation-response',
+ *     payload: {
+ *       confirmationId: payload.confirmationId,
+ *       approved,
+ *       metadata: {
+ *         timestamp: new Date().toISOString(),
+ *         responseTime: Date.now() - receivedAt // ms since the request arrived
+ *       }
+ *     }
+ *   } satisfies ConfirmationResponseEvent);
  * });
  * ```
  *
@@ -230,10 +732,343 @@ import { getWorkflow } from "./workflow/core/workflowRegistry.js";
  * @see {@link NeurolinkConstructorConfig} for configuration options
  * @since 1.0.0
  */
+
+/**
+ * Module-level AsyncLocalStorage for per-request metrics trace context.
+ * Eliminates the race condition where overlapping generate/stream calls on the
+ * same NeuroLink instance would clobber each other's trace context.
+ */
+const metricsTraceContextStorage = new AsyncLocalStorage<MetricsTraceContext>();
+
+/**
+ * Curator P2-4 dedup (concurrency-safe): native providers emit
+ * `generation:end` on the shared SDK emitter. We attach a fresh
+ * mutable `dedupContext` object directly to the per-call
+ * `StreamOptions` (under `_streamDedupContext`) so each stream gets
+ * its own instance — concurrent streams have different option objects
+ * and therefore different contexts, so they cannot interfere.
+ *
+ * Native provider emit sites read `options._streamDedupContext` and
+ * flip `.providerEmitted = true` before emitting; the orchestration's
+ * finally block reads the same closed-over reference and skips its
+ * own emit when the flag is set.
+ *
+ * This avoids the AsyncLocalStorage approach which doesn't reliably
+ * propagate through async-generator yield boundaries when iteration
+ * happens from outside the original `run()` scope (e.g. when the
+ * consumer drives `for await of result.stream` after `sdk.stream(...)`
+ * returns).
+ */
+export const STREAM_DEDUP_CONTEXT_KEY = "_streamDedupContext" as const;
+
+/**
+ * Native providers call this from their `generation:end` emit sites,
+ * passing the same `options` object they received. Safe no-op when
+ * the field isn't set.
+ */
+export function markStreamProviderEmittedGenerationEnd(
+  options: { _streamDedupContext?: StreamGenerationEndContext } | undefined,
+): void {
+  const ctx = options?._streamDedupContext;
+  if (ctx) {
+    ctx.providerEmitted = true;
+  }
+}
+
+/**
+ * Symbol-based brand for cross-module identification without circular imports.
+ *
+ * Provider constructors receive `sdk?: unknown` (the factory layer's
+ * contract). Rather than duck-typing via `"getInMemoryServers" in sdk`,
+ * use `isNeuroLink(value)` from this module to do a brand check —
+ * survives minification AND doesn't rely on method-name stability.
+ */
+export const NEUROLINK_BRAND: unique symbol = Symbol.for(
+  "@juspay/neurolink/sdk-brand",
+);
+
+/**
+ * True when a provider needs tools described in the prompt rather than
+ * passed via the API's native tool-calling parameter (ollama/openrouter
+ * are model-dependent; huggingface is deployment-dependent; the
+ * image/embedding providers don't support tool calling at all). Only these
+ * still receive the full tool listing in the system prompt on the generate
+ * path, where no provider instance exists yet to ask directly; every other
+ * provider gets tool definitions natively via its `tools` parameter, so
+ * repeating them in the prompt was pure token duplication. The stream path
+ * asks the provider instance (`provider.supportsTools()`) instead of this
+ * check. Derived from ProviderDescriptor.toolSupport instead of a
+ * hand-maintained Set — see PROVIDER_DESCRIPTORS in
+ * src/lib/factories/providerDescriptors.ts for the underlying data;
+ * BaseProvider resolves its own runtime default through MODEL_REGISTRY's
+ * `modelSupports()` facade.
+ */
+function isPromptOnlyToolProvider(providerName: string): boolean {
+  return ProviderFactory.getDescriptor(providerName)?.toolSupport !== "native";
+}
+
+/**
+ * Type-guard for opaque values that should be a {@link NeuroLink} instance.
+ *
+ * Designed for the provider-factory boundary where TS can't carry the type
+ * through `UnknownRecord` without forcing every caller into a circular
+ * dependency. Cheap to call and unaffected by minification.
+ */
+export function isNeuroLink(value: unknown): value is NeuroLink {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as Record<symbol, unknown>)[NEUROLINK_BRAND] === true
+  );
+}
+
+/**
+ * Create a Node {@link EventEmitter} exposed through the typed-emitter
+ * surface. The runtime object is a plain EventEmitter — the typed view only
+ * narrows the event-name/payload relationship for callers, so the widening
+ * hop through `unknown` is contained here once.
+ */
+function createTypedEmitter<
+  TEvents extends Record<string, unknown>,
+>(): TypedEventEmitter<TEvents> {
+  const emitter: unknown = new EventEmitter();
+  return emitter as TypedEventEmitter<TEvents>;
+}
+
+function turnInput(
+  optionsOrPrompt: GenerateOptions | StreamOptions | DynamicOptions | string,
+): string {
+  if (typeof optionsOrPrompt === "string") {
+    return spanModelRequestAttribute({ prompt: optionsOrPrompt });
+  }
+  const options = optionsOrPrompt as GenerateOptions;
+  return spanModelRequestAttribute({
+    messages: options.conversationMessages,
+    prompt: options.input?.text,
+  });
+}
+
+function observeTurn(span: Span, attrs: ObservationAttributes): void {
+  observe(span, "agent", attrs);
+  if (!isNestedOperation(span)) {
+    observeTrace(span, { input: attrs.input, output: attrs.output });
+  }
+}
+
+function startTurn(
+  span: Span,
+  optionsOrPrompt: GenerateOptions | StreamOptions | DynamicOptions | string,
+): void {
+  if (!span.isRecording()) {
+    return;
+  }
+  observeTurn(span, { input: turnInput(optionsOrPrompt) });
+  if (typeof optionsOrPrompt !== "string") {
+    const name = (optionsOrPrompt as GenerateOptions).context?.observationName;
+    if (name) {
+      span.updateName(name);
+    }
+  }
+  if (!isNestedOperation(span)) {
+    observeTrace(span, {
+      metadata: traceMetadataFromContext(context.active()),
+    });
+  }
+}
+
+function failTurnSpan(span: Span, error: Error): void {
+  const message = error.message;
+  if (isAbortError(error)) {
+    observeTurn(span, {
+      output: message,
+      level: "WARNING",
+      statusMessage: message,
+    });
+    return;
+  }
+  span.recordException(error);
+  span.setStatus({ code: SpanStatusCode.ERROR, message });
+  observeTurn(span, {
+    output: message,
+    level: "ERROR",
+    statusMessage: message,
+  });
+}
+
+function traceTurnStream<T>(
+  result: { stream: AsyncIterable<T>; model?: string; finishReason?: string },
+  span: Span,
+  turnContext: Context,
+): AsyncIterableIterator<T> {
+  const iterator = result.stream[Symbol.asyncIterator]();
+  let output = "";
+  let ended = false;
+  let started = false;
+  const finish = (): void => {
+    ended = true;
+    span.end();
+  };
+  const end = (level?: ObservationLevel, statusMessage?: string): void => {
+    observeTurn(span, {
+      output: output ? assistantMessages(output) : undefined,
+      metadata: { model: result.model },
+      level,
+      statusMessage,
+    });
+    finish();
+  };
+  const close = async (): Promise<void> => {
+    if (ended) {
+      return;
+    }
+    try {
+      await context.with(turnContext, async () => {
+        await iterator.return?.();
+      });
+    } finally {
+      end(
+        "WARNING",
+        started
+          ? "stream closed by the consumer before it finished"
+          : "stream closed before first chunk",
+      );
+    }
+  };
+  const advance = async (
+    pull: () => Promise<IteratorResult<T>>,
+    afterThrow = false,
+  ): Promise<IteratorResult<T>> => {
+    started = true;
+    try {
+      const step = await context.with(turnContext, pull);
+      if (step.done) {
+        span.setStatus({ code: SpanStatusCode.OK });
+        end(observationLevel(result.finishReason));
+        return { done: true, value: undefined };
+      }
+      const content =
+        typeof step.value === "object" && step.value !== null
+          ? (step.value as { content?: string }).content
+          : undefined;
+      if (typeof content === "string") {
+        output += content;
+      }
+      return step;
+    } catch (error) {
+      failTurnSpan(
+        span,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+      // A consumer that throws into the stream ends it early, as return()
+      // does, and the root has always kept the model in that case.
+      if (afterThrow) {
+        observeTurn(span, { metadata: { model: result.model } });
+      }
+      finish();
+      throw error;
+    }
+  };
+  const traced: AsyncIterableIterator<T> = {
+    async next(): Promise<IteratorResult<T>> {
+      if (ended) {
+        return { done: true, value: undefined };
+      }
+      return advance(() => iterator.next());
+    },
+    async return(): Promise<IteratorResult<T>> {
+      await close();
+      return { done: true, value: undefined };
+    },
+    async throw(error: Error): Promise<IteratorResult<T>> {
+      const forward = iterator.throw;
+      if (ended || forward === undefined) {
+        await close();
+        throw error;
+      }
+      return advance(() => forward.call(iterator, error), true);
+    },
+    [Symbol.asyncIterator]() {
+      return traced;
+    },
+  };
+  endSpanWhenDropped(traced, span);
+  return traced;
+}
+
+/**
+ * Runs every pull of `stream` inside `drainContext`, and forwards `return()`
+ * and `throw()` to it even before the first `next()`. A generator that has not
+ * started never enters its body, so wrapping the drain in one would swallow a
+ * pre-start close and leave the drain's own settle step unreached.
+ */
+function drainInContext<T>(
+  stream: AsyncIterable<T>,
+  drainContext: Context,
+): AsyncIterableIterator<T> {
+  const iterator = stream[Symbol.asyncIterator]();
+  const drained: AsyncIterableIterator<T> = {
+    next: () => context.with(drainContext, () => iterator.next()),
+    async return(): Promise<IteratorResult<T>> {
+      await context.with(drainContext, async () => iterator.return?.());
+      return { done: true, value: undefined };
+    },
+    async throw(error: Error): Promise<IteratorResult<T>> {
+      const forward = iterator.throw;
+      if (forward === undefined) {
+        await context.with(drainContext, async () => iterator.return?.());
+        throw error;
+      }
+      return context.with(drainContext, () => forward.call(iterator, error));
+    },
+    [Symbol.asyncIterator]() {
+      return drained;
+    },
+  };
+  return drained;
+}
+
+/** Monotonic source for {@link NeuroLink.logInstanceId}. Process-local by design. */
+let neuroLinkInstanceCounter = 0;
+
 export class NeuroLink {
+  /** @internal Brand for cross-module identification — see {@link isNeuroLink}. */
+  readonly [NEUROLINK_BRAND] = true as const;
+
   private mcpInitialized = false;
-  private emitter =
-    new EventEmitter() as unknown as TypedEventEmitter<NeuroLinkEvents>;
+  private mcpSkipped = false;
+  private mcpInitPromise: Promise<void> | null = null;
+  private emitter = createTypedEmitter<NeuroLinkEvents>();
+  /** Request ownership for conversation capture; unscoped emitter events are ignored. */
+  private readonly conversationEventContext = new AsyncLocalStorage<symbol>();
+
+  /**
+   * Process-unique id used to attribute this instance's log events. The SDK
+   * entry points run their bodies inside `logger.runInInstanceScope(this.logInstanceId, …)`,
+   * which is what lets a worker's log bridge receive only the worker's own
+   * events instead of everything in the process.
+   */
+  private readonly logInstanceId = `nl-${++neuroLinkInstanceCounter}`;
+
+  /**
+   * Detach callbacks for scoped log bridges of workers this instance created
+   * via {@link createWorkerInstance} with `onLog`, that have not yet been
+   * removed by the worker's own `dispose()`. The scoped-emitter registry
+   * lives on the process-global logger, keyed by the WORKER's id — not this
+   * host's — so it survives this host being garbage collected. If a caller
+   * disposes the host but forgets an individual worker (the host is the
+   * long-lived object in most delegation patterns; the worker the
+   * short-lived one), the bridge — and everything its `onLog` closes over —
+   * would otherwise stay registered for the life of the process. `dispose()`
+   * sweeps whatever is still here so host cleanup is sufficient on its own,
+   * matching the pre-scoped-routing behavior where a worker's forward
+   * listener lived on the host's own emitter and was removed by
+   * `this.emitter.removeAllListeners()`.
+   */
+  private readonly ownedWorkerLogBridgeDetachers = new Set<() => void>();
+
+  // TaskManager — lazy-initialized on first access via `this.tasks`
+  private _taskManager?: TaskManager;
+  private _taskManagerConfig?: TaskManagerConfig;
 
   private toolRegistry: MCPToolRegistry;
 
@@ -248,6 +1083,60 @@ export class NeuroLink {
   } | null = null;
   private readonly toolCacheDuration: number;
 
+  // NL-004: Model alias/deprecation configuration
+  private modelAliasConfig?: import("./types/index.js").ModelAliasConfig;
+
+  // Compaction watermark: prevents re-triggering compaction on already-compacted messages
+  // Per-session map to avoid cross-session pollution in server mode
+  private lastCompactionMessageCount = new Map<string, number>();
+
+  /** Extract sessionId from options context for compaction watermark keying */
+  private getCompactionSessionId(options: { context?: unknown }): string {
+    return (
+      ((options.context as Record<string, unknown> | undefined)
+        ?.sessionId as string) || "__default__"
+    );
+  }
+
+  // MCP Enhancement modules - wired into core execution path
+  private mcpToolResultCache?: ToolResultCache;
+  private mcpToolRouter?: ToolRouter;
+  private mcpToolBatcher?: ToolCallBatcher;
+  private mcpEnhancedDiscovery?: EnhancedToolDiscovery;
+  private mcpToolMiddlewares: ToolMiddleware[] = [];
+  /** Artifact store for externalized MCP tool outputs and banked payloads. */
+  private mcpArtifactStore?: ArtifactStore;
+  /** `artifacts` constructor config — consulted whenever a store is created. */
+  private artifactsConfig?: ArtifactStorageConfig;
+  /**
+   * True when this instance built `mcpArtifactStore` itself (local or Redis
+   * from config / STORAGE_TYPE). NeuroLink closes only stores it built — on
+   * replacement and on shutdown; a store handed in through `artifacts.store`
+   * or `setArtifactStore()` is the caller's to close.
+   */
+  private ownsArtifactStore = false;
+  /** Normalizer settings, kept so `setArtifactStore()` can rebuild it. */
+  private mcpOutputNormalizerConfig?: McpOutputNormalizerConfig;
+  private _disableToolCacheForCurrentRequest = false;
+  /**
+   * (toolName + args) keys already served during the CURRENT request.
+   * A repeat occurrence within one request bypasses the tool-result cache:
+   * when the model deliberately re-calls a tool with identical args in the
+   * same turn (a counter, a poll, "check status again"), it wants fresh
+   * state — serving the memoized first result silently freezes stateful
+   * tools (observed live: a 5-round counter loop executed once). Cross-
+   * request dedup — BZ-664's actual goal — is untouched: the first
+   * occurrence in a request may still be served from cache. Request-scoped
+   * like _disableToolCacheForCurrentRequest above (assigned a fresh Set at
+   * request start so `preservingTurnState`'s save/restore-by-reference works).
+   */
+  private _toolCacheKeysServedThisRequest = new Set<string>();
+  /** True only while a generate()/stream() turn is executing — the
+   *  repeat-call cache bypass applies inside a turn; direct executeTool
+   *  calls keep full BZ-664 cache semantics. */
+  private _generationTurnActive = false;
+  private mcpEnhancementsConfig?: MCPEnhancementsConfig;
+
   // Enhanced error handling support
   private toolCircuitBreakers: Map<string, CircuitBreaker> = new Map();
   private toolExecutionMetrics: Map<
@@ -258,6 +1147,7 @@ export class NeuroLink {
       failedExecutions: number;
       averageExecutionTime: number;
       lastExecutionTime: number;
+      errorCategories: Record<string, number>;
     }
   > = new Map();
 
@@ -280,19 +1170,22 @@ export class NeuroLink {
     success: boolean,
     result?: unknown,
     error?: Error,
+    executionId?: string,
   ): void {
     // Emit tool end event (NeuroLink format - enhanced with result/error)
-    this.emitter.emit("tool:end", {
-      toolName,
-      responseTime: Date.now() - startTime,
-      success,
-      timestamp: Date.now(),
-      result: result, // Enhanced: include actual result
-      error: error, // Enhanced: include error if present
-    });
-
-    // ADD: Bedrock-compatible tool:end event (positional parameters)
-    this.emitter.emit("tool:end", toolName, success ? result : error);
+    // Serialize error to string for consumer compatibility (event listeners
+    // commonly check `typeof event.error === "string"`).
+    this.emitter.emit(
+      "tool:end",
+      createToolEventPayload(toolName, {
+        responseTime: Date.now() - startTime,
+        success,
+        timestamp: Date.now(),
+        result,
+        error: error ? error.message : undefined,
+        executionId,
+      }) as Record<string, unknown>,
+    );
   }
   // Conversation memory support
   public conversationMemory?:
@@ -304,97 +1197,686 @@ export class NeuroLink {
     conversationMemory?: Partial<ConversationMemoryConfig>;
   };
 
+  // Pre-call tool routing: instance-level config from the constructor.
+  // The server catalog inside it can be supplied/replaced later via
+  // setToolRoutingServers() for hosts that register tools after construction.
+  private toolRoutingConfig?: ToolRoutingConfig;
+  // Lazy-initialized routing decision cache (ITEM C). Created on first use so
+  // instances that don't use routing pay no overhead.
+  private toolRoutingCacheInstance?: ToolRoutingCache;
+  // Persisted vector cache for the L2 embedding fast-path (ITEM B). Populated
+  // on the first turn and reused across subsequent turns so tool embedding
+  // vectors are computed once. Cleared when the catalog changes via
+  // setToolRoutingServers() so stale vectors are never reused.
+  private toolRoutingVectorCache?: Map<string, number[]>;
+
+  // Knowledge grounding: lexical-first host-supplied retrieval engine. Built
+  // once from constructor config and undefined unless grounding is enabled.
+  private knowledgeGroundingEngine?: KnowledgeGroundingEngine;
+
+  // Opt-in tool-signature deduplication config.
+  private toolDedupConfig?: ToolDedupConfig;
+  private toolsConfig?: ToolConfig;
+  /** Session-scoped pins of tools discovered via search_tools (tools.discovery mode). */
+  private discoveryPins: Map<string, Set<string>> = new Map();
+
   // Add orchestration property
   private enableOrchestration: boolean;
+
+  // Language-model middleware defaults, lowest precedence first: the layer
+  // read from NEUROLINK_MIDDLEWARE_PRESET, then the constructor's `middleware`
+  // option. The module-level global registry sits between them and is read on
+  // each call, so it can change after construction. See middleware/defaults.ts.
+  private readonly envMiddleware?: MiddlewareFactoryOptions;
+  private readonly constructorMiddleware?: MiddlewareFactoryOptions;
+
+  // Authentication provider for secure access control
+  private authProvider?: AuthProvider;
+  private pendingAuthConfig?: NeuroLinkAuthConfig;
+  private authInitPromise?: Promise<void>;
+
+  // Per-provider credential overrides (instance-level default)
+  private credentials?: NeurolinkCredentials;
+
+  // Curator P2-3: instance-level fallback policy. Read by
+  // runWithFallbackOrchestration on model-access-denied.
+  private readonly fallbackConfig: {
+    providerFallback?: (
+      err: unknown,
+    ) => Promise<{ provider?: string; model?: string } | null>;
+    modelChain?: string[];
+  } = {};
+
+  // ModelPool: opt-in multi-provider failover with per-member cooldown.
+  // Built once from config.modelPool in the constructor; null when not configured.
+  private readonly modelPool: ModelPool | null;
+
+  // RequestRouter: pluggable pre-call provider/model selector.
+  // Stored directly from config.requestRouter; null when not configured.
+  private readonly requestRouter: RequestRouter | null;
+
+  // ClassifierRouter: opt-in "classify → pick model + tools" pre-call router.
+  // Built from config.classifierRouter; null when not configured.
+  private readonly classifierRouter: ClassifierRouter | null;
+
+  // Tuning for the decision-driven relevance stage of context compaction.
+  // Undefined = the stage's own defaults; the stage itself is gated on a
+  // decision provider being configured, not on this.
+  private readonly contextRelevanceOptions: ContextRelevanceOptions | undefined;
+
+  // Host hooks riding along on every built-in decide site call. Undefined =
+  // no hooks, and the site calls behave exactly as they did without them.
+  private readonly decisionHooks: DecisionHooks | undefined;
+
+  /**
+   * Merge instance-level credentials with per-call credentials.
+   *
+   * Semantics: **deep merge at the provider level.** For each provider key
+   * present in both `this.credentials` and `callCredentials`, the per-call
+   * fields are merged ON TOP of the instance-level fields, so fields not
+   * mentioned in the per-call slice are preserved.
+   *
+   * Example:
+   * ```
+   * instance:  { openai: { apiKey: "key1", baseURL: "url1" } }
+   * per-call:  { openai: { apiKey: "key2" } }
+   * merged:    { openai: { apiKey: "key2", baseURL: "url1" } }   // baseURL preserved
+   * ```
+   *
+   * Providers present only in one source are carried through unchanged.
+   * Unrelated providers (not overridden in callCredentials) are carried through
+   * from instance credentials unchanged.
+   */
+  private resolveCredentials(
+    callCredentials?: NeurolinkCredentials,
+  ): NeurolinkCredentials | undefined {
+    if (!this.credentials && !callCredentials) {
+      return undefined;
+    }
+    if (!this.credentials) {
+      return callCredentials;
+    }
+    if (!callCredentials) {
+      return this.credentials;
+    }
+
+    // Per-provider deep merge: for each provider key in the per-call
+    // override, merge its fields on top of the instance-level slice so
+    // individual fields (e.g. baseURL) are preserved when only apiKey
+    // is overridden per-call.
+    const merged = { ...this.credentials } as Record<string, unknown>;
+    for (const key of Object.keys(callCredentials)) {
+      const instanceSlice = (this.credentials as Record<string, unknown>)[key];
+      const callSlice = (callCredentials as Record<string, unknown>)[key];
+      if (
+        instanceSlice &&
+        callSlice &&
+        typeof instanceSlice === "object" &&
+        typeof callSlice === "object"
+      ) {
+        merged[key] = {
+          ...(instanceSlice as object),
+          ...(callSlice as object),
+        };
+      } else {
+        merged[key] = callSlice ?? instanceSlice;
+      }
+    }
+    return merged as NeurolinkCredentials;
+  }
 
   // HITL (Human-in-the-Loop) support
   private hitlManager?: HITLManager;
 
-  // Mem0 memory instance and config for conversation context
-  private mem0Instance?: MemoryClient | null;
-  private mem0Config?: Mem0Config;
+  // Accumulated cost in USD across all generate() calls on this instance
+  private _sessionCostUsd: number = 0;
 
+  // File Reference Registry for lazy on-demand file processing
+  private fileRegistry: FileReferenceRegistry;
   /**
-   * Extract and set Langfuse context from options with proper async scoping
+   * What this instance may read or fetch when a call names a file path or a
+   * URL: resolved once from `config.attachments` and the
+   * `NEUROLINK_ATTACHMENT_*` variables, stamped onto every call's options so
+   * the loaders see the same answer. See `utils/attachmentPolicy.ts`.
    */
+  private readonly attachmentPolicy: AttachmentPolicy;
+
+  // Cached file tools to avoid redundant createFileTools() calls per generate/stream
+  private cachedFileTools: ReturnType<typeof createFileTools> | null = null;
+
+  // Memory instance and config
+  private memoryInstance?: HippocampusLike | null;
+  private memorySDKConfig?: HippocampusConfig;
+  /**
+   * Set when the instance-level condensation prompt failed validation at
+   * construction (see initializeConversationMemory). Memory stays off for
+   * the instance's lifetime; the reason is what the warning already said.
+   */
+  private memoryDisabledReason?: string;
+  /**
+   * Dedicated child instance Hippocampus condenses through. Built on first
+   * condensation, never at construction — so a read-only host, or one whose
+   * memory never activates, never pays for a second NeuroLink.
+   */
+  private memoryCondenser?: NeuroLink;
+  /**
+   * Set by `releaseMemoryCondenser()`, i.e. by `shutdown()` / `dispose()`,
+   * once the writes already scheduled have been drained. A memory write
+   * scheduled past that point must skip, and the condenser must never be
+   * rebuilt: a child resurrected after release would outlive its host,
+   * unreleased, and — after `dispose()` wiped the credentials — condense
+   * with none.
+   */
+  private memoryCondenserReleased = false;
+  /**
+   * Memory writes scheduled and not yet settled. `releaseMemoryCondenser()`
+   * awaits them (bounded) before it releases anything, so
+   * `await generate(); await shutdown();` — a serverless handler, a
+   * per-request instance, a one-shot CLI run — still stores its last turn.
+   */
+  private readonly pendingMemoryWrites = new Set<Promise<void>>();
+  /** Prompt templates already warned about, so a per-call template warns once. */
+  private readonly warnedCondensationPrompts = new Set<string>();
+  /** `decisionHooks.hookTimeoutMs` once validated; see `decisionHookTimeout`. */
+  private decisionHookTimeoutMs?: number;
+
+  // Skills subsystem — lazily initialized manager + instance config.
+  // `undefined` = not yet attempted, `null` = init failed (stay disabled).
+  private skillsManagerInstance?: SkillsManager | null;
+  private skillsConfig?: SkillsConfig;
+
   private async setLangfuseContextFromOptions<T>(
     options: { context?: unknown },
     callback: () => Promise<T>,
   ): Promise<T> {
-    if (
-      options.context &&
-      typeof options.context === "object" &&
-      options.context !== null
-    ) {
-      try {
-        const ctx = options.context as Record<string, unknown>;
-        if (ctx.userId || ctx.sessionId) {
-          return await new Promise<T>((resolve, reject) => {
-            setLangfuseContext(
-              {
-                userId: typeof ctx.userId === "string" ? ctx.userId : null,
-                sessionId:
-                  typeof ctx.sessionId === "string" ? ctx.sessionId : null,
-              },
-              async () => {
-                try {
-                  const result = await callback();
-                  resolve(result);
-                } catch (error) {
-                  reject(error);
-                }
-              },
-            );
-          });
-        }
-      } catch (error) {
-        logger.warn("Failed to set Langfuse context from options", {
-          error: error instanceof Error ? error.message : String(error),
-        });
+    if (!options.context || typeof options.context !== "object") {
+      return await callback();
+    }
+    const ctx = options.context as Record<string, JsonValue>;
+    const outer = getPropagatedAttributesFromContext(context.active());
+    const unset = (key: string, value: JsonValue): string | undefined =>
+      typeof value === "string" && !outer[key] ? value : undefined;
+    return await setLangfuseContext(
+      {
+        userId: unset(LangfuseOtelSpanAttributes.TRACE_USER_ID, ctx.userId),
+        sessionId: unset(
+          LangfuseOtelSpanAttributes.TRACE_SESSION_ID,
+          ctx.sessionId,
+        ),
+        conversationId:
+          typeof ctx.conversationId === "string"
+            ? ctx.conversationId
+            : undefined,
+        requestId:
+          typeof ctx.requestId === "string" ? ctx.requestId : undefined,
+        traceName: unset(LangfuseOtelSpanAttributes.TRACE_NAME, ctx.traceName),
+        tags: Array.isArray(ctx.tags)
+          ? ctx.tags.filter((tag): tag is string => typeof tag === "string")
+          : undefined,
+        metadata:
+          ctx.metadata && typeof ctx.metadata === "object"
+            ? (ctx.metadata as Record<string, JsonValue>)
+            : undefined,
+      },
+      callback,
+    );
+  }
+
+  private createMetricsTraceContext(): {
+    traceId: string;
+    parentSpanId: string;
+  } {
+    // Reuse the active OTel trace context so the in-process span records
+    // carry the traceId of the exported OTEL trace of the same request.
+    const activeSpan = trace.getSpan(context.active());
+    if (activeSpan) {
+      const spanCtx = activeSpan.spanContext();
+      // Only use the OTel context if it has a valid trace ID.
+      // parentSpanId stores the active span's ID as a parent reference;
+      // each Pipeline B span must generate its own unique spanId to comply
+      // with the OTel/W3C requirement that spanIds are unique per trace.
+      if (
+        spanCtx.traceId &&
+        spanCtx.traceId !== "00000000000000000000000000000000"
+      ) {
+        return {
+          traceId: spanCtx.traceId,
+          parentSpanId: spanCtx.spanId,
+        };
       }
     }
-    return await callback();
+    // Fallback: no active OTel context (e.g. standalone Pipeline B usage)
+    return {
+      traceId: crypto.randomUUID().replace(/-/g, ""),
+      parentSpanId: crypto.randomUUID().replace(/-/g, "").substring(0, 16),
+    };
+  }
+
+  private enforceSessionBudget(maxBudgetUsd?: number): void {
+    if (
+      maxBudgetUsd === undefined ||
+      maxBudgetUsd <= 0 ||
+      this._sessionCostUsd < maxBudgetUsd
+    ) {
+      return;
+    }
+
+    throw new NeuroLinkError({
+      code: "SESSION_BUDGET_EXCEEDED",
+      message: `Session budget exceeded: spent $${this._sessionCostUsd.toFixed(4)} of $${maxBudgetUsd.toFixed(4)} limit`,
+      category: ErrorCategory.VALIDATION,
+      severity: ErrorSeverity.HIGH,
+      retriable: false,
+      context: {
+        spent: this._sessionCostUsd,
+        limit: maxBudgetUsd,
+      },
+    });
+  }
+
+  private assertInputText(
+    text: string | undefined,
+    message: string,
+  ): asserts text is string {
+    if (!text || typeof text !== "string") {
+      throw new Error(message);
+    }
+  }
+
+  private async applyAuthenticatedRequestContext(options: {
+    auth?: { token?: string };
+    context?: Record<string, unknown>;
+    requestContext?: Record<string, unknown>;
+  }): Promise<void> {
+    if (options.auth?.token) {
+      const { AuthError } = await import("./auth/errors.js");
+      await this.ensureAuthProvider();
+      if (!this.authProvider) {
+        throw AuthError.create(
+          "PROVIDER_ERROR",
+          "No auth provider configured. Set auth in constructor or via setAuthProvider() before using auth: { token }.",
+        );
+      }
+
+      let authResult: Awaited<ReturnType<AuthProvider["authenticateToken"]>>;
+      try {
+        authResult = await withTimeout(
+          this.authProvider.authenticateToken(options.auth.token),
+          5000,
+          AuthError.create(
+            "PROVIDER_ERROR",
+            "Auth token validation timed out after 5000ms",
+          ),
+        );
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          "feature" in error &&
+          (error as { feature: string }).feature === "Auth"
+        ) {
+          throw error;
+        }
+        throw AuthError.create(
+          "PROVIDER_ERROR",
+          `Auth token validation failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+
+      if (!authResult.valid) {
+        throw AuthError.create(
+          "INVALID_TOKEN",
+          authResult.error || "Token validation failed",
+        );
+      }
+      if (!authResult.user) {
+        throw AuthError.create(
+          "INVALID_TOKEN",
+          "Token validated but no user identity returned",
+        );
+      }
+      if (!authResult.user.id) {
+        throw AuthError.create(
+          "INVALID_TOKEN",
+          "Token validated but user identity missing required 'id' field",
+        );
+      }
+
+      options.context = {
+        ...(options.context || {}),
+        userId: authResult.user.id,
+        userEmail: authResult.user.email,
+        userRoles: authResult.user.roles,
+      };
+    }
+
+    if (!options.requestContext) {
+      return;
+    }
+
+    const tokenDerivedFields =
+      options.auth?.token && this.authProvider
+        ? {
+            userId: options.context?.userId,
+            userEmail: options.context?.userEmail,
+            userRoles: options.context?.userRoles,
+          }
+        : {};
+    options.context = {
+      ...(options.context || {}),
+      ...options.requestContext,
+      ...tokenDerivedFields,
+    };
   }
 
   /**
-   * Simple sync config setup for mem0
+   * Fold the instance, global and environment middleware defaults beneath the
+   * call's own `middleware`. Runs before the lifecycle helpers so they layer
+   * onFinish/onError on top of the resolved config rather than replacing it.
+   * With no default set the options are left untouched.
    */
-  private initializeMem0Config(): boolean {
-    const config = this.conversationMemoryConfig?.conversationMemory;
-    if (!config?.mem0Enabled) {
+  private applyMiddlewareDefaults(options: {
+    middleware?: MiddlewareFactoryOptions;
+  }): void {
+    const resolved = resolveMiddlewareOptions(
+      [this.envMiddleware, getGlobalMiddleware(), this.constructorMiddleware],
+      options.middleware,
+    );
+    if (resolved !== options.middleware) {
+      options.middleware = resolved;
+    }
+  }
+
+  private applyGenerateLifecycleMiddleware(options: GenerateOptions): void {
+    if (!options.onFinish && !options.onError) {
+      return;
+    }
+
+    options.middleware = {
+      ...options.middleware,
+      middlewareConfig: {
+        ...options.middleware?.middlewareConfig,
+        lifecycle: {
+          ...options.middleware?.middlewareConfig?.lifecycle,
+          enabled: true,
+          config: {
+            ...options.middleware?.middlewareConfig?.lifecycle?.config,
+            ...(options.onFinish !== undefined
+              ? { onFinish: options.onFinish }
+              : {}),
+            ...(options.onError !== undefined
+              ? { onError: options.onError }
+              : {}),
+          },
+        },
+      },
+    };
+  }
+
+  private applyStreamLifecycleMiddleware(options: StreamOptions): void {
+    if (!options.onFinish && !options.onError && !options.onChunk) {
+      return;
+    }
+
+    const config = {
+      ...options.middleware?.middlewareConfig?.lifecycle?.config,
+      ...(options.onFinish !== undefined ? { onFinish: options.onFinish } : {}),
+      ...(options.onError !== undefined ? { onError: options.onError } : {}),
+      ...(options.onChunk !== undefined ? { onChunk: options.onChunk } : {}),
+    };
+    // BaseProvider.wrapStreamWithLifecycleCallbacks unconditionally wraps
+    // every provider's stream() result and fires onChunk/onFinish from
+    // there, reliably, for this exact config object. Stamp it so the
+    // model-level lifecycle middleware (builtin/lifecycle.ts) skips its own
+    // onChunk/onFinish firing for it instead of delivering each one twice.
+    // See markLifecycleStreamCallbacksOwnedByBaseProvider's doc comment for
+    // why generate()'s config below is never stamped this way.
+    markLifecycleStreamCallbacksOwnedByBaseProvider(config);
+
+    options.middleware = {
+      ...options.middleware,
+      middlewareConfig: {
+        ...options.middleware?.middlewareConfig,
+        lifecycle: {
+          ...options.middleware?.middlewareConfig?.lifecycle,
+          enabled: true,
+          config,
+        },
+      },
+    };
+  }
+
+  private initializeMemoryConfig(): boolean {
+    const memory = this.conversationMemoryConfig?.conversationMemory?.memory;
+    if (!memory?.enabled || this.memoryDisabledReason) {
       return false;
     }
 
-    this.mem0Config = config.mem0Config;
+    // Only the HippocampusConfig part reaches the Hippocampus constructor;
+    // `enabled`, `client`, `strictPrompt` and the write hooks are NeuroLink's.
+    const {
+      enabled: _enabled,
+      client: _client,
+      strictPrompt: _strictPrompt,
+      shouldWrite: _shouldWrite,
+      onBeforeStore: _onBeforeStore,
+      prompt,
+      ...sdkConfig
+    } = memory;
+
+    this.memorySDKConfig = {
+      ...sdkConfig,
+      // A blank template counts as unset here (validateInstanceCondensationPrompt
+      // skips it), so it must not reach Hippocampus either: it resolves
+      // `config.prompt || HC_CONDENSATION_PROMPT || built-in`, and "   " is
+      // truthy — it would condense with a template that has no placeholders.
+      ...(prompt?.trim() ? { prompt } : {}),
+      neurolink: {
+        ...(memory.neurolink ?? {}),
+        credentials: memory.neurolink?.credentials ?? this.credentials,
+        instance:
+          memory.neurolink?.instance ?? this.lazyMemoryCondenserInstance(),
+      },
+    };
     return true;
   }
 
   /**
-   * Async initialization called during generate/stream
+   * A `generate()`-only handle whose backing NeuroLink is constructed on the
+   * first condensation call, not when memory is configured or first read.
    */
-  private async ensureMem0Ready(): Promise<MemoryClient | null> {
-    if (this.mem0Instance !== undefined) {
-      return this.mem0Instance;
-    }
-
-    if (!this.initializeMem0Config()) {
-      this.mem0Instance = null;
-      return null;
-    }
-
-    if (!this.mem0Config) {
-      this.mem0Instance = null;
-      return null;
-    }
-
-    this.mem0Instance = await initializeMem0(this.mem0Config);
-    return this.mem0Instance;
+  private lazyMemoryCondenserInstance(): HippocampusNeurolinkLike {
+    return {
+      generate: async (options) => {
+        const condenser = this.getMemoryCondenser();
+        if (!condenser) {
+          // Hippocampus swallows a condensation error and keeps the old
+          // memory, which is exactly the right outcome for a write that
+          // outlived its host: skipped, never condensed with no credentials.
+          logger.debug(
+            "[NeuroLink] Memory condensation skipped: the host instance has been shut down",
+          );
+          throw new Error(
+            "Memory condenser released: the host NeuroLink instance has been shut down",
+          );
+        }
+        return condenser.generate(options);
+      },
+    };
   }
+
+  /**
+   * Release the lazily created condenser with its host. Its own
+   * `shutdown()` is a no-op when condensation never ran; when it did, the
+   * child's memory is disabled and it holds no MCP servers, so this is
+   * cheap — the point is that the host's lifecycle owns the child's.
+   *
+   * The writes already scheduled are drained FIRST, bounded by the write
+   * timeout: a turn's memory write is deferred to `setImmediate`, so
+   * `await generate(); await shutdown();` would otherwise never store the
+   * turn. Only then is the host marked released, so a write scheduled after
+   * that point skips instead of rebuilding the child.
+   */
+  private async releaseMemoryCondenser(): Promise<void> {
+    await this.drainPendingMemoryWrites();
+    this.memoryCondenserReleased = true;
+    const condenser = this.memoryCondenser;
+    if (!condenser) {
+      return;
+    }
+    this.memoryCondenser = undefined;
+    await condenser.shutdown();
+  }
+
+  /**
+   * Wait for every scheduled memory write to settle, including writes
+   * scheduled while waiting, within one `MEMORY_WRITE_TIMEOUT_MS` budget.
+   * A write that outlives the budget is left in flight and warned about —
+   * it will skip or fail on its own once the condenser is gone — rather
+   * than hold shutdown open indefinitely.
+   */
+  private async drainPendingMemoryWrites(): Promise<void> {
+    if (this.pendingMemoryWrites.size === 0) {
+      return;
+    }
+    const deadline = Date.now() + MEMORY_WRITE_TIMEOUT_MS;
+    while (this.pendingMemoryWrites.size > 0) {
+      const remainingMs = deadline - Date.now();
+      const inFlight = [...this.pendingMemoryWrites];
+      if (remainingMs <= 0) {
+        this.warnMemoryWritesLeftInFlight(inFlight.length);
+        return;
+      }
+      try {
+        await withTimeout(
+          Promise.allSettled(inFlight),
+          remainingMs,
+          new Error(
+            `Memory writes still in flight after ${MEMORY_WRITE_TIMEOUT_MS}ms`,
+          ),
+        );
+      } catch {
+        this.warnMemoryWritesLeftInFlight(this.pendingMemoryWrites.size);
+        return;
+      }
+    }
+  }
+
+  private warnMemoryWritesLeftInFlight(count: number): void {
+    logger.warn(
+      `[NeuroLink] Shutdown proceeded with ${count} memory write(s) still in flight after ${MEMORY_WRITE_TIMEOUT_MS}ms; the last turn may not be stored`,
+      { pendingWrites: count },
+    );
+  }
+
+  /**
+   * The child instance Hippocampus condenses through, or null once the host
+   * has been released.
+   *
+   * Deliberately NOT `this`: routing condensation through the parent would
+   * run its MCP init, skills and middleware, emit `generation:*` on the
+   * parent emitter and add the condensation call's cost to
+   * `_sessionCostUsd`. The child inherits `credentials` (or the explicit
+   * `memory.neurolink.credentials`) so condensation no longer depends on
+   * provider keys in `process.env`, has memory disabled so it can never
+   * recurse into a memory write of its own, and — like createWorkerInstance —
+   * joins the host tracer without a second Langfuse exporter.
+   */
+  private getMemoryCondenser(): NeuroLink | null {
+    if (this.memoryCondenser) {
+      return this.memoryCondenser;
+    }
+    if (this.memoryCondenserReleased) {
+      return null;
+    }
+    // Constructing an instance rebinds the process-global logger sink to the
+    // new instance's emitter. That sink is whatever the process last set —
+    // not necessarily this host's emitter (another instance may own a
+    // log-event bridge) — so it is captured and put back as it was, rather
+    // than pointed at the host.
+    const previousSink = logger.getEventEmitter();
+    const credentials =
+      this.conversationMemoryConfig?.conversationMemory?.memory?.neurolink
+        ?.credentials ?? this.credentials;
+    this.memoryCondenser = new NeuroLink({
+      ...(credentials ? { credentials } : {}),
+      conversationMemory: { enabled: false },
+      enableOrchestration: false,
+      ...(this.observabilityConfig
+        ? { observability: this.observabilityConfig }
+        : {}),
+    });
+    if (previousSink) {
+      logger.setEventEmitter(previousSink);
+    } else {
+      logger.clearEventEmitter(this.memoryCondenser.emitter);
+    }
+    return this.memoryCondenser;
+  }
+
+  /**
+   * Lazy initialization for memory — called during generate/stream.
+   */
+  private ensureMemoryReady(): HippocampusLike | null {
+    if (this.memoryInstance !== undefined) {
+      return this.memoryInstance;
+    }
+
+    if (!this.initializeMemoryConfig()) {
+      this.memoryInstance = null;
+      return null;
+    }
+
+    if (!this.memorySDKConfig) {
+      this.memoryInstance = null;
+      return null;
+    }
+
+    this.memoryInstance = initializeHippocampus(
+      this.memorySDKConfig,
+      this.conversationMemoryConfig?.conversationMemory?.memory?.client,
+    );
+    return this.memoryInstance;
+  }
+
   /**
    * Context storage for tool execution
    * This context will be merged with any runtime context passed by the AI model
    */
   private toolExecutionContext?: Record<string, unknown>;
+
+  /**
+   * Set when registerAgentTool() has registered at least one delegation
+   * tool — gates the per-turn delegation scope in generate().
+   */
+  private hasAgentTools = false;
+
+  /**
+   * Tools registered with `cacheable: false` — their results are never served
+   * from the tool-result cache. A tool whose answer depends on live state (a
+   * checklist, a work queue) would otherwise replay its first answer for the
+   * whole TTL to every caller passing the same arguments.
+   */
+  private readonly uncacheableTools = new Set<string>();
+
+  /** Set once registerTaskTools() has registered the checklist toolset. */
+  private hasTaskChecklistTools = false;
+
+  /** Set once registerDelegationTools() has registered the delegation toolset. */
+  private hasBackgroundDelegationTools = false;
+
+  /** Set once registerBackgroundCommandTools() has registered the command toolset. */
+  private hasBackgroundCommandTools = false;
+
+  /** Set once registerGitTools() has registered the read-only git toolset. */
+  private hasGitTools = false;
+
+  /**
+   * Set once `retrieve_context` has been registered. The constructor skips
+   * registration when neither Redis nor an artifact store exists; banking can
+   * create a store later, and this keeps that second attempt from
+   * re-registering the tool on instances that already have it.
+   */
+  private retrieveContextRegistered = false;
 
   /**
    * Creates a new NeuroLink instance for AI text generation with MCP tool integration.
@@ -407,9 +1889,9 @@ export class NeuroLink {
    * @param config.enableOrchestration - Whether to enable smart model orchestration (default: false)
    * @param config.hitl - Configuration for Human-in-the-Loop safety features
    * @param config.hitl.enabled - Whether to enable HITL tool confirmation (default: false)
-   * @param config.hitl.dangerousActions - Keywords that trigger confirmation (default: ['delete', 'remove', 'drop'])
+   * @param config.hitl.dangerousActions - Keywords that trigger confirmation; required when HITL is enabled
    * @param config.hitl.timeout - Confirmation timeout in milliseconds (default: 30000)
-   * @param config.hitl.allowArgumentModification - Allow users to modify tool parameters (default: true)
+   * @param config.hitl.allowArgumentModification - Advertised to the approval UI as `allowModification` (default: false); not enforced, a response's `modifiedArguments` is applied either way
    * @param config.toolRegistry - Optional tool registry instance for advanced use cases (default: new MCPToolRegistry())
    *
    * @example
@@ -448,13 +1930,140 @@ export class NeuroLink {
    * @throws {Error} When HITL configuration is invalid (if enabled)
    */
   private observabilityConfig?: ObservabilityConfig;
+  private telemetryHeld = false;
+  private metricsAggregator: MetricsAggregator = new MetricsAggregator();
+  private analyticsService: AnalyticsService;
+  /**
+   * Per-request metrics trace context backed by AsyncLocalStorage.
+   * Safe for concurrent requests on the same SDK instance.
+   * Context is set via metricsTraceContextStorage.run() in generate/stream.
+   */
+  private get _metricsTraceContext(): MetricsTraceContext | null {
+    return metricsTraceContextStorage.getStore() ?? null;
+  }
 
   constructor(config?: NeurolinkConstructorConfig) {
-    this.toolRegistry = config?.toolRegistry || new MCPToolRegistry();
+    // Validated first: an invalid default must throw before the constructor
+    // starts telemetry or any other process-wide state.
+    this.envMiddleware = readEnvMiddlewarePreset();
+    this.constructorMiddleware =
+      config?.middleware === undefined
+        ? undefined
+        : snapshotMiddlewareOptions(config.middleware, "NeuroLink constructor");
+
+    if (config?.toolRegistry) {
+      // A supplied registry (a host's, shared with a worker) keeps its owner's
+      // roots; per-call executeTool() binds this instance's policy anyway.
+      this.toolRegistry = config.toolRegistry;
+    } else {
+      this.toolRegistry = new MCPToolRegistry();
+      this.toolRegistry.setFileToolRootResolver(() =>
+        this.resolveFileToolRoots(undefined),
+      );
+    }
+    this.fileRegistry = new FileReferenceRegistry();
+    this.attachmentPolicy = resolveAttachmentPolicy(config?.attachments);
     this.observabilityConfig = config?.observability;
+    if (this.observabilityConfig) {
+      ensureTelemetry(this.observabilityConfig);
+    }
+    this.analyticsService = new AnalyticsService();
 
     // Initialize orchestration setting
     this.enableOrchestration = config?.enableOrchestration ?? false;
+
+    // NL-004: Initialize model alias configuration
+    if (config?.modelAliasConfig) {
+      this.modelAliasConfig = config.modelAliasConfig;
+    }
+
+    // Curator P2-3: capture fallback policy. Per-call options can still
+    // override, but these are the instance-level defaults.
+    if (config?.providerFallback) {
+      this.fallbackConfig.providerFallback = config.providerFallback;
+    }
+    if (config?.modelChain) {
+      this.fallbackConfig.modelChain = config.modelChain;
+    }
+
+    if (config?.toolRouting) {
+      // Shallow-clone so setToolRoutingServers() mutating this.toolRoutingConfig
+      // can't leak into the caller's config object, which may be shared across
+      // multiple NeuroLink instances.
+      this.toolRoutingConfig = { ...config.toolRouting };
+    }
+
+    const knowledgeGroundingConfig = config?.knowledgeGrounding;
+    if (knowledgeGroundingConfig?.enabled) {
+      if (
+        Array.isArray(knowledgeGroundingConfig.sources) &&
+        knowledgeGroundingConfig.sources.length > 0
+      ) {
+        // The engine builds its immutable index asynchronously; eligible
+        // generate() and stream() calls await readiness before retrieval.
+        this.knowledgeGroundingEngine = new KnowledgeGroundingEngine(
+          knowledgeGroundingConfig,
+        );
+      } else {
+        logger.warn(
+          "[KnowledgeGrounding] enabled but no sources were provided; grounding disabled for this instance",
+        );
+      }
+    }
+
+    if (config?.toolDedup) {
+      this.toolDedupConfig = { ...config.toolDedup };
+    }
+
+    if (config?.tools) {
+      // Shallow-clone so later caller mutations of the config object don't
+      // change this instance's tool policy mid-flight.
+      this.toolsConfig = { ...config.tools };
+    }
+
+    // ModelPool: build one instance from config; null when not configured.
+    this.modelPool = config?.modelPool ? new ModelPool(config.modelPool) : null;
+
+    // RequestRouter: store the host-supplied function; null when not configured.
+    this.requestRouter = config?.requestRouter ?? null;
+
+    // Tuning for the relevance stage of compaction. Storing it (rather than
+    // reading config at each call site) keeps compactor construction uniform
+    // across the five places that build one.
+    this.contextRelevanceOptions = config?.contextRelevance;
+    this.decisionHooks = config?.decisionHooks;
+
+    // ClassifierRouter: opt-in. The LLM strategy reuses this instance's
+    // generate() (marked so it never recursively re-routes). Fails open.
+    this.classifierRouter = config?.classifierRouter?.enabled
+      ? new ClassifierRouter(config.classifierRouter, {
+          generate: (genOptions) =>
+            this.preservingTurnState(() =>
+              this.generate({
+                ...genOptions,
+              }),
+            ),
+          // Fail-open by construction: siteDecide returns null rather than
+          // throwing, so an absent or broken decision provider leaves routing
+          // exactly as it was. The per-call credentials and ids arrive on the
+          // options themselves — classifyJev forwards them from the router
+          // input, since this caller is fixed at construction.
+          decide: (decideOptions) => this.siteDecide(decideOptions),
+          // Read lazily: `this.credentials` is assigned later in the
+          // constructor. Counts the request's per-call credentials too, so a
+          // host that holds no decision key itself but passes a tenant's on
+          // each call gets the decision strategy, as the other sites do.
+          hasDecisionProvider: (callCredentials) =>
+            this.resolveDecisionProviderName(undefined, callCredentials) !==
+            undefined,
+          logger: {
+            debug: (message, meta) =>
+              logger.debug(message, meta as Record<string, unknown>),
+            warn: (message, meta) =>
+              logger.warn(message, meta as Record<string, unknown>),
+          },
+        })
+      : null;
 
     logger.setEventEmitter(this.emitter);
 
@@ -490,16 +2099,54 @@ export class NeuroLink {
       constructorStartTime,
       constructorHrTimeStart,
     );
-    this.initializeLangfuse(
-      constructorId,
-      constructorStartTime,
-      constructorHrTimeStart,
-    );
+    this.initializeMCPEnhancements(config);
+    this.registerFileTools();
+    this.registerMemoryRetrievalTools();
+    if (config?.skills?.enabled) {
+      this.skillsConfig = config.skills;
+      this.registerSkillTools();
+    }
+    this.initializeMetricsListeners();
     this.logConstructorComplete(
       constructorId,
       constructorStartTime,
       constructorHrTimeStart,
     );
+
+    // Store auth config for lazy initialization
+    if (config?.auth) {
+      this.pendingAuthConfig = config.auth;
+    }
+
+    // Store per-provider credential overrides
+    if (config?.credentials) {
+      this.credentials = config.credentials;
+    }
+
+    // Store task config for lazy initialization
+    this._taskManagerConfig = config?.tasks;
+
+    // Eagerly create TaskManager and register tools if config is provided
+    if (this._taskManagerConfig) {
+      this._taskManager = new TaskManager(this, this._taskManagerConfig);
+      this._taskManager.setEmitter(this.emitter);
+      this.registerSchedulerTaskTools(this._taskManager);
+    }
+  }
+
+  /**
+   * TaskManager — scheduled and self-running tasks.
+   * Lazy-initialized on first access. Configurable via constructor `tasks` option.
+   * The actual async initialization (Redis connect, backend start) happens
+   * lazily inside TaskManager on first operation.
+   */
+  get tasks(): TaskManager {
+    if (!this._taskManager) {
+      this._taskManager = new TaskManager(this, this._taskManagerConfig);
+      this._taskManager.setEmitter(this.emitter);
+      this.registerSchedulerTaskTools(this._taskManager);
+    }
+    return this._taskManager;
   }
 
   /**
@@ -546,6 +2193,7 @@ export class NeuroLink {
       // Store config for later use and set flag for lazy initialization
       this.conversationMemoryConfig = config;
       this.conversationMemoryNeedsInit = true;
+      this.validateInstanceCondensationPrompt(config.conversationMemory.memory);
 
       const memoryInitEndTime = process.hrtime.bigint();
       const memoryInitDurationNs = memoryInitEndTime - memoryInitStartTime;
@@ -591,6 +2239,69 @@ export class NeuroLink {
   }
 
   /**
+   * Validate the condensation prompt template memory will condense with —
+   * the instance `prompt`, else `HC_CONDENSATION_PROMPT` (which Hippocampus
+   * reads when no config prompt is set). Hippocampus substitutes
+   * placeholders with `replaceAll` and requires none, so a template missing
+   * `{{NEW_CONTENT}}` yields a memory that never grows and one missing
+   * `{{OLD_MEMORY}}` overwrites the summary on every turn — both silently.
+   *
+   * Default is disable-and-log, matching every other memory failure; the
+   * log line is `error` because it is the only signal an operator gets that
+   * memory is off. With `memory.strictPrompt` the constructor throws instead.
+   *
+   * An empty or whitespace-only template counts as unset — Hippocampus
+   * resolves `config.prompt || HC_CONDENSATION_PROMPT || built-in`, so `""`
+   * means "use the next one down", never "a template with no placeholders".
+   */
+  private validateInstanceCondensationPrompt(
+    memory: HippocampusMemory | undefined,
+  ): void {
+    if (!memory?.enabled) {
+      return;
+    }
+    const configuredPrompt = memory.prompt?.trim() ? memory.prompt : undefined;
+    const envPrompt = process.env.HC_CONDENSATION_PROMPT?.trim()
+      ? process.env.HC_CONDENSATION_PROMPT
+      : undefined;
+    const template = configuredPrompt ?? envPrompt;
+    if (template === undefined) {
+      return;
+    }
+    const source = configuredPrompt !== undefined ? "prompt" : "env";
+    const configName =
+      source === "prompt"
+        ? "conversationMemory.memory.prompt"
+        : "HC_CONDENSATION_PROMPT";
+    const verdict = validateCondensationPrompt(template);
+    if (verdict.valid) {
+      if (verdict.missing.length > 0) {
+        logger.warn(
+          `[NeuroLink] Memory condensation prompt (${configName}) has no {{MAX_WORDS}} placeholder; maxWords will not be enforced`,
+          { source, missing: verdict.missing },
+        );
+      }
+      return;
+    }
+    const reason = `missing required placeholder(s) ${verdict.fatal
+      .map((name) => `{{${name}}}`)
+      .join(", ")}`;
+    if (memory.strictPrompt) {
+      throw ErrorFactory.invalidConfiguration(configName, reason, {
+        source,
+        missing: verdict.missing,
+      });
+    }
+    this.memoryDisabledReason = `${configName}: ${reason}`;
+    // `error`, not `warn`: warnings are hidden at the default log level, and
+    // a host whose memory is silently off has no other way to find out.
+    logger.error(
+      `[NeuroLink] Memory disabled: condensation prompt (${configName}) is ${reason}. Without {{NEW_CONTENT}} memory never grows; without {{OLD_MEMORY}} every turn overwrites it. Fix the template or set memory.strictPrompt to fail fast.`,
+      { source, missing: verdict.missing },
+    );
+  }
+
+  /**
    * Initialize HITL (Human-in-the-Loop) if enabled
    */
   private initializeHITL(
@@ -621,7 +2332,7 @@ export class NeuroLink {
           dangerousActions: config.hitl.dangerousActions || [],
           timeout: config.hitl.timeout || 30000,
           allowArgumentModification:
-            config.hitl.allowArgumentModification ?? true,
+            config.hitl.allowArgumentModification ?? DEFAULT_ALLOW_MODIFICATION,
           auditLogging: config.hitl.auditLogging ?? false,
         },
         message: "Starting HITL (Human-in-the-Loop) initialization",
@@ -662,7 +2373,7 @@ export class NeuroLink {
           dangerousActions: config.hitl.dangerousActions?.length || 0,
           timeout: config.hitl.timeout || 30000,
           allowArgumentModification:
-            config.hitl.allowArgumentModification ?? true,
+            config.hitl.allowArgumentModification ?? DEFAULT_ALLOW_MODIFICATION,
           auditLogging: config.hitl.auditLogging ?? false,
         });
       } catch (error) {
@@ -712,6 +2423,635 @@ export class NeuroLink {
     }
   }
 
+  /**
+   * Initialize MCP enhancement modules (cache, router, batcher, discovery).
+   * Wires standalone MCP modules into the core SDK execution path.
+   */
+  private initializeMCPEnhancements(config?: NeurolinkConstructorConfig): void {
+    const mcpConfig = config?.mcp;
+    this.mcpEnhancementsConfig = mcpConfig;
+
+    // BZ-664: ToolCache — enabled by default to prevent duplicate tool calls.
+    // Callers can explicitly opt out via mcp.cache.enabled = false.
+    if (mcpConfig?.cache?.enabled !== false) {
+      this.mcpToolResultCache = new ToolResultCache({
+        ttl: mcpConfig?.cache?.ttl ?? 300_000,
+        maxSize: mcpConfig?.cache?.maxSize ?? 500,
+        strategy: mcpConfig?.cache?.strategy ?? "lru",
+      });
+      logger.debug("[NeuroLink] MCP tool result cache initialized", {
+        ttl: mcpConfig?.cache?.ttl ?? 300_000,
+        maxSize: mcpConfig?.cache?.maxSize ?? 500,
+        strategy: mcpConfig?.cache?.strategy ?? "lru",
+      });
+    }
+
+    // ToolCallBatcher — disabled by default, opt-in
+    if (mcpConfig?.batcher?.enabled) {
+      this.mcpToolBatcher = new ToolCallBatcher({
+        maxBatchSize: mcpConfig.batcher.maxBatchSize ?? 10,
+        maxWaitMs: mcpConfig.batcher.maxWaitMs ?? 100,
+      });
+      // Wire batcher to execute tools via the internal execution path (bypass batcher itself)
+      this.mcpToolBatcher.setToolExecutor(
+        async (tool: string, args: unknown) => {
+          return this.executeToolInternal(tool, args, {
+            timeout: TOOL_TIMEOUTS.EXECUTION_DEFAULT_MS,
+            maxRetries: RETRY_ATTEMPTS.DEFAULT,
+            retryDelayMs: RETRY_DELAYS.BASE_MS,
+          });
+        },
+      );
+      logger.debug("[NeuroLink] MCP tool call batcher initialized");
+    }
+
+    // EnhancedToolDiscovery — enabled by default
+    if (mcpConfig?.discovery?.enabled !== false) {
+      this.mcpEnhancedDiscovery = new EnhancedToolDiscovery();
+      logger.debug("[NeuroLink] Enhanced tool discovery initialized");
+    }
+
+    // Middleware — store from config (empty by default)
+    if (mcpConfig?.middleware?.length) {
+      this.mcpToolMiddlewares = [...mcpConfig.middleware];
+      logger.debug("[NeuroLink] MCP tool middlewares registered", {
+        count: this.mcpToolMiddlewares.length,
+      });
+    }
+
+    // ToolRouter — lazy-initialized when 2+ external servers exist (see addExternalMCPServer)
+
+    // Artifact storage — where externalized MCP outputs and banked payloads
+    // live. Kept so both creation sites (externalize here, and
+    // getArtifactStore() on demand) resolve the same backend.
+    this.artifactsConfig = config?.artifacts;
+
+    // McpOutputNormalizer — active when mcp.outputLimits is configured
+    if (mcpConfig?.outputLimits) {
+      const strategy = mcpConfig.outputLimits.strategy ?? "externalize";
+      const maxBytes =
+        mcpConfig.outputLimits.maxBytes ?? DEFAULT_MAX_MCP_OUTPUT_BYTES;
+      const warnBytes =
+        mcpConfig.outputLimits.warnBytes ?? DEFAULT_WARN_MCP_OUTPUT_BYTES;
+      this.mcpOutputNormalizerConfig = { strategy, maxBytes, warnBytes };
+
+      let artifactStore: ArtifactStore | undefined;
+      if (strategy === "externalize") {
+        artifactStore = this.createConfiguredArtifactStore();
+        this.mcpArtifactStore = artifactStore;
+      }
+
+      this.installOutputNormalizer(artifactStore);
+    }
+  }
+
+  /**
+   * Register file reference tools with the MCP tool registry.
+   *
+   * Creates file access tools (list_attached_files, read_file_section,
+   * search_in_file, get_file_preview) bound to the FileReferenceRegistry
+   * and registers them as direct tools so they're available to LLMs.
+   */
+  private registerFileTools(): void {
+    const fileTools = createFileTools(this.fileRegistry);
+
+    // Use void to handle async registration without blocking constructor
+    const registrations = Object.entries(fileTools).map(
+      async ([toolName, toolDef]) => {
+        const toolId = `direct.${toolName}`;
+        // Register the real parameter schema (converted from Zod) instead of a
+        // `{}` placeholder so tool listings and token-budget accounting see the
+        // schema that actually ships to providers.
+        const fileToolSchema = convertZodToJsonSchema(
+          ((toolDef as Record<string, unknown>).inputSchema ??
+            (toolDef as Record<string, unknown>).parameters) as Parameters<
+            typeof convertZodToJsonSchema
+          >[0],
+        ) as ToolInfo["inputSchema"];
+        const toolInfo: ToolInfo = {
+          name: toolName,
+          description: toolDef.description || `File tool: ${toolName}`,
+          inputSchema: fileToolSchema,
+          serverId: "direct",
+          category: "built-in" as MCPServerCategory,
+        };
+
+        await this.toolRegistry.registerTool(toolId, toolInfo, {
+          execute: async (params: unknown) => {
+            try {
+              const result = await (
+                toolDef.execute as (
+                  params: unknown,
+                  ctx: unknown,
+                ) => Promise<unknown>
+              )(params, {
+                toolCallId: "file-tool",
+                messages: [],
+              });
+              return {
+                success: true,
+                data: result,
+                metadata: { toolName, serverId: "direct", executionTime: 0 },
+              };
+            } catch (error) {
+              // Known limitation: this non-throwing error path returns
+              // { success: false } without recording errorCategories in
+              // toolExecutionMetrics. These are internal file-tool failures
+              // (low frequency), so the risk of metric gaps is minimal.
+              // A full fix would require access to the metrics map here,
+              // which is not available in the registration closure.
+              return {
+                success: false,
+                error: error instanceof Error ? error.message : String(error),
+                metadata: { toolName, serverId: "direct", executionTime: 0 },
+              };
+            }
+          },
+          description: toolDef.description,
+          inputSchema: {},
+        });
+      },
+    );
+
+    // Fire-and-forget: registrations complete before any generate/stream call
+    // because those calls await initializeMCP() which is slower.
+    //
+    // The rejection handler is not decoration. registerTool() throws on a
+    // failed name/description validation (mcp/toolRegistry.ts), and that throw
+    // is not inside a try — so a rejected registration on a `void`-detached
+    // one-argument `.then()` would be an unhandled rejection, which terminates
+    // the process. Today the tool names come from createFileTools(), which are
+    // internal constants that pass validation, so this is latent rather than
+    // live; it stops being latent the moment a name is derived from anything
+    // outside this file. Losing one tool registration is the intended failure
+    // mode here — losing the host process is not.
+    void Promise.all(registrations).then(
+      () => {
+        logger.debug(
+          `[NeuroLink] Registered ${Object.keys(fileTools).length} file reference tools`,
+        );
+      },
+      (error: unknown) => {
+        logger.warn("[NeuroLink] File tool registration failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      },
+    );
+  }
+
+  /**
+   * Register SCHEDULER task tools bound to a TaskManager instance (task_create,
+   * task_list, … — scheduled/self-running jobs). Distinct from the agent task
+   * CHECKLIST (registerTaskTools() / tasks_create): different tools, different
+   * state, different purpose.
+   * Follows the same factory + registry pattern as registerFileTools().
+   * Called when TaskManager is created (eagerly or lazily via the `tasks` getter).
+   */
+  private registerSchedulerTaskTools(manager: TaskManager): void {
+    const taskTools = createTaskTools(manager);
+
+    for (const [toolName, toolDef] of Object.entries(taskTools)) {
+      const toolId = `direct.${toolName}`;
+      const toolInfo: ToolInfo = {
+        name: toolName,
+        description: toolDef.description || `Task tool: ${toolName}`,
+        inputSchema: {},
+        serverId: "direct",
+        category: "built-in" as MCPServerCategory,
+      };
+
+      // registerTool is async but its core logic is synchronous (Map.set).
+      // We fire-and-forget here but tools are available immediately after
+      // the synchronous validation + map insertion completes.
+      //
+      // The .catch() at the end of this call is required for the same reason
+      // as in registerFileTools() above: registerTool() throws on failed
+      // validation, and an unhandled rejection off a `void`-detached call
+      // terminates the process rather than failing this one registration.
+      // Latent today (createTaskTools() supplies internal, valid names), and
+      // cheap to keep correct.
+      void this.toolRegistry
+        .registerTool(toolId, toolInfo, {
+          execute: async (params: unknown) => {
+            try {
+              const result = await (
+                toolDef.execute as (
+                  params: unknown,
+                  ctx: unknown,
+                ) => Promise<unknown>
+              )(params, {
+                toolCallId: "task-tool",
+                messages: [],
+              });
+              return {
+                success: true,
+                data: result,
+                metadata: { toolName, serverId: "direct", executionTime: 0 },
+              };
+            } catch (error) {
+              return {
+                success: false,
+                error: error instanceof Error ? error.message : String(error),
+                metadata: { toolName, serverId: "direct", executionTime: 0 },
+              };
+            }
+          },
+          description: toolDef.description,
+          inputSchema: {},
+        })
+        .catch((error: unknown) => {
+          logger.warn("[NeuroLink] Task tool registration failed", {
+            toolId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+    }
+
+    logger.debug(
+      `[NeuroLink] Registered ${Object.keys(taskTools).length} task tools`,
+    );
+  }
+
+  /**
+   * Register memory retrieval tools that allow the AI to access
+   * conversation history, including full tool outputs.
+   * Only registered when Redis conversation memory is active.
+   */
+  private registerMemoryRetrievalTools(): void {
+    if (this.retrieveContextRegistered) {
+      return;
+    }
+    // Check if conversation memory is configured
+    // Memory retrieval tool requires Redis (getSessionRaw) but registration
+    // is deferred — the execute handler checks at runtime whether the actual
+    // memory manager supports getSessionRaw.
+    const memConfig = this.conversationMemoryConfig?.conversationMemory;
+    const hasRedisConfig =
+      !!memConfig?.redisConfig ||
+      (memConfig &&
+        "redis" in memConfig &&
+        !!(memConfig as { redis?: unknown }).redis) ||
+      process.env.STORAGE_TYPE === "redis";
+    const hasArtifactStore = !!this.mcpArtifactStore;
+
+    // Register when Redis is configured OR when an artifact store exists.
+    // Artifact store alone is sufficient for the artifactId retrieval path —
+    // session history retrieval just returns a clear error when Redis is absent.
+    if ((!memConfig?.enabled || !hasRedisConfig) && !hasArtifactStore) {
+      logger.debug(
+        "[NeuroLink] Skipping memory retrieval tools — requires Redis conversation memory or an artifact store",
+      );
+      return;
+    }
+
+    // Extract the canonical tool definition (schema + description) from the
+    // memoryRetrievalTools factory. We pass undefined as the memoryManager here
+    // because we only need the Zod inputSchema and description at registration
+    // time — the actual manager is resolved lazily at execution time.
+    const canonicalTools = createMemoryRetrievalTools(
+      undefined,
+      this.mcpArtifactStore,
+    );
+    const retrieveContextDef = canonicalTools.retrieve_context;
+
+    // Register via this.registerTool() so the tool ends up in the "user-defined"
+    // category inside toolRegistry. getCustomTools() returns that category, which
+    // is what ToolsManager reads to build the tool schema sent to the LLM.
+    // (Tools registered via toolRegistry.registerTool() directly land in the
+    // "built-in" category and are never included in the LLM's tool schema.)
+    this.registerTool("retrieve_context", {
+      name: "retrieve_context",
+      description:
+        retrieveContextDef.description ?? "Retrieve context or artifacts",
+      // Pass the Zod schema so ToolsManager gives the LLM full parameter types.
+      // registerTool() detects isZodSchema on inputSchema and preserves it.
+      inputSchema: retrieveContextDef.inputSchema,
+      execute: async (params: unknown) => {
+        // Lazy: conversationMemory is initialized on the first generate() call.
+        // It may be undefined (artifact-store-only), the Redis manager, or the
+        // in-memory manager (no Redis config, or Redis init fell back) —
+        // createMemoryRetrievalTools guards session retrieval on getSessionRaw
+        // capability and returns a descriptive error otherwise.
+        const tools = createMemoryRetrievalTools(
+          this.conversationMemory ?? undefined,
+          this.mcpArtifactStore,
+        );
+        // Return the result directly so the LLM receives clean output instead
+        // of a nested { success, data, metadata } wrapper.
+        // Bounded by TOOL_TIMEOUTS.EXECUTION_DEFAULT_MS so a stalled Redis or
+        // filesystem backend never hangs the tool call indefinitely.
+        return await withTimeout(
+          (
+            tools.retrieve_context.execute as (
+              params: unknown,
+              ctx: unknown,
+            ) => Promise<unknown>
+          )(params, { toolCallId: "memory-retrieval", messages: [] }),
+          TOOL_TIMEOUTS.EXECUTION_DEFAULT_MS,
+          ErrorFactory.toolTimeout(
+            "retrieve_context",
+            TOOL_TIMEOUTS.EXECUTION_DEFAULT_MS,
+          ),
+        );
+      },
+    });
+
+    this.retrieveContextRegistered = true;
+    logger.info("[NeuroLink] Memory retrieval tools registered");
+  }
+
+  /**
+   * Lazy initialization for the skills subsystem — mirrors ensureMemoryReady().
+   * Returns null (and stays null) when skills are not configured or the
+   * store failed to initialize; read paths fail open on that null.
+   */
+  private ensureSkillsReady(): SkillsManager | null {
+    if (this.skillsManagerInstance !== undefined) {
+      return this.skillsManagerInstance;
+    }
+    if (!this.skillsConfig?.enabled) {
+      this.skillsManagerInstance = null;
+      return null;
+    }
+    try {
+      this.skillsManagerInstance = new SkillsManager(this.skillsConfig);
+    } catch (error) {
+      logger.warn(
+        "[NeuroLink] Skills initialization failed — skills disabled for this instance",
+        { error: error instanceof Error ? error.message : String(error) },
+      );
+      this.skillsManagerInstance = null;
+    }
+    return this.skillsManagerInstance;
+  }
+
+  /**
+   * Register the built-in skill tools (list_skills, plus
+   * mutation tools when allowMutations is set). Follows the
+   * registerMemoryRetrievalTools() pattern: registered via registerTool()
+   * so they land in the "user-defined" category that reaches the LLM tool
+   * schema, with the manager resolved lazily at execution time.
+   */
+  private registerSkillTools(): void {
+    const canonicalTools = createSkillTools(() => this.ensureSkillsReady(), {
+      allowMutations: this.skillsConfig?.allowMutations === true,
+    });
+
+    for (const [toolName, toolDef] of Object.entries(canonicalTools)) {
+      this.registerTool(toolName, {
+        name: toolName,
+        description: toolDef.description ?? toolName,
+        // Zod schema — registerTool() detects isZodSchema and preserves it
+        // so ToolsManager gives the LLM full parameter types.
+        inputSchema: toolDef.inputSchema,
+        execute: async (params: unknown) =>
+          withTimeout(
+            (
+              toolDef.execute as (
+                params: unknown,
+                ctx: unknown,
+              ) => Promise<unknown>
+            )(params, { toolCallId: "skill-tool", messages: [] }),
+            TOOL_TIMEOUTS.EXECUTION_DEFAULT_MS,
+            ErrorFactory.toolTimeout(
+              toolName,
+              TOOL_TIMEOUTS.EXECUTION_DEFAULT_MS,
+            ),
+          ),
+      });
+    }
+
+    logger.info(
+      `[NeuroLink] Registered ${Object.keys(canonicalTools).length} skill tools`,
+      { allowMutations: this.skillsConfig?.allowMutations === true },
+    );
+  }
+
+  /**
+   * Skills augmentation for one generate()/stream() call:
+   *  1. Discovery — surface the skills listing per the resolved mode:
+   *     embedded in the use_skill tool description ("tool", default) or
+   *     appended to the system prompt ("system-prompt").
+   *  2. Per-call tools — inject use_skill + read_skill_resource into
+   *     options.tools (the RAG-tool pattern; same-name entries shadow
+   *     registered tools) with the sessionId closure-bound so activations
+   *     pin to the session.
+   *  3. Preload — activate host-requested skills up front, injecting their
+   *     instructions into this call's system prompt and pinning them.
+   * Fails open: any error leaves the call untouched.
+   */
+  private async applySkillsAugmentation(options: {
+    systemPrompt?: string;
+    skills?: SkillsCallOptions;
+    tools?: unknown;
+    context?: unknown;
+    // Callers may pass sessionId/userId top-level instead of in context —
+    // the platform merges them into context only later in the pipeline.
+    sessionId?: unknown;
+    userId?: unknown;
+    // GenerateOptions.output carries `mode`; StreamOptions.output does not —
+    // keep the field structural and read `mode` defensively below.
+    output?: unknown;
+  }): Promise<void> {
+    if (!this.skillsConfig?.enabled || options.skills?.enabled === false) {
+      return;
+    }
+    // Media-only modes have no meaningful text prompt to augment.
+    const mode = (options.output as { mode?: string } | undefined)?.mode;
+    if (
+      mode === "avatar" ||
+      mode === "music" ||
+      mode === "video" ||
+      mode === "ppt"
+    ) {
+      return;
+    }
+
+    try {
+      const manager = this.ensureSkillsReady();
+      if (!manager) {
+        return;
+      }
+      const discovery =
+        options.skills?.discovery ?? this.skillsConfig.discovery ?? "tool";
+      const scopeId =
+        options.skills?.scopeId ?? this.skillsConfig.defaultScopeId;
+      const tags = options.skills?.tags;
+      const sessionId =
+        this.resolveSkillSessionId(options.context) ??
+        this.resolveSkillSessionId(options);
+      const userId =
+        this.resolveSkillUserId(options.context) ??
+        this.resolveSkillUserId(options);
+      // Pinning requires somewhere to pin: without conversation memory the
+      // drained messages would be silently discarded while dedup reports
+      // already_loaded — so persistence is only on when memory is
+      // configured (or already initialized).
+      const memoryAvailable =
+        Boolean(this.conversationMemory) ||
+        Boolean(this.conversationMemoryConfig?.conversationMemory?.enabled);
+      const sessionPersistence =
+        (this.skillsConfig.sessionPersistence ?? true) &&
+        Boolean(sessionId) &&
+        memoryAvailable;
+      const visibility = {
+        ...(scopeId !== undefined ? { scopeId } : {}),
+        ...(tags !== undefined ? { tags } : {}),
+      };
+
+      if (discovery === "system-prompt") {
+        const block = await manager.buildPromptIndex(visibility);
+        if (block) {
+          options.systemPrompt = options.systemPrompt
+            ? `${options.systemPrompt}\n\n${block}`
+            : block;
+        }
+      }
+
+      const listing =
+        discovery === "tool"
+          ? await manager.buildToolListing(visibility)
+          : null;
+
+      const callTools = createSkillCallTools(() => this.ensureSkillsReady(), {
+        ...(sessionId ? { sessionId } : {}),
+        ...(scopeId !== undefined ? { scopeId } : {}),
+        sessionPersistence,
+        discovery,
+        listing,
+        // userId rides by closure: Redis memory keys sessions by
+        // userId:sessionId, so hydration must read the same key the
+        // store-turn path writes.
+        getStoredMessages: async (sid: string) =>
+          this.conversationMemory
+            ? await this.conversationMemory.getSessionMessages(sid, userId)
+            : [],
+      });
+      // Caller-supplied per-call tools win over the injected ones (a host
+      // may bring its own use_skill); the injected tools still shadow any
+      // registered base tool of the same name via the provider merge.
+      options.tools = {
+        ...callTools,
+        ...((options.tools as Record<string, unknown> | undefined) ?? {}),
+      };
+
+      if (options.skills?.preload?.length) {
+        await this.preloadSkills(manager, options, options.skills.preload, {
+          ...(sessionId ? { sessionId } : {}),
+          ...(userId ? { userId } : {}),
+          sessionPersistence,
+          ...(scopeId !== undefined ? { scopeId } : {}),
+        });
+      }
+
+      logger.debug("[NeuroLink] Skills augmentation applied", {
+        discovery,
+        listingLength: listing?.length ?? 0,
+        sessionPersistence,
+        preloadCount: options.skills?.preload?.length ?? 0,
+      });
+    } catch (error) {
+      logger.warn(
+        "[NeuroLink] Skills augmentation failed — continuing without skills",
+        { error: error instanceof Error ? error.message : String(error) },
+      );
+    }
+  }
+
+  /** Session id for skill activation tracking, from the call context. */
+  private resolveSkillSessionId(context: unknown): string | undefined {
+    const fromContext = (context as { sessionId?: unknown } | undefined)
+      ?.sessionId;
+    return typeof fromContext === "string" && fromContext
+      ? fromContext
+      : undefined;
+  }
+
+  /** User id for skill-session hydration (Redis keys sessions by userId). */
+  private resolveSkillUserId(context: unknown): string | undefined {
+    const fromContext = (context as { userId?: unknown } | undefined)?.userId;
+    return typeof fromContext === "string" && fromContext
+      ? fromContext
+      : undefined;
+  }
+
+  /**
+   * Activate host-requested skills before the model runs: instructions go
+   * into this call's system prompt; when persisting, the activation is
+   * pinned so later turns replay it from history instead. Unknown or
+   * already-active names are skipped with a warn/debug log (fail-open).
+   */
+  private async preloadSkills(
+    manager: SkillsManager,
+    options: { systemPrompt?: string },
+    names: string[],
+    call: {
+      sessionId?: string;
+      userId?: string;
+      sessionPersistence: boolean;
+      scopeId?: string;
+    },
+  ): Promise<void> {
+    const { sessionId, userId, sessionPersistence, scopeId } = call;
+    for (const name of names) {
+      const skill = await manager.get(name);
+      if (!skill || !isSkillVisibleInScope(skill, scopeId)) {
+        logger.warn("[NeuroLink] Preload skill not found — skipping", {
+          skill: name,
+        });
+        continue;
+      }
+      let block: string;
+      if (sessionId && sessionPersistence) {
+        // Always hydrate (empty history when memory isn't initialized yet):
+        // the tracker derives truth from stored pins + this turn's pending,
+        // never from stale in-process records.
+        manager.sessions.hydrate(
+          sessionId,
+          this.conversationMemory
+            ? await this.conversationMemory.getSessionMessages(
+                sessionId,
+                userId,
+              )
+            : [],
+        );
+        if (manager.sessions.isActive(sessionId, skill.id, skill.name)) {
+          continue;
+        }
+        block = manager.sessions.recordActivation(sessionId, skill).content;
+      } else {
+        block = buildSkillActivationMessage(skill).content;
+      }
+      options.systemPrompt = options.systemPrompt
+        ? `${options.systemPrompt}\n\n${block}`
+        : block;
+    }
+  }
+
+  /**
+   * Pinned skill messages recorded during this turn, ready for
+   * StoreConversationTurnOptions.skillMessages. Empty when skills are off
+   * or nothing was activated.
+   */
+  private drainPendingSkillMessages(sessionId: unknown): ChatMessage[] {
+    if (typeof sessionId !== "string" || !sessionId) {
+      return [];
+    }
+    const manager = this.skillsManagerInstance;
+    if (!manager) {
+      return [];
+    }
+    return manager.sessions.drainPending(sessionId);
+  }
+
+  /**
+   * Programmatic access to the skills subsystem (search/list/get/mutations).
+   * Returns null when skills are not configured or failed to initialize.
+   */
+  getSkillsManager(): SkillsManager | null {
+    return this.ensureSkillsReady();
+  }
+
   /** Format memory context for prompt inclusion */
   private formatMemoryContext(
     memoryContext: string,
@@ -724,34 +3064,376 @@ ${memoryContext}
 Current user's request: ${currentInput}`;
   }
 
-  /** Extract memory context from search results */
-  private extractMemoryContext(memories: Array<{ memory?: string }>): string {
-    return memories
-      .map((m) => m.memory || "")
-      .filter(Boolean)
-      .join("\n");
+  /**
+   * Format memory context from multiple users into a labeled block.
+   */
+  private formatMultiUserMemoryContext(
+    memories: Map<string, string>,
+    currentInput: string,
+  ): string {
+    const memoryBlocks: string[] = [];
+    for (const [label, memory] of memories) {
+      memoryBlocks.push(`[${label}]\n${memory}`);
+    }
+    return `Context from previous conversations:
+
+${memoryBlocks.join("\n\n")}
+
+Current user's request: ${currentInput}`;
   }
 
-  /** Store conversation turn in mem0 */
-  private async storeMem0ConversationTurn(
-    mem0: MemoryClient,
-    userContent: string,
-    aiResponse: string,
-    userId: string,
-    metadata: Record<string, unknown>,
-  ): Promise<void> {
-    // Store both user message and AI response for better context extraction
-    const conversationTurn = [
-      { role: "user" as const, content: userContent },
-      { role: "assistant" as const, content: aiResponse },
-    ];
+  /**
+   * Determine whether memory should be read (retrieved) for this call.
+   * Respects both the global memory SDK config and per-call overrides.
+   */
+  private shouldReadMemory(
+    perCallMemory: { enabled?: boolean; read?: boolean } | undefined,
+    userId: unknown,
+  ): boolean {
+    if (
+      !this.conversationMemoryConfig?.conversationMemory?.memory?.enabled ||
+      this.memoryDisabledReason ||
+      !userId
+    ) {
+      return false;
+    }
+    if (perCallMemory?.enabled === false) {
+      return false;
+    }
+    if (perCallMemory?.read === false) {
+      return false;
+    }
+    return true;
+  }
 
-    await mem0.add(conversationTurn, {
-      user_id: userId,
-      metadata,
-      infer: true,
-      async_mode: true,
+  /**
+   * Determine whether memory should be written (stored) for this call.
+   * Respects both the global memory SDK config and per-call overrides.
+   */
+  private shouldWriteMemory(
+    perCallMemory: { enabled?: boolean; write?: boolean } | undefined,
+    userId: unknown,
+    content: string | undefined | null,
+  ): boolean {
+    if (
+      !this.conversationMemoryConfig?.conversationMemory?.memory?.enabled ||
+      this.memoryDisabledReason ||
+      !userId
+    ) {
+      return false;
+    }
+    if (!content?.trim()) {
+      return false;
+    }
+    if (perCallMemory?.enabled === false) {
+      return false;
+    }
+    if (perCallMemory?.write === false) {
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Retrieve condensed memory for a user (and optionally additional users).
+   * Returns the input text enhanced with memory context, or unchanged if no memory.
+   */
+  private async retrieveMemory(
+    inputText: string,
+    userId: string,
+    additionalUsers?: AdditionalMemoryUser[],
+  ): Promise<string> {
+    const client = this.ensureMemoryReady();
+    if (!client) {
+      return inputText;
+    }
+
+    // Collect all user IDs to read (primary + additional users with read !== false)
+    const readableAdditional = (additionalUsers || []).filter(
+      (u) => u.read !== false,
+    );
+
+    if (readableAdditional.length === 0) {
+      // Single user — use original fast path
+      const memory = await client.get(userId);
+      if (!memory) {
+        return inputText;
+      }
+      return this.formatMemoryContext(memory, inputText);
+    }
+
+    // Multi-user: fetch all memories in parallel
+    // Build entries with labels for formatting
+    const entries = [
+      { id: userId, label: "User" },
+      ...readableAdditional.map((u) => ({
+        id: u.userId,
+        label: u.label || u.userId,
+      })),
+    ];
+    const results = await Promise.all(
+      entries.map(async (entry) => {
+        const memory = await client.get(entry.id);
+        return { ...entry, memory } as const;
+      }),
+    );
+
+    const memories = new Map<string, string>();
+    for (const { label, memory } of results) {
+      if (memory) {
+        memories.set(label, memory);
+      }
+    }
+
+    if (memories.size === 0) {
+      return inputText;
+    }
+
+    return this.formatMultiUserMemoryContext(memories, inputText);
+  }
+
+  /**
+   * Build the `add()` options for one memory owner. A per-owner prompt that
+   * fails template validation is dropped (warned once per distinct template)
+   * so that owner condenses with the instance prompt instead — Hippocampus
+   * resolves `options.prompt || this.prompt`, so omitting it is the fallback.
+   * An empty or whitespace-only prompt counts as unset and is omitted the
+   * same way, unvalidated: `""` already falls through in Hippocampus, but
+   * `"   "` is truthy and would be used literally.
+   */
+  private resolveMemoryAddOptions(
+    owner: string,
+    prompt: string | undefined,
+    maxWords: number | undefined,
+  ): { prompt?: string; maxWords?: number } | undefined {
+    let effectivePrompt = prompt?.trim() ? prompt : undefined;
+    if (effectivePrompt !== undefined) {
+      const verdict = validateCondensationPrompt(effectivePrompt);
+      if (
+        verdict.missing.length > 0 &&
+        !this.warnedCondensationPrompts.has(effectivePrompt)
+      ) {
+        if (this.warnedCondensationPrompts.size >= 64) {
+          this.warnedCondensationPrompts.clear();
+        }
+        this.warnedCondensationPrompts.add(effectivePrompt);
+        if (verdict.valid) {
+          logger.warn(
+            "[NeuroLink] Per-owner memory condensation prompt has no {{MAX_WORDS}} placeholder; maxWords will not be enforced for this owner",
+            { owner, missing: verdict.missing },
+          );
+        } else {
+          logger.warn(
+            `[NeuroLink] Per-owner memory condensation prompt is missing ${verdict.fatal
+              .map((name) => `{{${name}}}`)
+              .join(", ")}; using the instance prompt for this owner instead`,
+            { owner, missing: verdict.missing },
+          );
+        }
+      }
+      if (!verdict.valid) {
+        effectivePrompt = undefined;
+      }
+    }
+    if (effectivePrompt === undefined && maxWords === undefined) {
+      return undefined;
+    }
+    // No `prompt` key at all when there is none to send, rather than
+    // `prompt: undefined`: what reaches the client is exactly the fallback.
+    return {
+      ...(effectivePrompt !== undefined ? { prompt: effectivePrompt } : {}),
+      ...(maxWords !== undefined ? { maxWords } : {}),
+    };
+  }
+
+  /**
+   * Store a conversation turn in memory (non-blocking).
+   * Calls add(userId, content) which internally condenses old + new via LLM.
+   * Supports additional users with per-user prompt and maxWords overrides.
+   *
+   * The write hooks (`shouldWrite`, `onBeforeStore`; per-call wins over
+   * instance) run inside the deferred closure so an async hook never sits on
+   * the response path. A `false` / `null` verdict, a non-string transform or
+   * a thrown hook skips every `add()` for the turn — a missed memory is
+   * recoverable, a polluted condensed summary is not.
+   */
+  private storeMemoryInBackground(
+    turn: MemoryTurn,
+    perCallMemory: MemoryCallOptions | undefined,
+    langfuseIdentity?: { traceName?: string | null; sessionId?: string | null },
+  ): void {
+    const { userId } = turn;
+    const instanceHooks =
+      this.conversationMemoryConfig?.conversationMemory?.memory;
+    const shouldWrite =
+      perCallMemory?.shouldWrite ?? instanceHooks?.shouldWrite;
+    const onBeforeStore =
+      perCallMemory?.onBeforeStore ?? instanceHooks?.onBeforeStore;
+
+    const memoryWrite = async () => {
+      try {
+        // A write scheduled after shutdown()/dispose() finished draining has
+        // no host left to condense on; landing it would rebuild the released
+        // condenser. (A write scheduled before is what the drain waits for.)
+        if (this.memoryCondenserReleased) {
+          logger.debug(
+            "[NeuroLink] Memory write skipped: the instance has been shut down",
+            { userId },
+          );
+          return;
+        }
+        const client = this.ensureMemoryReady();
+        if (!client) {
+          return;
+        }
+
+        if (shouldWrite) {
+          let allowed: boolean;
+          try {
+            allowed = await withTimeout(
+              Promise.resolve(shouldWrite(turn)),
+              MEMORY_WRITE_TIMEOUT_MS,
+              new Error(
+                `memory.shouldWrite exceeded ${MEMORY_WRITE_TIMEOUT_MS}ms`,
+              ),
+            );
+          } catch (error) {
+            logger.warn(
+              "[NeuroLink] memory.shouldWrite hook threw; skipping memory write for this turn",
+              {
+                userId,
+                error: error instanceof Error ? error.message : String(error),
+              },
+            );
+            return;
+          }
+          if (!allowed) {
+            logger.debug("[NeuroLink] memory.shouldWrite declined the turn", {
+              userId,
+            });
+            return;
+          }
+        }
+
+        let content = `User: ${turn.prompt}\nAssistant: ${turn.response}`;
+        if (onBeforeStore) {
+          let transformed: string | null;
+          try {
+            transformed = await withTimeout(
+              Promise.resolve(onBeforeStore(content, turn)),
+              MEMORY_WRITE_TIMEOUT_MS,
+              new Error(
+                `memory.onBeforeStore exceeded ${MEMORY_WRITE_TIMEOUT_MS}ms`,
+              ),
+            );
+          } catch (error) {
+            logger.warn(
+              "[NeuroLink] memory.onBeforeStore hook threw; skipping memory write for this turn",
+              {
+                userId,
+                error: error instanceof Error ? error.message : String(error),
+              },
+            );
+            return;
+          }
+          if (transformed === null) {
+            logger.debug("[NeuroLink] memory.onBeforeStore vetoed the turn", {
+              userId,
+            });
+            return;
+          }
+          if (typeof transformed !== "string") {
+            logger.warn(
+              "[NeuroLink] memory.onBeforeStore returned a non-string; skipping memory write for this turn",
+              { userId, returnedType: typeof transformed },
+            );
+            return;
+          }
+          content = transformed;
+        }
+        if (!content.trim()) {
+          return;
+        }
+
+        // Collect all users to write: primary + additional users with write !== false
+        const writeOps: Promise<string>[] = [
+          client.add(
+            userId,
+            content,
+            this.resolveMemoryAddOptions(
+              userId,
+              perCallMemory?.prompt,
+              perCallMemory?.maxWords,
+            ),
+          ),
+        ];
+
+        const writableAdditional = (
+          perCallMemory?.additionalUsers || []
+        ).filter((u) => u.write !== false);
+        for (const user of writableAdditional) {
+          writeOps.push(
+            client.add(
+              user.userId,
+              content,
+              this.resolveMemoryAddOptions(
+                user.userId,
+                user.prompt,
+                user.maxWords,
+              ),
+            ),
+          );
+        }
+
+        // withTimeout races against Promise.all — if the timeout fires, the
+        // await resolves with an error but the underlying client.add() calls
+        // may still complete in the background. This is acceptable: the memory
+        // client API (Mem0) doesn't support AbortSignal, and these are
+        // fire-and-forget background writes where a stale completion is harmless.
+        await withTimeout(
+          Promise.all(writeOps),
+          MEMORY_WRITE_TIMEOUT_MS,
+          new Error(
+            `Background memory write timed out after ${MEMORY_WRITE_TIMEOUT_MS}ms`,
+          ),
+        );
+      } catch (error) {
+        logger.warn("Memory storage failed:", error);
+      }
+    };
+
+    const identifiedMemoryWrite =
+      langfuseIdentity?.traceName || langfuseIdentity?.sessionId
+        ? () =>
+            setLangfuseContext(
+              {
+                userId,
+                sessionId: langfuseIdentity.sessionId ?? undefined,
+                traceName: langfuseIdentity.traceName ?? undefined,
+              },
+              memoryWrite,
+            )
+        : memoryWrite;
+    const wrappedMemoryWrite = context.bind(
+      context.active(),
+      identifiedMemoryWrite,
+    );
+    // Tracked from the moment it is scheduled, not from when setImmediate
+    // fires: shutdown() typically runs in that gap, and a write it cannot
+    // see is a write it cannot wait for. `memoryWrite` never rejects (it
+    // catches internally), so the settle only ever resolves.
+    const scheduled = new Promise<void>((resolve) => {
+      setImmediate(() => {
+        Promise.resolve()
+          .then(wrappedMemoryWrite)
+          .then(
+            () => resolve(),
+            () => resolve(),
+          );
+      });
     });
+    this.pendingMemoryWrites.add(scheduled);
+    void scheduled.then(() => this.pendingMemoryWrites.delete(scheduled));
   }
 
   /**
@@ -808,7 +3490,10 @@ Current user's request: ${currentInput}`;
       this.externalServerManager = new ExternalServerManager(
         {
           maxServers: 20,
-          defaultTimeout: 30000, // Increased from 15s to 30s for proxy latency (e.g., LiteLLM)
+          defaultTimeout: Math.max(
+            10000,
+            Number(process.env.MCP_CLIENT_TIMEOUT) || 60000,
+          ),
           enableAutoRestart: true,
           enablePerformanceMonitoring: true,
         },
@@ -869,6 +3554,9 @@ Current user's request: ${currentInput}`;
    * Setup event handlers for external server manager
    */
   private setupExternalServerEventHandlers(constructorId: string): void {
+    this.externalServerManager.on("healthCheck", (event) => {
+      this.emitter.emit("externalMCP:serverHealth", event);
+    });
     this.externalServerManager.on("connected", (event) => {
       logger.debug(`[NeuroLink] 🔗 EXTERNAL_SERVER_EVENT_CONNECTED`, {
         constructorId,
@@ -928,107 +3616,20 @@ Current user's request: ${currentInput}`;
     });
   }
 
-  /**
-   * Initialize Langfuse observability for AI operations tracking
-   */
-  private initializeLangfuse(
-    constructorId: string,
-    constructorStartTime: number,
-    constructorHrTimeStart: bigint,
-  ): void {
-    const langfuseInitStartTime = process.hrtime.bigint();
-
-    try {
-      const langfuseConfig = this.observabilityConfig?.langfuse;
-
-      // Check if we should use external provider mode - bypass enabled check
-      const useExternalProvider =
-        langfuseConfig?.autoDetectExternalProvider === true ||
-        langfuseConfig?.useExternalTracerProvider === true;
-
-      if (langfuseConfig?.enabled || useExternalProvider) {
-        logger.debug(`[NeuroLink] 📊 LOG_POINT_C019_LANGFUSE_INIT_START`, {
-          logPoint: "C019_LANGFUSE_INIT_START",
-          constructorId,
-          timestamp: new Date().toISOString(),
-          elapsedMs: Date.now() - constructorStartTime,
-          elapsedNs: (
-            process.hrtime.bigint() - constructorHrTimeStart
-          ).toString(),
-          langfuseInitStartTimeNs: langfuseInitStartTime.toString(),
-          message: "Starting Langfuse observability initialization",
-        });
-
-        // Initialize OpenTelemetry (sets defaults from config)
-        initializeOpenTelemetry(langfuseConfig);
-
-        const healthStatus = getLangfuseHealthStatus();
-        const langfuseInitDurationNs =
-          process.hrtime.bigint() - langfuseInitStartTime;
-
-        if (
-          healthStatus.initialized &&
-          healthStatus.hasProcessor &&
-          healthStatus.isHealthy
-        ) {
-          logger.debug(`[NeuroLink] ✅ LOG_POINT_C020_LANGFUSE_INIT_SUCCESS`, {
-            logPoint: "C020_LANGFUSE_INIT_SUCCESS",
-            constructorId,
-            timestamp: new Date().toISOString(),
-            elapsedMs: Date.now() - constructorStartTime,
-            elapsedNs: (
-              process.hrtime.bigint() - constructorHrTimeStart
-            ).toString(),
-            langfuseInitDurationNs: langfuseInitDurationNs.toString(),
-            langfuseInitDurationMs: Number(langfuseInitDurationNs) / 1_000_000,
-            healthStatus,
-            message: "Langfuse observability initialized successfully",
-          });
-        } else {
-          logger.warn(`[NeuroLink] ⚠️ LOG_POINT_C021_LANGFUSE_INIT_WARNING`, {
-            logPoint: "C021_LANGFUSE_INIT_WARNING",
-            constructorId,
-            timestamp: new Date().toISOString(),
-            elapsedMs: Date.now() - constructorStartTime,
-            elapsedNs: (
-              process.hrtime.bigint() - constructorHrTimeStart
-            ).toString(),
-            langfuseInitDurationNs: langfuseInitDurationNs.toString(),
-            healthStatus,
-            message: "Langfuse initialized but not healthy",
-          });
-        }
-      } else {
-        logger.debug(`[NeuroLink] 🚫 LOG_POINT_C022_LANGFUSE_DISABLED`, {
-          logPoint: "C022_LANGFUSE_DISABLED",
-          constructorId,
-          timestamp: new Date().toISOString(),
-          elapsedMs: Date.now() - constructorStartTime,
-          elapsedNs: (
-            process.hrtime.bigint() - constructorHrTimeStart
-          ).toString(),
-          message:
-            "Langfuse observability not enabled - skipping initialization",
-        });
-      }
-    } catch (error) {
-      const langfuseInitErrorDurationNs =
-        process.hrtime.bigint() - langfuseInitStartTime;
-
-      logger.error(`[NeuroLink] ❌ LOG_POINT_C023_LANGFUSE_INIT_ERROR`, {
-        logPoint: "C023_LANGFUSE_INIT_ERROR",
-        constructorId,
-        timestamp: new Date().toISOString(),
-        elapsedMs: Date.now() - constructorStartTime,
-        elapsedNs: (
-          process.hrtime.bigint() - constructorHrTimeStart
-        ).toString(),
-        langfuseInitDurationNs: langfuseInitErrorDurationNs.toString(),
-        errorMessage: error instanceof Error ? error.message : String(error),
-        errorStack: error instanceof Error ? error.stack : undefined,
-        message: "Langfuse observability initialization failed",
-      });
+  private holdTelemetry(): void {
+    if (!this.telemetryHeld) {
+      this.telemetryHeld = true;
+      acquireTelemetry(this.observabilityConfig);
     }
+  }
+
+  private async releaseTelemetryHold(): Promise<void> {
+    if (!this.telemetryHeld) {
+      await flushOpenTelemetry();
+      return;
+    }
+    this.telemetryHeld = false;
+    await releaseTelemetry();
   }
 
   /**
@@ -1070,6 +3671,49 @@ Current user's request: ${currentInput}`;
    * Uses isolated async context to prevent hanging
    */
   private async initializeMCP(): Promise<void> {
+    // Skip if already initialized or explicitly skipped — prevents redundant
+    // re-init on every generate call.
+    if (this.mcpInitialized || this.mcpSkipped) {
+      return;
+    }
+
+    // Deduplicate concurrent initialization attempts — if an init is already
+    // in-flight, coalesce callers onto the same promise instead of running
+    // a second parallel initialization.
+    if (this.mcpInitPromise) {
+      return this.mcpInitPromise;
+    }
+
+    // Environment-level kill switch — skip MCP-specific initialization on cold
+    // start but always ensure providers are registered exactly once.
+    if (process.env.NEUROLINK_SKIP_MCP === "true") {
+      this.mcpInitPromise = (async () => {
+        await this.initializeProviderRegistryInternal();
+        this.mcpSkipped = true;
+      })();
+      try {
+        await this.mcpInitPromise;
+      } finally {
+        this.mcpInitPromise = null;
+      }
+      return;
+    }
+
+    this.mcpInitPromise = this.performMCPInitializationOnce();
+    try {
+      await this.mcpInitPromise;
+    } finally {
+      // Clear the in-flight promise so a future call (e.g. after cleanup/reset)
+      // can re-initialize if needed.
+      this.mcpInitPromise = null;
+    }
+  }
+
+  /**
+   * Actual one-shot MCP initialization logic. Called at most once per
+   * NeuroLink instance lifetime (unless cleanup() resets the flag).
+   */
+  private async performMCPInitializationOnce(): Promise<void> {
     const mcpInitId = `mcp-init-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     const mcpInitStartTime = Date.now();
     const mcpInitHrTimeStart = process.hrtime.bigint();
@@ -1266,13 +3910,36 @@ Current user's request: ${currentInput}`;
   }
 
   /**
-   * Load MCP configuration from .mcp-config.json with parallel loading for improved performance
+   * Load the project MCP configuration, if this instance is allowed one.
+   *
+   * The working directory is not searched on its own. A file is loaded only
+   * when `mcp.configPath` names it, `mcp.trustProjectConfig` opts into
+   * `<cwd>/.mcp-config.json`, the CLI has registered its hash-pinned trust
+   * decision, or a host set `ProviderRegistry.setOptions({ enableManualMCP:
+   * true })` after construction (the constructor resets it to `false`, the
+   * SDK default). Otherwise this is a no-op and only servers added through
+   * `addExternalMCPServer` / `addInMemoryMCPServer` exist.
    */
   private async loadMCPConfigurationInternal(): Promise<void> {
     try {
+      const resolution = await resolveProjectMcpConfigPath({
+        configPath: this.mcpEnhancementsConfig?.configPath,
+        trustProjectConfig: this.mcpEnhancementsConfig?.trustProjectConfig,
+        enableManualMCP: ProviderRegistry.getOptions().enableManualMCP,
+      });
+      if (!resolution) {
+        mcpLogger.debug(
+          "[NeuroLink] No project MCP configuration to load: the working directory is not searched unless mcp.configPath, mcp.trustProjectConfig or a CLI trust decision names a file",
+        );
+        return;
+      }
+      mcpLogger.debug("[NeuroLink] Loading project MCP configuration", {
+        path: resolution.path,
+        source: resolution.source,
+      });
       const configResult =
         await this.externalServerManager.loadMCPConfiguration(
-          undefined, // Use default config path
+          resolution.path,
           { parallel: true }, // Enable parallel loading
         );
 
@@ -1372,8 +4039,17 @@ Current user's request: ${currentInput}`;
 
       // For Ollama, check if service is running and model is available
       if (route.provider === "ollama") {
+        let ollamaAttempt: OllamaDiagnosticPermit | undefined;
+        let ollamaOutcome: OllamaDiagnosticOutcome = "not-run";
         try {
-          const response = await fetch("http://localhost:11434/api/tags", {
+          const ollamaContext = captureOllamaDiagnosticContext();
+          const gate = beginOllamaDiagnostic(ollamaContext);
+          if (gate.kind === "suppressed") {
+            return {};
+          }
+          ollamaAttempt = gate;
+          ollamaOutcome = "transport-failure";
+          const response = await fetch(ollamaContext.url, {
             method: "GET",
             signal: AbortSignal.timeout(2000),
           });
@@ -1389,6 +4065,7 @@ Current user's request: ${currentInput}`;
             return {}; // Return empty object to preserve existing fallback behavior
           }
 
+          ollamaOutcome = "protocol-failure";
           const responseData = await response.json();
           const models = responseData?.models;
 
@@ -1401,26 +4078,47 @@ Current user's request: ${currentInput}`;
             return {}; // Return empty object for fallback behavior
           }
 
+          ollamaOutcome = "success";
           // Filter and validate models before comparison
           const validModels = models.filter(
             (m): m is { name: string } =>
               m && typeof m === "object" && typeof m.name === "string",
           );
 
-          const targetModel = route.model || "llama3.2:latest";
-          const modelIsAvailable = validModels.some(
-            (m) => m.name === targetModel,
-          );
-
-          if (!modelIsAvailable) {
+          const targetModel = route.model;
+          if (targetModel) {
+            // Check if the specific routed model is available
+            const modelIsAvailable = validModels.some(
+              (m) => m.name === targetModel,
+            );
+            if (!modelIsAvailable) {
+              logger.debug("Orchestration provider validation failed", {
+                taskType: classification.type,
+                routedProvider: route.provider,
+                routedModel: route.model,
+                reason: `Ollama model '${targetModel}' not found`,
+                orchestrationTime: `${Date.now() - startTime}ms`,
+              });
+              // Fall back to first available model instead of abandoning orchestration
+              if (validModels.length > 0) {
+                route.model = validModels[0].name;
+              } else {
+                return {}; // No models at all — preserve existing fallback behavior
+              }
+            }
+          } else if (validModels.length === 0) {
+            // No model specified and none available
             logger.debug("Orchestration provider validation failed", {
               taskType: classification.type,
               routedProvider: route.provider,
               routedModel: route.model,
-              reason: `Ollama model '${route.model || "llama3.2:latest"}' not found`,
+              reason: "No Ollama models available",
               orchestrationTime: `${Date.now() - startTime}ms`,
             });
             return {}; // Return empty object to preserve existing fallback behavior
+          } else {
+            // No model specified but models are available — use the first one
+            route.model = validModels[0].name;
           }
         } catch (error) {
           logger.debug("Orchestration provider validation failed", {
@@ -1429,11 +4127,15 @@ Current user's request: ${currentInput}`;
             routedModel: route.model,
             reason:
               error instanceof Error
-                ? error.message
+                ? getOllamaDiagnosticErrorMessage(error)
                 : "Ollama service check failed",
             orchestrationTime: `${Date.now() - startTime}ms`,
           });
           return {}; // Return empty object to preserve existing fallback behavior
+        } finally {
+          if (ollamaAttempt) {
+            completeOllamaDiagnostic(ollamaAttempt, ollamaOutcome);
+          }
         }
       }
 
@@ -1507,8 +4209,17 @@ Current user's request: ${currentInput}`;
 
       // For Ollama, check if service is running and model is available
       if (route.provider === "ollama") {
+        let ollamaAttempt: OllamaDiagnosticPermit | undefined;
+        let ollamaOutcome: OllamaDiagnosticOutcome = "not-run";
         try {
-          const response = await fetch("http://localhost:11434/api/tags", {
+          const ollamaContext = captureOllamaDiagnosticContext();
+          const gate = beginOllamaDiagnostic(ollamaContext);
+          if (gate.kind === "suppressed") {
+            return {};
+          }
+          ollamaAttempt = gate;
+          ollamaOutcome = "transport-failure";
+          const response = await fetch(ollamaContext.url, {
             method: "GET",
             signal: AbortSignal.timeout(2000),
           });
@@ -1524,6 +4235,7 @@ Current user's request: ${currentInput}`;
             return {}; // Return empty object to preserve existing fallback behavior
           }
 
+          ollamaOutcome = "protocol-failure";
           const responseData = await response.json();
           const models = responseData?.models;
 
@@ -1536,26 +4248,47 @@ Current user's request: ${currentInput}`;
             return {}; // Return empty object for fallback behavior
           }
 
+          ollamaOutcome = "success";
           // Filter and validate models before comparison
           const validModels = models.filter(
             (m): m is { name: string } =>
               m && typeof m === "object" && typeof m.name === "string",
           );
 
-          const targetModel = route.model || "llama3.2:latest";
-          const modelIsAvailable = validModels.some(
-            (m) => m.name === targetModel,
-          );
-
-          if (!modelIsAvailable) {
+          const targetModel = route.model;
+          if (targetModel) {
+            // Check if the specific routed model is available
+            const modelIsAvailable = validModels.some(
+              (m) => m.name === targetModel,
+            );
+            if (!modelIsAvailable) {
+              logger.debug("Stream orchestration provider validation failed", {
+                taskType: classification.type,
+                routedProvider: route.provider,
+                routedModel: route.model,
+                reason: `Ollama model '${targetModel}' not found`,
+                orchestrationTime: `${Date.now() - startTime}ms`,
+              });
+              // Fall back to first available model instead of abandoning orchestration
+              if (validModels.length > 0) {
+                route.model = validModels[0].name;
+              } else {
+                return {}; // No models at all — preserve existing fallback behavior
+              }
+            }
+          } else if (validModels.length === 0) {
+            // No model specified and none available
             logger.debug("Stream orchestration provider validation failed", {
               taskType: classification.type,
               routedProvider: route.provider,
               routedModel: route.model,
-              reason: `Ollama model '${route.model || "llama3.2:latest"}' not found`,
+              reason: "No Ollama models available",
               orchestrationTime: `${Date.now() - startTime}ms`,
             });
             return {}; // Return empty object to preserve existing fallback behavior
+          } else {
+            // No model specified but models are available — use the first one
+            route.model = validModels[0].name;
           }
         } catch (error) {
           logger.debug("Stream orchestration provider validation failed", {
@@ -1564,11 +4297,15 @@ Current user's request: ${currentInput}`;
             routedModel: route.model,
             reason:
               error instanceof Error
-                ? error.message
+                ? getOllamaDiagnosticErrorMessage(error)
                 : "Ollama service check failed",
             orchestrationTime: `${Date.now() - startTime}ms`,
           });
           return {}; // Return empty object to preserve existing fallback behavior
+        } finally {
+          if (ollamaAttempt) {
+            completeOllamaDiagnostic(ollamaAttempt, ollamaOutcome);
+          }
         }
       }
 
@@ -1600,6 +4337,26 @@ Current user's request: ${currentInput}`;
   }
 
   /**
+   * Read a nonempty orchestration preference only when provider is absent/auto.
+   * An explicit provider always takes precedence over incoming or generated
+   * context; empty, non-string and auto preferences are ignored.
+   */
+  private getOrchestratedPreferredProvider(options: {
+    provider?: string;
+    context?: Record<string, unknown>;
+  }): string | undefined {
+    if (options.provider && options.provider !== "auto") {
+      return undefined;
+    }
+    const preferred = options.context?.__orchestratedPreferredProvider;
+    return typeof preferred === "string" &&
+      preferred.length > 0 &&
+      preferred !== "auto"
+      ? preferred
+      : undefined;
+  }
+
+  /**
    * MAIN ENTRY POINT: Enhanced generate method with new function signature
    * Replaces both generateText and legacy methods
    */
@@ -1623,9 +4380,7 @@ Current user's request: ${currentInput}`;
     };
     if (anyOptions.messages && anyOptions.messages.length > 0) {
       const lastMessage = anyOptions.messages[anyOptions.messages.length - 1];
-      return typeof lastMessage.content === "string"
-        ? lastMessage.content
-        : JSON.stringify(lastMessage.content);
+      return stringifyContentSafe(lastMessage.content);
     }
 
     // Handle input.text format
@@ -1689,16 +4444,176 @@ Current user's request: ${currentInput}`;
   }
 
   /**
-   * Check if Langfuse telemetry is enabled
-   * Centralized utility to avoid duplication across providers
+   * @description Reports whether any tracing backend is active.
+   * @returns {boolean} `true` when OpenTelemetry is initialized or a Langfuse exporter is running.
    */
   isTelemetryEnabled(): boolean {
-    // Check if observability config enables telemetry
-    if (this.observabilityConfig?.langfuse?.enabled) {
-      return true;
+    return (
+      isOpenTelemetryInitialized() || getLangfuseHealthStatus().hasProcessor
+    );
+  }
+
+  /**
+   * Get comprehensive telemetry status including Langfuse and OpenTelemetry state
+   * and every registered exporter with its queued, delivered and dropped spans.
+   * `openTelemetry.enabled` is whether tracing is initialized, as it always
+   * was. Beside a host TracerProvider, `openTelemetry.usingExternalProvider`
+   * is `true`: NeuroLink exports nothing to the endpoint.
+   */
+  getTelemetryStatus(): {
+    enabled: boolean;
+    langfuse?: {
+      enabled: boolean;
+      baseUrl?: string;
+      environment?: string;
+    };
+    openTelemetry?: {
+      enabled: boolean;
+      endpoint?: string;
+      serviceName?: string;
+      usingExternalProvider?: boolean;
+    };
+    exporters: ExporterStatus[];
+  } {
+    const langfuseConfig = this.observabilityConfig?.langfuse;
+    const langfuseOptions =
+      typeof langfuseConfig === "object" ? langfuseConfig : undefined;
+    const { hasProcessor, usingExternalProvider } = getLangfuseHealthStatus();
+
+    return {
+      enabled: isOpenTelemetryInitialized(),
+      langfuse:
+        langfuseConfig !== undefined || hasProcessor
+          ? {
+              enabled: hasProcessor,
+              baseUrl:
+                langfuseOptions?.baseUrl ||
+                process.env.LANGFUSE_BASE_URL ||
+                undefined,
+              environment:
+                langfuseOptions?.environment ??
+                process.env.LANGFUSE_TRACING_ENVIRONMENT,
+            }
+          : undefined,
+      openTelemetry:
+        isOpenTelemetryInitialized() || process.env.OTEL_EXPORTER_OTLP_ENDPOINT
+          ? {
+              enabled: isOpenTelemetryInitialized(),
+              endpoint: process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
+              serviceName: process.env.OTEL_SERVICE_NAME,
+              ...(usingExternalProvider && { usingExternalProvider }),
+            }
+          : undefined,
+      exporters: getExporterRegistry().getStatuses(),
+    };
+  }
+
+  /**
+   * Get aggregated observability metrics (latency, tokens, cost, success rate)
+   */
+  getMetrics(): MetricsSummary {
+    return this.metricsAggregator.getMetrics();
+  }
+
+  /**
+   * Get all recorded spans
+   */
+  getSpans(): SpanData[] {
+    return this.metricsAggregator.getSpans();
+  }
+
+  /**
+   * Get traces (spans grouped by traceId with parent-child hierarchy)
+   */
+  getTraces(): TraceView[] {
+    return this.metricsAggregator.getTraces();
+  }
+
+  /**
+   * Reset all collected metrics and spans
+   */
+  resetMetrics(): void {
+    this.metricsAggregator.reset();
+  }
+
+  /**
+   * Record a span for metrics tracking
+   */
+  recordMetricsSpan(span: SpanData): void {
+    this.metricsAggregator.recordSpan(span);
+  }
+
+  /**
+   * Get provider metrics analysis
+   * Retrieves aggregated performance, token usage, latency, and success rates per provider.
+   *
+   * @param options - Filtering options
+   * @returns Comprehensive provider metrics result
+   */
+  async getProviderMetrics(
+    options?: ProviderMetricsOptions,
+  ): Promise<ProviderMetricsResult> {
+    // Propagate unexpected failures — empty datasets are returned by the
+    // service as valid zeroed results; fabricating those here hid real bugs.
+    return this.analyticsService.getProviderMetrics(options);
+  }
+
+  /**
+   * Get cost analysis breakdown
+   * Analyzes AI generation costs across requested groups and provides future projections.
+   *
+   * @param options - Cost configuration options
+   * @returns Detailed cost analysis breakdown
+   */
+  async getCostAnalysis(
+    options?: CostAnalysisOptions,
+  ): Promise<CostAnalysisResult> {
+    return this.analyticsService.getCostAnalysis(options);
+  }
+
+  /**
+   * Get team-wide usage analytics
+   * Retrieves request counts, unique active users, provider breakdown, and quality scoring.
+   *
+   * @param options - Team query options
+   * @returns Comprehensive team analytics report
+   */
+  async getTeamAnalytics(
+    options?: TeamAnalyticsOptions,
+  ): Promise<TeamAnalyticsResult> {
+    return this.analyticsService.getTeamAnalytics(options);
+  }
+
+  /**
+   * Record a memory operation span to both instance and global metrics aggregators.
+   * This ensures memory spans are visible via sdk.getSpans() and getMetricsAggregator().getSpans().
+   */
+  private recordMemorySpan(
+    operationName: string,
+    attributes: Record<string, string | number>,
+    durationMs: number,
+    status: SpanStatus,
+    statusMessage?: string,
+  ): void {
+    const traceCtx = this._metricsTraceContext;
+    const span = SpanSerializer.createSpan(
+      SpanType.MEMORY,
+      operationName,
+      attributes,
+      traceCtx?.parentSpanId,
+      traceCtx?.traceId,
+    );
+    span.durationMs = durationMs;
+    const endedSpan = SpanSerializer.endSpan(span, status);
+    if (statusMessage) {
+      endedSpan.statusMessage = statusMessage;
     }
-    // Check if OpenTelemetry was initialized (by this or external app)
-    return isOpenTelemetryInitialized();
+    this.metricsAggregator.recordSpan(endedSpan);
+    try {
+      getMetricsAggregator().recordSpan(endedSpan);
+    } catch {
+      /* ignore */
+    }
   }
 
   /**
@@ -1706,26 +4621,7 @@ Current user's request: ${currentInput}`;
    * This method can be called externally to ensure Langfuse is properly initialized
    */
   async initializeLangfuseObservability(): Promise<void> {
-    try {
-      const langfuseConfig = this.observabilityConfig?.langfuse;
-
-      if (langfuseConfig?.enabled) {
-        initializeOpenTelemetry(langfuseConfig);
-
-        logger.debug(
-          "[NeuroLink] Langfuse observability initialized via public method",
-        );
-      } else {
-        logger.debug(
-          "[NeuroLink] Langfuse not enabled, skipping initialization",
-        );
-      }
-    } catch (error) {
-      logger.warn(
-        "[NeuroLink] Failed to initialize Langfuse observability:",
-        error,
-      );
-    }
+    this.holdTelemetry();
   }
 
   /**
@@ -1735,9 +4631,33 @@ Current user's request: ${currentInput}`;
     try {
       logger.debug("[NeuroLink] Starting graceful shutdown");
 
+      // Kill host-owned background work first: a shutdown must not leave
+      // child processes or delegate workers running with nobody to collect
+      // them.
       try {
-        await flushOpenTelemetry();
-        await shutdownOpenTelemetry();
+        await killAllCommands(this);
+        await cancelBackgroundDelegates(this);
+        logger.debug("[NeuroLink] Background commands and delegates stopped");
+      } catch (error) {
+        logger.warn("[NeuroLink] Background work cleanup failed:", error);
+      }
+
+      try {
+        await this.releaseMemoryCondenser();
+      } catch (error) {
+        logger.warn("[NeuroLink] Memory condenser shutdown failed:", error);
+      }
+
+      // Persisted attachments live under a private tmpdir; remove them with
+      // the instance instead of leaving uploads behind for the exit sweep.
+      try {
+        await this.fileRegistry.clear();
+      } catch (error) {
+        logger.warn("[NeuroLink] File registry cleanup failed:", error);
+      }
+
+      try {
+        await this.releaseTelemetryHold();
         logger.debug("[NeuroLink] OpenTelemetry shutdown completed");
       } catch (error) {
         logger.warn("[NeuroLink] OpenTelemetry shutdown failed:", error);
@@ -1752,7 +4672,47 @@ Current user's request: ${currentInput}`;
         }
       }
 
+      // Shutdown TaskManager
+      if (this._taskManager) {
+        try {
+          await withTimeout(
+            this._taskManager.shutdown(),
+            5000,
+            new Error("TaskManager shutdown timed out"),
+          );
+        } catch (error) {
+          logger.warn("[NeuroLink] TaskManager shutdown error:", error);
+        } finally {
+          this._taskManager = undefined;
+        }
+      }
+
+      // Release the artifact store this instance built (a pooled Redis
+      // connection, for one). An injected store is the caller's to close.
+      if (this.ownsArtifactStore && this.mcpArtifactStore?.close) {
+        try {
+          await this.mcpArtifactStore.close();
+          logger.debug("[NeuroLink] Artifact store closed");
+        } catch (error) {
+          logger.warn("[NeuroLink] Artifact store close failed:", error);
+        }
+      }
+
+      // Close conversation memory manager (release Redis connections, etc.)
+      if (this.conversationMemory?.close) {
+        try {
+          await this.conversationMemory.close();
+          logger.debug("[NeuroLink] Conversation memory shutdown completed");
+        } catch (error) {
+          logger.warn(
+            "[NeuroLink] Conversation memory shutdown failed:",
+            error,
+          );
+        }
+      }
+
       logger.debug("[NeuroLink] Graceful shutdown completed");
+      this.credentials = undefined;
     } catch (error) {
       logger.error("[NeuroLink] Shutdown failed:", error);
       throw error;
@@ -1760,10 +4720,395 @@ Current user's request: ${currentInput}`;
   }
 
   /**
+   * Fire-and-forget analytics tracking with rejection logging.
+   */
+  private enqueueAnalyticsTrackRequest(
+    record: Parameters<AnalyticsService["trackRequest"]>[0],
+  ): void {
+    this.analyticsService.trackRequest(record).catch((error: unknown) => {
+      logger.debug("[NeuroLink] analytics trackRequest failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }
+
+  /**
+   * Estimate cost using the canonical SDK pricing table (same source as
+   * AnalyticsService.trackRequest) — avoids diverging TokenTracker rates.
+   */
+  private estimateCostFromUsage(
+    provider: string,
+    model: string,
+    usage:
+      | {
+          input?: number;
+          output?: number;
+          total?: number;
+          cacheReadTokens?: number;
+          cacheCreationTokens?: number;
+        }
+      | undefined,
+  ): number | undefined {
+    if (!usage || model === "unknown") {
+      return undefined;
+    }
+    const totalCost = calculateAdvancedCost(
+      model,
+      usage.input || 0,
+      usage.output || 0,
+      provider === "unknown" ? undefined : provider,
+      {
+        cacheReadTokens: usage.cacheReadTokens,
+        cacheCreationTokens: usage.cacheCreationTokens,
+      },
+    );
+    return totalCost > 0 ? totalCost : undefined;
+  }
+
+  /**
+   * Handle generation:end: records advanced analytics for every generation
+   * and the metrics span for a non-streamed one. A streamed generation gets
+   * its span from stream:complete / stream:error instead.
+   */
+  private handleGenerationEndMetrics(data: Record<string, unknown>): void {
+    try {
+      const result = data.result as Record<string, unknown> | undefined;
+      const usage = result?.usage as
+        | { input?: number; output?: number; total?: number }
+        | undefined;
+      const analytics = result?.analytics as { cost?: number } | undefined;
+      const provider =
+        (data.provider as string) || (result?.provider as string) || "unknown";
+      const model =
+        (result?.model as string) || (data.model as string) || "unknown";
+      const responseTime = (data.responseTime as number) || 0;
+      const eventTimestamp =
+        typeof data.timestamp === "number" && Number.isFinite(data.timestamp)
+          ? data.timestamp
+          : Date.now();
+      const traceCtx = this._metricsTraceContext;
+
+      const reportedCost =
+        typeof analytics?.cost === "number" && Number.isFinite(analytics.cost)
+          ? analytics.cost
+          : undefined;
+      const cost =
+        reportedCost !== undefined && reportedCost > 0
+          ? reportedCost
+          : (this.estimateCostFromUsage(provider, model, usage) ??
+            reportedCost);
+      const aborted = data.aborted === true;
+      const failed = !aborted && (data.success === false || !!data.error);
+
+      if (data.streamed !== true) {
+        let span = SpanSerializer.createGenerationSpan({
+          provider,
+          model,
+          name: `gen_ai.${provider}.chat`,
+          traceId: traceCtx?.traceId,
+          input: data.prompt,
+          temperature: data.temperature as number | undefined,
+          maxTokens: data.maxTokens as number | undefined,
+        });
+        if (traceCtx) {
+          span.parentSpanId = traceCtx.parentSpanId;
+        }
+        let spanStatus: SpanStatus;
+        let statusMessage: string | undefined;
+        if (data.aborted === true) {
+          spanStatus = SpanStatus.WARNING;
+          statusMessage = "Generation aborted by client";
+        } else if (data.success === false || data.error) {
+          spanStatus = SpanStatus.ERROR;
+          statusMessage = data.error ? String(data.error) : undefined;
+        } else {
+          spanStatus = SpanStatus.OK;
+        }
+        span = SpanSerializer.endSpan(span, spanStatus, statusMessage);
+        span.durationMs = responseTime;
+
+        const finishReason =
+          (result?.finishReason as string | undefined) ??
+          (data.finishReason as string | undefined);
+        if (finishReason) {
+          span.attributes["gen_ai.finish_reason"] = finishReason;
+          if (finishReason === "content-filter" || finishReason === "length") {
+            span = SpanSerializer.endSpan(
+              span,
+              SpanStatus.WARNING,
+              `Generation stopped: finishReason=${finishReason}`,
+            );
+          }
+        }
+
+        if (data.retryCount !== undefined) {
+          span.attributes["gen_ai.retry_count"] = data.retryCount as number;
+        }
+
+        if (usage) {
+          span = SpanSerializer.enrichWithTokenUsage(span, {
+            promptTokens: usage.input || 0,
+            completionTokens: usage.output || 0,
+            totalTokens:
+              usage.total || (usage.input || 0) + (usage.output || 0),
+          });
+        }
+
+        if (cost !== undefined && cost > 0) {
+          span = SpanSerializer.enrichWithCost(span, { totalCost: cost });
+        }
+
+        const content = (result?.content as string) || (result?.text as string);
+        if (content) {
+          span = SpanSerializer.updateAttributes(span, {
+            output:
+              content.length > 5000
+                ? content.substring(0, 5000) + "...[truncated]"
+                : content,
+          });
+        }
+
+        this.metricsAggregator.recordSpan(span);
+        getMetricsAggregator().recordSpan(span);
+      }
+
+      this.enqueueAnalyticsTrackRequest({
+        provider,
+        model,
+        userId: (data.userId as string) || (data.user as string) || undefined,
+        teamId: (data.teamId as string) || undefined,
+        department: (data.department as string) || undefined,
+        timestamp: eventTimestamp,
+        latency: responseTime,
+        inputTokens: usage?.input || 0,
+        outputTokens: usage?.output || 0,
+        totalTokens: usage?.total || (usage?.input || 0) + (usage?.output || 0),
+        cost,
+        isError: failed,
+        errorMessage: aborted
+          ? "Generation aborted by client"
+          : data.error
+            ? String(data.error)
+            : undefined,
+        qualityScore: parseAnalyticsQualityScore(data.qualityScore),
+      });
+    } catch {
+      // Non-blocking
+    }
+  }
+
+  /**
+   * Pipeline B span recording for stream:complete.
+   * Advanced analytics are recorded from generation:end only (avoids duplicates
+   * when both stream:complete and generation:end fire for the same request).
+   */
+  private handleStreamCompleteMetrics(data: Record<string, unknown>): void {
+    try {
+      const metadata = data.metadata as Record<string, unknown> | undefined;
+      const durationMs = (metadata?.durationMs as number) || 0;
+      const chunkCount = (metadata?.chunkCount as number) || 0;
+      const totalLength = (metadata?.totalLength as number) || 0;
+      const provider = (data.provider as string) || "unknown";
+      const model = (data.model as string) || "unknown";
+      const traceCtx = this._metricsTraceContext;
+
+      let span = SpanSerializer.createGenerationSpan({
+        provider,
+        model,
+        name: `gen_ai.${provider}.stream`,
+        traceId: traceCtx?.traceId,
+      });
+      if (traceCtx) {
+        span.parentSpanId = traceCtx.parentSpanId;
+      }
+      span = SpanSerializer.endSpan(span, SpanStatus.OK);
+      span.durationMs = durationMs;
+      span.attributes["stream.chunk_count"] = chunkCount;
+      span.attributes["stream.content_length"] = totalLength;
+
+      const streamFinishReason =
+        (metadata?.finishReason as string | undefined) ??
+        (data.finishReason as string | undefined);
+      if (streamFinishReason) {
+        span.attributes["gen_ai.finish_reason"] = streamFinishReason;
+        if (
+          streamFinishReason === "content-filter" ||
+          streamFinishReason === "length"
+        ) {
+          span = SpanSerializer.endSpan(
+            span,
+            SpanStatus.WARNING,
+            `Stream stopped: finishReason=${streamFinishReason}`,
+          );
+        }
+      }
+
+      if (data.prompt) {
+        const promptStr = String(data.prompt);
+        span = SpanSerializer.updateAttributes(span, {
+          input:
+            promptStr.length > 5000
+              ? promptStr.substring(0, 5000) + "...[truncated]"
+              : promptStr,
+        });
+      }
+
+      const streamContent = data.content as string;
+      if (streamContent) {
+        span = SpanSerializer.updateAttributes(span, {
+          output:
+            streamContent.length > 5000
+              ? streamContent.substring(0, 5000) + "...[truncated]"
+              : streamContent,
+        });
+      }
+
+      const usage = metadata?.usage as
+        | { input?: number; output?: number; total?: number }
+        | undefined;
+      if (usage) {
+        span = SpanSerializer.enrichWithTokenUsage(span, {
+          promptTokens: usage.input || 0,
+          completionTokens: usage.output || 0,
+          totalTokens: usage.total || (usage.input || 0) + (usage.output || 0),
+        });
+
+        const estimated = this.estimateCostFromUsage(provider, model, usage);
+        if (estimated !== undefined) {
+          span = SpanSerializer.enrichWithCost(span, { totalCost: estimated });
+        }
+      }
+
+      this.metricsAggregator.recordSpan(span);
+      getMetricsAggregator().recordSpan(span);
+    } catch {
+      // Non-blocking
+    }
+  }
+
+  private handleToolEndMetrics(data: Record<string, unknown>): void {
+    try {
+      const toolName =
+        (data.toolName as string) || (data.tool as string) || "unknown";
+      const responseTime =
+        (data.responseTime as number) || (data.duration as number) || 0;
+      const success =
+        data.success !== undefined ? (data.success as boolean) : !data.error;
+      const traceCtx = this._metricsTraceContext;
+
+      let span = SpanSerializer.createSpan(
+        SpanType.TOOL_CALL,
+        `tool.${toolName}`,
+        {
+          "tool.name": toolName,
+          "tool.success": success,
+        },
+        traceCtx?.parentSpanId,
+        traceCtx?.traceId,
+      );
+      span = SpanSerializer.endSpan(
+        span,
+        success ? SpanStatus.OK : SpanStatus.ERROR,
+      );
+      span.durationMs = responseTime;
+
+      if (!success) {
+        if (data.error) {
+          span.statusMessage = String(data.error);
+        } else if (data.result) {
+          span.statusMessage = extractMcpErrorText(data.result);
+        }
+      }
+
+      if (data.result) {
+        try {
+          span.attributes["tool.result"] = JSON.stringify(
+            data.result,
+          ).substring(0, 500);
+        } catch {
+          // Non-blocking
+        }
+      }
+
+      this.metricsAggregator.recordSpan(span);
+      getMetricsAggregator().recordSpan(span);
+    } catch {
+      // Non-blocking
+    }
+  }
+
+  /**
+   * Pipeline B span recording for stream:error.
+   * Analytics for failed streams come from generation:end (success: false).
+   */
+  private handleStreamErrorMetrics(data: Record<string, unknown>): void {
+    try {
+      const metadata = data.metadata as Record<string, unknown> | undefined;
+      const durationMs = (metadata?.durationMs as number) || 0;
+      const chunkCount = (metadata?.chunkCount as number) || 0;
+      const errorName = (metadata?.errorName as string) || "UnknownError";
+      const errorMessage = (data.content as string) || "Stream error";
+      const provider = (data.provider as string) || "unknown";
+      const model = (data.model as string) || "unknown";
+      const traceCtx = this._metricsTraceContext;
+
+      let span = SpanSerializer.createGenerationSpan({
+        provider,
+        model,
+        name: `gen_ai.${provider}.stream.error`,
+        traceId: traceCtx?.traceId,
+      });
+      if (traceCtx) {
+        span.parentSpanId = traceCtx.parentSpanId;
+      }
+      span = SpanSerializer.endSpan(span, SpanStatus.ERROR);
+      span.durationMs = durationMs;
+      span.statusMessage = `${errorName}: ${errorMessage}`;
+      span.attributes["stream.chunk_count"] = chunkCount;
+
+      const isAbort =
+        errorName === "AbortError" ||
+        errorMessage.toLowerCase().includes("aborted") ||
+        errorMessage.toLowerCase().includes("abort");
+      span.attributes["error.type"] = isAbort ? "abort" : errorName;
+      if (isAbort) {
+        span.attributes["stream.aborted"] = true;
+      }
+
+      this.metricsAggregator.recordSpan(span);
+      getMetricsAggregator().recordSpan(span);
+    } catch {
+      // Non-blocking
+    }
+  }
+
+  /**
+   * Initialize event listeners that feed span data to MetricsAggregator.
+   * Listens to generation:end, stream:complete, and tool:end events.
+   */
+  private initializeMetricsListeners(): void {
+    this.emitter.on("generation:end", ((...args: unknown[]) => {
+      this.handleGenerationEndMetrics(args[0] as Record<string, unknown>);
+    }) as (...args: unknown[]) => void);
+
+    this.emitter.on("stream:complete", ((...args: unknown[]) => {
+      this.handleStreamCompleteMetrics(args[0] as Record<string, unknown>);
+    }) as (...args: unknown[]) => void);
+
+    this.emitter.on("tool:end", ((...args: unknown[]) => {
+      this.handleToolEndMetrics(args[0] as Record<string, unknown>);
+    }) as (...args: unknown[]) => void);
+
+    this.emitter.on("stream:error", ((...args: unknown[]) => {
+      this.handleStreamErrorMetrics(args[0] as Record<string, unknown>);
+    }) as (...args: unknown[]) => void);
+  }
+
+  /**
    * Generate AI response with comprehensive feature support.
    *
    * Primary method for AI generation with support for all NeuroLink features:
-   * - Multi-provider support (13+ providers)
+   * - Multi-provider support
    * - MCP tool integration
    * - Structured JSON output with Zod schemas
    * - Conversation memory (Redis or in-memory)
@@ -1783,6 +5128,7 @@ Current user's request: ${currentInput}`;
    * @param optionsOrPrompt.maxTokens - Maximum tokens to generate
    * @param optionsOrPrompt.thinkingConfig - Extended thinking configuration (thinkingLevel: 'minimal'|'low'|'medium'|'high')
    * @param optionsOrPrompt.context - Context with conversationId and userId for memory
+   * @param optionsOrPrompt.useKnowledgeGrounding - Whether to use the instance's configured knowledge for this call
    * @returns Promise resolving to generation result with content and metadata
    *
    * @example Basic text generation
@@ -1860,312 +5206,2024 @@ Current user's request: ${currentInput}`;
    * @since 1.0.0
    */
   async generate(
-    optionsOrPrompt: GenerateOptions | string,
+    optionsOrPrompt: GenerateOptions | DynamicOptions | string,
   ): Promise<GenerateResult> {
-    const originalPrompt = this._extractOriginalPrompt(optionsOrPrompt);
-    // Convert string prompt to full options
+    return logger.runInInstanceScope(this.logInstanceId, async () => {
+      this.holdTelemetry();
+      return this.generateInInstanceScope(optionsOrPrompt);
+    });
+  }
+
+  /**
+   * Body of {@link generate}, always entered through the instance log scope
+   * so every log call beneath it is attributable to this instance.
+   */
+  private async generateInInstanceScope(
+    optionsOrPrompt: GenerateOptions | DynamicOptions | string,
+  ): Promise<GenerateResult> {
+    // Host-loop delegation (registerAgentTool): enter a per-turn scope so
+    // delegation caps count against THIS top-level generate, and withhold
+    // depth-limited agent tools from the request. beginDelegationTurn
+    // returns null when a scope is already active, so the re-entrant call
+    // below proceeds through the normal body sharing the turn's counters.
+    if (this.hasAgentTools) {
+      const { beginDelegationTurn } =
+        await import("./agent/agentToolRegistrar.js");
+      const scope = beginDelegationTurn(this, optionsOrPrompt);
+      if (scope) {
+        return scope.run(() =>
+          this.generate(
+            scope.options as GenerateOptions | DynamicOptions | string,
+          ),
+        );
+      }
+    }
+    // Defensive call-isolation clone — mirrors stream(): downstream
+    // generate-prep (memory retrieval, orchestration, RAG/MCP tool
+    // injection) mutates nested branches on the caller-supplied options
+    // object. Without cloning here, callers reusing a single options
+    // bag across generate() calls accumulate state across them.
+    // String prompts are immutable, so they pass through.
+    if (typeof optionsOrPrompt !== "string") {
+      optionsOrPrompt = cloneOptionsForCallIsolation(optionsOrPrompt);
+      // Resolved once per call and always overwrites a caller-supplied
+      // policy; an invalid root fails here, before any model call.
+      bindFileToolRoots(
+        optionsOrPrompt,
+        this.resolveFileToolRoots(
+          (optionsOrPrompt as GenerateOptions).toolRoots,
+        ),
+      );
+      // The deprecated `conversationHistory` field is not wired into message
+      // building — messages passed there never reach the model, which reads
+      // as "the SDK forgot my context" rather than a caller bug. Warn loudly
+      // instead of failing silently; `conversationMessages` is the wired path.
+      const legacyOpts = optionsOrPrompt as {
+        conversationHistory?: unknown[];
+        conversationMessages?: unknown[];
+      };
+      if (
+        Array.isArray(legacyOpts.conversationHistory) &&
+        legacyOpts.conversationHistory.length > 0 &&
+        !legacyOpts.conversationMessages
+      ) {
+        logger.warn(
+          "[NeuroLink.generate] `conversationHistory` is deprecated and NOT passed to the model — use `conversationMessages` (ChatMessage[]) instead.",
+        );
+      }
+    }
+    // Resolved once here and removed from the options, so no internal
+    // re-entrant generate() can prepend the agent instructions twice.
+    let agentModeVersion: TerminalAgentModeVersion | undefined;
+    if (typeof optionsOrPrompt !== "string") {
+      const { agentMode, ...rest } = optionsOrPrompt as GenerateOptions;
+      if (agentMode !== undefined) {
+        const resolved = resolveTerminalAgentMode(agentMode, rest.systemPrompt);
+        agentModeVersion = resolved.version;
+        optionsOrPrompt = {
+          ...rest,
+          systemPrompt: resolved.systemPrompt,
+        } as GenerateOptions;
+      }
+    }
+    const startedAt = Date.now();
+    const turnOptions = optionsOrPrompt;
+    try {
+      return await this.setLangfuseContextFromOptions(
+        typeof turnOptions === "string" ? {} : (turnOptions as GenerateOptions),
+        () =>
+          tracers.sdk.startActiveSpan(
+            "generate",
+            { kind: SpanKind.INTERNAL },
+            (turnSpan) =>
+              this.runGenerateTurn(turnOptions, agentModeVersion, turnSpan),
+          ),
+      );
+    } catch (error) {
+      // Lifecycle middleware (wrapGenerate.catch in builtin/lifecycle.ts)
+      // stamps errors it already surfaced with the shared Symbol marker
+      // (see utils/lifecycleCallbacks.ts). For errors thrown BEFORE the
+      // language model was wrapped (e.g. unknown provider name,
+      // validation failures, factory exceptions), the mark is absent —
+      // fire the consumer's onError here so it sees every failure path.
+      // Awaited so async handlers fully settle before generate()
+      // rethrows, matching the middleware-managed path.
+      await this.fireConsumerOnErrorIfNotFired(
+        optionsOrPrompt,
+        error,
+        startedAt,
+      );
+      throw error;
+    }
+  }
+
+  private async runGenerateTurn(
+    optionsOrPrompt: GenerateOptions | DynamicOptions | string,
+    agentModeVersion: TerminalAgentModeVersion | undefined,
+    turnSpan: Span,
+  ): Promise<GenerateResult> {
+    try {
+      const groundingOptions =
+        typeof optionsOrPrompt === "string"
+          ? ({ input: { text: optionsOrPrompt } } as GenerateOptions)
+          : (optionsOrPrompt as GenerateOptions);
+      const knowledgeOutcome =
+        await this.retrieveKnowledgeGrounding(groundingOptions);
+      if (knowledgeOutcome?.ephemeralContext) {
+        const block = knowledgeOutcome.ephemeralContext.content;
+        optionsOrPrompt = {
+          ...groundingOptions,
+          systemPrompt: this.appendKnowledgeGroundingBlockToSystemPrompt(
+            groundingOptions.systemPrompt,
+            block,
+          ),
+        } as GenerateOptions | DynamicOptions;
+      }
+      startTurn(turnSpan, optionsOrPrompt);
+      const result = await this.runWithFallbackOrchestration(
+        optionsOrPrompt,
+        "generate",
+        (opts) =>
+          tracers.sdk.startActiveSpan(
+            "generate.attempt",
+            { kind: SpanKind.INTERNAL },
+            (attemptSpan) => {
+              observe(attemptSpan, "span", {});
+              return this.executeGenerateWithMetricsContext(opts, attemptSpan);
+            },
+          ),
+      );
+      if (knowledgeOutcome) {
+        result.knowledge = knowledgeOutcome.metadata;
+      }
+      if (agentModeVersion) {
+        result.agentModeVersion = agentModeVersion;
+      }
+      observeTurn(turnSpan, {
+        output: assistantMessages({
+          text: result.content,
+          toolCalls: result.toolExecutions,
+        }),
+        metadata: { model: result.model },
+        level: observationLevel(result.finishReason),
+      });
+      turnSpan.setStatus({ code: SpanStatusCode.OK });
+      return result;
+    } catch (error) {
+      failTurnSpan(
+        turnSpan,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+      throw error;
+    } finally {
+      turnSpan.end();
+    }
+  }
+
+  private async fireConsumerOnErrorIfNotFired(
+    optionsOrPrompt: unknown,
+    error: unknown,
+    startedAt: number,
+  ): Promise<void> {
+    if (hasLifecycleErrorFired(error)) {
+      return;
+    }
+    if (typeof optionsOrPrompt !== "object" || optionsOrPrompt === null) {
+      return;
+    }
+    const opts = optionsOrPrompt as {
+      onError?: (payload: {
+        error: Error;
+        duration: number;
+        recoverable: boolean;
+      }) => unknown;
+      middleware?: {
+        middlewareConfig?: {
+          lifecycle?: { config?: { timeoutMs?: number } };
+        };
+      };
+    };
+    const userOnError = opts.onError;
+    if (!userOnError) {
+      return;
+    }
+    const err = error instanceof Error ? error : new Error(String(error));
+    // Bound the consumer callback so a never-settling handler can't hang
+    // generate()/stream(). The deadline honors per-call
+    // `lifecycle.timeoutMs` and the `NEUROLINK_LIFECYCLE_TIMEOUT_MS` env
+    // var (CLI surface), falling back to 5_000. Errors raised here are
+    // logged and swallowed; the original failure still propagates to the
+    // caller because the outer catch re-throws.
+    const lifecycle = opts.middleware?.middlewareConfig?.lifecycle?.config;
+    const timeoutMs = resolveLifecycleTimeoutMs(lifecycle);
+    // Mark the error first so the AI-SDK lifecycle middleware can't
+    // re-fire the same callback if the throw races a parallel catch.
+    markLifecycleErrorFired(err);
+    try {
+      await withTimeout(
+        Promise.resolve(
+          userOnError({
+            error: err,
+            duration: Date.now() - startedAt,
+            recoverable: false,
+          }),
+        ),
+        timeoutMs,
+        new Error(`consumer onError callback timed out after ${timeoutMs}ms`),
+      );
+    } catch (e) {
+      logger.warn("[NeuroLink] consumer onError callback error:", e);
+    }
+  }
+
+  /**
+   * Curator P2-3: wraps a generate/stream call with the fallback
+   * orchestration (`providerFallback` callback + `modelChain` walker).
+   *
+   * On a qualifying error from the inner call:
+   *  1. Resolve the effective callback (per-call > instance > synthesised
+   *     from modelChain) and the effective chain (per-call > instance).
+   *  2. Walk attempts: invoke callback (or pop next chain entry) → emit
+   *     `model.fallback` event → re-call inner with the new {provider,
+   *     model}.
+   *  3. Stop on first success, on a callback returning null, or after
+   *     exhausting the chain (throw the most recent error).
+   *
+   * What qualifies depends on how fallback was configured: an EXPLICIT
+   * `providerFallback` callback is consulted for any error except client
+   * aborts (the callback owns the decision — it receives the error
+   * unmodified and can return null to bubble), while modelChain-only
+   * configs keep the narrow model-access-denied gate.
+   */
+  private async runWithFallbackOrchestration<T>(
+    optionsOrPrompt: GenerateOptions | DynamicOptions | string,
+    kind: "generate" | "stream",
+    inner: (opts: GenerateOptions | DynamicOptions | string) => Promise<T>,
+  ): Promise<T> {
+    const initialAttempt = await this.attemptInner(inner, optionsOrPrompt);
+    if ("ok" in initialAttempt) {
+      return initialAttempt.ok;
+    }
+    let lastError = initialAttempt.error;
+
+    // Resolve the fallback configuration BEFORE gating so the gate can
+    // distinguish an explicit callback from a modelChain-only setup.
+    const requestedProvider = (
+      typeof optionsOrPrompt === "object"
+        ? (optionsOrPrompt as { provider?: string }).provider
+        : undefined
+    ) as string | undefined;
+    const requestedModel = (
+      typeof optionsOrPrompt === "object"
+        ? (optionsOrPrompt as { model?: string }).model
+        : undefined
+    ) as string | undefined;
+
+    const callOpts =
+      typeof optionsOrPrompt === "object"
+        ? (optionsOrPrompt as Record<string, unknown>)
+        : ({} as Record<string, unknown>);
+
+    const perCallCallback = callOpts.providerFallback as
+      | ((
+          err: unknown,
+        ) => Promise<{ provider?: string; model?: string } | null>)
+      | undefined;
+    const perCallChain = callOpts.modelChain as string[] | undefined;
+
+    const effectiveCallback =
+      perCallCallback ?? this.fallbackConfig.providerFallback;
+    const effectiveChain = perCallChain ?? this.fallbackConfig.modelChain;
+
+    // Explicit callback (per-call or instance providerFallback): the callback
+    // owns the decision for any error except genuine caller cancels — it can
+    // return null to bubble. modelChain-only keeps the narrow
+    // model-access-denied gate so chain walkers don't retry errors the chain
+    // can't fix.
+    //
+    // Error shape alone cannot identify a caller cancel: NeuroLink's own
+    // watchdog/timeout controllers abort the same composed signal, and SDKs
+    // normalize that into the identical AbortError shapes a user cancel
+    // produces (e.g. Anthropic's APIUserAbortError). Ground truth is the
+    // caller-supplied abortSignal itself — only when IT has fired is an
+    // abort-shaped error a real cancel; otherwise the abort was internally
+    // initiated (turn/stall watchdog, per-step timeout) and the callback
+    // must still be consulted so provider hangs can fall back. Read live
+    // (not captured) so the post-retry re-gate sees a cancel that arrives
+    // mid-fallback; cloneOptionsForCallIsolation keeps abortSignal
+    // by-reference, so the retried options observe the same signal.
+    const callerAborted = (): boolean =>
+      (callOpts.abortSignal as AbortSignal | undefined)?.aborted === true;
+    // modelChain-only orchestration advances on two error shapes the next
+    // member can actually fix: access-denied (the original gate) and
+    // model-not-found ("Invalid model name" from a gateway that doesn't
+    // serve that member — a chain written for one LiteLLM deployment must
+    // not hard-fail on another just because a member is absent there).
+    const shouldOrchestrateFallback = (err: unknown): boolean =>
+      effectiveCallback
+        ? !(isAbortError(err) && callerAborted())
+        : looksLikeModelAccessDenied(err) || sharedLooksLikeModelNotFound(err);
+
+    if (!shouldOrchestrateFallback(lastError)) {
+      throw lastError;
+    }
+
+    if (!effectiveCallback && !effectiveChain) {
+      throw lastError;
+    }
+
+    // Synthesise a callback from modelChain if no explicit callback exists.
+    const chainCursor = { i: 0, list: effectiveChain ?? [] };
+    const synthesizedFromChain: (
+      err: unknown,
+    ) => Promise<{ provider?: string; model?: string } | null> = async () => {
+      while (chainCursor.i < chainCursor.list.length) {
+        const next = chainCursor.list[chainCursor.i++];
+        if (next !== requestedModel) {
+          return { model: next };
+        }
+      }
+      return null;
+    };
+    const callback = effectiveCallback ?? synthesizedFromChain;
+
+    let attempts = 0;
+    const maxAttempts = (effectiveChain?.length ?? 0) + 5;
+    let attemptedRequestedModel = requestedModel;
+    while (attempts++ < maxAttempts) {
+      let next: { provider?: string; model?: string } | null;
+      try {
+        next = await callback(lastError);
+      } catch (cbErr) {
+        logger.warn("[NeuroLink] providerFallback callback threw", {
+          error: cbErr instanceof Error ? cbErr.message : String(cbErr),
+        });
+        throw lastError;
+      }
+      if (!next) {
+        throw lastError;
+      }
+
+      // Emit model.fallback event so cost/audit listeners can record it.
+      try {
+        this.emitter.emit("model.fallback", {
+          requestedProvider,
+          requestedModel: attemptedRequestedModel,
+          fallbackProvider: next.provider ?? requestedProvider,
+          fallbackModel: next.model,
+          reason:
+            lastError instanceof Error ? lastError.message : String(lastError),
+          kind,
+          timestamp: Date.now(),
+        });
+      } catch {
+        /* listener errors are non-fatal */
+      }
+
+      // Defensive call-isolation clone for the retry attempt. The shallow
+      // spread below would keep nested branches (`input`, `tools`, `memory`,
+      // `rag`, …) pointing at the same objects the previous attempt's
+      // prepare stages mutated — so the retry inherits e.g. memory-retrieved
+      // history appended to `input.messages`, RAG-injected tools, etc.
+      // Re-cloning at the retry boundary mirrors the entry-level isolation
+      // applied in generate()/stream() so each fallback attempt sees a
+      // fresh options bag.
+      const retriedOptions =
+        typeof optionsOrPrompt === "object"
+          ? cloneOptionsForCallIsolation({
+              ...optionsOrPrompt,
+              ...(next.provider && { provider: next.provider }),
+              ...(next.model && { model: next.model }),
+              // Strip the fallback hooks so the retry doesn't re-orchestrate.
+              providerFallback: undefined,
+              modelChain: undefined,
+            })
+          : optionsOrPrompt;
+
+      const retryAttempt = await this.attemptInner(
+        inner,
+        retriedOptions as GenerateOptions | DynamicOptions | string,
+      );
+      if ("ok" in retryAttempt) {
+        return retryAttempt.ok;
+      }
+      lastError = retryAttempt.error;
+      attemptedRequestedModel = next.model ?? attemptedRequestedModel;
+      if (!shouldOrchestrateFallback(lastError)) {
+        throw lastError;
+      }
+    }
+    throw lastError;
+  }
+
+  private async attemptInner<T>(
+    inner: (opts: GenerateOptions | DynamicOptions | string) => Promise<T>,
+    options: GenerateOptions | DynamicOptions | string,
+  ): Promise<{ ok: T } | { error: unknown }> {
+    try {
+      const ok = await inner(options);
+      return { ok };
+    } catch (error) {
+      return { error };
+    }
+  }
+
+  private async executeGenerateWithMetricsContext(
+    optionsOrPrompt: GenerateOptions | DynamicOptions | string,
+    generateSpan: ReturnType<typeof tracers.sdk.startSpan>,
+  ): Promise<GenerateResult> {
+    return metricsTraceContextStorage.run(
+      this.createMetricsTraceContext(),
+      () => this.executeGenerateRequest(optionsOrPrompt, generateSpan),
+    );
+  }
+
+  private async executeGenerateRequest(
+    optionsOrPrompt: GenerateOptions | DynamicOptions | string,
+    generateSpan: ReturnType<typeof tracers.sdk.startSpan>,
+  ): Promise<GenerateResult> {
+    let resolvedOptions: GenerateOptions | undefined;
+    try {
+      const { options, originalPrompt } = await this.prepareGenerateRequest(
+        optionsOrPrompt,
+        generateSpan,
+      );
+      resolvedOptions = options;
+      const earlyResult = await this.maybeHandleEarlyGenerateResult(
+        options,
+        generateSpan,
+      );
+      if (earlyResult) {
+        generateSpan.setStatus({ code: SpanStatusCode.OK });
+        return earlyResult;
+      }
+
+      // Pre-call tool routing for generate(): mirrors the stream() routing path.
+      // Runs inside the generate's Langfuse context (setLangfuseContextFromOptions)
+      // so the router's own generation span nests under this turn's trace.
+      // After the early-result short-circuit so workflow/media turns skip it.
+      const result = await this.setLangfuseContextFromOptions(
+        options,
+        async () => {
+          await this.applyToolRoutingExclusions(
+            options,
+            options.input?.text ?? "",
+          );
+          return this.runStandardGenerateRequest(
+            options,
+            originalPrompt,
+            generateSpan,
+          );
+        },
+      );
+      generateSpan.setStatus({ code: SpanStatusCode.OK });
+      return result;
+    } catch (error) {
+      if (isAbortError(error)) {
+        generateSpan.setAttribute("ai.finishReason", "aborted");
+        generateSpan.setAttribute("aborted", true);
+      } else {
+        generateSpan.recordException(
+          error instanceof Error ? error : new Error(String(error)),
+        );
+        generateSpan.setStatus({
+          code: SpanStatusCode.ERROR,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+
+      // G7 fix: Distinguish context overflow errors with dedicated attributes
+      if (error instanceof ContextBudgetExceededError) {
+        generateSpan.setAttribute("error.type", "context_overflow");
+        generateSpan.setAttribute(
+          "context.estimated_tokens",
+          error.estimatedTokens,
+        );
+        generateSpan.setAttribute(
+          "context.available_tokens",
+          error.availableTokens,
+        );
+      }
+
+      this.emitGenerateErrorEvent(
+        (resolvedOptions ?? optionsOrPrompt) as GenerateOptions | string,
+        error,
+      );
+      throw error;
+    } finally {
+      this._disableToolCacheForCurrentRequest = false;
+      this._toolCacheKeysServedThisRequest = new Set();
+      this._generationTurnActive = false;
+      generateSpan.end();
+    }
+  }
+
+  private async prepareGenerateRequest(
+    optionsOrPrompt: GenerateOptions | DynamicOptions | string,
+    generateSpan: ReturnType<typeof tracers.sdk.startSpan>,
+  ): Promise<{
+    options: GenerateOptions;
+    originalPrompt: string | undefined;
+  }> {
+    const originalPrompt = this._extractOriginalPrompt(
+      optionsOrPrompt as GenerateOptions | string,
+    );
     const options: GenerateOptions =
       typeof optionsOrPrompt === "string"
         ? { input: { text: optionsOrPrompt } }
-        : optionsOrPrompt;
+        : ({ ...optionsOrPrompt } as GenerateOptions);
 
-    // Validate prompt
-    if (!options.input?.text || typeof options.input.text !== "string") {
-      throw new Error("Input text is required and must be a non-empty string");
+    // Normalise: all downstream code assumes options.input is defined.
+    // Media-only callers may omit `input` entirely (or pass `input: {}`);
+    // synthesise an empty shell so the rest of the pipeline can rely on it.
+    if (!options.input) {
+      options.input = {};
     }
 
-    // Check if workflow is requested
+    // Dynamic argument resolution — resolve any function-valued options before downstream use
+    await this.resolveDynamicOptions(options as Record<string, unknown>);
+
+    options.model = resolveModel(options.model, this.modelAliasConfig);
+    this._disableToolCacheForCurrentRequest = !!options.disableToolCache;
+    this._toolCacheKeysServedThisRequest = new Set();
+    this._generationTurnActive = true;
+
+    generateSpan.setAttribute(
+      "sdk.provider",
+      (options.provider as string) || "default",
+    );
+    generateSpan.setAttribute("sdk.model", options.model || "default");
+    generateSpan.setAttribute(
+      "input_length",
+      typeof optionsOrPrompt === "string"
+        ? optionsOrPrompt.length
+        : options.input?.text?.length || 0,
+    );
+    generateSpan.setAttribute(
+      "has_tools",
+      !!(options.tools && Object.keys(options.tools).length > 0),
+    );
+
+    // Ensure options.input is always an object — callers may omit it for
+    // media-only modes (avatar / music / video) or STT flows. Downstream code
+    // accesses it unconditionally, so we guarantee a non-null object here and
+    // rely on the per-mode checks below to populate / validate the text field.
+    options.input ??= {};
+
+    // When STT audio is provided, ensure options.input.text is initialised
+    // (the transcription will supply the text inside runStandardGenerateRequest).
+    const hasSttAudio = !!(options.stt?.enabled && options.stt?.audio);
+    if (hasSttAudio && !options.input.text) {
+      options.input.text = "";
+    }
+    // Modality dispatch (video / avatar / music) carries the prompt inside
+    // `output.{video|avatar|music}` — input.text is not meaningful for these
+    // modes. Synthesize an empty input.text and skip validation, mirroring
+    // the STT-audio exception above.
+    const isMediaModalityMode =
+      options.output?.mode === "video" ||
+      options.output?.mode === "avatar" ||
+      options.output?.mode === "music";
+    if (isMediaModalityMode && !options.input.text) {
+      options.input.text = "";
+    }
+    if (!hasSttAudio && !isMediaModalityMode) {
+      this.assertInputText(
+        options.input?.text,
+        "Input text is required and must be a non-empty string",
+      );
+    }
+
+    // Input validation (trimWhitespace, minLength, maxLength, requireContent).
+    // Guard on a string input.text — release's media-only / STT flows may leave
+    // it empty/undefined, and those never carry inputValidation anyway.
+    if (options.inputValidation && typeof options.input.text === "string") {
+      const iv = options.inputValidation;
+      if (iv.trimWhitespace) {
+        options.input.text = options.input.text.trim();
+      }
+      if (iv.requireContent && !options.input.text.trim()) {
+        throw new Error(
+          "Input content is required but was empty or whitespace",
+        );
+      }
+      if (iv.minLength && options.input.text.length < iv.minLength) {
+        throw new Error(
+          `Input text is too short (${options.input.text.length} < ${iv.minLength})`,
+        );
+      }
+      if (iv.maxLength && options.input.text.length > iv.maxLength) {
+        throw new Error(
+          `Input text is too long (${options.input.text.length} > ${iv.maxLength})`,
+        );
+      }
+    }
+
+    // PII detection and redaction
+    if (
+      options.piiDetection?.enabled &&
+      typeof options.input.text === "string"
+    ) {
+      const piiResult = await detectAndRedactPII(options.input.text, {
+        enabled: true,
+        action: options.piiDetection.action ?? "warn",
+        detectTypes: options.piiDetection.detectTypes,
+        customPatterns: options.piiDetection.customPatterns,
+        allowList: options.piiDetection.allowList,
+        redactionText: options.piiDetection.redactionText,
+      });
+      if (piiResult.action === "abort") {
+        throw new Error(
+          piiResult.feedback ?? "Request blocked: PII detected in input",
+        );
+      }
+      // Replace input text with redacted version
+      options.input.text = piiResult.text;
+    }
+
+    this.enforceSessionBudget(options.maxBudgetUsd);
+    this.applyMiddlewareDefaults(options);
+    this.applyGenerateLifecycleMiddleware(options);
+    await this.applyAuthenticatedRequestContext(options);
+
+    return { options, originalPrompt };
+  }
+
+  private async maybeHandleEarlyGenerateResult(
+    options: GenerateOptions,
+    generateSpan: ReturnType<typeof tracers.sdk.startSpan>,
+  ): Promise<GenerateResult | null> {
     if (options.workflow || options.workflowConfig) {
-      return await this.generateWithWorkflow(options);
+      // Workflow engine operates on text; media generation modes (avatar, music,
+      // video, ppt) use dedicated code paths and are incompatible with workflows.
+      const workflowMediaMode = options.output?.mode;
+      if (
+        workflowMediaMode === "avatar" ||
+        workflowMediaMode === "music" ||
+        workflowMediaMode === "video" ||
+        workflowMediaMode === "ppt"
+      ) {
+        throw new Error(
+          `Workflow mode is not compatible with output.mode="${workflowMediaMode}". ` +
+            'Remove the workflow config or use output.mode="text".',
+        );
+      }
+      if (options.stt?.enabled && options.stt?.audio) {
+        // prepareGenerateRequest synthesizes input.text = "" for audio-only
+        // calls, so without this guard generateWithWorkflow runs with an
+        // empty prompt. Fail fast when there's no text fallback.
+        if (!options.input?.text?.trim()) {
+          throw new Error(
+            "STT audio is not supported with workflow mode without input.text",
+          );
+        }
+        logger.warn(
+          "[NeuroLink] STT audio preprocessing is not supported with workflow mode; audio will be ignored",
+        );
+      }
+      return this.generateWithWorkflow(options);
     }
 
-    // Set session and user IDs from context for Langfuse spans and execute with proper async scoping
-    return await this.setLangfuseContextFromOptions(options, async () => {
-      if (
-        this.conversationMemoryConfig?.conversationMemory?.mem0Enabled &&
-        options.context?.userId
-      ) {
-        try {
-          const mem0 = await this.ensureMem0Ready();
-          if (!mem0) {
-            logger.debug(
-              "Mem0 not available, continuing without memory retrieval",
-            );
+    // Single source of truth for "what kind of request is this" — see
+    // resolveRequestKind's doc comment for the full precedence table.
+    const requestKind = resolveRequestKind(options, options.model);
+    if (requestKind === "music") {
+      return this.generateWithMusic(options, generateSpan);
+    }
+
+    if (requestKind === "avatar") {
+      return this.generateWithAvatar(options, generateSpan);
+    }
+
+    if (requestKind !== "ppt") {
+      return null;
+    }
+
+    if (options.stt?.enabled && options.stt?.audio) {
+      // Same fail-fast as the workflow branch — see comment above.
+      if (!options.input?.text?.trim()) {
+        throw new Error(
+          "STT audio is not supported with PPT mode without input.text",
+        );
+      }
+      logger.warn(
+        "[NeuroLink] STT audio preprocessing is not supported with PPT mode; audio will be ignored",
+      );
+    }
+    const pptResult = await this.generateWithPPT(options);
+    generateSpan.setAttribute("output_length", pptResult.content?.length ?? 0);
+    if (pptResult.analytics) {
+      generateSpan.setAttribute(
+        "tokens.input",
+        pptResult.analytics.tokenUsage?.input ?? 0,
+      );
+      generateSpan.setAttribute(
+        "tokens.output",
+        pptResult.analytics.tokenUsage?.output ?? 0,
+      );
+      generateSpan.setAttribute("cost", pptResult.analytics.cost ?? 0);
+    }
+    generateSpan.setStatus({ code: SpanStatusCode.OK });
+    return pptResult;
+  }
+
+  private async runStandardGenerateRequest(
+    options: GenerateOptions,
+    originalPrompt: string | undefined,
+    generateSpan: ReturnType<typeof tracers.sdk.startSpan>,
+  ): Promise<GenerateResult> {
+    const startTime = Date.now();
+
+    // Pre-call classifier router: opt-in. Classifies the request and selects a
+    // provider/model from the configured base pool (and optionally narrows the
+    // tool set) BEFORE orchestration/requestRouter, so it takes precedence.
+    // Fails open.
+    await this.applyClassifierRouting(
+      options,
+      options.input?.text ?? originalPrompt ?? "",
+      !options.disableTools &&
+        (!!(options.tools && Object.keys(options.tools).length > 0) ||
+          this.getCustomTools().size > 0),
+      !!(options.input?.images && options.input.images.length > 0),
+      options.thinkingConfig?.thinkingLevel,
+    );
+
+    await this.maybeApplyGenerateOrchestration(options);
+
+    // Pre-call request router: opt-in, only when the caller did not set both
+    // provider+model. Fails open (any router error leaves options unchanged).
+    await this.applyRequestRouter(
+      options,
+      options.input?.text ?? originalPrompt ?? "",
+      !options.disableTools &&
+        (!!(options.tools && Object.keys(options.tools).length > 0) ||
+          this.getCustomTools().size > 0),
+      !!(options.input?.images && options.input.images.length > 0),
+      options.thinkingConfig?.thinkingLevel,
+    );
+
+    this.emitter.emit("generation:start", {
+      provider: options.provider || "auto",
+      timestamp: startTime,
+    });
+    this.emitter.emit("response:start");
+    this.emitter.emit(
+      "message",
+      `Starting ${options.provider || "auto"} text generation...`,
+    );
+
+    const factoryResult = processFactoryOptions(options);
+    if (factoryResult.hasFactoryConfig && options.factoryConfig) {
+      const validation = validateFactoryConfig(options.factoryConfig);
+      if (!validation.isValid) {
+        logger.warn("Invalid factory configuration detected", {
+          errors: validation.errors,
+        });
+      }
+    }
+
+    await this.prepareGenerateAugmentations(options);
+    const textOptions = await this.buildGenerateTextOptions(
+      options,
+      originalPrompt,
+      factoryResult,
+    );
+    // STT preprocessing: transcribe audio input before LLM generation
+    let sttTranscription: STTResult | undefined;
+    if (options.stt?.enabled && options.stt.audio) {
+      try {
+        // Always call — registerAllProviders() is idempotent via internal
+        // `registered` + `registrationPromise` deduplication. The previous
+        // isRegistered() guard short-circuited even when STT handler
+        // registration failed silently after AI providers were registered.
+        await ProviderRegistry.registerAllProviders();
+        const { STTProcessor } = await import("./utils/sttProcessor.js");
+        const sttCredentials = this.resolveSTTCredentials(
+          options.credentials?.stt,
+        );
+        const sttProvider = this.resolveSTTProvider(
+          options.stt.provider,
+          sttCredentials,
+        );
+        sttTranscription = await STTProcessor.transcribe(
+          options.stt.audio,
+          sttProvider,
+          options.stt,
+          sttCredentials,
+        );
+        // Inject transcription into the LLM prompt
+        if (sttTranscription.text) {
+          const existingText =
+            textOptions.prompt || textOptions.input?.text || "";
+          if (!existingText) {
+            // No user text — use transcription directly as the prompt
+            textOptions.prompt = sttTranscription.text;
+            if (textOptions.input) {
+              textOptions.input.text = sttTranscription.text;
+            }
           } else {
-            const memories = await mem0.search(options.input.text, {
-              user_id: options.context.userId as string,
-              limit: 5,
-            });
-
-            if (memories && memories.length > 0) {
-              // Enhance the input with memory context
-              const memoryContext = this.extractMemoryContext(memories);
-
-              options.input.text = this.formatMemoryContext(
-                memoryContext,
-                options.input.text,
-              );
+            // User provided text — prepend transcription as context
+            const combined = `[Transcribed audio]: ${sttTranscription.text}\n\n${existingText}`;
+            if (textOptions.prompt) {
+              textOptions.prompt = combined;
+            }
+            if (textOptions.input?.text) {
+              textOptions.input.text = combined;
             }
           }
-        } catch (error) {
-          logger.warn("Mem0 memory retrieval failed:", error);
         }
-      }
-
-      const startTime = Date.now();
-
-      // Apply orchestration if enabled and no specific provider/model requested
-      if (this.enableOrchestration && !options.provider && !options.model) {
-        try {
-          const orchestratedOptions = await this.applyOrchestration(options);
-          logger.debug("Orchestration applied", {
-            originalProvider: options.provider || "auto",
-            orchestratedProvider: orchestratedOptions.provider,
-            orchestratedModel: orchestratedOptions.model,
-            prompt: options.input.text.substring(0, 100),
-          });
-
-          // Use orchestrated options
-          Object.assign(options, orchestratedOptions);
-        } catch (error) {
-          logger.warn(
-            "Orchestration failed, continuing with original options",
-            {
-              error: error instanceof Error ? error.message : String(error),
-              originalProvider: options.provider || "auto",
-            },
-          );
-          // Continue with original options if orchestration fails
+      } catch (sttError) {
+        const existingText =
+          textOptions.prompt || textOptions.input?.text || "";
+        if (!existingText) {
+          // Audio-only request — no text to fall back to, fail fast
+          throw sttError;
         }
+        logger.warn(
+          `[NeuroLink] STT transcription failed, falling back to text: ${sttError instanceof Error ? sttError.message : String(sttError)}`,
+        );
       }
+    }
 
-      // Emit generation start event (NeuroLink format - keep existing)
-      this.emitter.emit("generation:start", {
-        provider: options.provider || "auto",
-        timestamp: startTime,
+    const textResult = await this.generateTextInternal(textOptions);
+
+    // For STT-only calls, originalPrompt was captured before transcription.
+    // Use the transcribed text as the effective prompt for telemetry, memory,
+    // and trace attribution so traces don't show empty prompts.
+    const effectiveOriginalPrompt = sttTranscription?.text
+      ? originalPrompt
+        ? `[Transcribed audio]: ${sttTranscription.text}\n\n${originalPrompt}`
+        : sttTranscription.text
+      : originalPrompt;
+
+    // Attach STT transcription to result
+    const generateResult = this.finalizeGenerateRequestResult({
+      generateSpan,
+      options,
+      textOptions,
+      textResult,
+      factoryResult,
+      originalPrompt: effectiveOriginalPrompt,
+      startTime,
+    });
+    if (sttTranscription) {
+      generateResult.transcription = sttTranscription;
+    }
+    return generateResult;
+  }
+
+  private async maybeApplyGenerateOrchestration(
+    options: GenerateOptions,
+  ): Promise<void> {
+    if (!this.enableOrchestration || options.provider || options.model) {
+      return;
+    }
+
+    try {
+      const orchestratedOptions = await this.applyOrchestration(options);
+      logger.debug("Orchestration applied", {
+        originalProvider: options.provider || "auto",
+        orchestratedProvider: orchestratedOptions.provider,
+        orchestratedModel: orchestratedOptions.model,
+        prompt: (options.input?.text ?? "").substring(0, 100),
       });
+      Object.assign(options, orchestratedOptions);
+      if (orchestratedOptions.model) {
+        options.model = resolveModel(options.model, this.modelAliasConfig);
+      }
+    } catch (error) {
+      logger.warn("Orchestration failed, continuing with original options", {
+        error: error instanceof Error ? error.message : String(error),
+        originalProvider: options.provider || "auto",
+      });
+    }
+  }
 
-      // ADD: Bedrock-compatible response:start event
-      this.emitter.emit("response:start");
-
-      // ADD: Bedrock-compatible message event
-      this.emitter.emit(
-        "message",
-        `Starting ${options.provider || "auto"} text generation...`,
+  /**
+   * Applies the host-configured `requestRouter` to `options` in place.
+   *
+   * The router is skipped when:
+   *   - no `requestRouter` is configured on this instance, or
+   *   - a valid orchestration preference already owns the provider/model pair, or
+   *   - the caller explicitly set both `options.provider` AND `options.model`
+   *     (we only skip the router if BOTH are set; a caller setting only one
+   *     still lets the router fill in the other field).
+   *
+   * Fails open: any router error is logged at WARN level and the call
+   * continues with the original options unmodified.
+   *
+   * @param options — the mutable options object (generate or stream).
+   * @param promptText — the text prompt used to build the RouterInputContext.
+   * @param hasTools — true when at least one tool is available for this call.
+   * @param requiresVision — true when the call includes image attachments.
+   * @param thinkingLevel — optional thinking level string from the call options.
+   */
+  private async applyRequestRouter(
+    options: {
+      provider?: string;
+      model?: string;
+      region?: string;
+      context?: Record<string, unknown>;
+    },
+    promptText: string,
+    hasTools: boolean,
+    requiresVision: boolean,
+    thinkingLevel?: string,
+  ): Promise<void> {
+    if (!this.requestRouter) {
+      return;
+    }
+    // Stand down if the classifier router already selected a provider/model on
+    // this turn — one explicit precedence order: classifierRouter wins.
+    if (options.context?.__classifierRouted) {
+      return;
+    }
+    // Keep an orchestration-selected model with the provider that owns it.
+    if (this.getOrchestratedPreferredProvider(options)) {
+      return;
+    }
+    // Skip if the caller explicitly set both provider AND model — they know
+    // what they want; the router should not override an intentional choice.
+    if (options.provider && options.model) {
+      return;
+    }
+    // Skip when a ModelPool is also configured: the pool unconditionally
+    // overrides provider+model for each member it selects.  Allowing the
+    // router to run first would set options.provider/model to a value the
+    // pool immediately clobbers, creating silent ownership confusion and
+    // making the pool bypass the "user didn't set provider+model" guard above
+    // on subsequent attempts.
+    if (this.modelPool) {
+      logger.debug(
+        "[NeuroLink] applyRequestRouter: skipped — modelPool takes precedence",
       );
+      return;
+    }
 
-      // Process factory configuration
-      const factoryResult = processFactoryOptions(options);
+    const ctx: RouterInputContext = {
+      prompt: promptText,
+      // Cheap token estimate: ~4 chars/token.
+      estimatedInputTokens: Math.ceil(promptText.length / 4),
+      hasTools,
+      requiresVision,
+      thinkingLevel,
+    };
 
-      // Validate factory configuration if present
-      if (factoryResult.hasFactoryConfig && options.factoryConfig) {
-        const validation = validateFactoryConfig(options.factoryConfig);
-        if (!validation.isValid) {
-          logger.warn("Invalid factory configuration detected", {
-            errors: validation.errors,
-          });
-          // Continue with warning rather than throwing - graceful degradation
+    try {
+      const decision = await this.requestRouter(ctx);
+      // Apply provider/model/region as a coherent set: when the router supplies
+      // a provider (the caller didn't pin one), take its model and region too.
+      // If the caller pinned the provider but not the model, only apply the
+      // router's model when it targets the same provider.
+      if (decision.provider && !options.provider) {
+        options.provider = decision.provider;
+        // Adopt the router's model and region only when they belong to the
+        // provider the router just selected — never mix a router model onto a
+        // caller-pinned different provider.
+        if (decision.model && !options.model) {
+          options.model = decision.model;
+        }
+        if (decision.region && !options.region) {
+          options.region = decision.region;
+        }
+      } else if (!decision.provider) {
+        // Router returned a no-op or model-only decision.
+        if (decision.model && !options.model) {
+          options.model = decision.model;
+        }
+        if (decision.region && !options.region) {
+          options.region = decision.region;
+        }
+      }
+      // If decision.provider differs from the caller-pinned options.provider,
+      // we skip the router result entirely to avoid an incoherent pairing.
+      if (decision.reason) {
+        logger.debug("[NeuroLink] requestRouter decision", {
+          reason: decision.reason,
+          provider: options.provider,
+          model: options.model,
+        });
+      }
+    } catch (routerErr) {
+      logger.warn("[NeuroLink] requestRouter threw — proceeding unrouted", {
+        error:
+          routerErr instanceof Error ? routerErr.message : String(routerErr),
+      });
+    }
+  }
+
+  /**
+   * Dependencies handed to every `ContextCompactor`.
+   *
+   * `siteDecide` returns null whenever no decision provider is configured or
+   * the call fails, so passing this unconditionally is safe: the compactor
+   * runs its previous pipeline unchanged and pays nothing for the option.
+   * `outer` is the request the compaction runs for — its credentials, abort
+   * signal and ids — so both decision stages go to the caller's account.
+   */
+  private contextCompactorDeps(
+    outer?: DecisionSiteContext,
+  ): ContextCompactorDeps {
+    return {
+      decide: (decisionOptions: DecisionCallerOptions) =>
+        this.siteDecide(decisionOptions, outer),
+      relevance: this.contextRelevanceOptions,
+    };
+  }
+
+  /**
+   * What a decide site inherits from the request it runs inside. Read off the
+   * request options so every site — routing, tool routing, both compaction
+   * stages — forwards the same fields the same way. The request id is the
+   * documented top-level `requestId` first, then `context.requestId`.
+   */
+  private decisionSiteContext(
+    options: {
+      credentials?: NeurolinkCredentials;
+      abortSignal?: AbortSignal;
+      context?: unknown;
+      requestId?: string;
+    },
+    sessionId?: string,
+  ): DecisionSiteContext {
+    const requestContext = options.context as
+      | Record<string, unknown>
+      | undefined;
+    const requestId =
+      options.requestId ??
+      (typeof requestContext?.requestId === "string"
+        ? requestContext.requestId
+        : undefined);
+    const contextSessionId =
+      typeof requestContext?.sessionId === "string"
+        ? requestContext.sessionId
+        : undefined;
+    return {
+      credentials: options.credentials,
+      signal: options.abortSignal,
+      sessionId: sessionId ?? contextSessionId,
+      requestId,
+    };
+  }
+
+  /**
+   * Applies the host-configured `classifierRouter` to `options` in place.
+   *
+   * Classifies the request by difficulty and selects a provider/model from the
+   * configured base pool (cheaper/faster for easy tasks, more capable for hard
+   * ones), and optionally narrows the tool set via `toolFilter`/`excludeTools`.
+   *
+   * Skipped when: no router is configured; the inbound call is the classifier's
+   * own generate() (marked `__classifierRouted`); the caller pinned BOTH
+   * provider and model; or a ModelPool is configured (the pool owns selection).
+   * Fails open — any error leaves options unchanged.
+   */
+  private async applyClassifierRouting(
+    options: {
+      provider?: string;
+      model?: string;
+      region?: string;
+      compactionThreshold?: number;
+    },
+    promptText: string,
+    hasTools: boolean,
+    requiresVision: boolean,
+    thinkingLevel?: string,
+  ): Promise<void> {
+    if (!this.classifierRouter) {
+      return;
+    }
+    const opt = options as {
+      provider?: string;
+      model?: string;
+      region?: string;
+      context?: Record<string, unknown>;
+      disableTools?: boolean;
+      excludeTools?: string[];
+      toolFilter?: string[];
+      conversationMessages?: unknown[];
+      credentials?: NeurolinkCredentials;
+      abortSignal?: AbortSignal;
+      requestId?: string;
+    };
+    // Prevent recursion: the LLM classifier itself calls generate() with this
+    // marker set. Also respect any explicit prior routing decision.
+    if (opt.context?.__classifierRouted) {
+      return;
+    }
+    // Honor an intentional caller choice of BOTH provider and model.
+    if (options.provider && options.model) {
+      return;
+    }
+    // A ModelPool overrides provider/model per member unconditionally; let it
+    // own selection (mirrors applyRequestRouter precedence).
+    if (this.modelPool) {
+      logger.debug(
+        "[NeuroLink] applyClassifierRouting: skipped — modelPool takes precedence",
+      );
+      return;
+    }
+
+    const sessionId =
+      typeof opt.context?.sessionId === "string"
+        ? opt.context.sessionId
+        : undefined;
+    // Routing runs before conversation memory is loaded, so only the history
+    // the caller passed in is countable here.
+    const sessionBound = sessionId !== undefined;
+    const priorMessageCount = Array.isArray(opt.conversationMessages)
+      ? opt.conversationMessages.length
+      : undefined;
+    // The decision call inherits this request's credentials, abort signal
+    // and ids exactly as the other sites do, so it reaches the caller's
+    // account, dies with the turn, and correlates on the same requestId.
+    const siteContext = this.decisionSiteContext(opt, sessionId);
+
+    try {
+      const decision = await this.classifierRouter.route({
+        prompt: promptText,
+        estimatedInputTokens: Math.ceil((promptText?.length ?? 0) / 4),
+        hasTools,
+        requiresVision,
+        thinkingLevel,
+        sessionId,
+        sessionBound,
+        priorMessageCount,
+        credentials: siteContext.credentials,
+        signal: siteContext.signal,
+        requestId: siteContext.requestId,
+      });
+      if (!decision) {
+        return;
+      }
+
+      // Apply provider/model/region as a coherent set (same discipline as
+      // applyRequestRouter): only fill fields the caller did not pin.
+      if (decision.provider && !options.provider) {
+        options.provider = decision.provider;
+        if (decision.model && !options.model) {
+          options.model = decision.model;
+        }
+        if (decision.region && !options.region) {
+          options.region = decision.region;
+        }
+      } else if (!decision.provider && decision.model && !options.model) {
+        options.model = decision.model;
+      }
+
+      // Narrow tools unless the caller disabled tools entirely.
+      if (!opt.disableTools) {
+        if (decision.excludeTools && decision.excludeTools.length > 0) {
+          opt.excludeTools = Array.from(
+            new Set([...(opt.excludeTools ?? []), ...decision.excludeTools]),
+          );
+        }
+        if (decision.toolFilter && decision.toolFilter.length > 0) {
+          const allow = decision.toolFilter;
+          opt.toolFilter =
+            opt.toolFilter && opt.toolFilter.length > 0
+              ? opt.toolFilter.filter((t) => allow.includes(t))
+              : [...allow];
         }
       }
 
-      // RAG Integration: If rag config is provided, prepare the RAG search tool
-      if (options.rag?.files?.length) {
-        try {
-          const { prepareRAGTool } = await import("./rag/ragIntegration.js");
-          const ragResult = await prepareRAGTool(
-            options.rag,
-            options.provider as string | undefined,
+      // Context budget: only ever narrowed, and only when the caller left it
+      // unset. A caller that pinned a threshold has made a statement about
+      // their own traffic that a per-request guess should not overrule.
+      if (
+        decision.compactionThreshold !== undefined &&
+        options.compactionThreshold === undefined
+      ) {
+        options.compactionThreshold = decision.compactionThreshold;
+        logger.debug("[NeuroLink] classifierRouter context budget", {
+          compactionThreshold: decision.compactionThreshold,
+          contextScope: decision.contextScope,
+        });
+      }
+
+      // Mark routed so orchestration/requestRouter stand down this turn.
+      if (decision.provider || decision.model) {
+        const ctx = opt.context ?? {};
+        ctx.__classifierRouted = true;
+        opt.context = ctx;
+      }
+
+      // Telemetry: a debug log is not an observability surface. Routing
+      // silently changes which model — and therefore which bill — serves a
+      // request, so the decision has to be visible on the trace next to the
+      // generation it produced.
+      try {
+        const activeSpan = trace.getActiveSpan();
+        if (activeSpan) {
+          activeSpan.setAttribute(
+            "classifier_routing.difficulty",
+            decision.difficulty ?? "unknown",
           );
-
-          // Inject the RAG tool into the tools record
-          if (!options.tools) {
-            options.tools = {};
+          activeSpan.setAttribute(
+            "classifier_routing.provider",
+            options.provider ?? "",
+          );
+          activeSpan.setAttribute(
+            "classifier_routing.model",
+            options.model ?? "",
+          );
+          if (decision.contextScope) {
+            activeSpan.setAttribute(
+              "classifier_routing.context_scope",
+              decision.contextScope,
+            );
           }
-          (options.tools as Record<string, unknown>)[ragResult.toolName] =
-            ragResult.tool;
+          if (decision.compactionThreshold !== undefined) {
+            activeSpan.setAttribute(
+              "classifier_routing.compaction_threshold",
+              decision.compactionThreshold,
+            );
+          }
+          if (decision.reason) {
+            activeSpan.setAttribute(
+              "classifier_routing.reason",
+              decision.reason,
+            );
+          }
+        }
+      } catch {
+        // Telemetry must never affect routing behaviour.
+      }
 
-          // Inject RAG-aware system prompt so the AI uses the RAG tool first
-          const ragSystemInstruction = [
+      if (decision.reason) {
+        logger.debug("[NeuroLink] classifierRouter decision", {
+          reason: decision.reason,
+          difficulty: decision.difficulty,
+          provider: options.provider,
+          model: options.model,
+        });
+      }
+    } catch (classifierErr) {
+      logger.warn("[NeuroLink] classifierRouter threw — proceeding unrouted", {
+        error:
+          classifierErr instanceof Error
+            ? classifierErr.message
+            : String(classifierErr),
+      });
+    }
+  }
+
+  private async prepareGenerateAugmentations(
+    options: GenerateOptions,
+  ): Promise<void> {
+    if (options.rag?.files?.length) {
+      try {
+        const { prepareRAGTool } = await import("./rag/ragIntegration.js");
+        const ragResult = await prepareRAGTool(
+          options.rag,
+          options.provider as string | undefined,
+          this.attachmentPolicy,
+        );
+
+        if (!options.tools) {
+          options.tools = {};
+        }
+        (options.tools as Record<string, unknown>)[ragResult.toolName] =
+          ragResult.tool;
+        options.systemPrompt =
+          (options.systemPrompt || "") +
+          [
             `\n\nIMPORTANT: You have a tool called "${ragResult.toolName}" that searches through`,
             `${ragResult.filesLoaded} loaded document(s) containing ${ragResult.chunksIndexed} indexed chunks.`,
             `ALWAYS use the "${ragResult.toolName}" tool FIRST to answer the user's question before using any other tools.`,
             `This tool searches your local knowledge base of pre-loaded documents and is the primary source of truth.`,
             `Do NOT use websearchGrounding or any web search tools when the answer can be found in the loaded documents.`,
           ].join(" ");
-          options.systemPrompt =
-            (options.systemPrompt || "") + ragSystemInstruction;
 
-          logger.info("[RAG] Tool injected into generate()", {
-            toolName: ragResult.toolName,
-            filesLoaded: ragResult.filesLoaded,
-            chunksIndexed: ragResult.chunksIndexed,
-          });
-        } catch (error) {
-          logger.warn(
-            "[RAG] Failed to prepare RAG tool, continuing without RAG",
-            {
-              error: error instanceof Error ? error.message : String(error),
-            },
-          );
-        }
-      }
-
-      // 🔧 CRITICAL FIX: Convert to TextGenerationOptions while preserving the input object for multimodal support
-      const baseOptions: TextGenerationOptions = {
-        prompt: options.input.text,
-        provider: options.provider as AIProviderName,
-        model: options.model,
-        temperature: options.temperature,
-        maxTokens: options.maxTokens,
-        systemPrompt: options.systemPrompt,
-        schema: options.schema,
-        output: options.output,
-        tools: options.tools, // Includes RAG tools if rag config was provided
-        disableTools: options.disableTools,
-        enableAnalytics: options.enableAnalytics,
-        enableEvaluation: options.enableEvaluation,
-        context: options.context as Record<string, JsonValue> | undefined,
-        evaluationDomain: options.evaluationDomain,
-        toolUsageContext: options.toolUsageContext,
-        input: options.input, // This includes text, images, and content arrays
-        region: options.region,
-        tts: options.tts,
-      };
-
-      // Apply factory enhancement using centralized utilities
-      const textOptions = enhanceTextGenerationOptions(
-        baseOptions,
-        factoryResult,
-      );
-
-      // Pass conversation memory config if available
-      if (this.conversationMemory) {
-        textOptions.conversationMemoryConfig = this.conversationMemory.config;
-        // Include original prompt for context summarization
-        textOptions.originalPrompt = originalPrompt;
-      }
-
-      // Detect and execute domain-specific tools
-      const { toolResults, enhancedPrompt } = await this.detectAndExecuteTools(
-        textOptions.prompt || options.input.text,
-        factoryResult.domainType,
-      );
-
-      // Update prompt with tool results if available
-      if (enhancedPrompt !== textOptions.prompt) {
-        textOptions.prompt = enhancedPrompt;
-        logger.debug("Enhanced prompt with tool results", {
-          originalLength: options.input.text.length,
-          enhancedLength: enhancedPrompt.length,
-          toolResults: toolResults.length,
+        logger.info("[RAG] Tool injected into generate()", {
+          toolName: ragResult.toolName,
+          filesLoaded: ragResult.filesLoaded,
+          chunksIndexed: ragResult.chunksIndexed,
         });
+      } catch (error) {
+        logger.warn(
+          "[RAG] Failed to prepare RAG tool, continuing without RAG",
+          {
+            error: error instanceof Error ? error.message : String(error),
+          },
+        );
       }
+    }
 
-      // Use redesigned generation logic
-      const textResult = await this.generateTextInternal(textOptions);
+    // Skills: surface the discovery listing and inject the per-call
+    // use_skill / read_skill_resource tools (bodies load on activation).
+    await this.applySkillsAugmentation(options);
 
-      // Emit generation completion event (NeuroLink format - enhanced with content)
+    // Media-only modes (avatar, music, video, ppt) do not have a meaningful
+    // text prompt to augment with memory — skip injection to avoid corrupting
+    // the empty/synthesized input.text that was set for these modes.
+    const mediaOnlyMode =
+      options.output?.mode === "avatar" ||
+      options.output?.mode === "music" ||
+      options.output?.mode === "video" ||
+      options.output?.mode === "ppt";
+    if (
+      mediaOnlyMode ||
+      !this.shouldReadMemory(options.memory, options.context?.userId) ||
+      !options.context?.userId
+    ) {
+      return;
+    }
+
+    try {
+      if (options.input) {
+        options.input.text = await this.retrieveMemory(
+          options.input.text ?? "",
+          options.context.userId as string,
+          options.memory?.additionalUsers,
+        );
+      }
+      logger.debug("Memory retrieval successful (generate)");
+    } catch (error) {
+      logger.warn("Memory retrieval failed (generate):", error);
+    }
+  }
+
+  private async buildGenerateTextOptions(
+    options: GenerateOptions,
+    originalPrompt: string | undefined,
+    factoryResult: ReturnType<typeof processFactoryOptions>,
+  ): Promise<TextGenerationOptions> {
+    const baseOptions: TextGenerationOptions = {
+      prompt: options.input?.text,
+      provider: options.provider as AIProviderName,
+      model: options.model,
+      temperature: options.temperature,
+      // Listed explicitly because this literal is the only road into the
+      // provider: `topP` is declared on both `GenerateOptions` and
+      // `TextGenerationOptions`, but it was missing here and so was silently
+      // dropped on every generate() call regardless of provider, while
+      // stream() (which spreads its options) already forwarded it.
+      topP: options.topP,
+      maxTokens: options.maxTokens,
+      systemPrompt: options.systemPrompt,
+      schema: options.schema,
+      output: options.output,
+      tools: options.tools,
+      disableTools: options.disableTools,
+      toolFilter: options.toolFilter,
+      excludeTools: options.excludeTools,
+      // This explicit field list is the only road into the provider, so a
+      // flag left out here never reaches BaseProvider — which is exactly how
+      // disableInternalFallback was dropped on generate() while stream()
+      // (which spreads its options) honoured it.
+      disableInternalFallback: options.disableInternalFallback,
+      maxSteps: options.maxSteps,
+      toolRoots: options.toolRoots,
+      toolChoice: options.toolChoice,
+      toolChoiceSteps: options.toolChoiceSteps,
+      prepareStep: options.prepareStep,
+      replayToolSteps: options.replayToolSteps,
+      enabledToolNames: options.enabledToolNames,
+      enableAnalytics: options.enableAnalytics,
+      enableEvaluation: options.enableEvaluation,
+      context: options.context as Record<string, JsonValue> | undefined,
+      evaluationDomain: options.evaluationDomain,
+      toolUsageContext: options.toolUsageContext,
+      input: options.input,
+      // Multimodal file-processing options must survive the reconstruction
+      // into TextGenerationOptions — the message builder reads them downstream
+      // (csv encoding/formatting/sanitization/parse timeout, PDF
+      // password/decryption #258). Omitting them here silently dropped e.g.
+      // every csvOptions field (incl. the CLI --csv-* flags) or
+      // pdfOptions.password so the CLI --pdf-password / SDK pdfOptions never
+      // reached convertToImages.
+      csvOptions: options.csvOptions,
+      pdfOptions: options.pdfOptions,
+      imageOptions: options.imageOptions,
+      // #413/#440: the audio option bag belongs in the same list. Left out
+      // here it was accepted by the public type and then silently discarded
+      // before the message builder, like every field above.
+      audioOptions: options.audioOptions,
+      // videoOptions belongs in that same list and was never in it, so no SDK
+      // caller's video settings have ever reached a provider -- frames and
+      // quality included, not just the native-video flags added alongside.
+      videoOptions: options.videoOptions,
+      officeOptions: options.officeOptions,
+      region: options.region,
+      tts: options.tts,
+      stt: options.stt,
+      fileRegistry: this.fileRegistry,
+      attachmentPolicy: this.attachmentPolicy,
+      timeout: options.timeout,
+      turnTimeoutMs: options.turnTimeoutMs,
+      stallTimeoutMs: options.stallTimeoutMs,
+      wrapupTimeLeadMs: options.wrapupTimeLeadMs,
+      toolTimeoutMs: options.toolTimeoutMs,
+      toolExecutionCapture: options.toolExecutionCapture,
+      abortSignal: options.abortSignal,
+      skipToolPromptInjection: options.skipToolPromptInjection,
+      middleware: options.middleware,
+      conversationMessages: options.conversationMessages,
+      credentials: options.credentials,
+      // Extended thinking. Every provider gates it on `thinkingConfig`, so
+      // omitting the field here meant it never reached one: the request went
+      // out with no thinking block and the result carried no reasoning, with
+      // nothing raised to say the option had been discarded. This is the same
+      // failure the note above records for `disableInternalFallback` — an
+      // allowlist that silently swallows a documented option.
+      //
+      // `thinkingConfig` is the only one of the documented thinking options
+      // that `GenerateOptions` actually declares. `thinking`, `thinkingBudget`
+      // and `thinkingLevel` are folded into a `thinkingConfig` only by the CLI,
+      // in `src/lib/utils/thinkingConfig.ts`; nothing on the SDK path does that
+      // merge. They exist solely on the internal `TextGenerationOptions`, so no
+      // caller can pass them through
+      // generate() today. Declaring them is a public-type decision and is
+      // deliberately left out of this fix.
+      thinkingConfig: options.thinkingConfig,
+      onFinish: options.onFinish,
+      onError: options.onError,
+    };
+
+    const extraContext = options as Record<string, unknown>;
+    if (extraContext.sessionId || extraContext.userId) {
+      baseOptions.context = {
+        ...baseOptions.context,
+        ...(extraContext.sessionId && !baseOptions.context?.sessionId
+          ? { sessionId: extraContext.sessionId as JsonValue }
+          : {}),
+        ...(extraContext.userId && !baseOptions.context?.userId
+          ? { userId: extraContext.userId as JsonValue }
+          : {}),
+      };
+    }
+
+    const textOptions = bindFileToolRoots(
+      enhanceTextGenerationOptions(baseOptions, factoryResult),
+      this.fileToolRootsFor(options),
+    );
+    if (this.conversationMemory) {
+      textOptions.conversationMemoryConfig = this.conversationMemory.config;
+      textOptions.originalPrompt = originalPrompt;
+    }
+
+    const { toolResults, enhancedPrompt } = await this.detectAndExecuteTools(
+      textOptions.prompt || options.input?.text || "",
+      factoryResult.domainType,
+    );
+    if (enhancedPrompt !== textOptions.prompt) {
+      textOptions.prompt = enhancedPrompt;
+      logger.debug("Enhanced prompt with tool results", {
+        originalLength: (options.input?.text ?? "").length,
+        enhancedLength: enhancedPrompt.length,
+        toolResults: toolResults.length,
+      });
+    }
+
+    return textOptions;
+  }
+
+  /**
+   * Provider-agnostic JSON recovery for schema requests. Structured-output
+   * enforcement makes valid JSON the overwhelming case; for every other
+   * provider path — including generate() overrides (Vertex, Anthropic,
+   * Bedrock, Google AI Studio) — object/array roots are recovered here via
+   * balanced-scan + jsonrepair and scalar JSON roots via plain JSON.parse,
+   * with the parsed value exposed as `structuredData`. If nothing JSON-shaped
+   * is recoverable (pure prose), the raw text is returned, `structuredData`
+   * stays undefined, and a WARN makes the case observable.
+   *
+   * Mutates `textResult` in place, and must run BEFORE the end-of-generation
+   * emits so event consumers see the same content/structuredData the caller
+   * receives.
+   */
+  private recoverStructuredData(
+    textResult: TextGenerationResult,
+    schema: OptionalValidationSchema,
+  ): void {
+    // A provider path that produced its own `structuredData` normally owns it.
+    // The one exception is a STRING the caller's schema rejects: that is the
+    // raw completion leaking through as structured output (the shape a
+    // truncated response degrades to), so re-run recovery over the text rather
+    // than handing back a value the declared schema forbids.
+    const structuredIsRejectedString =
+      typeof textResult.structuredData === "string" &&
+      !schemaAccepts(schema, textResult.structuredData);
+    if (
+      !schema ||
+      (textResult.structuredData !== undefined &&
+        !structuredIsRejectedString) ||
+      typeof textResult.content !== "string"
+    ) {
+      return;
+    }
+    if (structuredIsRejectedString) {
+      textResult.structuredData = undefined;
+    }
+    const coerced = coerceJsonToSchema(textResult.content, schema);
+    if (coerced) {
+      textResult.content = coerced.content;
+      textResult.structuredData = coerced.structuredData;
+      if (coerced.repaired) {
+        textResult.jsonRepaired = true;
+      }
+      if (coerced.truncated) {
+        textResult.jsonTruncated = true;
+      }
+      return;
+    }
+    const scalar = recoverScalarRoot(textResult.content, schema);
+    switch (scalar.kind) {
+      case "empty":
+        // A JSON-encoded empty string is an EMPTY completion, not a recovered
+        // scalar — normalize to a true empty so callers' empty-response
+        // handling fires instead of a literal '""' reaching the user.
+        // `structuredData` stays undefined.
+        textResult.content = "";
+        logger.warn(
+          "[NeuroLink] schema requested but the model returned an empty JSON string; normalizing to empty content",
+          { provider: textResult.provider, model: textResult.model },
+        );
+        break;
+      case "accepted":
+        // Only publish a scalar root the caller's schema actually accepts.
+        // Under an OBJECT schema a recovered string is the raw completion in
+        // disguise — the shape a truncated response degrades to — and exposing
+        // it hands the caller a `structuredData` that violates the schema they
+        // passed.
+        textResult.structuredData = scalar.value;
+        break;
+      case "rejected":
+        logger.warn(
+          "[NeuroLink] recovered a JSON scalar the requested schema rejects; leaving structuredData unset",
+          {
+            provider: textResult.provider,
+            model: textResult.model,
+            scalarType: typeof scalar.value,
+          },
+        );
+        break;
+      case "nullish":
+        // JSON null/undefined — no structured value to publish.
+        break;
+      case "not-json":
+        logger.warn(
+          "[NeuroLink] schema requested but no JSON could be recovered from model output; returning raw text",
+          { provider: textResult.provider, model: textResult.model },
+        );
+        break;
+    }
+  }
+
+  private finalizeGenerateRequestResult(params: {
+    generateSpan: ReturnType<typeof tracers.sdk.startSpan>;
+    options: GenerateOptions;
+    textOptions: TextGenerationOptions;
+    textResult: TextGenerationResult;
+    factoryResult: ReturnType<typeof processFactoryOptions>;
+    originalPrompt: string | undefined;
+    startTime: number;
+  }): GenerateResult {
+    const {
+      generateSpan,
+      options,
+      textOptions,
+      textResult,
+      factoryResult,
+      originalPrompt,
+      startTime,
+    } = params;
+
+    this.recoverStructuredData(textResult, textOptions.schema);
+
+    // Surface truncation when a schema was requested: either the provider
+    // reported finishReason="length" or the recovered JSON came from an
+    // unclosed span. Either way `structuredData` may be incomplete — warn at
+    // info level so it is observable in production (not just debug logs).
+    if (textOptions.schema) {
+      if (textResult.finishReason === "length") {
+        textResult.jsonTruncated = true;
+      }
+      if (textResult.jsonTruncated) {
+        logger.warn(
+          "[NeuroLink] Structured output may be truncated (finishReason=length or unclosed JSON); " +
+            "increase maxTokens to fit the full response.",
+          {
+            provider: textResult.provider,
+            model: textResult.model,
+            finishReason: textResult.finishReason,
+            outputTokens: textResult.usage?.output,
+          },
+        );
+      }
+    }
+
+    const nativeAlreadyEmitted = !!(
+      textResult as { _generationEndEmitted?: boolean }
+    )._generationEndEmitted;
+    if (!nativeAlreadyEmitted) {
       this.emitter.emit("generation:end", {
         provider: textResult.provider,
         responseTime: Date.now() - startTime,
         toolsUsed: textResult.toolsUsed,
         timestamp: Date.now(),
-        result: textResult, // Enhanced: include full result
+        result: textResult,
+        // Use the effective prompt (which already incorporates STT-transcribed
+        // text for audio-only calls) so observers see the real prompt instead
+        // of an empty string. Falls back through the same chain as before for
+        // text-only calls.
+        prompt:
+          originalPrompt ||
+          options.input?.text ||
+          (options as Record<string, unknown>).prompt,
+        temperature: textOptions.temperature,
+        maxTokens: textOptions.maxTokens,
+      });
+    }
+    this.emitter.emit("response:end", textResult.content || "");
+    this.emitter.emit(
+      "message",
+      `Generation completed in ${Date.now() - startTime}ms`,
+    );
+
+    const generateResult: GenerateResult = {
+      content: textResult.content,
+      structuredData: textResult.structuredData,
+      finishReason: textResult.finishReason,
+      // Turn-exit discriminator + raw provider stop reason + step count from
+      // native agentic loops — this DTO is an explicit field list, so new
+      // provider-result fields MUST be copied here or they silently vanish.
+      stopReason: textResult.stopReason,
+      rawFinishReason: textResult.rawFinishReason,
+      stepsUsed: textResult.stepsUsed,
+      jsonRepaired: textResult.jsonRepaired,
+      jsonTruncated: textResult.jsonTruncated,
+      provider: textResult.provider,
+      model: textResult.model,
+      usage: textResult.usage
+        ? {
+            input: textResult.usage.input || 0,
+            output: textResult.usage.output || 0,
+            total: textResult.usage.total || 0,
+            // Optional tiers must be forwarded or they silently vanish at
+            // this DTO boundary (cache-aware cost + savings need them).
+            ...(textResult.usage.cacheReadTokens !== undefined && {
+              cacheReadTokens: textResult.usage.cacheReadTokens,
+            }),
+            ...(textResult.usage.cacheCreationTokens !== undefined && {
+              cacheCreationTokens: textResult.usage.cacheCreationTokens,
+            }),
+            ...(textResult.usage.reasoning !== undefined && {
+              reasoning: textResult.usage.reasoning,
+            }),
+            ...(textResult.usage.cacheSavingsPercent !== undefined && {
+              cacheSavingsPercent: textResult.usage.cacheSavingsPercent,
+            }),
+          }
+        : undefined,
+      responseTime: textResult.responseTime,
+      toolsUsed: textResult.toolsUsed,
+      toolCalls: textResult.toolCalls ?? [],
+      toolExecutions: toToolExecutionRecords(
+        textResult.toolExecutions,
+        options.toolExecutionCapture,
+      ),
+      enhancedWithTools: textResult.enhancedWithTools,
+      availableTools: transformAvailableTools(textResult.availableTools),
+      analytics: textResult.analytics,
+      imageOutput: textResult.imageOutput,
+      evaluation: textResult.evaluation
+        ? {
+            ...textResult.evaluation,
+            isOffTopic: textResult.evaluation.isOffTopic ?? false,
+            alertSeverity:
+              textResult.evaluation.alertSeverity ?? ("none" as const),
+            reasoning:
+              textResult.evaluation.reasoning ?? "No evaluation provided",
+            evaluationModel: textResult.evaluation.evaluationModel ?? "unknown",
+            evaluationTime: textResult.evaluation.evaluationTime ?? Date.now(),
+            evaluationDomain:
+              textResult.evaluation.evaluationDomain ??
+              textOptions.evaluationDomain ??
+              factoryResult.domainType,
+          }
+        : undefined,
+      audio: textResult.audio,
+      ttsMetadata: textResult.ttsMetadata,
+      transcription: textResult.transcription,
+      video: textResult.video,
+      avatar: textResult.avatar,
+      music: textResult.music,
+      ppt: textResult.ppt,
+      // Forward reasoning/reasoningTokens from the provider layer.
+      // The shared native generate loop extracts these from vendor reasoning
+      // parts (DeepSeek's `reasoning_content`, Anthropic thinking blocks,
+      // OpenAI o-series) for the providers that use it — OpenAI-compatible,
+      // Anthropic and SageMaker. Vertex and AI Studio override generate() and
+      // leave the text field undefined. They're declared on
+      // `GenerateResult`, but the builder previously dropped them on the
+      // floor — so callers asking for `result.reasoning` got `undefined`
+      // even when the model emitted a chain-of-thought.
+      reasoning: textResult.reasoning,
+      reasoningTokens: textResult.reasoningTokens,
+      ...(textResult.retries && { retries: textResult.retries }),
+    };
+
+    // Response validation (if configured)
+    if (options.responseValidation) {
+      const validationResult = validateResponse(generateResult.content ?? "", {
+        minLength: options.responseValidation.minLength,
+        maxLength: options.responseValidation.maxLength,
+        requiredPhrases: options.responseValidation.requiredPhrases,
+        forbiddenPhrases: options.responseValidation.forbiddenPhrases,
+        jsonSchema: options.responseValidation.jsonSchema,
+        customValidator: options.responseValidation.customValidator,
+        truncationAction: options.responseValidation.truncationAction,
+        truncationSuffix: options.responseValidation.truncationSuffix,
+        retryOnFailure: options.responseValidation.retryOnFailure,
+        maxRetries: options.responseValidation.maxRetries,
       });
 
-      // ADD: Bedrock-compatible response:end event with content
-      this.emitter.emit("response:end", textResult.content || "");
-
-      // ADD: Bedrock-compatible message event
-      this.emitter.emit(
-        "message",
-        `Generation completed in ${Date.now() - startTime}ms`,
-      );
-
-      // Convert back to GenerateResult
-      const generateResult: GenerateResult = {
-        content: textResult.content,
-        provider: textResult.provider,
-        model: textResult.model,
-        usage: textResult.usage
-          ? {
-              input: textResult.usage.input || 0,
-              output: textResult.usage.output || 0,
-              total: textResult.usage.total || 0,
-            }
-          : undefined,
-        responseTime: textResult.responseTime,
-        toolsUsed: textResult.toolsUsed,
-        toolExecutions: transformToolExecutions(textResult.toolExecutions),
-        enhancedWithTools: textResult.enhancedWithTools,
-        availableTools: transformAvailableTools(textResult.availableTools),
-        analytics: textResult.analytics,
-        // CRITICAL FIX: Include imageOutput for image generation models
-        imageOutput: textResult.imageOutput,
-        evaluation: textResult.evaluation
-          ? {
-              ...textResult.evaluation,
-              isOffTopic:
-                ((textResult.evaluation as unknown as UnknownRecord)
-                  .isOffTopic as boolean) ?? false,
-              alertSeverity:
-                ((textResult.evaluation as unknown as UnknownRecord)
-                  .alertSeverity as "low" | "medium" | "high" | "none") ??
-                ("none" as const),
-              reasoning:
-                ((textResult.evaluation as unknown as UnknownRecord)
-                  .reasoning as string) ?? "No evaluation provided",
-              evaluationModel:
-                ((textResult.evaluation as unknown as UnknownRecord)
-                  .evaluationModel as string) ?? "unknown",
-              evaluationTime:
-                ((textResult.evaluation as unknown as UnknownRecord)
-                  .evaluationTime as number) ?? Date.now(),
-              // Include evaluationDomain from original options
-              evaluationDomain:
-                ((textResult.evaluation as unknown as UnknownRecord)
-                  .evaluationDomain as string) ??
-                textOptions.evaluationDomain ??
-                factoryResult.domainType,
-            }
-          : undefined,
-        audio: textResult.audio,
-        video: textResult.video,
-        ppt: textResult.ppt,
-      };
-
-      if (
-        this.conversationMemoryConfig?.conversationMemory?.mem0Enabled &&
-        options.context?.userId &&
-        generateResult.content
-      ) {
-        // Non-blocking memory storage - run in background
-        setImmediate(async () => {
-          try {
-            const mem0 = await this.ensureMem0Ready();
-            if (mem0) {
-              await this.storeMem0ConversationTurn(
-                mem0,
-                originalPrompt,
-                generateResult.content,
-                options.context?.userId as string,
-                {
-                  timestamp: new Date().toISOString(),
-                  provider: generateResult.provider,
-                  model: generateResult.model,
-                  type: "conversation_turn",
-                },
-              );
-            }
-          } catch (error) {
-            // Non-blocking: Log error but don't fail the generation
-            logger.warn("Mem0 memory storage failed:", error);
-          }
-        });
+      if (validationResult.action === "abort") {
+        throw new Error(
+          validationResult.feedback ??
+            `Response validation failed: ${validationResult.issues.map((i) => i.message).join("; ")}`,
+        );
       }
 
-      return generateResult;
+      // Apply validated/truncated text
+      if (validationResult.text !== generateResult.content) {
+        generateResult.content = validationResult.text;
+      }
+    }
+
+    if (generateResult.analytics?.cost && generateResult.analytics.cost > 0) {
+      this._sessionCostUsd += generateResult.analytics.cost;
+    }
+    this.scheduleGenerateMemoryStorage(options, originalPrompt, generateResult);
+
+    generateSpan.setAttribute(
+      "output_length",
+      generateResult.content?.length || 0,
+    );
+    generateSpan.setAttribute("tokens.input", generateResult.usage?.input || 0);
+    generateSpan.setAttribute(
+      "tokens.output",
+      generateResult.usage?.output || 0,
+    );
+    generateSpan.setAttribute(
+      "finish_reason",
+      generateResult.finishReason || "unknown",
+    );
+
+    // G3 fix: Record step count and whether max steps was reached
+    // Read steps from the raw provider result (textResult), not the flattened DTO
+    const stepCount = (textResult as { steps?: unknown[] })?.steps?.length ?? 1;
+    const maxSteps = options.maxSteps ?? 200; // DEFAULT_MAX_STEPS
+    generateSpan.setAttribute("step_count", stepCount);
+    generateSpan.setAttribute("max_steps_reached", stepCount >= maxSteps);
+
+    generateSpan.setAttribute(
+      "result_provider",
+      generateResult.provider || "unknown",
+    );
+    generateSpan.setAttribute(
+      "result_model",
+      generateResult.model || "unknown",
+    );
+    generateSpan.setAttribute(
+      "generate.retry_count",
+      generateResult.retries?.count || 0,
+    );
+    generateSpan.setStatus({ code: SpanStatusCode.OK });
+
+    return generateResult;
+  }
+
+  private emitGenerateErrorEvent(
+    optionsOrPrompt: GenerateOptions | string,
+    error: unknown,
+  ): void {
+    const errProvider =
+      typeof optionsOrPrompt === "object"
+        ? optionsOrPrompt.provider || "unknown"
+        : "unknown";
+    const errModel =
+      typeof optionsOrPrompt === "object"
+        ? optionsOrPrompt.model || "unknown"
+        : "unknown";
+
+    // Distinguish client aborts from real failures so consumers (and Langfuse)
+    // can route them differently. `aborted: true` is additive — `success`
+    // remains false for backwards-compat with existing listeners that only
+    // branch on the boolean.
+    const aborted = isAbortError(error);
+    // A native path that already emitted its own `generation:end` for this
+    // failure marks the error, because on the failure path it has no result
+    // object to mark. Re-emitting here would double every native failure.
+    if (
+      error &&
+      typeof error === "object" &&
+      (error as { _generationEndEmitted?: boolean })._generationEndEmitted
+    ) {
+      return;
+    }
+    try {
+      this.emitter.emit("generation:end", {
+        provider: errProvider,
+        model: errModel,
+        responseTime: 0,
+        error: error instanceof Error ? error.message : String(error),
+        success: false,
+        aborted,
+      });
+    } catch (emitError: unknown) {
+      void emitError;
+    }
+  }
+
+  /**
+   * Schedule non-blocking memory storage after generate completes.
+   */
+  private scheduleGenerateMemoryStorage(
+    options: GenerateOptions,
+    originalPrompt: string | undefined,
+    generateResult: GenerateResult,
+  ): void {
+    // Memory storage
+    if (
+      this.shouldWriteMemory(
+        options.memory,
+        options.context?.userId,
+        generateResult.content,
+      ) &&
+      options.context?.userId
+    ) {
+      const sessionId = options.context.sessionId;
+      this.storeMemoryInBackground(
+        {
+          prompt: originalPrompt ?? "",
+          response: generateResult.content.trim(),
+          userId: options.context.userId as string,
+          ...(typeof sessionId === "string" ? { sessionId } : {}),
+          provider: generateResult.provider,
+          model: generateResult.model,
+          toolsUsed:
+            generateResult.toolsUsed ??
+            generateResult.toolExecutions?.map((t) => t.toolName),
+          usage: generateResult.usage,
+          finishReason: generateResult.finishReason,
+        },
+        options.memory,
+        options.context as { traceName?: string; sessionId?: string },
+      );
+    }
+  }
+
+  /**
+   * Handle PPT generation mode
+   */
+  private async generateWithPPT(
+    options: GenerateOptions,
+  ): Promise<GenerateResult> {
+    const startTime = Date.now();
+
+    // Dynamic import to avoid circular deps (same pattern as RAG)
+    const { generatePresentation } =
+      await import("./features/ppt/presentationOrchestrator.js");
+    const { extractPPTContext, getEffectivePPTProvider } =
+      await import("./features/ppt/utils.js");
+
+    // Get provider instance for content planning
+    const requestedProvider = (options.provider || "vertex") as AIProviderName;
+    const provider = await AIProviderFactory.createProvider(
+      requestedProvider,
+      options.model,
+      true,
+      this,
+      undefined,
+      this.resolveCredentials(options.credentials),
+    );
+
+    // Resolve effective PPT provider (may auto-select if current is not PPT-compatible)
+    const effectiveProvider = await getEffectivePPTProvider(
+      provider,
+      requestedProvider as string,
+      options.model || "default",
+      this,
+    );
+
+    // Extract PPT context from options
+    const pptContext = extractPPTContext(options);
+
+    // Generate the presentation
+    const pptResult = await generatePresentation({
+      context: pptContext,
+      provider:
+        effectiveProvider.provider as import("./types/index.js").AIProvider,
+      providerName: effectiveProvider.providerName,
+      modelName: effectiveProvider.modelName,
+      neurolink: this,
     });
+
+    // Map PPT result to GenerateResult
+    return {
+      content: `Presentation generated: ${pptResult.filePath} (${pptResult.totalSlides} slides)`,
+      finishReason: "stop",
+      provider: pptResult.provider || (requestedProvider as string),
+      model: pptResult.model || options.model || "default",
+      usage: undefined,
+      responseTime: Date.now() - startTime,
+      ppt: pptResult,
+    };
+  }
+
+  /**
+   * Dispatch a music-generation request to the registered music handler
+   * for the provider named in `options.output.music.provider`.
+   */
+  private async generateWithMusic(
+    options: GenerateOptions,
+    generateSpan: ReturnType<typeof tracers.sdk.startSpan>,
+  ): Promise<GenerateResult> {
+    const startTime = Date.now();
+    const musicOptions = options.output?.music;
+    if (!musicOptions) {
+      throw new Error(
+        'output.mode="music" requires output.music with at least { provider, prompt }.',
+      );
+    }
+    const providerName = musicOptions.provider;
+    if (!providerName) {
+      throw new Error(
+        'output.music.provider is required (e.g. "beatoven", "elevenlabs-music", "lyria", "replicate").',
+      );
+    }
+    // This early-dispatch path never creates an AI provider, so
+    // ProviderRegistry.registerAllProviders() has NOT necessarily run —
+    // with the module-scope auto-registration retired, the handlers must
+    // be registered here explicitly. registerDefaultMusicHandlers() is
+    // idempotent (skip-if-registered), so the repeat call is free.
+    const { registerDefaultMusicHandlers } = await import("./music/index.js");
+    registerDefaultMusicHandlers();
+    const { MusicProcessor } = await import("./utils/musicProcessor.js");
+    const musicResult = await MusicProcessor.generate(providerName, {
+      ...musicOptions,
+      prompt: musicOptions.prompt ?? options.input?.text ?? "",
+    });
+    generateSpan.setAttribute("music.provider", providerName);
+    generateSpan.setAttribute("music.bytes", musicResult.size);
+    generateSpan.setStatus({ code: SpanStatusCode.OK });
+    return {
+      content: `Music generated (${providerName}, ${musicResult.size} bytes, ${musicResult.format}).`,
+      finishReason: "stop",
+      provider: providerName,
+      model: musicResult.metadata?.model ?? providerName,
+      usage: undefined,
+      responseTime: Date.now() - startTime,
+      music: musicResult,
+    };
+  }
+
+  /**
+   * Dispatch an avatar (lip-sync) request to the registered avatar handler
+   * for the provider named in `options.output.avatar.provider`.
+   */
+  private async generateWithAvatar(
+    options: GenerateOptions,
+    generateSpan: ReturnType<typeof tracers.sdk.startSpan>,
+  ): Promise<GenerateResult> {
+    const startTime = Date.now();
+    const avatarOptions = options.output?.avatar;
+    if (!avatarOptions) {
+      throw new Error(
+        'output.mode="avatar" requires output.avatar with at least { provider, image, audio|text }.',
+      );
+    }
+    const providerName = avatarOptions.provider;
+    if (!providerName) {
+      throw new Error(
+        'output.avatar.provider is required (e.g. "d-id", "heygen", "replicate").',
+      );
+    }
+    // Same early-dispatch registration as generateWithMusic above: no AI
+    // provider is created on this path, so the retired module-scope
+    // auto-run must be replaced by an explicit (idempotent) call here.
+    const { registerDefaultAvatarHandlers } = await import("./avatar/index.js");
+    registerDefaultAvatarHandlers();
+    const { AvatarProcessor } = await import("./utils/avatarProcessor.js");
+    const avatarResult = await AvatarProcessor.generate(
+      providerName,
+      avatarOptions,
+    );
+    generateSpan.setAttribute("avatar.provider", providerName);
+    generateSpan.setAttribute("avatar.bytes", avatarResult.size);
+    generateSpan.setStatus({ code: SpanStatusCode.OK });
+    return {
+      content: `Avatar generated (${providerName}, ${avatarResult.size} bytes, ${avatarResult.format}).`,
+      finishReason: "stop",
+      provider: providerName,
+      model: avatarResult.metadata?.model ?? providerName,
+      usage: undefined,
+      responseTime: Date.now() - startTime,
+      avatar: avatarResult,
+    };
   }
 
   /**
@@ -2180,7 +7238,7 @@ Current user's request: ${currentInput}`;
     logger.debug("[NeuroLink] Executing workflow generation", {
       workflowId: options.workflow,
       hasInlineConfig: !!options.workflowConfig,
-      prompt: options.input.text.substring(0, 100),
+      prompt: (options.input?.text ?? "").substring(0, 100),
       startTime: workflowStartTime,
     });
 
@@ -2202,10 +7260,17 @@ Current user's request: ${currentInput}`;
 
     // Execute workflow
     const workflowResult = await runWorkflow(workflowConfig, {
-      prompt: options.input.text,
-      conversationHistory: options.conversationHistory as
-        | Array<{ role: "user" | "assistant"; content: string }>
-        | undefined,
+      prompt: options.input?.text ?? "",
+      conversationHistory:
+        options.conversationMessages
+          ?.filter((m) => m.role === "user" || m.role === "assistant")
+          .map((m) => ({
+            role: m.role as "user" | "assistant",
+            content: stringifyContentSafe(m.content),
+          })) ??
+        (options.conversationHistory as
+          | Array<{ role: "user" | "assistant"; content: string }>
+          | undefined),
       timeout: options.timeout as number | undefined,
       verbose: false,
       metadata: options.context as Record<string, JsonValue> | undefined,
@@ -2289,7 +7354,7 @@ Current user's request: ${currentInput}`;
     logger.debug("[NeuroLink] Executing workflow streaming (progressive)", {
       workflowId: options.workflow,
       hasInlineConfig: !!options.workflowConfig,
-      prompt: options.input.text.substring(0, 100),
+      prompt: (options.input?.text ?? "").substring(0, 100),
     });
 
     // Determine workflow configuration
@@ -2307,16 +7372,22 @@ Current user's request: ${currentInput}`;
     }
 
     // Import streaming workflow runner
-    const { runWorkflowWithStreaming } = await import(
-      "./workflow/core/workflowRunner.js"
-    );
+    const { runWorkflowWithStreaming } =
+      await import("./workflow/core/workflowRunner.js");
 
     // Execute workflow with progressive streaming
     const workflowStream = runWorkflowWithStreaming(workflowConfig, {
-      prompt: options.input.text,
-      conversationHistory: options.conversationHistory as
-        | Array<{ role: "user" | "assistant"; content: string }>
-        | undefined,
+      prompt: options.input?.text ?? "",
+      conversationHistory:
+        options.conversationMessages
+          ?.filter((m) => m.role === "user" || m.role === "assistant")
+          .map((m) => ({
+            role: m.role as "user" | "assistant",
+            content: stringifyContentSafe(m.content),
+          })) ??
+        (options.conversationHistory as
+          | Array<{ role: "user" | "assistant"; content: string }>
+          | undefined),
       timeout: options.timeout as number | undefined,
       verbose: false,
       metadata: options.context as Record<string, JsonValue> | undefined,
@@ -2324,9 +7395,8 @@ Current user's request: ${currentInput}`;
     });
 
     // Store final result for metadata
-    let finalResult: Partial<
-      import("./workflow/types.js").WorkflowResult
-    > | null = null;
+    let finalResult: Partial<import("./types/index.js").WorkflowResult> | null =
+      null;
     let preliminaryTime = 0;
 
     // Create a generator that yields progressive chunks
@@ -2389,7 +7459,7 @@ Current user's request: ${currentInput}`;
       // After stream completes, update result with final workflow data
       if (finalResult) {
         const result = finalResult as Partial<
-          import("./workflow/types.js").WorkflowResult
+          import("./types/index.js").WorkflowResult
         >;
         const responseTime = Date.now() - startTime;
 
@@ -2465,6 +7535,17 @@ Current user's request: ${currentInput}`;
   async generateText(
     options: TextGenerationOptions,
   ): Promise<TextGenerationResult> {
+    return logger.runInInstanceScope(this.logInstanceId, () =>
+      this.generateTextInInstanceScope(options),
+    );
+  }
+
+  /**
+   * Body of {@link generateText}, always entered through the instance log scope.
+   */
+  private async generateTextInInstanceScope(
+    options: TextGenerationOptions,
+  ): Promise<TextGenerationResult> {
     // Validate required parameters for backward compatibility
     if (
       !options.prompt ||
@@ -2476,8 +7557,19 @@ Current user's request: ${currentInput}`;
       );
     }
 
+    // Isolate from the caller's object, then resolve file-tool roots exactly
+    // as generate() does: a widening or missing root rejects here, before any
+    // model call, and the resolved policy travels on the private channel.
+    const isolated = cloneOptionsForCallIsolation(options);
+    // NL-004: Resolve model aliases/deprecations before processing
+    isolated.model = resolveModel(isolated.model, this.modelAliasConfig);
+    bindFileToolRoots(isolated, this.resolveFileToolRoots(isolated.toolRoots));
+    // generateText() reaches the same providers as generate() without passing
+    // through its prelude, so the middleware defaults are folded in here too.
+    this.applyMiddlewareDefaults(isolated);
+
     // Use internal generation method directly
-    return await this.generateTextInternal(options);
+    return await this.generateTextInternal(isolated);
   }
 
   /**
@@ -2493,69 +7585,614 @@ Current user's request: ${currentInput}`;
   private async generateTextInternal(
     options: TextGenerationOptions,
   ): Promise<TextGenerationResult> {
-    const generateInternalId = `generate-internal-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-    const generateInternalStartTime = Date.now();
-    const generateInternalHrTimeStart = process.hrtime.bigint();
-    const functionTag = "NeuroLink.generateTextInternal";
+    const internalSpan = tracers.sdk.startSpan("generateTextInternal", {
+      kind: SpanKind.INTERNAL,
+    });
+    return this.executeGenerateTextInternalWithSpan(options, internalSpan);
+  }
 
-    this.logGenerateTextInternalStart(
-      generateInternalId,
-      generateInternalStartTime,
-      generateInternalHrTimeStart,
-      options,
-      functionTag,
+  private async executeGenerateTextInternalWithSpan(
+    options: TextGenerationOptions,
+    internalSpan: ReturnType<typeof tracers.sdk.startSpan>,
+  ): Promise<TextGenerationResult> {
+    return this.conversationEventContext.run(
+      Symbol("generate-conversation"),
+      () => this.executeGenerateTextInternalInEventScope(options, internalSpan),
     );
-    this.emitGenerationStartEvents(options);
+  }
 
+  private async executeGenerateTextInternalInEventScope(
+    options: TextGenerationOptions,
+    internalSpan: ReturnType<typeof tracers.sdk.startSpan>,
+  ): Promise<TextGenerationResult> {
+    const { eventSequence, cleanup } = this.setupStreamEventListeners();
+    try {
+      const context = {
+        ...this.initializeGenerateTextInternalContext(options),
+        eventSequence,
+      };
+      internalSpan.setAttribute("request_id", context.requestId);
+      internalSpan.setAttribute(
+        "has_conversation_memory",
+        !!this.conversationMemory,
+      );
+      internalSpan.setAttribute(
+        "sdk.provider",
+        (options.provider as string) || "auto",
+      );
+      internalSpan.setAttribute("sdk.model", options.model || "default");
+
+      this.logGenerateTextInternalStart(
+        context.generateInternalId,
+        context.generateInternalStartTime,
+        context.generateInternalHrTimeStart,
+        options,
+        context.functionTag,
+      );
+      this.emitGenerationStartEvents(options);
+
+      return await this.runGenerateTextInternalFlow(
+        options,
+        internalSpan,
+        context,
+      );
+    } catch (error) {
+      // Client aborts are user-initiated cancellations, not system faults.
+      if (isAbortError(error)) {
+        internalSpan.setAttribute("ai.finishReason", "aborted");
+        internalSpan.setAttribute("aborted", true);
+      } else {
+        internalSpan.recordException(
+          error instanceof Error ? error : new Error(String(error)),
+        );
+        internalSpan.setStatus({
+          code: SpanStatusCode.ERROR,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+      throw error;
+    } finally {
+      cleanup();
+      internalSpan.end();
+    }
+  }
+
+  private initializeGenerateTextInternalContext(
+    options: TextGenerationOptions,
+  ): {
+    generateInternalId: string;
+    generateInternalStartTime: number;
+    generateInternalHrTimeStart: bigint;
+    functionTag: string;
+    requestId: string;
+  } {
+    const generateInternalId = `generate-internal-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const existingRequestId = (
+      options.context as Record<string, unknown> | undefined
+    )?.requestId;
+    const requestId =
+      typeof existingRequestId === "string" && existingRequestId
+        ? existingRequestId
+        : `req-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    options.context = { ...options.context, requestId };
+    return {
+      generateInternalId,
+      generateInternalStartTime: Date.now(),
+      generateInternalHrTimeStart: process.hrtime.bigint(),
+      functionTag: "NeuroLink.generateTextInternal",
+      requestId,
+    };
+  }
+
+  private async runGenerateTextInternalFlow(
+    options: TextGenerationOptions,
+    internalSpan: ReturnType<typeof tracers.sdk.startSpan>,
+    context: {
+      generateInternalId: string;
+      generateInternalStartTime: number;
+      generateInternalHrTimeStart: bigint;
+      functionTag: string;
+      requestId: string;
+      eventSequence: StreamEventSequence[];
+    },
+  ): Promise<TextGenerationResult> {
     try {
       await this.initializeConversationMemoryForGeneration(
-        generateInternalId,
-        generateInternalStartTime,
-        generateInternalHrTimeStart,
+        context.generateInternalId,
+        context.generateInternalStartTime,
+        context.generateInternalHrTimeStart,
       );
       const mcpResult = await this.attemptMCPGeneration(
         options,
-        generateInternalId,
-        generateInternalStartTime,
-        generateInternalHrTimeStart,
-        functionTag,
+        context.generateInternalId,
+        context.generateInternalStartTime,
+        context.generateInternalHrTimeStart,
+        context.functionTag,
       );
-
       if (mcpResult) {
-        await storeConversationTurn(
-          this.conversationMemory,
+        return this.finalizeGenerateTextInternalResult({
+          path: "mcp",
+          result: mcpResult,
           options,
-          mcpResult,
-          new Date(generateInternalStartTime),
-        );
-        this.emitter.emit("response:end", mcpResult.content || "");
-        return mcpResult;
+          internalSpan,
+          requestId: context.requestId,
+          startTime: context.generateInternalStartTime,
+          events: context.eventSequence,
+        });
       }
 
-      const directResult = await this.directProviderGeneration(options);
-      logger.debug(`[${functionTag}] Direct generation successful`);
+      if (options.abortSignal?.aborted) {
+        throw new DOMException("The operation was aborted", "AbortError");
+      }
 
+      await this.captureOriginalConversationMessagesForRecovery(options);
+      const directResult = await this.directProviderGeneration(options);
+      logger.debug(`[${context.functionTag}] Direct generation successful`);
+
+      return this.finalizeGenerateTextInternalResult({
+        path: "direct",
+        result: directResult,
+        options,
+        internalSpan,
+        requestId: context.requestId,
+        startTime: context.generateInternalStartTime,
+        events: context.eventSequence,
+      });
+    } catch (error) {
+      const recoveredResult = await this.handleGenerateTextInternalFailure(
+        options,
+        context,
+        error,
+      );
+      if (recoveredResult) {
+        return recoveredResult;
+      }
+      // Convert raw DOMException AbortErrors (and other untyped abort shapes)
+      // into NeuroLinkError(ABORT) so callers can branch on
+      // `error.category === ErrorCategory.ABORT` instead of message matching.
+      // Skipped if the error is already a typed abort to avoid double-wrap.
+      if (isAbortError(error) && !(error instanceof NeuroLinkError)) {
+        throw ErrorFactory.aborted(
+          error instanceof Error ? error : new Error(String(error)),
+        );
+      }
+      throw error;
+    }
+  }
+
+  private async captureOriginalConversationMessagesForRecovery(
+    options: TextGenerationOptions,
+  ): Promise<void> {
+    if (!this.conversationMemory) {
+      return;
+    }
+
+    const originalMessages = await getConversationMessages(
+      this.conversationMemory,
+      options,
+    );
+    (
+      options as TextGenerationOptions & {
+        _originalConversationMessages?: unknown[];
+      }
+    )._originalConversationMessages = originalMessages
+      ? [...originalMessages]
+      : undefined;
+  }
+
+  private async finalizeGenerateTextInternalResult(params: {
+    path: "mcp" | "direct";
+    result: TextGenerationResult;
+    options: TextGenerationOptions;
+    internalSpan: ReturnType<typeof tracers.sdk.startSpan>;
+    requestId: string;
+    startTime: number;
+    events?: StreamEventSequence[];
+  }): Promise<TextGenerationResult> {
+    const {
+      path,
+      result,
+      options,
+      internalSpan,
+      requestId,
+      startTime,
+      events,
+    } = params;
+    const historyEvents = events?.filter(
+      (event) => event.type !== "response:chunk",
+    );
+    if (historyEvents?.length) {
+      result.events = historyEvents;
+    }
+
+    logger.info(
+      `[NeuroLink.generateTextInternal] generate() - COMPLETE SUCCESS${path === "mcp" ? " (MCP path)" : ""}`,
+      {
+        provider: result.provider,
+        model: result.model,
+        responseTimeMs: Date.now() - startTime,
+        tokensUsed: result.usage?.total || 0,
+        toolsUsed: result.toolsUsed?.length || 0,
+        ...(result.usage?.cacheCreationTokens !== undefined && {
+          cacheCreationTokens: result.usage.cacheCreationTokens,
+        }),
+        ...(result.usage?.cacheReadTokens !== undefined && {
+          cacheReadTokens: result.usage.cacheReadTokens,
+        }),
+        ...(result.usage?.cacheSavingsPercent !== undefined && {
+          cacheSavingsPercent: result.usage.cacheSavingsPercent,
+        }),
+      },
+    );
+
+    const memStoreStart = Date.now();
+    try {
       await storeConversationTurn(
         this.conversationMemory,
         options,
-        directResult,
-        new Date(generateInternalStartTime),
+        result,
+        new Date(startTime),
+        requestId,
+        this.drainPendingSkillMessages(
+          (options.context as Record<string, unknown> | undefined)?.sessionId,
+        ),
       );
-      this.emitter.emit("response:end", directResult.content || "");
-      this.emitter.emit("message", `Text generation completed successfully`);
+      this.recordMemorySpan(
+        "memory.store",
+        { "memory.operation": "store", "memory.path": path },
+        Date.now() - memStoreStart,
+        SpanStatus.OK,
+      );
+    } catch (memoryError) {
+      this.recordMemorySpan(
+        "memory.store",
+        { "memory.operation": "store", "memory.path": path },
+        Date.now() - memStoreStart,
+        SpanStatus.ERROR,
+        memoryError instanceof Error
+          ? memoryError.message
+          : String(memoryError),
+      );
+    }
 
-      return directResult;
-    } catch (error) {
-      logger.error(`[${functionTag}] All generation methods failed`, {
+    this.emitter.emit("response:end", result.content || "");
+    if (path === "direct") {
+      this.emitter.emit("message", "Text generation completed successfully");
+    }
+    internalSpan.setAttribute("path", path);
+    internalSpan.setAttribute("tokens.input", result.usage?.input || 0);
+    internalSpan.setAttribute("tokens.output", result.usage?.output || 0);
+    internalSpan.setAttribute("result_provider", result.provider || "unknown");
+    internalSpan.setStatus({ code: SpanStatusCode.OK });
+
+    return result;
+  }
+
+  private async handleGenerateTextInternalFailure(
+    options: TextGenerationOptions,
+    context: {
+      generateInternalStartTime: number;
+      functionTag: string;
+      requestId: string;
+    },
+    error: unknown,
+  ): Promise<TextGenerationResult | null> {
+    const recoveredResult = await this.tryRecoverGenerateTextOverflow(
+      options,
+      context.functionTag,
+      error,
+      context.generateInternalStartTime,
+    );
+    if (recoveredResult) {
+      return recoveredResult;
+    }
+
+    if (isAbortError(error)) {
+      // Aborted generations DO NOT write to conversation memory.
+      // Fabricating an assistant turn out of an error condition (the previous
+      // "[generation was interrupted]" sentinel) pollutes the next prompt and
+      // — at the right shape — causes the model to echo the sentinel as its
+      // response. See Curator SI-069 / SI-071. Aborts are signalled to
+      // callers via the thrown error and the "error" emitter event below;
+      // there is nothing to persist, so persisting nothing is correct.
+      //
+      // Title generation continues to work: it reads the user message of the
+      // first *successful* turn (RedisConversationMemoryManager
+      // .generateConversationTitle) and never required a fabricated assistant
+      // turn — the previous comment claiming otherwise was inaccurate.
+      logger.info(
+        `[${context.functionTag}] Generation aborted — skipping memory write (aborts must not pollute conversation history)`,
+        {
+          hasMemory: !!this.conversationMemory,
+          memoryType: this.conversationMemory?.constructor?.name || "NONE",
+          sessionId:
+            (options.context as Record<string, unknown>)?.sessionId ||
+            "unknown",
+        },
+      );
+    } else {
+      logger.error(`[${context.functionTag}] All generation methods failed`, {
         error: error instanceof Error ? error.message : String(error),
       });
+    }
 
-      this.emitter.emit("response:end", "");
+    this.emitter.emit("response:end", "");
+    // Node EventEmitter rethrows the original error from emit("error", e) if
+    // there is no listener registered, which would short-circuit the caller's
+    // catch block and prevent the abort-typed-error wrap from running. Only
+    // emit when a consumer is listening; non-listening callers receive the
+    // error via the thrown rejection instead, which is the canonical path.
+    if (this.emitter.listenerCount("error") > 0) {
       this.emitter.emit(
         "error",
         error instanceof Error ? error : new Error(String(error)),
       );
-      throw error;
+    }
+    return null;
+  }
+
+  private async tryRecoverGenerateTextOverflow(
+    options: TextGenerationOptions,
+    functionTag: string,
+    error: unknown,
+    attemptStartTimeMs?: number,
+  ): Promise<TextGenerationResult | null> {
+    // Reviewer Finding #3: drop the `!this.conversationMemory` gate so
+    // inline-conversationMessages callers also benefit from post-provider
+    // recovery when their pre-dispatch estimate happens to undershoot
+    // and the provider rejects at a higher real token count.
+    if (!isContextOverflowError(error)) {
+      return null;
+    }
+
+    const inlineMessages = (
+      options as TextGenerationOptions & {
+        _originalConversationMessages?: unknown[];
+        conversationMessages?: unknown[];
+      }
+    )._originalConversationMessages as unknown[] | undefined;
+    const callerMessages = (
+      options as TextGenerationOptions & {
+        conversationMessages?: unknown[];
+      }
+    ).conversationMessages as unknown[] | undefined;
+
+    if (!this.conversationMemory && !inlineMessages && !callerMessages) {
+      return null;
+    }
+
+    logger.warn(
+      `[${functionTag}] Context overflow detected by provider, attempting smart recovery`,
+      {
+        error: error instanceof Error ? error.message : String(error),
+        overflowProvider: getContextOverflowProvider(error),
+      },
+    );
+
+    try {
+      const actualOverflow = parseProviderOverflowDetails(error);
+      const originalMessages =
+        inlineMessages ??
+        callerMessages ??
+        (this.conversationMemory
+          ? await getConversationMessages(this.conversationMemory, options)
+          : []);
+      const recoveryBudget = checkContextBudget({
+        provider: options.provider || "openai",
+        model: options.model,
+        maxTokens: options.maxTokens,
+        currentPrompt: options.prompt,
+        systemPrompt: options.systemPrompt,
+      });
+      const actualTokens =
+        actualOverflow?.actualTokens ?? recoveryBudget.estimatedInputTokens;
+      const budgetTokens =
+        actualOverflow?.budgetTokens ?? recoveryBudget.availableInputTokens;
+      // Target the HISTORY's share, not the whole budget: the compactor's stage
+      // gates measure messages only, so handing them the full figure lets an
+      // over-budget request through untouched. The 0.7 factor stays on top as
+      // recovery headroom — this path runs only after the provider has already
+      // rejected the request once, so aiming well under is deliberate.
+      const recoveryOverhead =
+        (recoveryBudget.breakdown?.systemPrompt ?? 0) +
+        (recoveryBudget.breakdown?.currentPrompt ?? 0);
+      const compactionTarget = Math.max(
+        0,
+        Math.floor((budgetTokens - recoveryOverhead) * 0.7),
+      );
+      const requiredReduction =
+        actualTokens > 0
+          ? (actualTokens - compactionTarget) / actualTokens
+          : 0.5;
+
+      // Reviewer Finding #3: escalating truncation across attempts. The
+      // first attempt uses the budget-derived fraction (single-round
+      // compaction). If that still leaves the conversation over budget,
+      // subsequent attempts apply progressively harder truncation
+      // (0.5 → 0.75 → 0.9) before giving up. This replaces the previous
+      // single-pass behaviour where one undersized fraction guaranteed
+      // failure on the next provider call.
+      const escalationFractions = [
+        Math.min(0.9, requiredReduction + 0.15),
+        0.5,
+        0.75,
+        0.9,
+      ];
+      let lastCompactionResult: Awaited<
+        ReturnType<ContextCompactor["compact"]>
+      > | null = null;
+      let compactedMessages: unknown[] = originalMessages;
+      let verifiedBudget: ReturnType<typeof checkContextBudget> | null = null;
+      let recoveredFraction = -1;
+
+      for (let i = 0; i < escalationFractions.length; i++) {
+        const fraction = escalationFractions[i];
+        const compactor = new ContextCompactor(
+          {
+            enableSummarize: false,
+            enablePrune: true,
+            enableDeduplicate: true,
+            enableTruncate: true,
+            truncationFraction: fraction,
+          },
+          this.contextCompactorDeps(this.decisionSiteContext(options)),
+        );
+        const compactionResult = await compactor.compact(
+          originalMessages as import("./types/index.js").ChatMessage[],
+          compactionTarget,
+          undefined,
+          (options.context as Record<string, unknown>)?.requestId as
+            | string
+            | undefined,
+        );
+        if (!compactionResult.compacted) {
+          continue;
+        }
+        lastCompactionResult = compactionResult;
+        const repairedResult = repairToolPairs(compactionResult.messages);
+        const verifyBudget = checkContextBudget({
+          provider: options.provider || "openai",
+          model: options.model,
+          maxTokens: options.maxTokens,
+          systemPrompt: options.systemPrompt,
+          currentPrompt: options.prompt,
+          toolReplayMode: this.resolveToolReplayModeForBudget(options),
+          conversationMessages: repairedResult.messages as Array<{
+            role: string;
+            content: string;
+          }>,
+        });
+        if (verifyBudget.withinBudget) {
+          compactedMessages = repairedResult.messages;
+          verifiedBudget = verifyBudget;
+          recoveredFraction = fraction;
+          break;
+        }
+        verifiedBudget = verifyBudget;
+      }
+
+      if (!lastCompactionResult) {
+        // Reviewer follow-up: when no escalation fraction managed to
+        // compact the conversation, the request will hit the same
+        // provider 400 again on retry. Surface a typed
+        // ContextBudgetExceededError + `compaction.insufficient` event
+        // instead of returning null (which lets callers propagate the
+        // opaque provider error).
+        try {
+          this.emitter.emit("compaction.insufficient", {
+            stagesAttempted: [],
+            finalTokens: actualTokens,
+            budget: budgetTokens,
+            provider: options.provider || "openai",
+            model: options.model,
+            phase: "post-provider-recovery-no-compaction",
+            fractionsTried: escalationFractions,
+            timestamp: Date.now(),
+          });
+        } catch {
+          /* listener errors are non-fatal */
+        }
+        throw new ContextBudgetExceededError(
+          `Context overflow recovery: no compaction stage was able to ` +
+            `reduce conversation messages. Provider rejected at ` +
+            `~${actualTokens} tokens; budget is ${budgetTokens} tokens.`,
+          {
+            estimatedTokens: actualTokens,
+            availableTokens: budgetTokens,
+            stagesUsed: [],
+            breakdown: {},
+          },
+        );
+      }
+
+      if (!verifiedBudget?.withinBudget) {
+        logger.error(
+          `[${functionTag}] Recovery compaction insufficient after escalation, aborting retry`,
+          {
+            estimatedTokens: verifiedBudget?.estimatedInputTokens,
+            availableTokens: verifiedBudget?.availableInputTokens,
+            stagesAttempted: lastCompactionResult.stagesUsed,
+            fractionsTried: escalationFractions,
+          },
+        );
+        // Reviewer Finding #3: emit `compaction.insufficient` so
+        // cost / audit listeners record the specific failure mode.
+        try {
+          this.emitter.emit("compaction.insufficient", {
+            stagesAttempted: lastCompactionResult.stagesUsed,
+            finalTokens: verifiedBudget?.estimatedInputTokens,
+            budget: verifiedBudget?.availableInputTokens,
+            provider: options.provider || "openai",
+            model: options.model,
+            phase: "post-provider-recovery",
+            fractionsTried: escalationFractions,
+            timestamp: Date.now(),
+          });
+        } catch {
+          /* listener errors are non-fatal */
+        }
+        throw new ContextBudgetExceededError(
+          `Context overflow recovery failed. Provider rejected at ~${actualTokens} tokens, ` +
+            `recovery compaction achieved ${lastCompactionResult.tokensAfter} tokens ` +
+            `but budget is ${budgetTokens} tokens (after escalation through ` +
+            `${escalationFractions.length} fractions).`,
+          {
+            estimatedTokens: lastCompactionResult.tokensAfter,
+            availableTokens: budgetTokens,
+            stagesUsed: lastCompactionResult.stagesUsed,
+            breakdown: verifiedBudget?.breakdown ?? {},
+          },
+        );
+      }
+
+      // Whole-turn budget semantics: the retry inherits the REMAINING
+      // turnTimeoutMs, not a fresh clock — attempt 1 already spent part of
+      // the caller's budget, and a fresh clock let one generate() run ~2×
+      // the configured deadline (the 66-minute-turn incident shape).
+      // Floored so a compacted retry still gets a workable window — but the
+      // floor never exceeds the caller's own turnTimeoutMs (a 10s caller
+      // budget must not receive a 30s retry).
+      let retryTurnTimeoutMs = options.turnTimeoutMs;
+      if (
+        typeof options.turnTimeoutMs === "number" &&
+        Number.isFinite(options.turnTimeoutMs) &&
+        attemptStartTimeMs !== undefined
+      ) {
+        const elapsedMs = Date.now() - attemptStartTimeMs;
+        retryTurnTimeoutMs = Math.max(
+          options.turnTimeoutMs - elapsedMs,
+          Math.min(MIN_RECOVERY_TURN_BUDGET_MS, options.turnTimeoutMs),
+        );
+      }
+
+      logger.info(
+        `[${functionTag}] Smart recovery verified, retrying generation`,
+        {
+          tokensSaved: lastCompactionResult.tokensSaved,
+          compactionTarget,
+          verifiedTokens: verifiedBudget.estimatedInputTokens,
+          verifiedBudget: verifiedBudget.availableInputTokens,
+          recoveredFraction,
+          retryTurnTimeoutMs,
+        },
+      );
+
+      return this.directProviderGeneration({
+        ...options,
+        conversationMessages: compactedMessages,
+        ...(retryTurnTimeoutMs !== undefined && {
+          turnTimeoutMs: retryTurnTimeoutMs,
+        }),
+      } as TextGenerationOptions);
+    } catch (retryError) {
+      if (retryError instanceof ContextBudgetExceededError) {
+        throw retryError;
+      }
+      logger.error(`[${functionTag}] Recovery attempt failed`, {
+        error:
+          retryError instanceof Error ? retryError.message : String(retryError),
+      });
+      return null;
     }
   }
 
@@ -2623,7 +8260,24 @@ Current user's request: ${currentInput}`;
         },
       );
 
-      await this.conversationMemory.initialize();
+      try {
+        await this.conversationMemory.initialize();
+      } catch (err) {
+        logger.warn(
+          "[NEUROLINK] Redis memory init failed, falling back to in-memory",
+          {
+            error: err instanceof Error ? err.message : String(err),
+            generateInternalId,
+          },
+        );
+        const memCfg = this.conversationMemoryConfig?.conversationMemory;
+        this.conversationMemory = new ConversationMemoryManager({
+          enabled: true,
+          maxSessions: memCfg?.maxSessions ?? 100,
+          maxTurnsPerSession: memCfg?.maxTurnsPerSession ?? 50,
+        });
+        await this.conversationMemory.initialize();
+      }
 
       const conversationMemoryEndTime = process.hrtime.bigint();
       const conversationMemoryDurationNs =
@@ -2658,10 +8312,7 @@ Current user's request: ${currentInput}`;
     generateInternalHrTimeStart: bigint,
     functionTag: string,
   ): Promise<TextGenerationResult | null> {
-    if (
-      !options.disableTools &&
-      !(options.tts?.enabled && !options.tts?.useAiResponse)
-    ) {
+    if (!options.disableTools && !isDirectTTSRequest(options.tts)) {
       return await this.performMCPGenerationRetries(
         options,
         generateInternalId,
@@ -2672,6 +8323,55 @@ Current user's request: ${currentInput}`;
     }
 
     return null;
+  }
+
+  /**
+   * Non-retryable tool-error predicate shared by `performMCPGenerationRetries`
+   * and `tryMCPGeneration`. Returns `true` when the error indicates the model
+   * hallucinated a tool name or sent invalid arguments — retrying would
+   * re-trigger the same deterministic failure with the same tool set.
+   *
+   * Belt-and-suspenders: prefers class-identity `.isInstance()` (stable across
+   * Phase 5+ native substitution) but falls back to `error.name` and message
+   * substring checks so cross-module-boundary errors (Jest, bundlers, wrapped
+   * errors) are still caught. The name fallback covers both
+   * `AI_InvalidToolInputError` (current v5/v6 SDK) and the legacy
+   * `AI_InvalidToolArgumentsError` (v4).
+   */
+  private static isNonRetryableToolError(error: unknown): boolean {
+    // Class-identity path: only meaningful when the throw really is an Error.
+    if (
+      error instanceof Error &&
+      (NoSuchToolError.isInstance(error) ||
+        InvalidToolInputError.isInstance(error))
+    ) {
+      return true;
+    }
+
+    // Duck-type fallback for non-Error throws, wrapped errors, or values that
+    // serialize to JSON without preserving the prototype chain. Extract name
+    // and message defensively — `error` may be `null`, a string, or an object
+    // with non-string `name`/`message` properties.
+    const errAny = error as
+      | { name?: unknown; message?: unknown }
+      | null
+      | undefined;
+    const maybeName =
+      errAny && typeof errAny.name === "string" ? errAny.name : "";
+    const maybeMessage =
+      errAny && typeof errAny.message === "string"
+        ? errAny.message
+        : String(error ?? "");
+
+    return (
+      maybeName === "AI_NoSuchToolError" ||
+      maybeName === "AI_InvalidToolInputError" ||
+      maybeName === "AI_InvalidToolArgumentsError" ||
+      maybeMessage.includes("NoSuchToolError") ||
+      maybeMessage.includes("InvalidToolInputError") ||
+      maybeMessage.includes("InvalidToolArgumentsError") ||
+      maybeMessage.includes("Model tried to call unavailable tool")
+    );
   }
 
   /**
@@ -2686,8 +8386,25 @@ Current user's request: ${currentInput}`;
   ): Promise<TextGenerationResult | null> {
     const maxMcpRetries = RETRY_ATTEMPTS.QUICK;
 
+    // Captured BEFORE the first attempt: ensureMCPGenerationBudget (inside
+    // tryMCPGeneration) auto-scales options.timeout for >100K-token contexts
+    // when the caller left it unset, so checking options.timeout inside the
+    // catch below could not tell caller-set apart from auto-scaled.
+    const callerSetTimeout = options.timeout !== undefined;
+
+    // NL-007: Track retry metadata for observability
+    const retryErrors: Array<{ code: string; message: string }> = [];
+    let retryCount = 0;
+
     const maxAttempts = maxMcpRetries + 1;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (options.abortSignal?.aborted) {
+        logger.debug(
+          `[${functionTag}] Abort signal already fired before attempt ${attempt}, stopping retries`,
+        );
+        throw new DOMException("The operation was aborted", "AbortError");
+      }
+
       try {
         logger.debug(
           `[${functionTag}] Attempting MCP generation (attempt ${attempt}/${maxAttempts})...`,
@@ -2705,8 +8422,13 @@ Current user's request: ${currentInput}`;
               contentLength: mcpResult.content?.length || 0,
               toolsUsed: mcpResult.toolsUsed?.length || 0,
               toolExecutions: mcpResult.toolExecutions?.length || 0,
+              retryCount,
             },
           );
+          // NL-007: Attach retry metadata to result
+          if (retryCount > 0) {
+            mcpResult.retries = { count: retryCount, errors: retryErrors };
+          }
           return mcpResult;
         } else {
           logger.debug(
@@ -2720,13 +8442,79 @@ Current user's request: ${currentInput}`;
           );
         }
       } catch (error) {
+        // Immediately propagate AbortError — never retry aborted requests
+        if (isAbortError(error)) {
+          logger.debug(
+            `[${functionTag}] AbortError detected on attempt ${attempt}, stopping retries`,
+          );
+          throw error;
+        }
+
+        // A TimeoutError against an explicit caller-set options.timeout is
+        // deterministic-by-construction: every remaining retry AND the
+        // direct-generation fallback would re-run the same provider+model
+        // under the same per-step budget. Observed in production as ~650s
+        // of doomed follow-ups after a 90s step timeout. Surface it now.
+        // Name check (not instanceof): two TimeoutError classes exist
+        // (utils/timeout.ts and utils/async/withTimeout.ts) and both stamp
+        // name = "TimeoutError".
+        if (
+          callerSetTimeout &&
+          error instanceof Error &&
+          error.name === "TimeoutError"
+        ) {
+          logger.warn(
+            `[${functionTag}] Per-step timeout (${String(options.timeout)}) exhausted on attempt ${attempt} — surfacing instead of retrying with the same budget`,
+          );
+          throw error;
+        }
+
+        // NL-007: Record retry error for observability
+        retryCount++;
+        const errMsg = error instanceof Error ? error.message : String(error);
+        const errCode =
+          error instanceof NeuroLinkError
+            ? error.code
+            : error instanceof Error
+              ? error.name
+              : "UNKNOWN";
+        retryErrors.push({ code: errCode, message: errMsg.substring(0, 500) });
+
         logger.debug(
           `[${functionTag}] MCP generation failed on attempt ${attempt}/${maxAttempts}`,
           {
-            error: error instanceof Error ? error.message : String(error),
+            error: errMsg,
             willRetry: attempt < maxAttempts,
+            retryCount,
           },
         );
+
+        // Check for non-retryable errors — see NeuroLink.isNonRetryableToolError.
+        // Skipping remaining retries when the model hallucinated a tool name or
+        // sent bad arguments avoids re-triggering the same deterministic failure.
+        const isToolError = NeuroLink.isNonRetryableToolError(error);
+
+        const isNonRetryable =
+          isContextOverflowError(error) ||
+          isToolError ||
+          isNonRetryableProviderError(error) ||
+          (error instanceof Error &&
+            (error as Error & { isRetryable?: boolean }).isRetryable ===
+              false) ||
+          (error instanceof Error &&
+            (error as Error & { statusCode?: number }).statusCode === 400) ||
+          // A 429 already went through the provider layer's bounded,
+          // Retry-After-aware retry (withProviderRetry) — re-running the
+          // whole MCP generation against a rate-limited key is redundant
+          // and only delays fallback orchestration.
+          getErrorStatusCode(error) === 429;
+
+        if (isNonRetryable) {
+          logger.debug(
+            `[${functionTag}] Non-retryable error detected, skipping remaining retries`,
+          );
+          break;
+        }
 
         if (attempt >= maxAttempts) {
           logger.debug(
@@ -2735,7 +8523,21 @@ Current user's request: ${currentInput}`;
           break;
         }
 
-        await new Promise((resolve) => setTimeout(resolve, 500));
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, 500);
+          if (options.abortSignal) {
+            const onAbort = () => {
+              clearTimeout(timer);
+              resolve();
+            };
+            options.abortSignal.addEventListener("abort", onAbort, {
+              once: true,
+            });
+          }
+        });
+        if (options.abortSignal?.aborted) {
+          throw new DOMException("The operation was aborted", "AbortError");
+        }
       }
     }
 
@@ -2748,170 +8550,89 @@ Current user's request: ${currentInput}`;
   private async tryMCPGeneration(
     options: TextGenerationOptions,
   ): Promise<TextGenerationResult | null> {
+    if (options.abortSignal?.aborted) {
+      throw new DOMException("The operation was aborted", "AbortError");
+    }
+
     // 🚀 EXHAUSTIVE LOGGING POINT T001: TRY MCP GENERATION ENTRY
+    const requestId =
+      ((options.context as Record<string, unknown>)?.requestId as string) ||
+      "unknown";
     const tryMCPId = `try-mcp-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     const tryMCPStartTime = Date.now();
     const tryMCPHrTimeStart = process.hrtime.bigint();
     const functionTag = "NeuroLink.tryMCPGeneration";
 
     try {
-      // Initialize MCP if needed
-      await this.initializeMCP();
-
-      if (!this.mcpInitialized) {
-        logger.warn(`[NeuroLink] ⚠️ LOG_POINT_T004_MCP_NOT_AVAILABLE`, {
-          logPoint: "T004_MCP_NOT_AVAILABLE",
-          tryMCPId,
-          timestamp: new Date().toISOString(),
-          elapsedMs: Date.now() - tryMCPStartTime,
-          elapsedNs: (process.hrtime.bigint() - tryMCPHrTimeStart).toString(),
-          mcpInitialized: this.mcpInitialized,
-          mcpComponents: {
-            hasExternalServerManager: !!this.externalServerManager,
-            hasToolRegistry: !!this.toolRegistry,
-            hasProviderRegistry: !!AIProviderFactory,
-          },
-          fallbackReason: "MCP_NOT_INITIALIZED",
-          message:
-            "MCP not available - returning null for fallback to direct generation",
-        });
-        return null; // Skip MCP if not available
-      }
-
-      // Context creation removed - was never used
-
-      // Determine provider
-      const providerName =
-        options.provider === "auto" || !options.provider
-          ? await getBestProvider()
-          : options.provider;
-
-      // Get available tools
-      const availableTools = await this.getAllAvailableTools();
-      const targetTool = availableTools.find(
-        (t) =>
-          t.name.includes("SuccessRateSRByTime") ||
-          t.name.includes("juspay-analytics"),
-      );
-      logger.debug("Available tools for AI prompt generation", {
-        toolsCount: availableTools.length,
-        toolNames: availableTools.map((t) => t.name),
-        hasTargetTool: !!targetTool,
-        targetToolDetails: targetTool
-          ? {
-              name: targetTool.name,
-              description: targetTool.description,
-              server: targetTool.server,
-            }
-          : null,
-      });
-
-      // Create tool-aware system prompt
-      const enhancedSystemPrompt = this.createToolAwareSystemPrompt(
-        options.systemPrompt,
-        availableTools,
-      );
-      logger.debug("Tool-aware system prompt created", {
-        originalPromptLength: options.systemPrompt?.length || 0,
-        enhancedPromptLength: enhancedSystemPrompt.length,
-        enhancedPromptPreview: enhancedSystemPrompt.substring(0, 500) + "...",
-      });
-
-      // Get conversation messages for context
-      const conversationMessages = await getConversationMessages(
-        this.conversationMemory,
+      const generationContext = await this.prepareMCPGenerationContext(
         options,
+        requestId,
+        tryMCPId,
+        tryMCPStartTime,
+        tryMCPHrTimeStart,
       );
-
-      // Create provider and generate
-      const provider = await AIProviderFactory.createProvider(
-        providerName as AIProviderName,
-        options.model,
-        !options.disableTools, // Pass disableTools as inverse of enableMCP
-        this as unknown as UnknownRecord, // Pass SDK instance
-        options.region, // Pass region parameter
-      );
-
-      // ADD: Emit connection events for all providers (Bedrock-compatible)
-      this.emitter.emit("connected");
-      this.emitter.emit(
-        "message",
-        `${providerName} provider initialized successfully`,
-      );
-
-      // Enable tool execution for the provider using BaseProvider method
-      provider.setupToolExecutor(
-        {
-          customTools: this.getCustomTools(),
-          executeTool: this.executeTool.bind(this),
-        },
-        functionTag,
-      );
-
-      const result = await provider.generate({
-        ...options,
-        systemPrompt: enhancedSystemPrompt,
-        conversationMessages, // Inject conversation history
-      });
-
-      const responseTime = Date.now() - tryMCPStartTime;
-
-      // Enhanced result validation - consider tool executions as valid results
-      const hasContent =
-        result && result.content && result.content.trim().length > 0;
-      const hasToolExecutions =
-        result && result.toolExecutions && result.toolExecutions.length > 0;
-
-      // Log detailed result analysis for debugging
-      mcpLogger.debug(`[${functionTag}] Result validation:`, {
-        hasResult: !!result,
-        hasContent,
-        hasToolExecutions,
-        contentLength: result?.content?.length || 0,
-        toolExecutionsCount: result?.toolExecutions?.length || 0,
-        toolsUsedCount: result?.toolsUsed?.length || 0,
-      });
-
-      // Accept result if it has content OR successful tool executions
-      if (!hasContent && !hasToolExecutions) {
-        mcpLogger.debug(
-          `[${functionTag}] Result rejected: no content and no tool executions`,
-        );
-        return null; // Let caller fall back to direct generation
+      if (!generationContext) {
+        return null;
       }
 
-      // Transform tool executions with enhanced preservation
-      const transformedToolExecutions = transformToolExecutionsForMCP(
-        result.toolExecutions,
+      // Provider construction runs BEFORE the budget check so runtime
+      // model-limit discovery (ensureModelLimits) can register real context
+      // windows first — ensureMCPGenerationBudget otherwise computes against
+      // the static default window (see directProviderGeneration for the
+      // lock-out this ordering prevents).
+      const provider = await AIProviderFactory.createProvider(
+        generationContext.providerName as AIProviderName,
+        options.model,
+        !options.disableTools,
+        this,
+        options.region,
+        this.resolveCredentials(options.credentials),
+      );
+      provider.setTraceContext(this._metricsTraceContext);
+      // Never rejects — discovery failure degrades to static defaults.
+      await provider.ensureModelLimits?.();
+
+      const conversationMessages = await this.ensureMCPGenerationBudget(
+        options,
+        requestId,
+        generationContext.providerName,
+        generationContext.enhancedSystemPrompt,
+        generationContext.availableTools,
+        generationContext.conversationMessages,
       );
 
-      // Log transformation results
-      mcpLogger.debug(`[${functionTag}] Tool execution transformation:`, {
-        originalCount: result?.toolExecutions?.length || 0,
-        transformedCount: transformedToolExecutions.length,
-        transformedTools: transformedToolExecutions.map((te) => te.toolName),
+      return this.generateWithMCPProvider({
+        options,
+        requestId,
+        functionTag,
+        tryMCPStartTime,
+        provider,
+        providerName: generationContext.providerName,
+        availableTools: generationContext.availableTools,
+        enhancedSystemPrompt: generationContext.enhancedSystemPrompt,
+        conversationMessages,
       });
-
-      // Return enhanced result with preserved tool information
-      return {
-        content: result.content || "", // Ensure content is never undefined
-        provider: providerName,
-        usage: result.usage,
-        responseTime,
-        toolsUsed: result.toolsUsed || [],
-        toolExecutions: transformedToolExecutions,
-        enhancedWithTools: Boolean(hasToolExecutions), // Mark as enhanced if tools were actually used
-        availableTools: transformToolsForMCP(
-          transformToolsToExpectedFormat(availableTools),
-        ),
-        audio: result.audio,
-        video: result.video,
-        ppt: result.ppt,
-        // Include analytics and evaluation from BaseProvider
-        analytics: result.analytics,
-        evaluation: result.evaluation,
-      };
     } catch (error) {
+      // Immediately propagate AbortError — never swallow aborted requests
+      if (isAbortError(error)) {
+        mcpLogger.debug(`[${functionTag}] AbortError detected, rethrowing`);
+        throw error;
+      }
+
+      // Propagate non-retryable tool errors — see NeuroLink.isNonRetryableToolError.
+      // The caller's retry loop detects this and breaks immediately instead of
+      // retrying the same deterministic failure.
+      const isToolError = NeuroLink.isNonRetryableToolError(error);
+      if (isToolError) {
+        mcpLogger.warn(
+          `[${functionTag}] Non-retryable tool error, rethrowing`,
+          {
+            error: error instanceof Error ? error.message : String(error),
+          },
+        );
+        throw error;
+      }
+
       mcpLogger.warn(`[${functionTag}] MCP generation failed`, {
         error: error instanceof Error ? error.message : String(error),
       });
@@ -2919,8 +8640,590 @@ Current user's request: ${currentInput}`;
     }
   }
 
+  private async prepareMCPGenerationContext(
+    options: TextGenerationOptions,
+    requestId: string,
+    tryMCPId: string,
+    tryMCPStartTime: number,
+    tryMCPHrTimeStart: bigint,
+  ): Promise<{
+    providerName: string;
+    availableTools: ToolInfo[];
+    enhancedSystemPrompt: string;
+    conversationMessages: ChatMessage[];
+  } | null> {
+    await this.initializeMCP();
+
+    if (!this.mcpInitialized) {
+      logger.warn(`[NeuroLink] ⚠️ LOG_POINT_T004_MCP_NOT_AVAILABLE`, {
+        logPoint: "T004_MCP_NOT_AVAILABLE",
+        tryMCPId,
+        timestamp: new Date().toISOString(),
+        elapsedMs: Date.now() - tryMCPStartTime,
+        elapsedNs: (process.hrtime.bigint() - tryMCPHrTimeStart).toString(),
+        mcpInitialized: this.mcpInitialized,
+        mcpComponents: {
+          hasExternalServerManager: !!this.externalServerManager,
+          hasToolRegistry: !!this.toolRegistry,
+          hasProviderRegistry: !!AIProviderFactory,
+        },
+        fallbackReason: "MCP_NOT_INITIALIZED",
+        message:
+          "MCP not available - returning null for fallback to direct generation",
+      });
+      return null;
+    }
+
+    const providerName =
+      options.provider === "auto" || !options.provider
+        ? await getBestProvider()
+        : options.provider;
+    let availableTools = await this.getAllAvailableTools();
+    const { tools: circuitBreakerFilteredTools, unavailableTools } =
+      this.toolRegistry.getAvailableTools(this.toolCircuitBreakers);
+    const cbFilteredNames = new Set(
+      circuitBreakerFilteredTools.map((tool) => tool.name),
+    );
+    availableTools = availableTools.filter((tool) =>
+      cbFilteredNames.has(tool.name),
+    );
+    availableTools = this.applyToolInfoFiltering(availableTools, options);
+
+    const targetTool = availableTools.find(
+      (tool) =>
+        tool.name.includes("SuccessRateSRByTime") ||
+        tool.name.includes("juspay-analytics"),
+    );
+    logger.debug("Available tools for AI prompt generation", {
+      toolsCount: availableTools.length,
+      toolNames: availableTools.map((tool) => tool.name),
+      unavailableToolsCount: unavailableTools.length,
+      unavailableTools,
+      hasTargetTool: !!targetTool,
+      targetToolDetails: targetTool
+        ? {
+            name: targetTool.name,
+            description: targetTool.description,
+            server: targetTool.server,
+          }
+        : null,
+    });
+
+    const circuitBreakerNote =
+      unavailableTools.length > 0
+        ? `\n\nNOTE: The following tools are temporarily unavailable due to repeated failures: ${unavailableTools.join(", ")}. Do not attempt to call these tools.`
+        : "";
+    // Circuit-breaker-open tools are ENFORCED out of the native tool set via
+    // the per-call denylist — asking the model nicely (the note above) is
+    // informational, exclusion is the guarantee. Previously only the
+    // system-prompt listing was filtered; the native array still shipped them.
+    if (unavailableTools.length > 0) {
+      options.excludeTools = [
+        ...new Set([...(options.excludeTools ?? []), ...unavailableTools]),
+      ];
+    }
+    // Providers with native tool calling receive full definitions via their
+    // `tools` parameter; only prompt-based providers still get the listing.
+    const nativeToolSupport = !isPromptOnlyToolProvider(
+      String(providerName).toLowerCase(),
+    );
+    const enhancedSystemPrompt = options.skipToolPromptInjection
+      ? (options.systemPrompt || "") + circuitBreakerNote
+      : this.createToolAwareSystemPrompt(
+          options.systemPrompt,
+          availableTools,
+          nativeToolSupport,
+        ) + circuitBreakerNote;
+    logger.debug("Tool-aware system prompt created", {
+      requestId,
+      originalPromptLength: options.systemPrompt?.length || 0,
+      enhancedPromptLength: enhancedSystemPrompt.length,
+      skippedToolInjection: !!options.skipToolPromptInjection,
+      enhancedPromptPreview: enhancedSystemPrompt.substring(0, 80) + "...",
+    });
+
+    logger.debug("[Observability] System prompt metadata", {
+      requestId,
+      systemPromptLength: enhancedSystemPrompt.length,
+      systemPromptHash:
+        enhancedSystemPrompt.length > 0
+          ? `sha256:${enhancedSystemPrompt.slice(0, 8)}...`
+          : "empty",
+      hasCustomSystemPrompt: !!options.systemPrompt,
+    });
+
+    // Caller-supplied conversationMessages win — mirroring
+    // directProviderGeneration. getConversationMessages() returns [] whenever
+    // no memory manager / session context is configured, which silently
+    // dropped an inline history on the MCP-first path (the default path for
+    // any bare `new NeuroLink()` with tools enabled) while the direct path
+    // honored it.
+    const conversationMessages = (
+      (options as TextGenerationOptions).conversationMessages?.length
+        ? (options as TextGenerationOptions).conversationMessages
+        : await getConversationMessages(this.conversationMemory, options)
+    ) as ChatMessage[];
+    this.logMCPConversationSummary(requestId, conversationMessages);
+
+    logger.debug("[Observability] Available tools for LLM", {
+      requestId,
+      toolCount: availableTools.length,
+      toolNames: availableTools.map((tool) => tool.name),
+    });
+
+    return {
+      providerName,
+      availableTools,
+      enhancedSystemPrompt,
+      conversationMessages,
+    };
+  }
+
+  private logMCPConversationSummary(
+    requestId: string,
+    conversationMessages: ChatMessage[],
+  ): void {
+    if (!logger.shouldLog("debug")) {
+      return;
+    }
+
+    try {
+      logger.debug("[Observability] Conversation history summary", {
+        requestId,
+        messageCount: conversationMessages.length,
+        messages: conversationMessages.map((message, index) => {
+          let contentLength: number;
+          if (typeof message.content === "string") {
+            contentLength = message.content.length;
+          } else {
+            try {
+              contentLength = JSON.stringify(message.content).length;
+            } catch {
+              contentLength = 0;
+            }
+          }
+
+          return {
+            index,
+            role: message.role,
+            contentLength,
+            contentPreview:
+              typeof message.content === "string"
+                ? message.content.substring(0, 200)
+                : "[multimodal]",
+          };
+        }),
+      });
+    } catch {
+      // Ignore serialization errors in debug logging
+    }
+  }
+
+  /**
+   * The replay mode the budget check should size stored tool rows by: the
+   * request's `replayToolSteps`, else the instance's, else the builder's
+   * `"marker"` default — the same resolution BaseProvider applies before
+   * building messages, so the estimate matches the prompt.
+   *
+   * Reach: every `checkContextBudget` call on the generate and stream paths,
+   * including the post-compaction and post-truncation re-checks. It does NOT
+   * reach the compactor's own stage gates or the summarizer's sizing
+   * (`ContextCompactor`, `SummarizationEngine`): those still count tool rows
+   * at stored size, so under `"marker"` / `"off"` a stage may prune or
+   * summarize more history than the prompt would have carried. Threading the
+   * mode into the compactor is a follow-up, tracked in
+   * docs/features/context-compaction.md ("Context budget").
+   */
+  private resolveToolReplayModeForBudget(options: {
+    replayToolSteps?: ToolReplayMode;
+  }): ToolReplayMode {
+    return (
+      options.replayToolSteps ??
+      this.conversationMemory?.config?.replayToolSteps ??
+      "marker"
+    );
+  }
+
+  private async ensureMCPGenerationBudget(
+    options: TextGenerationOptions,
+    requestId: string,
+    providerName: string,
+    enhancedSystemPrompt: string,
+    availableTools: ToolInfo[],
+    conversationMessages: ChatMessage[],
+  ): Promise<ChatMessage[]> {
+    const budgetResult = checkContextBudget({
+      provider: providerName,
+      model: options.model,
+      maxTokens: options.maxTokens,
+      systemPrompt: enhancedSystemPrompt,
+      conversationMessages: conversationMessages as Array<{
+        role: string;
+        content: string;
+      }>,
+      currentPrompt: options.prompt,
+      toolDefinitions: availableTools,
+      compactionThreshold: options.compactionThreshold,
+      toolReplayMode: this.resolveToolReplayModeForBudget(options),
+    });
+
+    logger.info("[TokenBudget] Token breakdown", {
+      requestId,
+      system: budgetResult.breakdown?.systemPrompt || 0,
+      history: budgetResult.breakdown?.conversationHistory || 0,
+      tools: budgetResult.breakdown?.toolDefinitions || 0,
+      currentPrompt: budgetResult.breakdown?.currentPrompt || 0,
+      files: budgetResult.breakdown?.fileAttachments || 0,
+      total: budgetResult.estimatedInputTokens,
+      budget: budgetResult.availableInputTokens,
+      usagePercent: Math.round(budgetResult.usageRatio * 1000) / 10,
+      conversationMessageCount: conversationMessages.length,
+      shouldCompact: budgetResult.shouldCompact,
+    });
+
+    // Scale timeout for large contexts if caller didn't set one explicitly.
+    // Providers read options.timeout via getTimeout(), so setting it here
+    // propagates to any downstream provider call.
+    if (
+      options.timeout === undefined &&
+      budgetResult.estimatedInputTokens > 100_000
+    ) {
+      // >100K → 1.5x, >200K → 2x, >300K → 2.5x (capped at 4x) of 60s base
+      const scale =
+        1 + Math.floor((budgetResult.estimatedInputTokens - 1) / 100_000) * 0.5;
+      const scaledMs = Math.round(60_000 * Math.min(scale, 4));
+      options.timeout = scaledMs;
+      logger.info("[TokenBudget] Scaled timeout for large context", {
+        requestId,
+        estimatedTokens: budgetResult.estimatedInputTokens,
+        scaledTimeoutMs: scaledMs,
+      });
+    }
+
+    const compactionSessionId = this.getCompactionSessionId(options);
+    const lastCompactionCount =
+      this.lastCompactionMessageCount.get(compactionSessionId) ?? 0;
+    if (
+      !budgetResult.shouldCompact ||
+      !this.conversationMemory ||
+      conversationMessages.length <= lastCompactionCount
+    ) {
+      return conversationMessages;
+    }
+
+    return this.compactMCPConversationForBudget({
+      options,
+      requestId,
+      providerName,
+      enhancedSystemPrompt,
+      availableTools,
+      conversationMessages,
+      availableInputTokens: budgetResult.availableInputTokens,
+      historyBudget: resolveHistoryBudget(
+        budgetResult,
+        options.compactionThreshold,
+      ),
+      usageRatio: budgetResult.usageRatio,
+      estimatedInputTokens: budgetResult.estimatedInputTokens,
+      compactionSessionId,
+    });
+  }
+
+  private async compactMCPConversationForBudget(context: {
+    options: TextGenerationOptions;
+    requestId: string;
+    providerName: string;
+    enhancedSystemPrompt: string;
+    availableTools: ToolInfo[];
+    conversationMessages: ChatMessage[];
+    availableInputTokens: number;
+    /** Tokens history may occupy — availableInput minus system/prompt/tools/files. */
+    historyBudget: number;
+    usageRatio: number;
+    estimatedInputTokens: number;
+    compactionSessionId: string;
+  }): Promise<ChatMessage[]> {
+    const {
+      options,
+      requestId,
+      providerName,
+      enhancedSystemPrompt,
+      availableTools,
+      conversationMessages,
+      availableInputTokens,
+      historyBudget,
+      usageRatio,
+      estimatedInputTokens,
+      compactionSessionId,
+    } = context;
+    logger.info(
+      "[NeuroLink] Context budget exceeded, triggering auto-compaction",
+      {
+        usageRatio,
+        estimatedTokens: estimatedInputTokens,
+        availableTokens: availableInputTokens,
+      },
+    );
+
+    const compactor = new ContextCompactor(
+      {
+        provider: providerName,
+        summarizationProvider:
+          this.conversationMemoryConfig?.conversationMemory
+            ?.summarizationProvider,
+        summarizationModel:
+          this.conversationMemoryConfig?.conversationMemory?.summarizationModel,
+      },
+      this.contextCompactorDeps(
+        this.decisionSiteContext(options, compactionSessionId),
+      ),
+    );
+
+    // Fixed overhead (system + prompt + tools + files) already exceeds the
+    // window — no amount of history compaction can fit this request, and
+    // compacting to an empty history would only hide the real cause.
+    if (historyBudget <= 0) {
+      throw new ContextBudgetExceededError(
+        `Context exceeds model budget before any history is included. ` +
+          `System prompt, current prompt and tool definitions alone require ` +
+          `more than the ${availableInputTokens}-token input budget. ` +
+          `Reduce the tool set or the prompt size.`,
+        {
+          estimatedTokens: estimatedInputTokens,
+          availableTokens: availableInputTokens,
+          stagesUsed: [],
+          breakdown: {},
+        },
+      );
+    }
+
+    const compactionResult = await compactor.compact(
+      conversationMessages,
+      historyBudget,
+      this.conversationMemoryConfig?.conversationMemory,
+      requestId,
+      { currentRequest: options.prompt },
+    );
+
+    let compactedMessages = conversationMessages;
+    if (compactionResult.compacted) {
+      const repairedResult = repairToolPairs(compactionResult.messages);
+      compactedMessages = repairedResult.messages;
+      this.lastCompactionMessageCount.set(
+        compactionSessionId,
+        compactedMessages.length,
+      );
+      logger.info("[NeuroLink] Context compacted successfully", {
+        stagesUsed: compactionResult.stagesUsed,
+        tokensSaved: compactionResult.tokensSaved,
+      });
+    }
+
+    const postCompactBudget = checkContextBudget({
+      provider: providerName,
+      model: options.model,
+      maxTokens: options.maxTokens,
+      systemPrompt: enhancedSystemPrompt,
+      conversationMessages: compactedMessages as Array<{
+        role: string;
+        content: string;
+      }>,
+      currentPrompt: options.prompt,
+      toolReplayMode: this.resolveToolReplayModeForBudget(options),
+      toolDefinitions: availableTools,
+    });
+
+    if (postCompactBudget.withinBudget) {
+      return compactedMessages;
+    }
+
+    const overageRatio = postCompactBudget.usageRatio - 1.0;
+    logger.warn(
+      "[NeuroLink] Post-compaction still over budget, attempting emergency content truncation",
+      {
+        requestId,
+        estimatedTokens: postCompactBudget.estimatedInputTokens,
+        availableTokens: postCompactBudget.availableInputTokens,
+        overagePercent: Math.round(overageRatio * 100),
+        stagesUsedInCompaction: compactionResult.stagesUsed,
+      },
+    );
+
+    compactedMessages = emergencyContentTruncation(
+      compactedMessages,
+      postCompactBudget.availableInputTokens,
+      postCompactBudget.breakdown,
+      providerName,
+    );
+
+    const finalBudget = checkContextBudget({
+      provider: providerName,
+      model: options.model,
+      maxTokens: options.maxTokens,
+      systemPrompt: enhancedSystemPrompt,
+      conversationMessages: compactedMessages as Array<{
+        role: string;
+        content: string;
+      }>,
+      currentPrompt: options.prompt,
+      toolReplayMode: this.resolveToolReplayModeForBudget(options),
+      toolDefinitions: availableTools,
+    });
+
+    if (!finalBudget.withinBudget) {
+      // Clear watermark so handleContextOverflow recovery can re-compact
+      this.lastCompactionMessageCount.delete(compactionSessionId);
+
+      throw new ContextBudgetExceededError(
+        `Context exceeds model budget after all compaction stages. ` +
+          `Estimated: ${finalBudget.estimatedInputTokens} tokens, ` +
+          `Budget: ${finalBudget.availableInputTokens} tokens. ` +
+          `Conversation is too large to fit in the model's context window.`,
+        {
+          estimatedTokens: finalBudget.estimatedInputTokens,
+          availableTokens: finalBudget.availableInputTokens,
+          stagesUsed: compactionResult.stagesUsed,
+          breakdown: finalBudget.breakdown,
+        },
+      );
+    }
+
+    return compactedMessages;
+  }
+
+  private async generateWithMCPProvider(context: {
+    options: TextGenerationOptions;
+    requestId: string;
+    functionTag: string;
+    tryMCPStartTime: number;
+    /** Constructed by the caller BEFORE the budget check (see tryMCPGeneration). */
+    provider: Awaited<ReturnType<typeof AIProviderFactory.createProvider>>;
+    providerName: string;
+    availableTools: ToolInfo[];
+    enhancedSystemPrompt: string;
+    conversationMessages: ChatMessage[];
+  }): Promise<TextGenerationResult | null> {
+    const {
+      options,
+      requestId,
+      functionTag,
+      tryMCPStartTime,
+      provider,
+      providerName,
+      availableTools,
+      enhancedSystemPrompt,
+      conversationMessages,
+    } = context;
+    this.emitter.emit("connected");
+    this.emitter.emit(
+      "message",
+      `${providerName} provider initialized successfully`,
+    );
+    provider.setupToolExecutor(
+      {
+        customTools: this.getCustomTools(),
+        executeTool: (toolName: string, params: unknown) =>
+          this.executeTool(toolName, params, {
+            disableToolCache: options.disableToolCache,
+          }),
+      },
+      functionTag,
+    );
+
+    logger.debug("[Observability] User input to LLM", {
+      requestId,
+      promptPreview: options.prompt?.substring(0, 200),
+      promptLength: options.prompt?.length || 0,
+      model: options.model,
+      maxTokens: options.maxTokens,
+      temperature: options.temperature,
+      maxSteps: options.maxSteps,
+      skipToolPromptInjection: options.skipToolPromptInjection,
+    });
+
+    provider.setFileToolRootPolicy?.(this.fileToolRootsFor(options));
+    const result = await provider.generate({
+      ...options,
+      systemPrompt: enhancedSystemPrompt,
+      conversationMessages,
+    });
+    const responseTime = Date.now() - tryMCPStartTime;
+    const hasContent = !!(result?.content && result.content.trim().length > 0);
+    const hasToolExecutions = !!(
+      result?.toolExecutions && result.toolExecutions.length > 0
+    );
+
+    mcpLogger.debug(`[${functionTag}] Result validation:`, {
+      hasResult: !!result,
+      hasContent,
+      hasToolExecutions,
+      contentLength: result?.content?.length || 0,
+      toolExecutionsCount: result?.toolExecutions?.length || 0,
+      toolsUsedCount: result?.toolsUsed?.length || 0,
+    });
+
+    if (!hasContent && !hasToolExecutions) {
+      mcpLogger.debug(
+        `[${functionTag}] Result rejected: no content and no tool executions`,
+      );
+      return null;
+    }
+
+    const transformedToolExecutions = transformToolExecutionsForMCP(
+      result.toolExecutions,
+    );
+    mcpLogger.debug(`[${functionTag}] Tool execution transformation:`, {
+      originalCount: result?.toolExecutions?.length || 0,
+      transformedCount: transformedToolExecutions.length,
+      transformedTools: transformedToolExecutions.map((te) => te.toolName),
+    });
+
+    return {
+      content: result.content || "",
+      provider: providerName,
+      model: result.model,
+      usage: result.usage,
+      responseTime,
+      finishReason: result.finishReason,
+      stopReason: result.stopReason,
+      rawFinishReason: result.rawFinishReason,
+      stepsUsed: result.stepsUsed,
+      toolsUsed: result.toolsUsed || [],
+      toolCalls: result.toolCalls ?? [],
+      toolExecutions: transformedToolExecutions,
+      // A tool RAN (toolsUsed), not merely dispatched (toolExecutions can
+      // include failed/never-found calls) — see hasToolExecutions above,
+      // which still gates the null-result check and must not change.
+      enhancedWithTools: !!(result.toolsUsed && result.toolsUsed.length > 0),
+      availableTools: transformToolsForMCP(
+        transformToolsToExpectedFormat(availableTools),
+      ),
+      audio: result.audio,
+      ttsMetadata: result.ttsMetadata,
+      video: result.video,
+      avatar: result.avatar,
+      music: result.music,
+      ppt: result.ppt,
+      imageOutput: result.imageOutput,
+      analytics: result.analytics,
+      evaluation: result.evaluation,
+      // Forward reasoning from provider so callers asking for `result.reasoning`
+      // (DeepSeek `reasoning_content`, Anthropic thinking, Gemini thought parts,
+      // OpenAI o1) actually receive it.
+      reasoning: result.reasoning,
+      reasoningTokens: result.reasoningTokens,
+      // Propagate the native-emission flag so finalizeGenerateRequestResult
+      // skips the public top-level `generation:end` emission when the
+      // provider already emitted it itself (Vertex / Google AI Studio).
+      _generationEndEmitted: (result as { _generationEndEmitted?: boolean })
+        ._generationEndEmitted,
+    } as TextGenerationResult & { _generationEndEmitted?: boolean };
+  }
+
   /**
    * Direct provider generation (no MCP, no recursion)
+   * An explicit provider precedes orchestration context; otherwise a valid
+   * orchestration preference is tried before the existing provider fallback list.
    */
   private async directProviderGeneration(
     options: TextGenerationOptions,
@@ -2943,14 +9246,9 @@ Current user's request: ${currentInput}`;
     const requestedProvider =
       options.provider === "auto" ? undefined : options.provider;
 
-    // Check for orchestrated preferred provider in context
+    // Read the shared preference while keeping an explicit provider first.
     const preferredOrchestrated =
-      options.context &&
-      typeof options.context === "object" &&
-      "__orchestratedPreferredProvider" in options.context
-        ? (options.context as { __orchestratedPreferredProvider?: string })
-            .__orchestratedPreferredProvider
-        : undefined;
+      this.getOrchestratedPreferredProvider(options);
 
     // Build provider list with orchestrated preference first, then fallback to full list
     const tryProviders = preferredOrchestrated
@@ -2961,34 +9259,569 @@ Current user's request: ${currentInput}`;
       : requestedProvider
         ? [requestedProvider]
         : providerPriority;
+    // The caller owns fallback order (a providerFallback / modelChain caller,
+    // or a router that retries on its own): bound the walk to its first
+    // candidate so an unavailable provider surfaces as its own error instead
+    // of a silent switch. An explicit provider is already a one-element
+    // list; this only changes the "auto" and orchestrated-preference walks.
+    const providersToTry =
+      options.disableInternalFallback === true
+        ? tryProviders.slice(0, 1)
+        : tryProviders;
+    // Caller-owned fallback never enters tryProviders: providerFallback and
+    // modelChain are walked by runWithFallbackOrchestration around the public
+    // generate() call, and a configured ModelPool is consumed by the block
+    // above. Slicing here therefore never clips a caller's own list.
 
     logger.debug(`[${functionTag}] Starting direct generation`, {
       requestedProvider: requestedProvider || "auto",
       preferredOrchestrated: preferredOrchestrated || "none",
-      tryProviders,
-      allowFallback: !requestedProvider || !!preferredOrchestrated,
+      tryProviders: providersToTry,
+      allowFallback: providersToTry.length > 1,
     });
+
+    // ─── ModelPool path ──────────────────────────────────────────────────────
+    // When a ModelPool is configured, source the candidate sequence from the
+    // pool instead of (or in addition to) the static tryProviders list.
+    // Preserves the existing isNonRetryableProviderError short-circuit and
+    // AbortError propagation semantics. Falls through to the standard path
+    // when no pool is configured.
+    if (this.modelPool) {
+      const pool = this.modelPool;
+      const maxPoolAttempts = pool.maxAttempts;
+      const triedKeys = new Set<string>();
+      let poolLastError: Error | null = null;
+
+      for (let attempt = 0; attempt < maxPoolAttempts; attempt++) {
+        if (options.abortSignal?.aborted) {
+          throw new DOMException("The operation was aborted", "AbortError");
+        }
+
+        const member = pool.selectNext(triedKeys);
+        if (!member) {
+          // All available members exhausted.
+          break;
+        }
+        triedKeys.add(pool.memberKey(member));
+
+        // Temporarily override provider/model/region from the pool member.
+        const savedProvider = options.provider;
+        const savedModel = options.model;
+        const savedRegion = options.region;
+        options.provider = member.provider as AIProviderName;
+        // When the member omits model/region, clear inherited values so the
+        // provider's own default is used rather than a mismatched caller value.
+        options.model = member.model ?? undefined;
+        options.region = member.region ?? undefined;
+
+        const poolProviderName = member.provider;
+        logger.debug(`[${functionTag}] ModelPool: attempting member`, {
+          provider: poolProviderName,
+          model: member.model ?? options.model,
+          attempt,
+        });
+
+        try {
+          // Get conversation messages for context (use pre-compacted if provided)
+          const poolOptionsWithMessages = options as TextGenerationOptions & {
+            conversationMessages?: unknown[];
+          };
+          const poolConversationMessages = poolOptionsWithMessages
+            .conversationMessages?.length
+            ? poolOptionsWithMessages.conversationMessages
+            : await getConversationMessages(this.conversationMemory, options);
+
+          const poolProvider = await AIProviderFactory.createProvider(
+            poolProviderName as AIProviderName,
+            options.model,
+            !options.disableTools,
+            this,
+            options.region,
+            this.resolveCredentials(options.credentials),
+          );
+
+          poolProvider.setTraceContext(this._metricsTraceContext);
+          poolProvider.setupToolExecutor(
+            {
+              customTools: this.getCustomTools(),
+              executeTool: (toolName: string, params: unknown) =>
+                this.executeTool(toolName, params, {
+                  disableToolCache: options.disableToolCache,
+                }),
+            },
+            functionTag,
+          );
+
+          poolProvider.setFileToolRootPolicy?.(this.fileToolRootsFor(options));
+          const poolResult = await poolProvider.generate({
+            ...options,
+            conversationMessages: poolConversationMessages,
+          });
+
+          if (!poolResult) {
+            throw new Error(
+              `ModelPool: provider ${poolProviderName} returned null result`,
+            );
+          }
+
+          pool.recordSuccess(member);
+          const responseTime = Date.now() - startTime;
+
+          // Restore original options fields so callers see a clean object.
+          options.provider = savedProvider;
+          options.model = savedModel;
+          options.region = savedRegion;
+
+          return {
+            content: poolResult.content || "",
+            provider: poolProviderName,
+            model: poolResult.model,
+            usage: poolResult.usage,
+            responseTime,
+            finishReason: poolResult.finishReason,
+            stopReason: poolResult.stopReason,
+            rawFinishReason: poolResult.rawFinishReason,
+            stepsUsed: poolResult.stepsUsed,
+            toolsUsed: poolResult.toolsUsed || [],
+            toolCalls: poolResult.toolCalls ?? [],
+            // Lossless pass-through: keep the full ToolExecutionRecord
+            // fields (params/resultText/isError/timing) alongside the
+            // legacy {toolName,executionTime,success} shape this internal
+            // result declares, so the final GenerateResult mapping
+            // reconstructs real records instead of empty ones.
+            toolExecutions: poolResult.toolExecutions?.map((te) => ({
+              ...te,
+              executionTime: te.durationMs,
+              success: !te.isError,
+            })),
+            // A tool RAN (toolsUsed), not merely dispatched.
+            enhancedWithTools: !!poolResult.toolsUsed?.length,
+            analytics: poolResult.analytics,
+            evaluation: poolResult.evaluation,
+            audio: poolResult.audio,
+            ttsMetadata: poolResult.ttsMetadata,
+            video: poolResult.video,
+            avatar: poolResult.avatar,
+            music: poolResult.music,
+            ppt: poolResult.ppt,
+            imageOutput: poolResult.imageOutput,
+            reasoning: poolResult.reasoning,
+            reasoningTokens: poolResult.reasoningTokens,
+            _generationEndEmitted: (
+              poolResult as { _generationEndEmitted?: boolean }
+            )._generationEndEmitted,
+          } as TextGenerationResult & { _generationEndEmitted?: boolean };
+        } catch (poolError) {
+          // Restore options unconditionally on failure.
+          options.provider = savedProvider;
+          options.model = savedModel;
+          options.region = savedRegion;
+
+          if (isAbortError(poolError)) {
+            throw poolError;
+          }
+          if (isNonRetryableForPool(poolError)) {
+            const poolErrMsg =
+              poolError instanceof Error
+                ? poolError.message
+                : String(poolError);
+            logger.warn(
+              `[${functionTag}] ModelPool: non-retryable error from ${poolProviderName}, stopping pool`,
+              { error: poolErrMsg },
+            );
+            pool.recordFailure(member, classifyProviderError(poolError));
+            // Wrap in a plain Error so runWithFallbackOrchestration does not
+            // mistake this for a ModelAccessDeniedError and start a second
+            // retry layer on top of the already-exhausted pool.
+            throw new Error(`[ModelPool] non-retryable: ${poolErrMsg}`, {
+              cause: poolError,
+            });
+          }
+
+          pool.recordFailure(member, classifyProviderError(poolError));
+          poolLastError =
+            poolError instanceof Error
+              ? poolError
+              : new Error(String(poolError));
+          logger.warn(
+            `[${functionTag}] ModelPool: member ${poolProviderName} failed`,
+            { error: poolLastError.message },
+          );
+        }
+      }
+
+      // All pool members failed or were exhausted.
+      const poolResponseTime = Date.now() - startTime;
+      logger.error(`[${functionTag}] ModelPool: all members failed`, {
+        triedKeys: Array.from(triedKeys),
+        lastError: poolLastError?.message,
+        responseTime: poolResponseTime,
+      });
+      // Wrap in a plain Error (not a typed error class) so that
+      // runWithFallbackOrchestration does not re-activate the modelChain /
+      // providerFallback layer on top of an already-exhausted pool.
+      throw new Error(
+        `[ModelPool] all members failed: ${poolLastError?.message ?? "no members available"}`,
+      );
+    }
+    // ─── End ModelPool path ───────────────────────────────────────────────────
 
     let lastError: Error | null = null;
 
     // Try each provider in order
-    for (const providerName of tryProviders) {
+    for (const providerName of providersToTry) {
+      if (options.abortSignal?.aborted) {
+        throw new DOMException("The operation was aborted", "AbortError");
+      }
+
       try {
         logger.debug(`[${functionTag}] Attempting provider: ${providerName}`);
 
-        // Get conversation messages for context
-        const conversationMessages = await getConversationMessages(
-          this.conversationMemory,
-          options,
-        );
+        // Get conversation messages for context (use pre-compacted if provided)
+        const optionsWithMessages = options as TextGenerationOptions & {
+          conversationMessages?: unknown[];
+        };
+        let conversationMessages = optionsWithMessages.conversationMessages
+          ?.length
+          ? optionsWithMessages.conversationMessages
+          : await getConversationMessages(this.conversationMemory, options);
 
+        // Provider construction runs BEFORE the budget check so runtime
+        // model-limit discovery (ensureModelLimits) can register real
+        // context windows first. The previous order created a lock-out:
+        // checkContextBudget ran against the static default window, its
+        // pre-dispatch hard cap threw before the provider (whose
+        // constructor owns the discovery) ever existed — so a blocked call
+        // prevented the very discovery that would have unblocked it.
         const provider = await AIProviderFactory.createProvider(
           providerName as AIProviderName,
           options.model,
           !options.disableTools, // Pass disableTools as inverse of enableMCP
-          this as unknown as UnknownRecord, // Pass SDK instance
+          this, // Pass SDK instance
           options.region, // Pass region parameter
+          this.resolveCredentials(options.credentials),
         );
+
+        // Propagate trace context for parent-child span hierarchy
+        provider.setTraceContext(this._metricsTraceContext);
+
+        // Never rejects — discovery failure degrades to static defaults.
+        await provider.ensureModelLimits?.();
+
+        // Pre-generation budget check
+        const budgetCheck = checkContextBudget({
+          provider: providerName,
+          model: options.model,
+          maxTokens: options.maxTokens,
+          systemPrompt: options.systemPrompt,
+          conversationMessages: conversationMessages as Array<{
+            role: string;
+            content: string;
+          }>,
+          currentPrompt: options.prompt,
+          toolReplayMode: this.resolveToolReplayModeForBudget(options),
+          toolDefinitions: options.tools
+            ? Object.values(options.tools)
+            : undefined,
+          compactionThreshold: options.compactionThreshold,
+        });
+
+        const dpgMessageCount = conversationMessages?.length || 0;
+        const dpgCompactionSessionId = this.getCompactionSessionId(options);
+        // Curator P1-2: pre-dispatch compaction must run for inline
+        // `conversationMessages` too (not just conversationMemory). Without
+        // this, a 1.3M-token caller-supplied conversation against a 128K
+        // window dispatches anyway and the provider returns
+        // "prompt is too long" — the bug Curator's report cited.
+        const dpgHasInlineMessages =
+          !!optionsWithMessages.conversationMessages?.length;
+        // Reviewer follow-up: gate the hard cap on the *actual compactable
+        // history* rather than `this.conversationMemory`. A configured-but-
+        // empty memory store leaves nothing to compact yet still satisfies
+        // `!this.conversationMemory === false`, so the previous check
+        // skipped the hard cap and dispatched the oversized payload.
+        const dpgHasCompactableMessages = dpgMessageCount > 0;
+
+        // Reviewer Finding #4: pre-dispatch hard cap for the standalone
+        // oversized case. When the budget check shows the request is
+        // over budget but there's nothing to compact (no memory + no
+        // inline messages — e.g. a huge prompt or huge tool definitions
+        // alone), recover by WINDOWING the prompt when the prompt is what
+        // blew the budget: keep its head and tail around an elision marker
+        // and dispatch. Agentic callers (Yama's session loop) carry their
+        // whole tool transcript in the prompt; the previous
+        // unconditional throw dead-ended every such turn — observed live
+        // as an unbounded retry loop (93K→299K tokens, no verdict, ever).
+        // The throw remains for the truly unrecoverable case: system
+        // prompt + tool definitions alone exceed the budget.
+        let promptWindowRecovered = false;
+        if (!budgetCheck.withinBudget && !dpgHasCompactableMessages) {
+          const fixedOverhead =
+            (budgetCheck.breakdown?.systemPrompt ?? 0) +
+            (budgetCheck.breakdown?.toolDefinitions ?? 0) +
+            (budgetCheck.breakdown?.fileAttachments ?? 0);
+          // 3% margin against estimator drift; 1024-token floor — below
+          // that, a windowed prompt carries too little to answer from.
+          const promptBudget = Math.floor(
+            (budgetCheck.availableInputTokens - fixedOverhead) * 0.97,
+          );
+          const promptText =
+            typeof options.prompt === "string" ? options.prompt : undefined;
+          if (
+            promptText &&
+            promptBudget >= 1024 &&
+            (budgetCheck.breakdown?.currentPrompt ?? 0) > promptBudget
+          ) {
+            const marker =
+              "\n\n[... middle of this prompt elided by NeuroLink to fit the model's context window ...]\n\n";
+            // Proportional char budget from the observed chars-per-token of
+            // THIS text, re-checked and shrunk until the estimator agrees.
+            let charBudget = Math.floor(
+              promptText.length *
+                (promptBudget /
+                  Math.max(budgetCheck.breakdown?.currentPrompt ?? 1, 1)),
+            );
+            let windowed = promptText;
+            for (let attempt = 0; attempt < 4; attempt++) {
+              const headChars = Math.floor(charBudget * 0.6);
+              const tailChars = Math.max(
+                charBudget - headChars - marker.length,
+                0,
+              );
+              windowed =
+                promptText.slice(0, headChars) +
+                marker +
+                (tailChars > 0 ? promptText.slice(-tailChars) : "");
+              const recheck = checkContextBudget({
+                provider: providerName,
+                model: options.model,
+                maxTokens: options.maxTokens,
+                systemPrompt: options.systemPrompt,
+                conversationMessages: [],
+                currentPrompt: windowed,
+                toolReplayMode: this.resolveToolReplayModeForBudget(options),
+                toolDefinitions: options.tools
+                  ? Object.values(options.tools)
+                  : undefined,
+              });
+              if (recheck.withinBudget) {
+                break;
+              }
+              charBudget = Math.floor(charBudget * 0.8);
+              if (attempt === 3) {
+                windowed = promptText; // give up — fall through to the throw
+              }
+            }
+            if (windowed !== promptText) {
+              logger.warn(
+                "[NeuroLink] Prompt exceeded the model's context budget with nothing to compact — " +
+                  "windowed the prompt (head+tail kept, middle elided) to fit.",
+                {
+                  provider: providerName,
+                  model: options.model,
+                  estimatedTokens: budgetCheck.estimatedInputTokens,
+                  budget: budgetCheck.availableInputTokens,
+                  originalPromptChars: promptText.length,
+                  windowedPromptChars: windowed.length,
+                },
+              );
+              try {
+                this.emitter.emit("compaction.applied", {
+                  stagesAttempted: ["pre-dispatch prompt window"],
+                  finalTokens: budgetCheck.availableInputTokens,
+                  budget: budgetCheck.availableInputTokens,
+                  provider: providerName,
+                  model: options.model,
+                  phase: "pre-dispatch-prompt-window",
+                  timestamp: Date.now(),
+                });
+              } catch {
+                /* listener errors are non-fatal */
+              }
+              options.prompt = windowed;
+              const inputHolder = (options as { input?: { text?: string } })
+                .input;
+              if (inputHolder && typeof inputHolder.text === "string") {
+                inputHolder.text = windowed;
+              }
+              promptWindowRecovered = true;
+            }
+          }
+          if (!promptWindowRecovered) {
+            try {
+              this.emitter.emit("compaction.insufficient", {
+                stagesAttempted: ["pre-dispatch hard cap"],
+                finalTokens: budgetCheck.estimatedInputTokens,
+                budget: budgetCheck.availableInputTokens,
+                provider: providerName,
+                model: options.model,
+                phase: "pre-dispatch-no-recovery",
+                timestamp: Date.now(),
+              });
+            } catch {
+              /* listener errors are non-fatal */
+            }
+            throw new ContextBudgetExceededError(
+              `Context exceeds model budget and no compaction is possible ` +
+                `(no conversationMemory, no inline conversationMessages — only ` +
+                `prompt + tools). Estimated: ${budgetCheck.estimatedInputTokens} ` +
+                `tokens, budget: ${budgetCheck.availableInputTokens} tokens. ` +
+                `Reduce prompt or tool-definition size, or trim the request.`,
+              {
+                estimatedTokens: budgetCheck.estimatedInputTokens,
+                availableTokens: budgetCheck.availableInputTokens,
+                stagesUsed: [],
+                breakdown: budgetCheck.breakdown,
+              },
+            );
+          }
+        }
+
+        if (
+          budgetCheck.shouldCompact &&
+          (this.conversationMemory || dpgHasInlineMessages) &&
+          dpgMessageCount >
+            (this.lastCompactionMessageCount.get(dpgCompactionSessionId) ?? 0)
+        ) {
+          const compactor = new ContextCompactor(
+            {
+              provider: providerName,
+              summarizationProvider:
+                this.conversationMemoryConfig?.conversationMemory
+                  ?.summarizationProvider,
+              summarizationModel:
+                this.conversationMemoryConfig?.conversationMemory
+                  ?.summarizationModel,
+            },
+            this.contextCompactorDeps(
+              this.decisionSiteContext(options, dpgCompactionSessionId),
+            ),
+          );
+          const compactionResult = await compactor.compact(
+            conversationMessages as import("./types/index.js").ChatMessage[],
+            resolveHistoryBudget(budgetCheck, options.compactionThreshold),
+            this.conversationMemoryConfig?.conversationMemory,
+            (options.context as Record<string, unknown>)?.requestId as
+              | string
+              | undefined,
+            { currentRequest: options.prompt },
+          );
+          if (compactionResult.compacted) {
+            const repairedResult = repairToolPairs(compactionResult.messages);
+            conversationMessages = repairedResult.messages;
+            this.lastCompactionMessageCount.set(
+              dpgCompactionSessionId,
+              conversationMessages.length,
+            );
+          }
+
+          // POST-COMPACTION BUDGET RE-CHECK (BUG-003 fix)
+          const postCompactBudget = checkContextBudget({
+            provider: providerName,
+            model: options.model,
+            maxTokens: options.maxTokens,
+            systemPrompt: options.systemPrompt,
+            conversationMessages: conversationMessages as Array<{
+              role: string;
+              content: string;
+            }>,
+            currentPrompt: options.prompt,
+            toolReplayMode: this.resolveToolReplayModeForBudget(options),
+            toolDefinitions: options.tools
+              ? Object.values(options.tools)
+              : undefined,
+          });
+
+          if (!postCompactBudget.withinBudget) {
+            logger.warn(
+              "[NeuroLink] directProviderGeneration: post-compaction still over budget, emergency truncation",
+              {
+                estimatedTokens: postCompactBudget.estimatedInputTokens,
+                availableTokens: postCompactBudget.availableInputTokens,
+                overagePercent: Math.round(
+                  (postCompactBudget.usageRatio - 1.0) * 100,
+                ),
+              },
+            );
+
+            // Curator P1-2: emit `compaction.insufficient` whenever a
+            // single round of compaction wasn't enough — even when
+            // emergency truncation will save the day. Lets cost / audit
+            // listeners track the "compaction was insufficient" signal
+            // separately from the eventual outcome.
+            try {
+              this.emitter.emit("compaction.insufficient", {
+                stagesAttempted: compactionResult.stagesUsed,
+                finalTokens: postCompactBudget.estimatedInputTokens,
+                budget: postCompactBudget.availableInputTokens,
+                provider: providerName,
+                model: options.model,
+                phase: "mid-compaction",
+                willEmergencyTruncate: true,
+                timestamp: Date.now(),
+              });
+            } catch {
+              /* listener errors are non-fatal */
+            }
+
+            conversationMessages = emergencyContentTruncation(
+              conversationMessages as import("./types/index.js").ChatMessage[],
+              postCompactBudget.availableInputTokens,
+              postCompactBudget.breakdown,
+              providerName,
+            );
+
+            const finalBudget = checkContextBudget({
+              provider: providerName,
+              model: options.model,
+              maxTokens: options.maxTokens,
+              systemPrompt: options.systemPrompt,
+              conversationMessages: conversationMessages as Array<{
+                role: string;
+                content: string;
+              }>,
+              currentPrompt: options.prompt,
+              toolReplayMode: this.resolveToolReplayModeForBudget(options),
+              toolDefinitions: options.tools
+                ? Object.values(options.tools)
+                : undefined,
+            });
+
+            if (!finalBudget.withinBudget) {
+              // Clear watermark so handleContextOverflow recovery can re-compact
+              this.lastCompactionMessageCount.delete(dpgCompactionSessionId);
+
+              // Curator P1-2: emit `compaction.insufficient` so cost / audit
+              // listeners can record the specific failure mode (separate
+              // from a generic provider error).
+              try {
+                this.emitter.emit("compaction.insufficient", {
+                  stagesAttempted: compactionResult.stagesUsed,
+                  finalTokens: finalBudget.estimatedInputTokens,
+                  budget: finalBudget.availableInputTokens,
+                  provider: providerName,
+                  model: options.model,
+                  phase: "post-emergency-truncation",
+                  timestamp: Date.now(),
+                });
+              } catch {
+                /* listener errors are non-fatal */
+              }
+
+              throw new ContextBudgetExceededError(
+                `Context exceeds model budget after all compaction stages. ` +
+                  `Estimated: ${finalBudget.estimatedInputTokens} tokens, ` +
+                  `Budget: ${finalBudget.availableInputTokens} tokens.`,
+                {
+                  estimatedTokens: finalBudget.estimatedInputTokens,
+                  availableTokens: finalBudget.availableInputTokens,
+                  stagesUsed: compactionResult.stagesUsed,
+                  breakdown: finalBudget.breakdown,
+                },
+              );
+            }
+          }
+        }
 
         // ADD: Emit connection events for successful provider creation (Bedrock-compatible)
         this.emitter.emit("connected");
@@ -3001,11 +9834,15 @@ Current user's request: ${currentInput}`;
         provider.setupToolExecutor(
           {
             customTools: this.getCustomTools(),
-            executeTool: this.executeTool.bind(this),
+            executeTool: (toolName: string, params: unknown) =>
+              this.executeTool(toolName, params, {
+                disableToolCache: options.disableToolCache,
+              }),
           },
           functionTag,
         );
 
+        provider.setFileToolRootPolicy?.(this.fileToolRootsFor(options));
         const result = await provider.generate({
           ...options,
           conversationMessages, // Inject conversation history
@@ -3027,17 +9864,68 @@ Current user's request: ${currentInput}`;
           model: result.model,
           usage: result.usage,
           responseTime,
+          finishReason: result.finishReason,
+          stopReason: result.stopReason,
+          rawFinishReason: result.rawFinishReason,
+          stepsUsed: result.stepsUsed,
           toolsUsed: result.toolsUsed || [],
-          enhancedWithTools: false,
+          // The providers record executed calls; without this line the public
+          // result never carried them, whatever the provider returned.
+          toolCalls: result.toolCalls ?? [],
+          // Lossless pass-through: keep the full ToolExecutionRecord fields
+          // alongside the legacy {toolName,executionTime,success} shape this
+          // internal result declares, so the final GenerateResult mapping
+          // reconstructs real records instead of empty ones.
+          toolExecutions: result.toolExecutions?.map((te) => ({
+            ...te,
+            executionTime: te.durationMs,
+            success: !te.isError,
+          })),
+          // A tool RAN (toolsUsed), not merely dispatched.
+          enhancedWithTools: !!result.toolsUsed?.length,
           analytics: result.analytics,
           evaluation: result.evaluation,
           audio: result.audio,
+          ttsMetadata: result.ttsMetadata,
           video: result.video,
+          avatar: result.avatar,
+          music: result.music,
           ppt: result.ppt,
           // CRITICAL FIX: Include imageOutput for image generation models
           imageOutput: result.imageOutput,
-        };
+          // Forward reasoning so callers asking for `result.reasoning`
+          // (DeepSeek `reasoning_content`, Anthropic thinking, Gemini
+          // thought parts, OpenAI o1) actually receive it.
+          reasoning: result.reasoning,
+          reasoningTokens: result.reasoningTokens,
+          // Propagate native-emission flag — see attemptMCPGeneration comment.
+          _generationEndEmitted: (result as { _generationEndEmitted?: boolean })
+            ._generationEndEmitted,
+        } as TextGenerationResult & { _generationEndEmitted?: boolean };
       } catch (error) {
+        // Immediately propagate AbortError — never fall back to next provider on abort
+        if (isAbortError(error)) {
+          logger.debug(
+            `[${functionTag}] AbortError detected on provider ${providerName}, stopping fallback`,
+          );
+          throw error;
+        }
+
+        // Circuit breaker for non-retryable errors (model not found, auth failed, etc.)
+        // These errors are permanent — retrying with the same config will always fail
+        // and wastes tokens/latency (e.g., 6 retries of 418KB = ~628K wasted tokens)
+        if (isNonRetryableProviderError(error)) {
+          logger.warn(
+            `[${functionTag}] Non-retryable error from provider ${providerName}, stopping fallback chain`,
+            {
+              error: error instanceof Error ? error.message : String(error),
+              errorType:
+                error instanceof Error ? error.constructor.name : typeof error,
+            },
+          );
+          throw error instanceof Error ? error : new Error(String(error));
+        }
+
         lastError = error instanceof Error ? error : new Error(String(error));
         logger.warn(`[${functionTag}] Provider ${providerName} failed`, {
           error: lastError.message,
@@ -3049,12 +9937,52 @@ Current user's request: ${currentInput}`;
     // All providers failed
     const responseTime = Date.now() - startTime;
     logger.error(`[${functionTag}] All providers failed`, {
-      triedProviders: tryProviders,
+      triedProviders: providersToTry,
       lastError: lastError?.message,
       responseTime,
     });
 
-    throw new Error(
+    // Reviewer follow-up: preserve typed ContextBudgetExceededError after
+    // the per-provider fallback loop. Each provider's hard cap is
+    // per-window; we let the loop try them all, but if every provider
+    // rejected on budget the caller still needs the typed error to
+    // distinguish "context too large" from a generic provider failure.
+    if (lastError instanceof ContextBudgetExceededError) {
+      throw lastError;
+    }
+
+    // A single-candidate list (an explicit provider, or
+    // disableInternalFallback) never actually tried "all providers" —
+    // naming the one provider that failed is clearer than the generic
+    // multi-provider wording. The multi-provider prefix is left untouched
+    // so existing message-matching suites keep passing.
+    // Both wrappers replace the provider's error with a new one, discarding
+    // anything attached to it. `_generationEndEmitted` has to survive: lose it
+    // and emitGenerateErrorEvent emits a second event for a failure the native
+    // provider already reported. Returns the error rather than throwing so each
+    // call site keeps its own `throw` — a never-returning helper reads better
+    // but tsconfig.cli.json will not accept it as terminating the enclosing
+    // function (TS2366). `cause` is set because the original error and its
+    // stack were simply being thrown away.
+    const wrapProviderError = (message: string): Error => {
+      const wrapped = new Error(message, { cause: lastError });
+      if (
+        lastError &&
+        (lastError as { _generationEndEmitted?: boolean })._generationEndEmitted
+      ) {
+        (wrapped as { _generationEndEmitted?: boolean })._generationEndEmitted =
+          true;
+      }
+      return wrapped;
+    };
+
+    if (providersToTry.length === 1) {
+      throw wrapProviderError(
+        `Provider ${providersToTry[0]} failed: ${lastError?.message || "Unknown error"}`,
+      );
+    }
+
+    throw wrapProviderError(
       `Failed to generate text with all providers. Last error: ${lastError?.message || "Unknown error"}`,
     );
   }
@@ -3062,15 +9990,76 @@ Current user's request: ${currentInput}`;
   /**
    * Create tool-aware system prompt that informs AI about available tools
    */
+  /**
+   * Apply per-call tool filtering (whitelist/blacklist) to a ToolInfo array.
+   * Used to filter the tool list before building the system prompt.
+   *
+   * Resolves the SAME policy as the native gate (`BaseProvider`
+   * `applyToolFiltering`) — per-call options plus the instance-level `tools`
+   * config — so what the model is told about tools never diverges from the
+   * tools it can actually call.
+   */
+  private applyToolInfoFiltering(
+    tools: ToolInfo[],
+    options: {
+      toolFilter?: string[];
+      enabledToolNames?: string[];
+      excludeTools?: string[];
+      disableTools?: boolean;
+    },
+  ): ToolInfo[] {
+    const policy = resolveToolPolicy({
+      options: {
+        disableTools: options.disableTools,
+        toolFilter: options.toolFilter,
+        enabledToolNames: options.enabledToolNames,
+        excludeTools: options.excludeTools,
+      },
+      instanceConfig: this.toolsConfig,
+      builtinToolNames: Object.keys(directAgentTools),
+    });
+
+    // Null prototype + own-property checks: a tool named "__proto__" must
+    // become an own entry — with a plain `{}`, `"__proto__" in record` is
+    // truthy via the prototype and the tool would be silently dropped from
+    // the listing while surviving the native gate. Matches the hardening on
+    // every other record in the tool-resolution pipeline.
+    const record: Record<string, ToolInfo> = Object.create(null) as Record<
+      string,
+      ToolInfo
+    >;
+    for (const tool of tools) {
+      if (!Object.hasOwn(record, tool.name)) {
+        record[tool.name] = tool;
+      }
+    }
+    const gated = applyToolGate(record, policy);
+    const filtered = tools.filter((t) => Object.hasOwn(gated, t.name));
+
+    if (filtered.length !== tools.length) {
+      logger.debug(`Tool info filtering applied for system prompt`, {
+        beforeCount: tools.length,
+        afterCount: filtered.length,
+        policySources: policy.sources,
+        toolFilter: options.toolFilter,
+        excludeTools: options.excludeTools,
+      });
+    }
+
+    return filtered;
+  }
+
   private createToolAwareSystemPrompt(
     originalSystemPrompt: string | undefined,
     availableTools: ToolInfo[],
+    nativeToolSupport: boolean,
   ): string {
     // AI prompt generation with tool analysis and structured logging
     const promptGenerationData = {
       originalPromptLength: originalSystemPrompt?.length || 0,
       availableToolsCount: availableTools.length,
       hasOriginalPrompt: !!originalSystemPrompt,
+      nativeToolSupport,
     };
 
     logger.debug(
@@ -3081,6 +10070,18 @@ Current user's request: ${currentInput}`;
     if (availableTools.length === 0) {
       logger.debug("No tools available - returning original prompt");
       return originalSystemPrompt || "";
+    }
+
+    if (nativeToolSupport) {
+      // The provider receives full tool definitions natively via its `tools`
+      // parameter — repeating name/description/parameters here was pure
+      // duplication (~850 tokens on the default surface, tens of thousands
+      // with MCP servers attached). Keep only a short, static (cache-stable)
+      // damping line so models don't over-reach for tools.
+      return (
+        (originalSystemPrompt || "") +
+        "\n\nTools are available via native tool calling. Use them only when they genuinely improve your response; for creative or conversational requests, respond naturally without tools."
+      );
     }
 
     const toolDescriptions = transformToolsToDescriptions(
@@ -3126,7 +10127,7 @@ Current user's request: ${currentInput}`;
   private async detectAndExecuteTools(
     prompt: string,
     _domainType?: string,
-  ): Promise<ToolExecutionResult> {
+  ): Promise<OrchestrationResult> {
     const functionTag = "NeuroLink.detectAndExecuteTools";
 
     try {
@@ -3195,6 +10196,7 @@ Current user's request: ${currentInput}`;
    * @param options.enableEvaluation - Whether to include response quality evaluation
    * @param options.context - Additional context for the request
    * @param options.evaluationDomain - Domain for specialized evaluation
+   * @param options.useKnowledgeGrounding - Whether to use the instance's configured knowledge for this call
    *
    * @returns Promise resolving to StreamResult with an async iterable stream
    *
@@ -3207,7 +10209,9 @@ Current user's request: ${currentInput}`;
    *
    * // Consume the stream
    * for await (const chunk of result.stream) {
-   *   process.stdout.write(chunk.content);
+   *   if ("content" in chunk) {
+   *     process.stdout.write(chunk.content);
+   *   }
    * }
    *
    * // Advanced streaming with options
@@ -3229,473 +10233,2747 @@ Current user's request: ${currentInput}`;
    * @throws {Error} When all providers fail to generate content
    * @throws {Error} When conversation memory operations fail (if enabled)
    */
-  async stream(options: StreamOptions): Promise<StreamResult> {
-    const startTime = Date.now();
-    const hrTimeStart = process.hrtime.bigint();
-    const streamId = `neurolink-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-    const originalPrompt = options.input.text; // Store the original prompt for memory storage
+  async stream(options: StreamOptions | DynamicOptions): Promise<StreamResult> {
+    const eventScope = Symbol("stream-conversation");
+    return this.conversationEventContext.run(eventScope, () =>
+      logger.runInInstanceScope(this.logInstanceId, async () => {
+        this.holdTelemetry();
+        const result = await this.streamInInstanceScope(options);
+        return preserveLiveStreamAccessors(result, {
+          ...result,
+          stream: this.bindConversationEventStream(result.stream, eventScope),
+        });
+      }),
+    );
+  }
 
-    await this.validateStreamInput(options);
-    this.emitStreamStartEvents(options, startTime);
+  /** Re-enter request ownership when the caller drives a deferred async iterator. */
+  private bindConversationEventStream<T>(
+    stream: AsyncIterable<T>,
+    eventScope: symbol,
+  ): AsyncIterableIterator<T> {
+    const scope = this.conversationEventContext;
+    const iterator = stream[Symbol.asyncIterator]();
+    const bound: AsyncIterableIterator<T> = {
+      next: () => scope.run(eventScope, () => iterator.next()),
+      async return(): Promise<IteratorResult<T>> {
+        await scope.run(eventScope, async () => iterator.return?.());
+        return { done: true, value: undefined };
+      },
+      async throw(error: Error): Promise<IteratorResult<T>> {
+        const forward = iterator.throw;
+        if (forward === undefined) {
+          await scope.run(eventScope, async () => iterator.return?.());
+          throw error;
+        }
+        return scope.run(eventScope, () => forward.call(iterator, error));
+      },
+      [Symbol.asyncIterator]() {
+        return bound;
+      },
+    };
+    return bound;
+  }
 
-    // Check if workflow is requested
-    if (options.workflow || options.workflowConfig) {
-      return await this.streamWithWorkflow(options, startTime);
+  /**
+   * Body of {@link stream}, always entered through the instance log scope.
+   *
+   * Note the scope covers setting the stream up, not draining it: logs
+   * emitted while the consumer iterates the returned stream run in the
+   * consumer's async context, so they are attributed to whatever scope the
+   * consumer is in. Provider loops that run to completion inside this call
+   * are covered.
+   */
+  private async streamInInstanceScope(
+    options: StreamOptions | DynamicOptions,
+  ): Promise<StreamResult> {
+    // Host-loop delegation (registerAgentTool): the same per-turn scope as
+    // generate() — delegation caps count against THIS streamed turn and
+    // depth-limited agent tools are withheld from the request. The provider
+    // stream loops start inside this call, so the ALS scope propagates into
+    // their tool executions. beginDelegationTurn returns null when a scope
+    // is already active (the re-entrant call below shares the counters).
+    if (this.hasAgentTools) {
+      const { beginDelegationTurn } =
+        await import("./agent/agentToolRegistrar.js");
+      const scope = beginDelegationTurn(this, options);
+      if (scope) {
+        return scope.run(() =>
+          this.stream(scope.options as StreamOptions | DynamicOptions),
+        );
+      }
+    }
+    logger.debug("[NeuroLink] stream() called with options", {
+      provider: options.provider,
+      model: options.model,
+      inputLength: options.input?.text?.length || 0,
+      disableTools: (options as StreamOptions).disableTools,
+      enableAnalytics: (options as StreamOptions).enableAnalytics,
+      enableEvaluation: (options as StreamOptions).enableEvaluation,
+      contextKeys: (options as StreamOptions).context
+        ? Object.keys((options as StreamOptions).context ?? {})
+        : [],
+      optionKeys: Object.keys(options),
+    });
+    // Defensive shallow clone of top-level options + the nested mutable
+    // branches that downstream stages (prepareStreamOptions's memory
+    // retrieval at `options.input.text`, applyStreamOrchestration's merge,
+    // RAG/MCP tool injection, etc.) mutate. Cloning at the entry point
+    // means callers can reuse a single options object across stream()
+    // calls without accumulating mutations across them — the earlier
+    // shallow rebind at the orchestration site only covered the
+    // top-level keys and left `options.input` shared with the caller.
+    options = cloneOptionsForCallIsolation(options);
+    let agentModeVersion: TerminalAgentModeVersion | undefined;
+    {
+      const { agentMode, ...rest } = options as StreamOptions;
+      if (agentMode !== undefined) {
+        const resolved = resolveTerminalAgentMode(agentMode, rest.systemPrompt);
+        agentModeVersion = resolved.version;
+        options = { ...rest, systemPrompt: resolved.systemPrompt };
+      }
+    }
+    bindFileToolRoots(
+      options,
+      this.resolveFileToolRoots((options as StreamOptions).toolRoots),
+    );
+    const startedAt = Date.now();
+    const turnOptions = options as StreamOptions;
+    try {
+      return await this.setLangfuseContextFromOptions(turnOptions, () =>
+        this.runStreamTurn(turnOptions, agentModeVersion),
+      );
+    } catch (error) {
+      // Mirror generate(): fire consumer onError for failures that
+      // happened before the wrapped language-model middleware could
+      // observe them (e.g. unknown provider, validation, factory
+      // exceptions). The shared Symbol marker (lifecycleCallbacks.ts)
+      // prevents double-fire when the AI-SDK lifecycle middleware
+      // already handled the error. Awaited so async handlers fully
+      // settle before stream() rethrows.
+      await this.fireConsumerOnErrorIfNotFired(options, error, startedAt);
+      throw error;
+    }
+  }
+
+  private async runStreamTurn(
+    options: StreamOptions,
+    agentModeVersion: TerminalAgentModeVersion | undefined,
+  ): Promise<StreamResult> {
+    const turnSpan = tracers.sdk.startSpan("stream", {
+      kind: SpanKind.INTERNAL,
+    });
+    const turnContext = trace.setSpan(context.active(), turnSpan);
+    let result: StreamResult;
+    try {
+      result = await context.with(turnContext, async () => {
+        const knowledgeOutcome = await this.retrieveKnowledgeGrounding(options);
+        const grounded = knowledgeOutcome?.ephemeralContext
+          ? ({
+              ...options,
+              systemPrompt: this.appendKnowledgeGroundingBlockToSystemPrompt(
+                options.systemPrompt,
+                knowledgeOutcome.ephemeralContext.content,
+              ),
+            } as StreamOptions)
+          : options;
+        startTurn(turnSpan, grounded);
+        const streamed = await this.streamWithIterationFallback(grounded);
+        if (knowledgeOutcome) {
+          streamed.knowledge = knowledgeOutcome.metadata;
+        }
+        if (agentModeVersion) {
+          streamed.agentModeVersion = agentModeVersion;
+        }
+        return streamed;
+      });
+    } catch (error) {
+      failTurnSpan(
+        turnSpan,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+      turnSpan.end();
+      throw error;
+    }
+    return preserveLiveStreamAccessors(result, {
+      ...result,
+      stream: traceTurnStream(result, turnSpan, turnContext),
+    });
+  }
+
+  /**
+   * Curator P2-3 / Reviewer Finding #2: stream-fallback that also covers
+   * errors thrown during async iteration (e.g. LiteLLM throwing inside
+   * `createLiteLLMTransformedStream`). The standard
+   * `runWithFallbackOrchestration` only catches errors thrown while the
+   * `StreamResult` is being created — once we hand the iterator back to
+   * the caller, errors raised during consumption used to bypass
+   * `providerFallback` / `modelChain`.
+   *
+   * This wrapper runs the orchestration to get an initial StreamResult,
+   * then wraps `result.stream` so that:
+   *   - chunks are forwarded transparently while consumption succeeds
+   *   - if iteration throws a model-access-denied error AND no chunks
+   *     have been yielded yet, we resolve the next fallback target,
+   *     emit `model.fallback`, and recurse
+   *   - if chunks were already yielded, the error propagates (mid-stream
+   *     recovery isn't safe — the consumer has half a response)
+   */
+  private async streamWithIterationFallback(
+    options: StreamOptions,
+  ): Promise<StreamResult> {
+    const result = await this.runWithFallbackOrchestration(
+      options,
+      "stream",
+      (opts) =>
+        metricsTraceContextStorage.run(this.createMetricsTraceContext(), () =>
+          this.executeStreamRequest({ ...(opts as StreamOptions) }),
+        ),
+    );
+
+    const callOpts = options as Record<string, unknown>;
+    const perCallCallback = callOpts.providerFallback as
+      | ((
+          err: unknown,
+        ) => Promise<{ provider?: string; model?: string } | null>)
+      | undefined;
+    const perCallChain = callOpts.modelChain as string[] | undefined;
+    const effectiveCallback =
+      perCallCallback ?? this.fallbackConfig.providerFallback;
+    const effectiveChain = perCallChain ?? this.fallbackConfig.modelChain;
+    if (!effectiveCallback && !effectiveChain) {
+      // No fallback configured — nothing to wrap.
+      return result;
     }
 
-    // Set session and user IDs from context for Langfuse spans and execute with proper async scoping
-    return await this.setLangfuseContextFromOptions(options, async () => {
-      let enhancedOptions: StreamOptions;
-      let factoryResult: {
-        hasStreamingConfig: boolean;
-        streamingEnabled?: boolean;
-        enhancedConfig?: StreamOptions["streaming"];
+    // Build a chain cursor scoped to this stream's lifetime; consumers
+    // who set up `modelChain` get sequential progression here too.
+    const chainCursor = {
+      i: 0,
+      list: effectiveChain ?? [],
+      requestedModel: options.model,
+    };
+    const callback =
+      effectiveCallback ??
+      (async () => {
+        while (chainCursor.i < chainCursor.list.length) {
+          const next = chainCursor.list[chainCursor.i++];
+          if (next !== chainCursor.requestedModel) {
+            return { model: next };
+          }
+        }
+        return null;
+      });
+
+    const self = this;
+    // Yield type is the original stream's element type, threaded through
+    // as unknown — we forward chunks unchanged so structural identity is
+    // preserved without a local type alias (CLAUDE.md rule 2).
+    const wrappedStream = (async function* (): AsyncGenerator<unknown> {
+      let yielded = 0;
+      let currentResult: StreamResult = result;
+      let attemptedRequestedProvider = options.provider;
+      let attemptedRequestedModel = options.model;
+      const maxAttempts = (effectiveChain?.length ?? 0) + 5;
+      for (let attempt = 0; attempt <= maxAttempts; attempt++) {
+        try {
+          for await (const chunk of currentResult.stream) {
+            yielded++;
+            yield chunk;
+          }
+          return;
+        } catch (err) {
+          if (yielded > 0 || !looksLikeModelAccessDenied(err)) {
+            throw err;
+          }
+          let next: { provider?: string; model?: string } | null;
+          try {
+            next = await callback(err);
+          } catch (cbErr) {
+            logger.warn(
+              "[NeuroLink.stream] providerFallback callback threw during iteration",
+              {
+                error: cbErr instanceof Error ? cbErr.message : String(cbErr),
+              },
+            );
+            throw err;
+          }
+          if (!next) {
+            throw err;
+          }
+          try {
+            self.emitter.emit("model.fallback", {
+              requestedProvider: attemptedRequestedProvider,
+              requestedModel: attemptedRequestedModel,
+              fallbackProvider: next.provider ?? attemptedRequestedProvider,
+              fallbackModel: next.model,
+              reason: err instanceof Error ? err.message : String(err),
+              kind: "stream",
+              phase: "iteration",
+              timestamp: Date.now(),
+            });
+          } catch {
+            /* listener errors are non-fatal */
+          }
+          const retriedOptions: StreamOptions = {
+            ...options,
+            ...(next.provider && {
+              provider: next.provider as StreamOptions["provider"],
+            }),
+            ...(next.model && { model: next.model }),
+            // Strip the hooks so the inner orchestration doesn't double-fall-back.
+            providerFallback: undefined,
+            modelChain: undefined,
+          } as StreamOptions;
+          attemptedRequestedProvider =
+            next.provider ?? attemptedRequestedProvider;
+          attemptedRequestedModel = next.model ?? attemptedRequestedModel;
+          currentResult = await metricsTraceContextStorage.run(
+            self.createMetricsTraceContext(),
+            () => self.executeStreamRequest({ ...retriedOptions }),
+          );
+        }
+      }
+      // Exhausted attempts — re-throw the most recent error captured by
+      // the inner loop. We only get here if the loop didn't return.
+      throw new Error(
+        `[NeuroLink.stream] iteration fallback exhausted ${maxAttempts} attempts`,
+      );
+    })();
+
+    // `result`'s toolsUsed/toolExecutions may be live getters (openai-compat
+    // providers back them with a getter over an array still being populated
+    // by a background loop) — a naked spread here would read them once, now,
+    // and freeze whatever they held at that instant. preserveLiveStreamAccessors
+    // re-applies the original getter descriptors onto the rebuilt object, the
+    // same fix already applied to withStreamModelFallback/
+    // wrapStreamWithLifecycleCallbacks in baseProvider.ts.
+    return preserveLiveStreamAccessors(result, {
+      ...result,
+      stream: wrappedStream as StreamResult["stream"],
+    });
+  }
+
+  private async executeStreamRequest(
+    options: StreamOptions,
+  ): Promise<StreamResult> {
+    // Dynamic argument resolution — resolve any function-valued options before downstream use
+    await this.resolveDynamicOptions(options);
+
+    const streamSpan = tracers.sdk.startSpan("stream.attempt", {
+      kind: SpanKind.INTERNAL,
+      attributes: {
+        [ATTR.NL_PROVIDER]: (options.provider as string) || "default",
+        ...(options.model && { [ATTR.NL_MODEL]: options.model }),
+        [ATTR.NL_INPUT_LENGTH]: options.input?.text?.length || 0,
+        // Count registered custom tools too — chat hosts put their MCP tools
+        // in the registry, so options.tools alone under-reports.
+        [ATTR.NL_HAS_TOOLS]:
+          !options.disableTools &&
+          (!!(options.tools && Object.keys(options.tools).length > 0) ||
+            this.getCustomTools().size > 0),
+        [ATTR.NL_STREAM_MODE]: true,
+      },
+    });
+    observe(streamSpan, "span", {});
+
+    const spanStartTime = Date.now();
+    this._disableToolCacheForCurrentRequest = !!options.disableToolCache;
+    this._toolCacheKeysServedThisRequest = new Set();
+    this._generationTurnActive = true;
+
+    try {
+      options.model = resolveModel(options.model, this.modelAliasConfig);
+
+      const startTime = Date.now();
+      const hrTimeStart = process.hrtime.bigint();
+      const streamId = `neurolink-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+      // STT preprocessing for stream(): transcribe audio buffer (not realtime frames)
+      // and inject into the prompt before validation/execution. Mirrors generate().
+      const sttOptions = options.stt;
+      const sttAudio = sttOptions?.audio;
+      const hasStreamSttAudio = !!(sttOptions?.enabled && sttAudio);
+      let streamSttTranscription: STTResult | undefined;
+      if (hasStreamSttAudio && sttOptions && sttAudio) {
+        if (!options.input) {
+          options.input = { text: "" };
+        }
+        try {
+          // registerAllProviders() is idempotent; always call.
+          await ProviderRegistry.registerAllProviders();
+          const { STTProcessor } = await import("./utils/sttProcessor.js");
+          const sttCredentials = this.resolveSTTCredentials(
+            options.credentials?.stt,
+          );
+          const sttProvider = this.resolveSTTProvider(
+            sttOptions.provider,
+            sttCredentials,
+          );
+          streamSttTranscription = await STTProcessor.transcribe(
+            sttAudio,
+            sttProvider,
+            sttOptions,
+            sttCredentials,
+          );
+          if (streamSttTranscription.text) {
+            const existingText = options.input.text || "";
+            options.input.text = existingText
+              ? `[Transcribed audio]: ${streamSttTranscription.text}\n\n${existingText}`
+              : streamSttTranscription.text;
+          }
+        } catch (sttError) {
+          const existingText = options.input.text || "";
+          if (!existingText) {
+            throw sttError;
+          }
+          logger.warn(
+            `[NeuroLink] Stream STT transcription failed, falling back to text: ${sttError instanceof Error ? sttError.message : String(sttError)}`,
+          );
+        }
+      }
+
+      const originalPrompt = options.input?.text ?? "";
+
+      options.fileRegistry = this.fileRegistry;
+      options.attachmentPolicy = this.attachmentPolicy;
+      await this.validateStreamRequestOptions(options, startTime);
+
+      const workflowResult = await this.maybeHandleWorkflowStreamRequest({
+        options,
+        startTime,
+        streamSpan,
+        spanStartTime,
+      });
+      if (workflowResult) {
+        return workflowResult;
+      }
+
+      // Make neurolink.stream the active span so every provider span (generations,
+      // tool calls) parents under it — one Langfuse trace per turn, not a forest.
+      const streamSpanContext = trace.setSpan(context.active(), streamSpan);
+
+      // Pre-call tool routing: run inside the stream-span + Langfuse context so
+      // the router's own generation span nests under this turn's trace instead
+      // of starting a separate one. Asks a cheap router LLM which tool servers
+      // the query needs and appends the unpicked servers' tools to
+      // `excludeTools`. Fails open (no exclusions). Routes on the current
+      // prompt enriched with a bounded window of recent conversation turns
+      // (pulled from conversation memory) so contextless follow-ups still
+      // classify correctly. After the workflow short-circuit, so workflow
+      // streams skip it.
+      await context.with(streamSpanContext, () =>
+        this.setLangfuseContextFromOptions(options, () =>
+          this.applyToolRoutingExclusions(options, originalPrompt),
+        ),
+      );
+
+      // Pre-call classifier router for stream: opt-in, fails open. Runs before
+      // the request router so it takes precedence.
+      await this.applyClassifierRouting(
+        options,
+        originalPrompt,
+        !options.disableTools &&
+          (!!(options.tools && Object.keys(options.tools).length > 0) ||
+            this.getCustomTools().size > 0),
+        !!(options.input?.images && options.input.images.length > 0),
+        (options as StreamOptions & { thinking?: { thinkingLevel?: string } })
+          .thinking?.thinkingLevel,
+      );
+
+      // Pre-call request router for stream: opt-in, fails open.
+      await this.applyRequestRouter(
+        options,
+        originalPrompt,
+        !options.disableTools &&
+          (!!(options.tools && Object.keys(options.tools).length > 0) ||
+            this.getCustomTools().size > 0),
+        !!(options.input?.images && options.input.images.length > 0),
+        (options as StreamOptions & { thinking?: { thinkingLevel?: string } })
+          .thinking?.thinkingLevel,
+      );
+
+      // Streaming TTS deferred: stream() always synthesizes the streamed AI
+      // response when TTS is enabled, regardless of generate()'s
+      // input-vs-response `useAiResponse` switch. It resolves
+      // `streamResult.audio` with the aggregate TTSResult. The resolver is
+      // plumbed explicitly through the params bag (M11: previously a
+      // `_streamTtsResolve` cast on the caller's options object — fragile if
+      // the same options object was reused across concurrent stream() calls).
+      const ttsOptions = options.tts;
+      const wantsStreamTtsMode2 = ttsOptions?.enabled === true;
+      let resolveStreamTtsAudio:
+        | ((value: TTSResult | undefined) => void)
+        | undefined;
+      let streamTtsMetadata: TTSMetadata | undefined;
+      const streamTtsAudioPromise = wantsStreamTtsMode2
+        ? new Promise<TTSResult | undefined>((resolve) => {
+            resolveStreamTtsAudio = resolve;
+          })
+        : undefined;
+
+      const streamResult = await context.with(streamSpanContext, () =>
+        this.setLangfuseContextFromOptions(options, async () => {
+          const attempt = await this.runStandardStreamRequest({
+            options,
+            streamSpan,
+            spanStartTime,
+            startTime,
+            hrTimeStart,
+            streamId,
+            originalPrompt,
+            ttsResolver: resolveStreamTtsAudio,
+            ttsMetadataSink: (metadata) => {
+              streamTtsMetadata = metadata;
+            },
+          });
+          attempt.stream = drainInContext(attempt.stream, context.active());
+          endSpanWhenDropped(attempt.stream, streamSpan);
+          return attempt;
+        }),
+      );
+      if (streamSttTranscription) {
+        streamResult.transcription = streamSttTranscription;
+      }
+      if (streamTtsAudioPromise) {
+        streamResult.audio = streamTtsAudioPromise;
+        streamResult.ttsMetadata = streamTtsMetadata;
+      }
+      return streamResult;
+    } catch (error) {
+      streamSpan.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: error instanceof Error ? error.message : String(error),
+      });
+      if (error instanceof Error) {
+        streamSpan.recordException(error);
+      }
+      streamSpan.end();
+      throw error;
+    }
+  }
+
+  /**
+   * Runs an internal call that re-enters the public generate() (the tool-routing
+   * router, the classifier router) without ending the outer turn's tool-cache
+   * state. generate()'s own `finally` resets these fields, so the outer turn
+   * would otherwise lose its repeat-call cache bypass for every later tool
+   * call. Restored by reference: the nested call assigns a new Set rather than
+   * mutating the outer one.
+   *
+   * Covers one turn re-entering itself. Two concurrent turns on one instance
+   * still share these fields.
+   */
+  private async preservingTurnState<T>(run: () => Promise<T>): Promise<T> {
+    const disableToolCache = this._disableToolCacheForCurrentRequest;
+    const keysServed = this._toolCacheKeysServedThisRequest;
+    const turnActive = this._generationTurnActive;
+    try {
+      return await run();
+    } finally {
+      this._disableToolCacheForCurrentRequest = disableToolCache;
+      this._toolCacheKeysServedThisRequest = keysServed;
+      this._generationTurnActive = turnActive;
+    }
+  }
+
+  /**
+   * Pre-call tool routing for both stream() and generate() turns: runs the
+   * router LLM once per turn and appends the unpicked servers' registered tool
+   * names to `options.excludeTools` — the per-call denylist enforced by
+   * `baseProvider.applyToolFiltering`. No-op unless `toolRouting.enabled` is
+   * true and a non-empty server catalog has been supplied. Never throws (the
+   * resolver fails open to an empty exclusion list). Accepts both StreamOptions
+   * and GenerateOptions since both share the required fields.
+   */
+  private async applyToolRoutingExclusions(
+    options: StreamOptions | GenerateOptions,
+    userQuery: string,
+  ): Promise<void> {
+    const routingConfig = this.toolRoutingConfig;
+    if (!routingConfig?.enabled || options.disableTools) {
+      return;
+    }
+    const servers = routingConfig.servers ?? [];
+    if (servers.length === 0) {
+      return;
+    }
+
+    // Whole setup is fail-open: catalog building (getCustomTools /
+    // buildToolRoutingCatalog) and the router call degrade to no exclusions
+    // rather than killing the stream/generate turn, honoring this method's
+    // "never throws" contract. Genuine cancellations still propagate.
+    try {
+      const registeredToolNames = Array.from(this.getCustomTools().keys());
+      const catalog = buildToolRoutingCatalog(servers, registeredToolNames);
+      if (catalog.length === 0) {
+        return;
+      }
+
+      // Fold a bounded window of recent conversation turns into the routing query.
+      // The router runs pre-memory and would otherwise see only this turn's raw
+      // text, so a contextless follow-up ("yes please") gives it nothing to
+      // classify — it fails open and routing narrows nothing. The main model
+      // still receives full history later via conversation memory; this only
+      // enriches the router's view. Fails open to the current query alone.
+      const recentMessages = await this.fetchRecentRoutingHistory(options);
+      const routingQuery =
+        recentMessages.length > 0
+          ? buildRoutingQueryFromHistory(recentMessages, userQuery)
+          : userQuery;
+
+      // --- ITEM C: routing decision cache ---
+      const cacheConfig = routingConfig.cache;
+      const cacheEnabled = cacheConfig?.enabled === true;
+      const stickinessEnabled = routingConfig.stickiness?.enabled === true;
+
+      // Lazy-init the cache instance once per NeuroLink instance.
+      if (
+        (cacheEnabled || stickinessEnabled) &&
+        !this.toolRoutingCacheInstance
+      ) {
+        this.toolRoutingCacheInstance = new ToolRoutingCache({
+          ttlMs: cacheConfig?.ttlMs,
+          maxEntries: cacheConfig?.maxEntries,
+          stickyTurns: routingConfig.stickiness?.turns,
+        });
+      }
+      const cache = this.toolRoutingCacheInstance;
+
+      // Derive sessionId for stickiness — same extraction path as
+      // fetchRecentRoutingHistory.
+      const requestContext = options.context as
+        | Record<string, unknown>
+        | undefined;
+      const sessionId =
+        typeof requestContext?.sessionId === "string"
+          ? requestContext.sessionId
+          : "";
+
+      // Cache key: session + normalized routing query.
+      // Require a non-empty sessionId to avoid anonymous sessions sharing a
+      // ":query" namespace (cross-session cache leak).
+      const cacheKey =
+        cacheEnabled && sessionId ? `${sessionId}:${routingQuery}` : undefined;
+
+      const routableServerCount = catalog.filter(
+        (s) => !(routingConfig.alwaysIncludeServerIds ?? []).includes(s.id),
+      ).length;
+
+      // --- ITEM E: build the emitDecision callback ---
+      // Constructed BEFORE the cache-hit check so it is available for all
+      // outcome paths, including cache-hit turns (Finding 4).
+      const routingStartTime = Date.now();
+      const emitDecision = (decision: ToolRoutingDecision): void => {
+        try {
+          const activeSpan = trace.getActiveSpan();
+          if (!activeSpan) {
+            return;
+          }
+          activeSpan.setAttribute("tool_routing.outcome", decision.outcome);
+          activeSpan.setAttribute(
+            "tool_routing.routable_server_count",
+            decision.routableServerCount,
+          );
+          activeSpan.setAttribute(
+            "tool_routing.selected_server_ids",
+            spanJsonAttribute(decision.selectedServerIds),
+          );
+          activeSpan.setAttribute(
+            "tool_routing.excluded_server_ids",
+            spanJsonAttribute(decision.excludedServerIds),
+          );
+          activeSpan.setAttribute(
+            "tool_routing.hallucinated_ids",
+            spanJsonAttribute(decision.hallucinatedIds),
+          );
+          activeSpan.setAttribute(
+            "tool_routing.excluded_tool_count",
+            decision.excludedToolCount,
+          );
+          activeSpan.setAttribute("tool_routing.cache_hit", decision.cacheHit);
+          activeSpan.setAttribute(
+            "tool_routing.duration_ms",
+            decision.durationMs,
+          );
+          // Optional L2 / tool-granularity fields (present only when embedding ran).
+          if (decision.embeddingActivated !== undefined) {
+            activeSpan.setAttribute(
+              "tool_routing.embedding_activated",
+              decision.embeddingActivated,
+            );
+          }
+          if (decision.candidateToolCount !== undefined) {
+            activeSpan.setAttribute(
+              "tool_routing.candidate_tool_count",
+              decision.candidateToolCount,
+            );
+          }
+          if (decision.granularity !== undefined) {
+            activeSpan.setAttribute(
+              "tool_routing.granularity",
+              decision.granularity,
+            );
+          }
+          // Which router actually decided. Three strategies can produce an
+          // "applied" outcome and they have wildly different cost and
+          // latency profiles, so an outcome without a strategy cannot be
+          // acted on — and a decision router that silently stopped firing
+          // looks identical to one that was never configured.
+          if (decision.strategy !== undefined) {
+            activeSpan.setAttribute("tool_routing.strategy", decision.strategy);
+          }
+        } catch {
+          // Telemetry must never affect routing behaviour.
+        }
       };
 
+      // Check the cache first.
+      if (cacheEnabled && cache && cacheKey !== undefined) {
+        const cached = cache.get(cacheKey);
+        if (cached) {
+          // Decrement stickiness turn counter even on a cache hit so the window
+          // advances correctly regardless of whether the LLM router ran
+          // (Finding 3). Re-apply stickiness to the cached exclusion list so
+          // the live stickiness window, not the one at write-time, is honoured
+          // (Finding 2 complement: we stored the pre-stickiness list, so
+          // re-applying here gives the correct per-turn view).
+          let cachedExcluded = cached.excludedToolNames;
+          if (stickinessEnabled && sessionId) {
+            try {
+              const stickyIds = cache.getStickyServerIds(sessionId);
+              if (stickyIds.length > 0) {
+                cachedExcluded = cachedExcluded.filter(
+                  (toolName) =>
+                    !stickyIds.some((id) => toolName.startsWith(`${id}_`)),
+                );
+              }
+            } catch {
+              // Stickiness failure is non-fatal.
+            }
+          }
+
+          // Notify the emitDecision callback so custom telemetry sinks observe
+          // every routing outcome, not just non-cached turns (Finding 4).
+          const cachedSelectedSet = new Set(cached.selectedServerIds);
+          const cachedExcludedServerIds = catalog
+            .map((e) => e.id)
+            .filter((id) => !cachedSelectedSet.has(id));
+          emitDecision({
+            outcome: "cache-hit",
+            selectedServerIds: cached.selectedServerIds,
+            excludedServerIds: cachedExcludedServerIds,
+            hallucinatedIds: [],
+            excludedToolCount: cachedExcluded.length,
+            routableServerCount,
+            cacheHit: true,
+            durationMs: Date.now() - routingStartTime,
+          });
+
+          logger.debug("[ToolRouting] Cache hit, skipping router LLM", {
+            hasSessionId: !!sessionId,
+            routingQueryLength: routingQuery.length,
+          });
+          if (cachedExcluded.length > 0) {
+            options.excludeTools = [
+              ...(options.excludeTools ?? []),
+              ...cachedExcluded,
+            ];
+          }
+          return;
+        }
+      }
+
+      let routedExcludeTools: string[];
+      let resolvedDecision: ToolRoutingDecision | undefined;
+      // Intercept the decision so we can store it in the cache.
+      const captureDecision = (decision: ToolRoutingDecision): void => {
+        resolvedDecision = decision;
+        emitDecision(decision);
+      };
+
+      // --- ITEM B: build the embedFn for the L2 embedding fast-path ---
+      // The vector cache is persisted at the NeuroLink instance level so
+      // tool embedding vectors are computed once and reused across turns
+      // (Finding 1 fix). It is cleared by setToolRoutingServers() when the
+      // catalog changes so stale vectors are never used after an update.
+      let routingEmbedFn:
+        | ((texts: string[]) => Promise<number[][]>)
+        | undefined;
+      // A host-owned routing callback owns every inference account. The
+      // instance's embedding fast-path would otherwise borrow turn credentials.
+      const embeddingCfg = routingConfig.generateFn
+        ? undefined
+        : routingConfig.embedding;
+      if (embeddingCfg?.enabled === true) {
+        try {
+          // Resolve the embedding provider: use the explicitly configured one
+          // if present, otherwise fall back to the stream/generate call's
+          // provider. The factory call is wrapped in try/catch so a provider
+          // that doesn't support embedMany (it throws at call time, not
+          // construction time) fails open when routingEmbedFn is invoked.
+          const embProviderName =
+            embeddingCfg.provider ??
+            ((options.provider && options.provider !== "auto"
+              ? options.provider
+              : undefined) as string | undefined) ??
+            routingConfig.routerModel?.provider;
+          if (embProviderName) {
+            const embProvider = await AIProviderFactory.createProvider(
+              embProviderName,
+              embeddingCfg.model,
+              true,
+              this,
+              undefined,
+              this.resolveCredentials(options.credentials),
+            );
+            // Bind embedMany with the configured model (may be undefined —
+            // the provider uses its default embedding model in that case).
+            routingEmbedFn = (texts: string[]) =>
+              withTimeout(
+                embProvider.embedMany(texts, embeddingCfg.model),
+                embeddingCfg.timeoutMs ?? 10000,
+              );
+
+            // Lazy-init the persistent vector cache for this instance.
+            // Subsequent turns reuse the same Map so text→vector lookups
+            // already populated from earlier turns are served from memory.
+            if (!this.toolRoutingVectorCache) {
+              this.toolRoutingVectorCache = new Map<string, number[]>();
+            }
+          }
+        } catch (embSetupError) {
+          logger.debug(
+            "[ToolRouting] Embedding provider setup failed, L2 path disabled for this turn",
+            {
+              error:
+                embSetupError instanceof Error
+                  ? embSetupError.message
+                  : String(embSetupError),
+            },
+          );
+          // routingEmbedFn remains undefined — fast-path is skipped.
+        }
+      }
+
+      routedExcludeTools = await resolveToolRoutingExclusions({
+        catalog,
+        alwaysIncludeServerIds: routingConfig.alwaysIncludeServerIds ?? [],
+        userQuery: routingQuery,
+        routerPromptPrefix: routingConfig.routerPromptPrefix,
+        routerModel: {
+          provider:
+            routingConfig.routerModel?.provider ??
+            (options.provider as string | undefined),
+          model: routingConfig.routerModel?.model ?? options.model,
+          region: routingConfig.routerModel?.region ?? options.region,
+          temperature: routingConfig.routerModel?.temperature,
+        },
+        timeoutMs: routingConfig.timeoutMs ?? DEFAULT_TOOL_ROUTING_TIMEOUT_MS,
+        // Forward the abort signal so a cancelled turn aborts the router
+        // call promptly instead of waiting out the routing timeout.
+        generateFn: (generateOptions) =>
+          this.preservingTurnState(() =>
+            (routingConfig.generateFn ?? ((input) => this.generate(input)))({
+              ...generateOptions,
+              abortSignal: options.abortSignal,
+            }),
+          ),
+        // Calibrated per-server routing when a decision provider is
+        // configured. siteDecide returns null without one, so the resolver
+        // falls straight through to the generative router as before. The
+        // outer request's credentials, abort signal and ids ride along.
+        // A host-owned routing callback owns the inference account too.
+        // Bypass the instance's decision fast-path in that explicit mode.
+        decideFn: routingConfig.generateFn
+          ? undefined
+          : (decisionOptions) =>
+              this.siteDecide(
+                decisionOptions,
+                this.decisionSiteContext(options, sessionId || undefined),
+              ),
+        decisionMinDropConfidence: routingConfig.minDropConfidence,
+        emitDecision: captureDecision,
+        // L2 / ITEM D — only populated when embedding is configured.
+        embedFn: routingEmbedFn,
+        embeddingConfig: embeddingCfg,
+        granularity: routingConfig.granularity ?? "server",
+        // Pass the persistent vector cache so tool embeddings are reused
+        // across turns (Finding 1).
+        embeddingVectorCache:
+          routingEmbedFn !== undefined
+            ? this.toolRoutingVectorCache
+            : undefined,
+      });
+
+      // Aborted during the router call — skip applying now-stale exclusions;
+      // the main generation path enforces the abort itself.
+      if (options.abortSignal?.aborted) {
+        return;
+      }
+
+      // Snapshot the raw (pre-stickiness) exclusion list before applying
+      // stickiness overrides. The cache stores this snapshot so future cache
+      // hits can re-apply the then-current stickiness state (Finding 2).
+      const preStickinessExcludeTools = routedExcludeTools;
+
+      // Apply stickiness FIRST: the sticky ids were recorded on a prior turn and
+      // represent servers that should stay warm for the current turn. Consuming
+      // (decrementing) them before recordSelection ensures the window covers the
+      // correct set of future turns rather than burning one count on the same
+      // turn the selection is recorded (off-by-one fix).
+      if (stickinessEnabled && cache && sessionId) {
+        try {
+          const stickyIds = cache.getStickyServerIds(sessionId);
+          if (stickyIds.length > 0) {
+            // Remove from routedExcludeTools any tool belonging to a sticky server.
+            // Precompute prefixes to avoid rebuilding the set inside the predicate.
+            const stickyPrefixes = stickyIds.map((id) => `${id}_`);
+            routedExcludeTools = routedExcludeTools.filter(
+              (toolName) =>
+                !stickyPrefixes.some((prefix) => toolName.startsWith(prefix)),
+            );
+          }
+        } catch {
+          // Stickiness failure is non-fatal.
+        }
+      }
+
+      // --- ITEM C: store result for future turns ---
+      if (resolvedDecision?.outcome === "applied" && cache) {
+        // Store the PRE-stickiness exclusion list in the cache so future hits
+        // re-apply the live stickiness window rather than the one from this
+        // turn (Finding 2).
+        if (cacheEnabled && cacheKey !== undefined) {
+          try {
+            cache.set(cacheKey, {
+              excludedToolNames: preStickinessExcludeTools,
+              selectedServerIds: resolvedDecision.selectedServerIds,
+            });
+          } catch {
+            // Cache write failure is non-fatal.
+          }
+        }
+        // Record selected servers for stickiness on subsequent turns. This must
+        // come after getStickyServerIds so the window count is not consumed on
+        // the same turn it is set (the off-by-one fix above).
+        if (stickinessEnabled && sessionId) {
+          try {
+            cache.recordSelection(
+              sessionId,
+              resolvedDecision.selectedServerIds,
+            );
+          } catch {
+            // Stickiness failure is non-fatal.
+          }
+        }
+      }
+
+      if (routedExcludeTools.length > 0) {
+        options.excludeTools = [
+          ...(options.excludeTools ?? []),
+          ...routedExcludeTools,
+        ];
+      }
+    } catch (error) {
+      if (isAbortError(error)) {
+        throw error;
+      }
+      logger.warn("[ToolRouting] Routing setup failed, failing open", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Loads a bounded window of prior conversation turns for the router so a
+   * follow-up turn carries the context it needs to classify intent. Reads this
+   * turn's conversation memory (keyed by `context.sessionId`) with
+   * summarization disabled to keep the router cheap. Fails open to an empty
+   * list — routing then falls back to the current query alone (prior
+   * behaviour). On the first turn of a conversation memory may not be
+   * initialised yet; that also yields an empty list, which is fine since the
+   * opening message already carries its own context.
+   */
+  private async fetchRecentRoutingHistory(
+    options: KnowledgeGroundingCallOptions,
+  ): Promise<ChatMessage[]> {
+    try {
+      const requestContext = options.context as
+        | Record<string, unknown>
+        | undefined;
+
+      // Inline multi-turn callers pass prior turns via options.conversationMessages
+      // (the same field the main model reads) rather than server-side session
+      // memory. Honor it directly so a contextless follow-up still routes with
+      // context even when no sessionId is present.
+      if (
+        options.conversationMessages &&
+        options.conversationMessages.length > 0
+      ) {
+        return options.conversationMessages;
+      }
+
+      const sessionId = requestContext?.sessionId;
+      if (typeof sessionId !== "string" || !sessionId) {
+        return [];
+      }
+
+      // The pre-call router runs earlier in the stream pipeline than the main
+      // generation path's own memory init (initializeConversationMemoryForGeneration),
+      // so this.conversationMemory is still undefined at router time and the
+      // router would only ever see the current turn. Trigger the same lazy init
+      // the main path uses — it is idempotent, so the later call is a no-op —
+      // so the router can read prior turns. Fails open via the surrounding catch.
+      await this.initializeConversationMemoryForGeneration(
+        `tool-routing-${Date.now()}`,
+        Date.now(),
+        process.hrtime.bigint(),
+      );
+
+      const memory = this.conversationMemory;
+      if (!memory) {
+        return [];
+      }
+      // Reuse the SAME reader the main model uses so the router sees identically
+      // curated history: polluted turns dropped, read instrumented under the
+      // neurolink.conversation.getMessages span. enableSummarization=false keeps
+      // routing cheap and free of any summary-LLM side effect. The remaining
+      // tool_call/tool_result turns are dropped at transcript-render time
+      // (buildRoutingQueryFromHistory) to mirror what the main model is sent.
+      const messages = await getConversationMessages(memory, {
+        ...options,
+        enableSummarization: false,
+      } as TextGenerationOptions);
+      logger.debug("[ToolRouting] Loaded conversation history for router", {
+        sessionId,
+        messageCount: messages.length,
+      });
+      return messages;
+    } catch (error) {
+      logger.debug(
+        "[ToolRouting] Failed to load conversation history; routing on current query only",
+        {
+          error: error instanceof Error ? error.message : String(error),
+        },
+      );
+      return [];
+    }
+  }
+
+  /**
+   * Supplies (or replaces) the pre-call tool routing server catalog.
+   *
+   * For hosts that only know their tool servers after constructing NeuroLink
+   * (e.g. tools are registered per session/conversation). Routing must still
+   * be enabled via the constructor's `toolRouting.enabled` — setting servers
+   * alone does not activate it.
+   */
+  setToolRoutingServers(servers: ToolRoutingServerDescriptor[]): void {
+    if (!this.toolRoutingConfig) {
+      logger.warn(
+        "[ToolRouting] setToolRoutingServers called without toolRouting constructor config — servers stored but routing stays disabled",
+      );
+      this.toolRoutingConfig = { enabled: false, servers };
+      return;
+    }
+    this.toolRoutingConfig.servers = servers;
+    // Clear the persisted vector cache so tool vectors are recomputed against
+    // the new catalog on the next turn (stale vectors must never be reused).
+    this.toolRoutingVectorCache = undefined;
+    // Cached routing decisions are catalog-dependent too; force the next turn
+    // to recompute exclusions against the new server/tool set.
+    this.toolRoutingCacheInstance = undefined;
+  }
+
+  /** Knowledge-grounding engine health (null when it was not configured). */
+  getKnowledgeStatus(): KnowledgeEngineStatus | null {
+    return this.knowledgeGroundingEngine?.getStatus() ?? null;
+  }
+
+  private appendKnowledgeGroundingBlockToSystemPrompt(
+    systemPrompt:
+      | GenerateOptions["systemPrompt"]
+      | StreamOptions["systemPrompt"]
+      | DynamicOptions["systemPrompt"],
+    block: string,
+  ): DynamicOptions["systemPrompt"] {
+    if (typeof systemPrompt === "function") {
+      const originalSystemPrompt = systemPrompt;
+      return async (context: DynamicResolutionContext) => {
+        const resolved = await resolveDynamicArgument(
+          originalSystemPrompt as DynamicArgument<string>,
+          context,
+        );
+        return resolved.value ? `${resolved.value}\n\n${block}` : block;
+      };
+    }
+    return systemPrompt ? `${systemPrompt}\n\n${block}` : block;
+  }
+
+  /**
+   * Retrieve knowledge grounding for a public generate/stream call without
+   * mutating its options. The outer call boundary decides how to apply the
+   * returned context. Returns undefined when the call does not opt in,
+   * grounding is disabled/not applicable, or retrieval fails open.
+   */
+  private async retrieveKnowledgeGrounding(
+    options: KnowledgeGroundingCallOptions,
+  ): Promise<KnowledgeGroundingOutcome | undefined> {
+    const engine = this.knowledgeGroundingEngine;
+    if (
+      !engine ||
+      !engine.isEnabled() ||
+      options.useKnowledgeGrounding !== true
+    ) {
+      return undefined;
+    }
+    const query = options.input?.text;
+    if (!query) {
+      return undefined;
+    }
+    try {
+      const conversationMessages =
+        options.conversationMessages !== undefined
+          ? options.conversationMessages
+          : await this.fetchRecentRoutingHistory(options);
+      const recentTurns = conversationMessages
+        .filter(
+          (message) => message.role === "user" || message.role === "assistant",
+        )
+        .slice(-DEFAULT_RECENT_TURNS)
+        .map((message) => ({
+          role:
+            message.role === "assistant"
+              ? ("assistant" as const)
+              : ("user" as const),
+          text: typeof message.content === "string" ? message.content : "",
+        }));
+      return await engine.ground({
+        query,
+        recentTurns,
+        scope: options.knowledgeContext,
+      });
+    } catch (error) {
+      logger.warn("[KnowledgeGrounding] grounding hook failed open", {
+        error: String(error),
+      });
+      return undefined;
+    }
+  }
+
+  private async validateStreamRequestOptions(
+    options: StreamOptions,
+    startTime: number,
+  ): Promise<void> {
+    await this.validateStreamInput(options);
+
+    // Input validation for stream
+    if (options.inputValidation && options.input?.text) {
+      const iv = options.inputValidation;
+      if (iv.trimWhitespace) {
+        options.input.text = options.input.text.trim();
+      }
+      if (iv.requireContent && !options.input.text.trim()) {
+        throw new Error(
+          "Input content is required but was empty or whitespace",
+        );
+      }
+      if (iv.minLength && options.input.text.length < iv.minLength) {
+        throw new Error(
+          `Input text is too short (${options.input.text.length} < ${iv.minLength})`,
+        );
+      }
+      if (iv.maxLength && options.input.text.length > iv.maxLength) {
+        throw new Error(
+          `Input text is too long (${options.input.text.length} > ${iv.maxLength})`,
+        );
+      }
+    }
+
+    // PII detection and redaction for stream
+    if (options.piiDetection?.enabled && options.input?.text) {
+      const piiResult = await detectAndRedactPII(options.input.text, {
+        enabled: true,
+        action: options.piiDetection.action ?? "warn",
+        detectTypes: options.piiDetection.detectTypes,
+        customPatterns: options.piiDetection.customPatterns,
+        allowList: options.piiDetection.allowList,
+        redactionText: options.piiDetection.redactionText,
+      });
+      if (piiResult.action === "abort") {
+        throw new Error(
+          piiResult.feedback ?? "Request blocked: PII detected in input",
+        );
+      }
+      options.input.text = piiResult.text;
+    }
+
+    this.enforceSessionBudget(options.maxBudgetUsd);
+    await this.applyAuthenticatedRequestContext(options);
+    this.emitStreamStartEvents(options, startTime);
+    this.applyMiddlewareDefaults(options);
+    this.applyStreamLifecycleMiddleware(options);
+  }
+
+  private async maybeHandleWorkflowStreamRequest(params: {
+    options: StreamOptions;
+    startTime: number;
+    streamSpan: ReturnType<typeof tracers.sdk.startSpan>;
+    spanStartTime: number;
+  }): Promise<StreamResult | null> {
+    if (!params.options.workflow && !params.options.workflowConfig) {
+      return null;
+    }
+
+    const result = await this.streamWithWorkflow(
+      params.options,
+      params.startTime,
+    );
+    const originalWorkflowStream = result.stream;
+    const self = this;
+    result.stream = (async function* () {
       try {
-        // Initialize conversation memory if needed (for lazy loading)
-        await this.initializeConversationMemoryForGeneration(
+        for await (const chunk of originalWorkflowStream) {
+          yield chunk;
+        }
+        params.streamSpan.setStatus({ code: SpanStatusCode.OK });
+      } catch (error) {
+        params.streamSpan.setStatus({
+          code: SpanStatusCode.ERROR,
+          message: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      } finally {
+        self._disableToolCacheForCurrentRequest = false;
+        self._toolCacheKeysServedThisRequest = new Set();
+        self._generationTurnActive = false;
+        params.streamSpan.setAttribute(
+          "response_time_ms",
+          Date.now() - params.spanStartTime,
+        );
+        params.streamSpan.end();
+      }
+    })();
+
+    return result;
+  }
+
+  private async runStandardStreamRequest(params: {
+    options: StreamOptions;
+    streamSpan: ReturnType<typeof tracers.sdk.startSpan>;
+    spanStartTime: number;
+    startTime: number;
+    hrTimeStart: bigint;
+    streamId: string;
+    originalPrompt: string;
+    /**
+     * Resolver for the streaming `streamResult.audio` Promise. Set when the
+     * caller requested `tts.enabled`. Always resolved
+     * exactly once: with the synthesised TTSResult on success, or `undefined`
+     * on synthesis failure / non-Mode-2 path / stream error. Plumbed
+     * explicitly via this params bag (M11) instead of via a side-channel
+     * cast on the caller's options object.
+     */
+    ttsResolver?: (value: TTSResult | undefined) => void;
+    /** Receives the mutable streaming-TTS metadata reference before return. */
+    ttsMetadataSink?: (value: TTSMetadata | undefined) => void;
+  }): Promise<StreamResult> {
+    const {
+      options,
+      streamSpan,
+      spanStartTime,
+      startTime,
+      hrTimeStart,
+      streamId,
+      originalPrompt,
+      ttsResolver,
+      ttsMetadataSink,
+    } = params;
+
+    logger.debug("[NeuroLink] Running standard stream request", {
+      streamId,
+      provider: options.provider,
+      model: options.model,
+      inputLength: options.input?.text?.length || 0,
+      disableTools: options.disableTools,
+      enableAnalytics: options.enableAnalytics,
+      enableEvaluation: options.enableEvaluation,
+      contextKeys: options.context ? Object.keys(options.context) : [],
+      optionKeys: Object.keys(options),
+      sessionId: options.context?.sessionId,
+    });
+
+    try {
+      const { enhancedOptions, factoryResult } =
+        await this.prepareStreamOptions(
+          options,
           streamId,
           startTime,
           hrTimeStart,
         );
-
-        // Initialize MCP
-        await this.initializeMCP();
-        const _originalPrompt = options.input.text;
-
-        if (
-          this.conversationMemoryConfig?.conversationMemory?.mem0Enabled &&
-          options.context?.userId
-        ) {
-          try {
-            const mem0 = await this.ensureMem0Ready();
-            if (!mem0) {
-              // Continue without memories if mem0 is not available
-              logger.debug(
-                "Mem0 not available, continuing without memory retrieval",
-              );
-            } else {
-              const memories = await mem0.search(options.input.text, {
-                user_id: options.context.userId as string,
-                limit: 5,
-              });
-
-              if (memories && memories.length > 0) {
-                // Enhance the input with memory context
-                const memoryContext = this.extractMemoryContext(memories);
-
-                options.input.text = this.formatMemoryContext(
-                  memoryContext,
-                  options.input.text,
-                );
-              }
-            }
-          } catch (error) {
-            // Non-blocking: Log error but continue with streaming
-            logger.warn("Mem0 memory retrieval failed:", error);
-          }
+      logger.debug("[NeuroLink] Stream options prepared", {
+        streamId,
+        options: enhancedOptions,
+        factoryResult,
+        sessionId: enhancedOptions.context?.sessionId,
+      });
+      // Curator P2-4 dedup (concurrency-safe): native provider stream paths
+      // emit `generation:end` themselves. We attach a per-stream mutable
+      // flag to `enhancedOptions._streamDedupContext`; the provider flips it
+      // before its own emit and the finally block below reads the same
+      // closed-over reference, so the orchestration does not emit a second
+      // event for the same stream. Concurrent streams have different option
+      // objects and therefore different contexts, so they cannot interfere.
+      //
+      // #1741: this MUST be attached before `createMCPStream`. That call
+      // reaches `provider.stream({ ...options })`, which copies the options
+      // — so a context attached afterwards never reaches the provider, and
+      // every native stream path silently emitted twice. The flag looked
+      // present on `enhancedOptions` and was simply absent from the object
+      // the provider actually held.
+      const dedupContext: StreamGenerationEndContext = {
+        providerEmitted: false,
+      };
+      (
+        enhancedOptions as StreamOptions & {
+          _streamDedupContext?: StreamGenerationEndContext;
         }
+      )._streamDedupContext = dedupContext;
 
-        // Apply orchestration if enabled and no specific provider/model requested
-        if (this.enableOrchestration && !options.provider && !options.model) {
-          try {
-            const orchestratedOptions =
-              await this.applyStreamOrchestration(options);
-            logger.debug("Stream orchestration applied", {
-              originalProvider: options.provider || "auto",
-              orchestratedProvider: orchestratedOptions.provider,
-              orchestratedModel: orchestratedOptions.model,
-              prompt: options.input.text?.substring(0, 100),
-            });
-
-            // Use orchestrated options
-            Object.assign(options, orchestratedOptions);
-          } catch (error) {
-            logger.warn(
-              "Stream orchestration failed, continuing with original options",
-              {
-                error: error instanceof Error ? error.message : String(error),
-                originalProvider: options.provider || "auto",
-              },
-            );
-            // Continue with original options if orchestration fails
-          }
-        }
-
-        // 🔧 AUTO-DISABLE TOOLS: For Ollama models that don't support tools (same logic as generate())
-        // This prevents overwhelming smaller models with massive tool descriptions in the system message
-        if (
-          (options.provider === "ollama" ||
-            options.provider?.toLowerCase().includes("ollama")) &&
-          !options.disableTools
-        ) {
-          const { ModelConfigurationManager } = await import(
-            "./core/modelConfiguration.js"
-          );
-          const modelConfig = ModelConfigurationManager.getInstance();
-          const ollamaConfig = modelConfig.getProviderConfiguration("ollama");
-          const toolCapableModels =
-            (ollamaConfig?.modelBehavior?.toolCapableModels as string[]) || [];
-
-          // Only disable tools if we have explicit evidence the model doesn't support them
-          // If toolCapableModels is empty or model is not specified, don't make assumptions
-          const modelName = options.model;
-          if (toolCapableModels.length > 0 && modelName) {
-            const modelSupportsTools = toolCapableModels.some((capableModel) =>
-              modelName.toLowerCase().includes(capableModel.toLowerCase()),
-            );
-            if (!modelSupportsTools) {
-              options.disableTools = true;
-              logger.debug(
-                "Auto-disabled tools for Ollama model that doesn't support them (stream)",
-                {
-                  model: options.model,
-                  toolCapableModels: toolCapableModels.slice(0, 3), // Show first 3 for brevity
-                },
-              );
-            }
-          }
-        }
-
-        // RAG Integration: If rag config is provided, prepare the RAG search tool (stream)
-        if (options.rag?.files?.length) {
-          try {
-            const { prepareRAGTool } = await import("./rag/ragIntegration.js");
-            const ragResult = await prepareRAGTool(
-              options.rag,
-              options.provider as string | undefined,
-            );
-
-            // Inject the RAG tool into the tools record
-            if (!options.tools) {
-              options.tools = {};
-            }
-            (options.tools as Record<string, unknown>)[ragResult.toolName] =
-              ragResult.tool;
-
-            // Inject RAG-aware system prompt so the AI uses the RAG tool first
-            const ragStreamInstruction = [
-              `\n\nIMPORTANT: You have a tool called "${ragResult.toolName}" that searches through`,
-              `${ragResult.filesLoaded} loaded document(s) containing ${ragResult.chunksIndexed} indexed chunks.`,
-              `ALWAYS use the "${ragResult.toolName}" tool FIRST to answer the user's question before using any other tools.`,
-              `This tool searches your local knowledge base of pre-loaded documents and is the primary source of truth.`,
-              `Do NOT use websearchGrounding or any web search tools when the answer can be found in the loaded documents.`,
-            ].join(" ");
-            options.systemPrompt =
-              (options.systemPrompt || "") + ragStreamInstruction;
-
-            logger.info("[RAG] Tool injected into stream()", {
-              toolName: ragResult.toolName,
-              filesLoaded: ragResult.filesLoaded,
-              chunksIndexed: ragResult.chunksIndexed,
-            });
-          } catch (error) {
-            logger.warn(
-              "[RAG] Failed to prepare RAG tool, continuing without RAG",
-              {
-                error: error instanceof Error ? error.message : String(error),
-              },
-            );
-          }
-        }
-
-        factoryResult = processStreamingFactoryOptions(options);
-        enhancedOptions = createCleanStreamOptions(options);
-        if (options.input?.text) {
-          const { toolResults: _toolResults, enhancedPrompt } =
-            await this.detectAndExecuteTools(options.input.text, undefined);
-          if (enhancedPrompt !== options.input.text) {
-            enhancedOptions.input.text = enhancedPrompt;
-          }
-        }
-
-        const { stream: mcpStream, provider: providerName } =
-          await this.createMCPStream(enhancedOptions);
-
-        let accumulatedContent = "";
-        let chunkCount = 0;
-
-        const eventSequence: Array<{
-          type: string;
-          seq: number;
-          timestamp: number;
-          [key: string]: unknown;
-        }> = [];
-        let eventSeqCounter = 0;
-
-        const captureEvent = (type: string, data?: unknown) => {
-          eventSequence.push({
-            type,
-            seq: eventSeqCounter++,
-            timestamp: Date.now(),
-            ...(data && typeof data === "object" ? data : { data }),
-          });
-        };
-
-        const onResponseChunk = (...args: unknown[]) => {
-          const chunk = args[0] as string;
-          captureEvent("response:chunk", { content: chunk });
-        };
-        const onToolStart = (...args: unknown[]) => {
-          const data = args[0] as { toolName: string; timestamp: number };
-          captureEvent("tool:start", data);
-        };
-        const onToolEnd = (...args: unknown[]) => {
-          const data = args[0] as {
-            toolName: string;
-            success: boolean;
-            responseTime: number;
-            result?: { uiComponent?: boolean; [key: string]: unknown };
-            [key: string]: unknown;
-          };
-          captureEvent("tool:end", data);
-
-          if (data.result && data.result.uiComponent === true) {
-            captureEvent("ui-component", {
-              toolName: data.toolName,
-              componentData: data.result,
-              timestamp: Date.now(),
-            });
-          }
-        };
-        const onUIComponent = (...args: unknown[]) => {
-          captureEvent("ui-component", args[0]);
-        };
-        const onHITLRequest = (...args: unknown[]) => {
-          captureEvent("hitl:confirmation-request", args[0]);
-        };
-        const onHITLResponse = (...args: unknown[]) => {
-          captureEvent("hitl:confirmation-response", args[0]);
-        };
-
-        this.emitter.on("response:chunk", onResponseChunk);
-        this.emitter.on("tool:start", onToolStart);
-        this.emitter.on("tool:end", onToolEnd);
-        this.emitter.on("ui-component", onUIComponent);
-        this.emitter.on("hitl:confirmation-request", onHITLRequest);
-        this.emitter.on("hitl:confirmation-response", onHITLResponse);
-
-        const metadata = {
-          fallbackAttempted: false,
-          guardrailsBlocked: false,
-          error: undefined as string | undefined,
-        };
-
-        const self = this;
-        const processedStream = (async function* () {
-          try {
-            for await (const chunk of mcpStream) {
-              chunkCount++;
-              if (
-                chunk &&
-                "content" in chunk &&
-                typeof chunk.content === "string"
-              ) {
-                accumulatedContent += chunk.content;
-                self.emitter.emit("response:chunk", chunk.content);
-              }
-              yield chunk;
-            }
-
-            if (chunkCount === 0 && !metadata.fallbackAttempted) {
-              metadata.fallbackAttempted = true;
-              const errorMsg =
-                "Stream completed with 0 chunks (possible guardrails block)";
-              metadata.error = errorMsg;
-
-              const fallbackRoute = ModelRouter.getFallbackRoute(
-                originalPrompt || enhancedOptions.input.text || "",
-                {
-                  provider: providerName,
-                  model: enhancedOptions.model || "gpt-4o",
-                  reasoning: "primary failed",
-                  confidence: 0.5,
-                },
-                { fallbackStrategy: "auto" },
-              );
-
-              logger.warn("Retrying with fallback provider", {
-                originalProvider: providerName,
-                fallbackProvider: fallbackRoute.provider,
-                reason: errorMsg,
-              });
-
-              try {
-                const fallbackProvider = await AIProviderFactory.createProvider(
-                  fallbackRoute.provider,
-                  fallbackRoute.model,
-                );
-
-                // Ensure fallback provider can execute tools
-                fallbackProvider.setupToolExecutor(
-                  {
-                    customTools: self.getCustomTools(),
-                    executeTool: self.executeTool.bind(self),
-                  },
-                  "NeuroLink.fallbackStream",
-                );
-
-                // Get conversation messages for context (same as primary stream)
-                const conversationMessages = await getConversationMessages(
-                  self.conversationMemory,
-                  {
-                    prompt: enhancedOptions.input.text,
-                    context: enhancedOptions.context as Record<string, unknown>,
-                  } as TextGenerationOptions,
-                );
-
-                const fallbackResult = await fallbackProvider.stream({
-                  ...enhancedOptions,
-                  model: fallbackRoute.model,
-                  conversationMessages,
-                });
-
-                let fallbackChunkCount = 0;
-                for await (const fallbackChunk of fallbackResult.stream) {
-                  fallbackChunkCount++;
-                  if (
-                    fallbackChunk &&
-                    "content" in fallbackChunk &&
-                    typeof fallbackChunk.content === "string"
-                  ) {
-                    accumulatedContent += fallbackChunk.content;
-                    self.emitter.emit("response:chunk", fallbackChunk.content);
-                  }
-                  yield fallbackChunk;
-                }
-
-                if (fallbackChunkCount === 0) {
-                  throw new Error(
-                    `Fallback provider ${fallbackRoute.provider} also returned 0 chunks`,
-                  );
-                }
-
-                // Fallback succeeded - likely guardrails blocked primary
-                metadata.guardrailsBlocked = true;
-              } catch (fallbackError) {
-                const fallbackErrorMsg =
-                  fallbackError instanceof Error
-                    ? fallbackError.message
-                    : String(fallbackError);
-                metadata.error = `${errorMsg}; Fallback failed: ${fallbackErrorMsg}`;
-                logger.error("Fallback provider failed", {
-                  fallbackProvider: fallbackRoute.provider,
-                  error: fallbackErrorMsg,
-                });
-                throw fallbackError;
-              }
-            }
-          } finally {
-            self.emitter.off("response:chunk", onResponseChunk);
-            self.emitter.off("tool:start", onToolStart);
-            self.emitter.off("tool:end", onToolEnd);
-            self.emitter.off("ui-component", onUIComponent);
-            self.emitter.off("hitl:confirmation-request", onHITLRequest);
-            self.emitter.off("hitl:confirmation-response", onHITLResponse);
-
-            // Store memory after stream consumption is complete
-            if (self.conversationMemory && enhancedOptions.context?.sessionId) {
-              const sessionId = (
-                enhancedOptions.context as Record<string, unknown>
-              )?.sessionId as string;
-              const userId = (
-                enhancedOptions.context as Record<string, unknown>
-              )?.userId as string;
-              let providerDetails: ProviderDetails | undefined;
-              if (enhancedOptions.model) {
-                providerDetails = {
-                  provider: providerName,
-                  model: enhancedOptions.model,
-                };
-              }
-
-              try {
-                await self.conversationMemory.storeConversationTurn({
-                  sessionId,
-                  userId,
-                  userMessage: originalPrompt ?? "",
-                  aiResponse: accumulatedContent,
-                  startTimeStamp: new Date(startTime),
-                  providerDetails,
-                  enableSummarization: enhancedOptions.enableSummarization,
-                  events: eventSequence.length > 0 ? eventSequence : undefined,
-                });
-
-                logger.debug(
-                  "[NeuroLink.stream] Stored conversation turn with events",
-                  {
-                    sessionId,
-                    eventCount: eventSequence.length,
-                    eventTypes: [...new Set(eventSequence.map((e) => e.type))],
-                  },
-                );
-              } catch (error) {
-                logger.warn("Failed to store stream conversation turn", {
-                  error: error instanceof Error ? error.message : String(error),
-                });
-              }
-            }
-
-            if (
-              self.conversationMemoryConfig?.conversationMemory?.mem0Enabled &&
-              enhancedOptions.context?.userId &&
-              accumulatedContent.trim()
-            ) {
-              // Non-blocking memory storage - run in background
-              setImmediate(async () => {
-                try {
-                  const mem0 = await self.ensureMem0Ready();
-                  if (mem0) {
-                    await self.storeMem0ConversationTurn(
-                      mem0,
-                      originalPrompt,
-                      accumulatedContent.trim(),
-                      enhancedOptions.context?.userId as string,
-                      {
-                        timestamp: new Date().toISOString(),
-                        type: "conversation_turn_stream",
-                      },
-                    );
-                  }
-                } catch (error) {
-                  logger.warn("Mem0 memory storage failed:", error);
-                }
-              });
-            }
-          }
-        })();
-        const streamResult = await this.processStreamResult(
-          processedStream,
-          enhancedOptions,
-          factoryResult,
-        );
-        const responseTime = Date.now() - startTime;
-
-        this.emitStreamEndEvents(streamResult);
-
-        return this.createStreamResponse(streamResult, processedStream, {
+      // Kept whole (not just destructured) so its toolsUsed/toolExecutions
+      // descriptors can be re-applied onto the final StreamResult near the
+      // bottom of this method, without ever reading — and thereby freezing —
+      // a getter-based provider's value here.
+      const mcpStreamOutcome = await this.createMCPStream(enhancedOptions);
+      const { stream: mcpStream } = mcpStreamOutcome;
+      const providerName = mcpStreamOutcome.provider ?? "unknown";
+      const tts: { result?: TTSResult } = {};
+      const { stream: incrementalStream, ttsMetadata: streamTtsMetadata } =
+        await this.createIncrementalTTSStream({
+          stream: mcpStream,
+          ttsOptions: enhancedOptions.tts,
           providerName,
-          options,
-          startTime,
-          responseTime,
-          streamId,
-          fallback: metadata.fallbackAttempted,
-          guardrailsBlocked: metadata.guardrailsBlocked,
-          error: metadata.error,
-          events: eventSequence,
+          fallbackProvider: enhancedOptions.provider,
+          onComplete: (result) => {
+            tts.result = result;
+          },
         });
-      } catch (error) {
-        return this.handleStreamError(
-          error,
-          options,
-          startTime,
-          streamId,
-          undefined,
-          undefined,
+      ttsMetadataSink?.(streamTtsMetadata);
+      // E1b: do NOT snapshot mcpStreamOutcome.toolCalls/toolResults here.
+      // For a provider whose tool loop runs in the background (native Vertex
+      // Claude — see the `allToolCalls`-backed getter in
+      // googleVertex/client.ts), toolCalls/toolResults are live getters that
+      // are still empty at this instant: `createMCPStream` has only just
+      // kicked the loop off, and it fills in as the caller drains
+      // `incrementalStream` below. Reading the getter now and storing the
+      // returned VALUE freezes that empty snapshot forever, because a
+      // property assignment is not a live binding — previously only the
+      // cross-provider fallback branch (handleStreamFallback) ever
+      // reassigned it, so every other path returned an empty array even
+      // after the caller had fully drained a stream with real tool calls.
+      // `streamState.toolCalls`/`toolResults` now start undefined and are
+      // set only by that fallback branch; every read goes through
+      // `currentToolCalls`/`currentToolResults`, which fall through to
+      // `mcpStreamOutcome`'s own (possibly still-live) getter so a read
+      // after the stream completes sees the real, current value. Providers
+      // that populate toolCalls eagerly (a plain array, not a getter) are
+      // unaffected — `mcpStreamOutcome.toolCalls` already holds their final
+      // value the first time it's read.
+      const streamState = {
+        finishReason: mcpStreamOutcome.finishReason ?? "stop",
+        toolCalls: undefined as StreamToolCall[] | undefined,
+        toolResults: undefined as StreamToolResult[] | undefined,
+      };
+      const currentToolCalls = (): StreamToolCall[] =>
+        streamState.toolCalls ?? mcpStreamOutcome.toolCalls ?? [];
+      const currentToolResults = (): StreamToolResult[] =>
+        streamState.toolResults ?? mcpStreamOutcome.toolResults ?? [];
+
+      streamSpan.setAttribute(ATTR.NL_PROVIDER, providerName || "unknown");
+
+      const { eventSequence, cleanup: cleanupListeners } =
+        this.setupStreamEventListeners();
+      const metadata = {
+        fallbackAttempted: false,
+        guardrailsBlocked: false,
+        error: undefined as string | undefined,
+        fallbackProvider: undefined as string | undefined,
+        fallbackModel: undefined as string | undefined,
+      };
+
+      const streamStartTime = Date.now();
+      const sessionId = (enhancedOptions.context as Record<string, unknown>)
+        ?.sessionId as string | undefined;
+      const drain = {
+        enhancedOptions,
+        originalPrompt,
+        startTime,
+        streamStartTime,
+        sessionId,
+        streamSpan,
+        spanStartTime,
+        ttsResolver,
+        incrementalStream,
+        streamTtsMetadata,
+        tts,
+        mcpStreamOutcome,
+        providerName,
+        dedupContext,
+        streamState,
+        currentToolCalls,
+        currentToolResults,
+        metadata,
+        eventSequence,
+        cleanupListeners,
+      };
+      const processedStream = this.drainStandardStreamOnce(drain);
+      const streamResult = await this.processStreamResult(
+        processedStream,
+        enhancedOptions,
+        factoryResult,
+      );
+      streamState.finishReason =
+        streamState.finishReason || streamResult.finishReason;
+      // Live, like toolCalls/toolResults below: the reason a stream ends with is
+      // only known after it drains, so a plain copy would stay the creation-time
+      // placeholder for every truncated or capped turn.
+      Object.defineProperty(streamResult, "finishReason", {
+        enumerable: true,
+        configurable: true,
+        get: () => streamState.finishReason,
+        set: (value: string) => {
+          streamState.finishReason = value;
+        },
+      });
+      // #1819 / E1b: a top-level cross-provider fallback (handleStreamFallback,
+      // inside `processedStream` above) only reassigns
+      // `streamState.toolCalls`/`toolResults` once the caller starts draining
+      // the stream — strictly AFTER this point, since `processedStream` is a
+      // lazy async generator and the `processStreamResult` call above
+      // resolves without pulling a single chunk. A plain value copy here
+      // (`streamResult.toolCalls = streamState.toolCalls`) would freeze
+      // whatever streamState held at THIS instant — always undefined this
+      // early — because a property assignment is not a live binding. Define
+      // live getters instead, routed through `currentToolCalls`/
+      // `currentToolResults` (see their definition above) so every later
+      // read reflects the fallback override once set, and otherwise falls
+      // through live to `mcpStreamOutcome`'s own getter — which is what
+      // fixes a background-tool-loop provider (native Vertex Claude)
+      // reporting empty toolCalls: that getter is only populated by the time
+      // the caller has finished draining the stream, and this getter is read
+      // after that, not frozen before it.
+      Object.defineProperty(streamResult, "toolCalls", {
+        enumerable: true,
+        configurable: true,
+        get: () => currentToolCalls(),
+      });
+      Object.defineProperty(streamResult, "toolResults", {
+        enumerable: true,
+        configurable: true,
+        get: () => currentToolResults(),
+      });
+      if (!streamResult.usage) {
+        streamResult.usage = mcpStreamOutcome.usage;
+      }
+      if (!streamResult.analytics) {
+        // CRITICAL: do NOT `await` a Promise-typed analytics here. Bedrock
+        // resolves its analytics from the stream's `finally` block — it
+        // only completes once the consumer has fully iterated the stream.
+        // Awaiting it before returning the StreamResult deadlocks: caller
+        // can't iterate (no stream yet), analytics can't resolve (no
+        // iteration). Pass the Promise through to the consumer instead;
+        // they (or the cost listener below) can await it after consumption.
+        //
+        // The outer StreamResult type (StreamResult.analytics in
+        // src/lib/types/stream.ts) explicitly allows `AnalyticsData |
+        // Promise<AnalyticsData>` — the cast widens the local
+        // `processStreamResult` return type which only declares the
+        // resolved shape.
+        (
+          streamResult as {
+            analytics?: typeof mcpStreamOutcome.analytics;
+          }
+        ).analytics = mcpStreamOutcome.analytics;
+      }
+
+      // The cost listener wants a resolved cost, but if the provider gave
+      // us a Promise (Bedrock) we can't tax the stream's return path on it.
+      // Defer cost accumulation: resolve in the background once the analytics
+      // Promise settles. Synchronous analytics (most providers) still fire
+      // immediately because Promise.resolve(non-promise) is sync-ish.
+      Promise.resolve(streamResult.analytics)
+        .then((analytics) => {
+          if (analytics?.cost && analytics.cost > 0) {
+            this._sessionCostUsd += analytics.cost;
+          }
+        })
+        .catch(() => {
+          /* analytics rejection is non-fatal — cost stays unupdated */
+        });
+
+      this.emitStreamEndEvents(streamResult);
+
+      return this.createStreamResponse(streamResult, processedStream, {
+        providerName,
+        options,
+        startTime,
+        responseTime: Date.now() - startTime,
+        streamId,
+        fallback: metadata.fallbackAttempted,
+        guardrailsBlocked: metadata.guardrailsBlocked,
+        error: metadata.error,
+        events: eventSequence,
+        sourceResult: mcpStreamOutcome,
+      });
+    } catch (error) {
+      ttsResolver?.(undefined);
+      if (options.disableInternalFallback) {
+        throw error;
+      }
+      return this.handleStreamError(
+        error,
+        options,
+        startTime,
+        streamId,
+        undefined,
+        undefined,
+      );
+    }
+  }
+
+  private drainStandardStreamOnce(
+    drain: Parameters<NeuroLink["drainStandardStream"]>[0],
+  ): AsyncIterableIterator<ProviderStreamChunk> {
+    const stream = this.drainStandardStream(drain);
+    let started = false;
+    const guarded: AsyncIterableIterator<ProviderStreamChunk> = {
+      next: () => {
+        started = true;
+        return stream.next();
+      },
+      return: async (value) => {
+        if (!started) {
+          started = true;
+          await this.settleStandardStreamDrain(drain, {
+            accumulatedContent: "",
+            chunkCount: 0,
+            streamError: undefined,
+            resolvedUsage: undefined,
+          });
+        }
+        return stream.return(value);
+      },
+      throw: async (error) => {
+        if (!started) {
+          started = true;
+          await this.settleStandardStreamDrain(drain, {
+            accumulatedContent: "",
+            chunkCount: 0,
+            streamError:
+              error instanceof Error ? error : new Error(String(error)),
+            resolvedUsage: undefined,
+          });
+        }
+        return stream.throw(error);
+      },
+      [Symbol.asyncIterator]: () => guarded,
+    };
+    return guarded;
+  }
+
+  private async *drainStandardStream(drain: {
+    enhancedOptions: StreamOptions;
+    originalPrompt: string;
+    startTime: number;
+    streamStartTime: number;
+    sessionId: string | undefined;
+    streamSpan: ReturnType<typeof tracers.sdk.startSpan>;
+    spanStartTime: number;
+    ttsResolver?: (value: TTSResult | undefined) => void;
+    incrementalStream: AsyncIterable<ProviderStreamChunk>;
+    streamTtsMetadata: TTSMetadata | undefined;
+    tts: { result?: TTSResult };
+    mcpStreamOutcome: StreamResult;
+    providerName: string;
+    dedupContext: StreamGenerationEndContext;
+    streamState: Parameters<NeuroLink["handleStreamFallback"]>[1];
+    currentToolCalls: () => StreamToolCall[];
+    currentToolResults: () => StreamToolResult[];
+    metadata: Parameters<NeuroLink["handleStreamFallback"]>[0];
+    eventSequence: ReturnType<
+      NeuroLink["setupStreamEventListeners"]
+    >["eventSequence"];
+    cleanupListeners: () => void;
+  }): AsyncGenerator<ProviderStreamChunk> {
+    const {
+      enhancedOptions,
+      originalPrompt,
+      streamStartTime,
+      sessionId,
+      ttsResolver,
+      incrementalStream,
+      streamTtsMetadata,
+      tts,
+      mcpStreamOutcome,
+      providerName,
+      streamState,
+      currentToolCalls,
+      currentToolResults,
+      metadata,
+    } = drain;
+    let accumulatedContent = "";
+    let chunkCount = 0;
+    let streamError: Error | undefined;
+    let resolvedUsage: TokenUsage | undefined;
+    let realOutputChunks = 0;
+    try {
+      for await (const chunk of incrementalStream) {
+        chunkCount++;
+        const isNoOutputSentinel =
+          chunk !== null &&
+          typeof chunk === "object" &&
+          "metadata" in chunk &&
+          (chunk as { metadata?: { noOutput?: boolean } }).metadata
+            ?.noOutput === true;
+        const hasTextContent =
+          chunk &&
+          "content" in chunk &&
+          typeof chunk.content === "string" &&
+          chunk.content.length > 0;
+        const hasMediaPayload =
+          chunk !== null &&
+          typeof chunk === "object" &&
+          "type" in chunk &&
+          (chunk.type === "audio" ||
+            chunk.type === "tts_audio" ||
+            chunk.type === "image");
+        if (!isNoOutputSentinel && (hasTextContent || hasMediaPayload)) {
+          realOutputChunks++;
+        }
+        if (chunk && "content" in chunk && typeof chunk.content === "string") {
+          accumulatedContent += chunk.content;
+          this.emitter.emit("response:chunk", chunk.content);
+          this.emitter.emit("stream:chunk", {
+            type: "stream:chunk",
+            content: chunk.content,
+            metadata: {
+              chunkIndex: chunkCount,
+              totalLength: accumulatedContent.length,
+              ...(isNoOutputSentinel && { noOutput: true }),
+            },
+            timestamp: Date.now(),
+          });
+        }
+        yield chunk;
+      }
+
+      const cappedByCallerBudget =
+        enhancedOptions.fallbackOnMaxSteps === false &&
+        mcpStreamOutcome.metadata?.stopReason === "step-cap";
+      if (
+        realOutputChunks === 0 &&
+        !cappedByCallerBudget &&
+        !metadata.fallbackAttempted &&
+        !enhancedOptions.disableInternalFallback &&
+        currentToolCalls().length === 0 &&
+        currentToolResults().length === 0
+      ) {
+        const fallbackStream = this.handleStreamFallback(
+          metadata,
+          streamState,
+          originalPrompt,
+          enhancedOptions,
+          providerName,
+          (content: string) => {
+            accumulatedContent += content;
+          },
+        );
+        const { stream: incrementalFallback } =
+          await this.createIncrementalTTSStream({
+            stream: fallbackStream,
+            ttsOptions: enhancedOptions.tts,
+            providerName,
+            fallbackProvider: enhancedOptions.provider,
+            ttsMetadata: streamTtsMetadata,
+            onComplete: (result) => {
+              tts.result = result;
+            },
+          });
+        yield* incrementalFallback;
+      }
+
+      ttsResolver?.(tts.result);
+
+      const drainedFinishReason = mcpStreamOutcome.metadata?.finishReason;
+      if (
+        !metadata.fallbackAttempted &&
+        (drainedFinishReason === "length" ||
+          drainedFinishReason === "tool-calls" ||
+          drainedFinishReason === "content-filter")
+      ) {
+        streamState.finishReason = drainedFinishReason;
+      }
+
+      resolvedUsage = mcpStreamOutcome.usage;
+      if (!resolvedUsage && mcpStreamOutcome.analytics) {
+        try {
+          const resolved = await Promise.resolve(mcpStreamOutcome.analytics);
+          if (resolved?.tokenUsage) {
+            resolvedUsage = resolved.tokenUsage;
+          }
+        } catch {
+          // non-blocking
+        }
+      }
+      if (resolvedUsage) {
+        mcpStreamOutcome.usage = resolvedUsage;
+      }
+
+      this.emitter.emit("stream:complete", {
+        type: "stream:complete",
+        content: accumulatedContent,
+        provider: metadata.fallbackProvider ?? providerName,
+        model:
+          metadata.fallbackModel ??
+          mcpStreamOutcome.model ??
+          enhancedOptions.model,
+        finishReason: streamState.finishReason ?? "stop",
+        prompt:
+          enhancedOptions.input?.text ||
+          (enhancedOptions as StreamOptions & { prompt?: string }).prompt,
+        metadata: {
+          chunkCount,
+          totalLength: accumulatedContent.length,
+          durationMs: Date.now() - streamStartTime,
+          sessionId,
+          usage: resolvedUsage,
+          finishReason: streamState.finishReason ?? "stop",
+          ...(metadata.fallbackAttempted && {
+            primaryProvider: providerName,
+            primaryModel: enhancedOptions.model,
+            fallback: true,
+          }),
+        },
+        timestamp: Date.now(),
+      });
+    } catch (error) {
+      logger.debug("[NeuroLink.stream] Stream error occurred", {
+        error: error instanceof Error ? error.message : String(error),
+        name: error instanceof Error ? error.name : "UnknownError",
+        provider: providerName,
+        model: enhancedOptions.model,
+        chunkCount,
+        totalLength: accumulatedContent.length,
+        durationMs: Date.now() - streamStartTime,
+        sessionId,
+      });
+      streamError = error instanceof Error ? error : new Error(String(error));
+      this.emitter.emit("stream:error", {
+        type: "stream:error",
+        content: error instanceof Error ? error.message : String(error),
+        provider: providerName,
+        model: enhancedOptions.model,
+        metadata: {
+          chunkCount,
+          totalLength: accumulatedContent.length,
+          durationMs: Date.now() - streamStartTime,
+          errorName: error instanceof Error ? error.name : "UnknownError",
+          sessionId,
+        },
+        timestamp: Date.now(),
+      });
+      throw error;
+    } finally {
+      await this.settleStandardStreamDrain(drain, {
+        accumulatedContent,
+        chunkCount,
+        streamError,
+        resolvedUsage,
+      });
+    }
+  }
+
+  private async settleStandardStreamDrain(
+    drain: Parameters<NeuroLink["drainStandardStream"]>[0],
+    outcome: {
+      accumulatedContent: string;
+      chunkCount: number;
+      streamError: Error | undefined;
+      resolvedUsage: TokenUsage | undefined;
+    },
+  ): Promise<void> {
+    const {
+      enhancedOptions,
+      originalPrompt,
+      startTime,
+      streamStartTime,
+      streamSpan,
+      spanStartTime,
+      ttsResolver,
+      mcpStreamOutcome,
+      providerName,
+      dedupContext,
+      streamState,
+      currentToolCalls,
+      metadata,
+      eventSequence,
+      cleanupListeners,
+    } = drain;
+    const { accumulatedContent, chunkCount, streamError, resolvedUsage } =
+      outcome;
+    ttsResolver?.(undefined);
+
+    logger.debug("[NeuroLink.stream] Stream finished, performing cleanup", {
+      provider: providerName,
+      model: enhancedOptions.model,
+      totalChunks: chunkCount,
+      totalLength: accumulatedContent.length,
+      durationMs: Date.now() - streamStartTime,
+      fallbackAttempted: metadata.fallbackAttempted,
+      guardrailsBlocked: metadata.guardrailsBlocked,
+      error: metadata.error,
+    });
+
+    if (!dedupContext.providerEmitted) {
+      try {
+        const finalProvider =
+          metadata.fallbackProvider ?? providerName ?? "unknown";
+        const finalModel =
+          metadata.fallbackModel ??
+          mcpStreamOutcome.model ??
+          enhancedOptions.model ??
+          "unknown";
+        const finalFinishReason = streamError
+          ? "error"
+          : (streamState.finishReason ?? "stop");
+        this.emitter.emit("generation:end", {
+          provider: finalProvider,
+          model: finalModel,
+          responseTime: Date.now() - streamStartTime,
+          toolsUsed: currentToolCalls().map((t) => t.toolName),
+          timestamp: Date.now(),
+          result: {
+            content: accumulatedContent,
+            usage: resolvedUsage,
+            model: finalModel,
+            provider: finalProvider,
+            finishReason: finalFinishReason,
+          },
+          prompt:
+            enhancedOptions.input?.text ||
+            (enhancedOptions as StreamOptions & { prompt?: string }).prompt,
+          temperature: enhancedOptions.temperature,
+          maxTokens: enhancedOptions.maxTokens,
+          success: !streamError,
+          error: streamError?.message,
+          streamed: true,
+        });
+      } catch (emitError) {
+        logger.debug(
+          "[NeuroLink.stream] generation:end listener threw — ignored",
+          {
+            error:
+              emitError instanceof Error
+                ? emitError.message
+                : String(emitError),
+          },
         );
       }
+    }
+
+    this._disableToolCacheForCurrentRequest = false;
+    this._toolCacheKeysServedThisRequest = new Set();
+    this._generationTurnActive = false;
+    cleanupListeners();
+
+    streamSpan.setAttribute("response_time_ms", Date.now() - spanStartTime);
+    streamSpan.setAttribute(ATTR.NL_OUTPUT_LENGTH, accumulatedContent.length);
+    const primaryFailed = !!(metadata.error || streamError);
+    streamSpan.setAttribute(
+      ATTR.GEN_AI_FINISH_REASON,
+      primaryFailed ? "error" : "stop",
+    );
+    if (metadata.fallbackAttempted) {
+      streamSpan.setAttribute("fallback_triggered", true);
+      if (metadata.fallbackProvider) {
+        streamSpan.setAttribute("fallback_provider", metadata.fallbackProvider);
+      }
+    }
+    if (primaryFailed) {
+      streamSpan.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: metadata.error || streamError?.message,
+      });
+    } else {
+      streamSpan.setStatus({ code: SpanStatusCode.OK });
+    }
+    streamSpan.end();
+
+    if (accumulatedContent.trim()) {
+      logger.info(`[NeuroLink.stream] stream() - COMPLETE SUCCESS`, {
+        provider: providerName,
+        model: enhancedOptions.model,
+        responseTimeMs: Date.now() - startTime,
+        contentLength: accumulatedContent.length,
+        fallback: metadata.fallbackAttempted,
+      });
+    }
+
+    await this.storeStreamConversationMemory({
+      enhancedOptions,
+      providerName,
+      originalPrompt,
+      accumulatedContent,
+      startTime,
+      eventSequence,
+      resultToolsUsed: (() => {
+        const fromResult = mcpStreamOutcome.toolsUsed;
+        if (Array.isArray(fromResult) && fromResult.length > 0) {
+          return fromResult;
+        }
+        const fromCalls = currentToolCalls().map((t) => t.toolName);
+        return fromCalls.length > 0 ? fromCalls : undefined;
+      })(),
     });
+  }
+
+  /** Wrap one provider stream with incremental TTS synthesis. */
+  private async createIncrementalTTSStream(params: {
+    stream: AsyncIterable<ProviderStreamChunk>;
+    ttsOptions: TTSOptions | undefined;
+    providerName: string;
+    fallbackProvider?: string;
+    ttsMetadata?: TTSMetadata;
+    onComplete: (value: TTSResult | undefined) => void;
+  }): Promise<{
+    stream: AsyncIterable<ProviderStreamChunk>;
+    ttsMetadata?: TTSMetadata;
+  }> {
+    const { stream, ttsOptions, providerName, fallbackProvider, onComplete } =
+      params;
+
+    if (!ttsOptions?.enabled) {
+      onComplete(undefined);
+      return { stream };
+    }
+
+    const { TTSProcessor } = await import("./utils/ttsProcessor.js");
+    const concreteFallback =
+      fallbackProvider === "auto" ? undefined : fallbackProvider;
+    const candidate = ttsOptions.provider ?? concreteFallback ?? providerName;
+    const ttsProvider =
+      candidate && TTSProcessor.supports(candidate) ? candidate : undefined;
+    const ttsMetadata = params.ttsMetadata ?? {
+      attempted: ttsProvider !== undefined,
+      success: false,
+    };
+    ttsMetadata.attempted = ttsProvider !== undefined;
+    ttsMetadata.success = false;
+    delete ttsMetadata.error;
+    delete ttsMetadata.latency;
+    const ttsStartedAt = Date.now();
+    let completionRecorded = false;
+    const recordCompletion = (
+      result: TTSResult | undefined,
+      error?: NonNullable<TTSMetadata["error"]>,
+    ) => {
+      if (completionRecorded) {
+        return;
+      }
+      completionRecorded = true;
+      ttsMetadata.success = error === undefined && result !== undefined;
+      if (error) {
+        ttsMetadata.error = error;
+      } else {
+        delete ttsMetadata.error;
+      }
+      ttsMetadata.latency = Date.now() - ttsStartedAt;
+      onComplete(result);
+    };
+    if (!ttsProvider) {
+      logger.warn(
+        `[NeuroLink.stream] No TTS provider resolved for incremental streaming (set tts.provider explicitly — chat provider "${candidate ?? "<unset>"}" is not a registered TTS handler)`,
+      );
+      recordCompletion(undefined);
+      return { stream, ttsMetadata };
+    }
+
+    return {
+      stream: interleaveTTSStream({
+        stream,
+        provider: ttsProvider,
+        options: ttsOptions,
+        onComplete: recordCompletion,
+      }),
+      ttsMetadata,
+    };
+  }
+
+  /** Prevent provider fallback streams from duplicating outer streaming TTS. */
+  private deferProviderStreamTTS(options: StreamOptions): StreamOptions {
+    if (options.tts?.enabled) {
+      return { ...options, tts: undefined };
+    }
+    return options;
+  }
+
+  /**
+   * Prepare stream options: initialize memory, MCP, retrieval, orchestration,
+   * Ollama tool auto-disable, factory processing, and tool detection.
+   */
+  private async prepareStreamOptions(
+    options: StreamOptions,
+    streamId: string,
+    startTime: number,
+    hrTimeStart: bigint,
+  ): Promise<{
+    enhancedOptions: StreamOptions;
+    factoryResult: {
+      hasStreamingConfig: boolean;
+      streamingEnabled?: boolean;
+      enhancedConfig?: StreamOptions["streaming"];
+    };
+  }> {
+    // Initialize conversation memory if needed (for lazy loading)
+    await this.initializeConversationMemoryForGeneration(
+      streamId,
+      startTime,
+      hrTimeStart,
+    );
+
+    // Memory retrieval
+    if (
+      this.shouldReadMemory(options.memory, options.context?.userId) &&
+      options.context?.userId
+    ) {
+      try {
+        options.input.text = await this.retrieveMemory(
+          options.input.text ?? "",
+          options.context.userId as string,
+          options.memory?.additionalUsers,
+        );
+        logger.debug("Memory retrieval successful");
+      } catch (error) {
+        logger.warn("Memory retrieval failed:", error);
+      }
+    }
+
+    // Skills: surface the discovery listing and inject the per-call
+    // use_skill / read_skill_resource tools (bodies load on activation).
+    await this.applySkillsAugmentation(options);
+
+    // Apply orchestration if enabled and no specific provider/model requested
+    if (this.enableOrchestration && !options.provider && !options.model) {
+      try {
+        const orchestratedOptions =
+          await this.applyStreamOrchestration(options);
+        logger.debug("Stream orchestration applied", {
+          originalProvider: options.provider || "auto",
+          orchestratedProvider: orchestratedOptions.provider,
+          orchestratedModel: orchestratedOptions.model,
+          prompt: options.input.text?.substring(0, 100),
+        });
+
+        // Use orchestrated options — rebind the local `options` to a fresh
+        // merged object instead of mutating the caller-supplied one
+        // (NEW2: avoids cross-call contamination when callers reuse options).
+        // Issue 6: extract to an explicit local so the rebind intent is
+        // obvious to future readers, and the lint suppression is scoped
+        // narrowly to the one statement that actually rebinds the param.
+        const mergedOptions = { ...options, ...orchestratedOptions };
+
+        options = mergedOptions;
+
+        // Re-resolve model alias in case orchestration returned an alias
+        if (orchestratedOptions.model) {
+          options.model = resolveModel(options.model, this.modelAliasConfig);
+        }
+      } catch (error) {
+        logger.warn(
+          "Stream orchestration failed, continuing with original options",
+          {
+            error: error instanceof Error ? error.message : String(error),
+            originalProvider: options.provider || "auto",
+          },
+        );
+        // Continue with original options if orchestration fails
+      }
+    }
+
+    // Auto-disable tools for Ollama models that don't support them
+    await this.autoDisableOllamaStreamTools(options);
+
+    // generate() skips MCP when tools are disabled, so stream() must too:
+    // initialization loads the working directory's .mcp-config.json and waits
+    // for every stdio server it names before the request is sent, so an
+    // `npx -y …` entry on a slow npm registry stalls a stream that never
+    // needed a tool. Decided after the Ollama check above, which can turn
+    // tools off. Providers register themselves in AIProviderFactory.
+    if (!options.disableTools) {
+      await this.initializeMCP();
+    }
+
+    // RAG Integration: If rag config is provided, prepare the RAG search tool
+    if (options.rag?.files?.length) {
+      try {
+        const { prepareRAGTool } = await import("./rag/ragIntegration.js");
+        const ragResult = await prepareRAGTool(
+          options.rag,
+          options.provider as string | undefined,
+          this.attachmentPolicy,
+        );
+
+        // Inject the RAG tool into the tools record
+        if (!options.tools) {
+          options.tools = {};
+        }
+        (options.tools as Record<string, unknown>)[ragResult.toolName] =
+          ragResult.tool;
+
+        // Inject RAG-aware system prompt so the AI uses the RAG tool first
+        const ragSystemInstruction = [
+          `\n\nIMPORTANT: You have a tool called "${ragResult.toolName}" that searches through`,
+          `${ragResult.filesLoaded} loaded document(s) containing ${ragResult.chunksIndexed} indexed chunks.`,
+          `ALWAYS use the "${ragResult.toolName}" tool FIRST to answer the user's question before using any other tools.`,
+          `This tool searches your local knowledge base of pre-loaded documents and is the primary source of truth.`,
+          `Do NOT use websearchGrounding or any web search tools when the answer can be found in the loaded documents.`,
+        ].join(" ");
+        options.systemPrompt =
+          (options.systemPrompt || "") + ragSystemInstruction;
+
+        logger.info("[RAG] Tool injected into stream()", {
+          toolName: ragResult.toolName,
+          filesLoaded: ragResult.filesLoaded,
+          chunksIndexed: ragResult.chunksIndexed,
+        });
+      } catch (error) {
+        logger.warn(
+          "[RAG] Failed to prepare RAG tool, continuing without RAG",
+          {
+            error: error instanceof Error ? error.message : String(error),
+          },
+        );
+      }
+    }
+
+    const factoryResult = processStreamingFactoryOptions(options);
+    const enhancedOptions = createCleanStreamOptions(options);
+    if (options.input?.text) {
+      const { toolResults: _toolResults, enhancedPrompt } =
+        await this.detectAndExecuteTools(options.input.text, undefined);
+      if (enhancedPrompt !== options.input.text) {
+        enhancedOptions.input.text = enhancedPrompt;
+      }
+    }
+
+    return { enhancedOptions, factoryResult };
+  }
+
+  /**
+   * Auto-disable tools for Ollama models that don't support them (stream mode).
+   * Prevents overwhelming smaller models with massive tool descriptions in the system message.
+   */
+  private async autoDisableOllamaStreamTools(
+    options: StreamOptions,
+  ): Promise<void> {
+    if (
+      (options.provider === "ollama" ||
+        options.provider?.toLowerCase().includes("ollama")) &&
+      !options.disableTools
+    ) {
+      const { ModelConfigurationManager } =
+        await import("./core/modelConfiguration.js");
+      const modelConfig = ModelConfigurationManager.getInstance();
+      const ollamaConfig = modelConfig.getProviderConfiguration("ollama");
+      const toolCapableModels =
+        (ollamaConfig?.modelBehavior?.toolCapableModels as string[]) || [];
+
+      // Only disable tools if we have explicit evidence the model doesn't support them
+      // If toolCapableModels is empty or model is not specified, don't make assumptions
+      const modelName = options.model;
+      if (toolCapableModels.length > 0 && modelName) {
+        const modelSupportsTools = toolCapableModels.some((capableModel) =>
+          modelName.toLowerCase().includes(capableModel.toLowerCase()),
+        );
+        if (!modelSupportsTools) {
+          options.disableTools = true;
+          logger.debug(
+            "Auto-disabled tools for Ollama model that doesn't support them (stream)",
+            {
+              model: options.model,
+              toolCapableModels: toolCapableModels.slice(0, 3), // Show first 3 for brevity
+            },
+          );
+        }
+      }
+    }
+  }
+
+  /**
+   * Set up event listeners for stream event capture (tool calls, HITL, UI components).
+   * Returns the shared event sequence array and a cleanup function to remove all listeners.
+   */
+  private setupStreamEventListeners(): {
+    eventSequence: Array<{
+      type: string;
+      seq: number;
+      timestamp: number;
+      [key: string]: unknown;
+    }>;
+    cleanup: () => void;
+  } {
+    const eventSequence: Array<{
+      type: string;
+      seq: number;
+      timestamp: number;
+      [key: string]: unknown;
+    }> = [];
+    let eventSeqCounter = 0;
+    const eventScope = this.conversationEventContext.getStore();
+    const ownedConfirmations = new Set<string>();
+    const confirmationId = (event: unknown): string | undefined => {
+      if (
+        !event ||
+        typeof event !== "object" ||
+        !("payload" in event) ||
+        !event.payload ||
+        typeof event.payload !== "object" ||
+        !("confirmationId" in event.payload) ||
+        typeof event.payload.confirmationId !== "string"
+      ) {
+        return undefined;
+      }
+      return event.payload.confirmationId;
+    };
+
+    const captureEvent = (
+      type: string,
+      data?: unknown,
+      ownedConfirmation?: string,
+    ) => {
+      // Never infer ownership from whichever listeners happen to be active.
+      // This also fails closed where async context propagation is unavailable.
+      const belongsToTurn =
+        eventScope !== undefined &&
+        this.conversationEventContext.getStore() === eventScope;
+      const belongsToConfirmation =
+        ownedConfirmation !== undefined &&
+        ownedConfirmations.has(ownedConfirmation);
+      if (!belongsToTurn && !belongsToConfirmation) {
+        return;
+      }
+      eventSequence.push({
+        type,
+        seq: eventSeqCounter++,
+        timestamp: Date.now(),
+        ...(data && typeof data === "object" ? data : { data }),
+      });
+    };
+
+    const onResponseChunk = (...args: unknown[]) => {
+      const chunk = args[0] as string;
+      captureEvent("response:chunk", { content: chunk });
+    };
+    const onToolStart = (...args: unknown[]) => {
+      const data = args[0] as {
+        tool?: string;
+        toolName?: string;
+        timestamp: number;
+      };
+      captureEvent("tool:start", {
+        ...data,
+        toolName: data.toolName ?? data.tool,
+      });
+    };
+    const onToolEnd = (...args: unknown[]) => {
+      const data = args[0] as {
+        tool?: string;
+        toolName?: string;
+        success?: boolean;
+        responseTime?: number;
+        duration?: number;
+        error?: string;
+        result?: { uiComponent?: boolean; [key: string]: unknown };
+        [key: string]: unknown;
+      };
+      const toolName = data.toolName ?? data.tool;
+      const responseTime =
+        data.responseTime ?? (data.duration as number | undefined);
+      const success =
+        data.success ?? (data.error !== undefined ? false : undefined);
+      const augmented = {
+        ...data,
+        toolName,
+        ...(responseTime !== undefined ? { responseTime } : {}),
+        ...(success !== undefined ? { success } : {}),
+        ...(data.error !== undefined ? { error: data.error } : {}),
+      };
+      captureEvent("tool:end", augmented);
+
+      if (augmented.result && augmented.result.uiComponent === true) {
+        captureEvent("ui-component", {
+          toolName,
+          componentData: augmented.result,
+          timestamp: Date.now(),
+          ...(success !== undefined ? { success } : {}),
+          ...(responseTime !== undefined ? { responseTime } : {}),
+        });
+      }
+    };
+    const onHostConversationEvent = (...args: unknown[]) => {
+      const event = args[0];
+      if (
+        event &&
+        typeof event === "object" &&
+        "type" in event &&
+        typeof event.type === "string" &&
+        "data" in event &&
+        event.data &&
+        typeof event.data === "object" &&
+        !Array.isArray(event.data)
+      ) {
+        captureEvent(event.type, { data: event.data });
+      }
+    };
+    const onUIComponent = (...args: unknown[]) => {
+      captureEvent("ui-component", args[0]);
+    };
+    const onHITLRequest = (...args: unknown[]) => {
+      if (
+        eventScope !== undefined &&
+        this.conversationEventContext.getStore() === eventScope
+      ) {
+        const id = confirmationId(args[0]);
+        if (id !== undefined) {
+          ownedConfirmations.add(id);
+        }
+        captureEvent("hitl:confirmation-request", args[0]);
+      }
+    };
+    const onHITLResponse = (...args: unknown[]) => {
+      const id = confirmationId(args[0]);
+      // A host answers from its own HTTP/async context. The issued confirmation
+      // id carries ownership without admitting arbitrary global emitter data.
+      if (id !== undefined && ownedConfirmations.has(id)) {
+        captureEvent("hitl:confirmation-response", args[0], id);
+        ownedConfirmations.delete(id);
+      }
+    };
+
+    this.emitter.on("response:chunk", onResponseChunk);
+    this.emitter.on("tool:start", onToolStart);
+    this.emitter.on("tool:end", onToolEnd);
+    this.emitter.on("ui-component", onUIComponent);
+    this.emitter.on("host:conversation-event", onHostConversationEvent);
+    this.emitter.on("hitl:confirmation-request", onHITLRequest);
+    this.emitter.on("hitl:confirmation-response", onHITLResponse);
+
+    const cleanup = () => {
+      this.emitter.off("response:chunk", onResponseChunk);
+      this.emitter.off("tool:start", onToolStart);
+      this.emitter.off("tool:end", onToolEnd);
+      this.emitter.off("ui-component", onUIComponent);
+      this.emitter.off("host:conversation-event", onHostConversationEvent);
+      this.emitter.off("hitl:confirmation-request", onHITLRequest);
+      this.emitter.off("hitl:confirmation-response", onHITLResponse);
+    };
+
+    return { eventSequence, cleanup };
+  }
+
+  /**
+   * Handle fallback when the primary stream returns 0 chunks.
+   * Yields chunks from a fallback provider and updates metadata accordingly.
+   */
+  private async *handleStreamFallback(
+    metadata: {
+      fallbackAttempted: boolean;
+      guardrailsBlocked: boolean;
+      error: string | undefined;
+      fallbackProvider: string | undefined;
+      fallbackModel: string | undefined;
+    },
+    streamState: {
+      finishReason: string;
+      // Undefined until this fallback branch reassigns them (see below) or
+      // the caller reads through `currentToolCalls`/`currentToolResults` in
+      // runStandardStreamRequest, which fall through live to
+      // `mcpStreamOutcome` while these stay unset.
+      toolCalls: StreamToolCall[] | undefined;
+      toolResults: StreamToolResult[] | undefined;
+    },
+    originalPrompt: string | undefined,
+    enhancedOptions: StreamOptions,
+    providerName: string,
+    appendContent: (content: string) => void,
+  ): AsyncGenerator<ProviderStreamChunk> {
+    metadata.fallbackAttempted = true;
+    const errorMsg =
+      "Stream completed with 0 chunks (possible guardrails block)";
+    metadata.error = errorMsg;
+
+    // Record a failed-provider span for the primary provider that returned 0 chunks
+    try {
+      const traceCtx = this._metricsTraceContext;
+      let failedSpan = SpanSerializer.createGenerationSpan({
+        provider: providerName,
+        model: enhancedOptions.model || "unknown",
+        name: `gen_ai.${providerName}.stream.failed`,
+        traceId: traceCtx?.traceId,
+        parentSpanId: traceCtx?.parentSpanId,
+      });
+      failedSpan = SpanSerializer.endSpan(failedSpan, SpanStatus.ERROR);
+      failedSpan.statusMessage = errorMsg;
+      failedSpan.durationMs = 0;
+      this.metricsAggregator.recordSpan(failedSpan);
+      getMetricsAggregator().recordSpan(failedSpan);
+    } catch {
+      /* non-blocking */
+    }
+
+    // BZ-1341: Support fallback provider override via options or env vars
+    const optFallbackProvider =
+      enhancedOptions.fallbackProvider?.trim() || undefined;
+    const optFallbackModel = enhancedOptions.fallbackModel?.trim() || undefined;
+    const envFallbackProvider =
+      process.env.FALLBACK_PROVIDER?.trim() || undefined;
+    const envFallbackModel = process.env.FALLBACK_MODEL?.trim() || undefined;
+
+    const modelConfigRoute = ModelRouter.getFallbackRoute(
+      originalPrompt || enhancedOptions.input.text || "",
+      {
+        provider: providerName,
+        model: enhancedOptions.model || "gpt-4o",
+        reasoning: "primary failed",
+        confidence: 0.5,
+      },
+      { fallbackStrategy: "auto" },
+    );
+
+    const fallbackRoute = {
+      ...modelConfigRoute,
+      provider:
+        optFallbackProvider ?? envFallbackProvider ?? modelConfigRoute.provider,
+      model: optFallbackModel ?? envFallbackModel ?? modelConfigRoute.model,
+    };
+
+    logger.warn("Retrying with fallback provider", {
+      originalProvider: providerName,
+      fallbackProvider: fallbackRoute.provider,
+      fallbackModel: fallbackRoute.model,
+      fallbackSource:
+        optFallbackProvider || optFallbackModel
+          ? "options"
+          : envFallbackProvider || envFallbackModel
+            ? "env"
+            : "model_config",
+      reason: errorMsg,
+    });
+
+    try {
+      const fallbackProvider = await AIProviderFactory.createProvider(
+        fallbackRoute.provider,
+        fallbackRoute.model,
+        true,
+        undefined,
+        undefined,
+        this.resolveCredentials(enhancedOptions.credentials),
+      );
+
+      // Ensure fallback provider can execute tools
+      fallbackProvider.setupToolExecutor(
+        {
+          customTools: this.getCustomTools(),
+          executeTool: (toolName: string, params: unknown) =>
+            this.executeTool(toolName, params, {
+              disableToolCache: enhancedOptions.disableToolCache,
+            }),
+        },
+        "NeuroLink.fallbackStream",
+      );
+
+      // Prefer the caller-supplied / compacted conversation messages that were
+      // threaded through options.  Only fall back to memory when no explicit
+      // history was provided — this preserves caller-supplied empty arrays
+      // (which signal "no prior context") and avoids resurrecting stale memory.
+      const conversationMessages =
+        enhancedOptions.conversationMessages !== undefined
+          ? enhancedOptions.conversationMessages
+          : await getConversationMessages(this.conversationMemory, {
+              prompt: enhancedOptions.input.text,
+              context: enhancedOptions.context as Record<string, unknown>,
+            } as TextGenerationOptions);
+
+      fallbackProvider.setFileToolRootPolicy?.(
+        this.fileToolRootsFor(enhancedOptions),
+      );
+      const fallbackResult = await fallbackProvider.stream({
+        ...this.deferProviderStreamTTS(enhancedOptions),
+        model: fallbackRoute.model,
+        conversationMessages,
+      });
+      const fallbackToolCalls = fallbackResult.toolCalls ?? [];
+      const fallbackToolResults = fallbackResult.toolResults ?? [];
+      if (fallbackToolCalls.length > 0 || fallbackToolResults.length > 0) {
+        streamState.toolCalls = fallbackToolCalls;
+        streamState.toolResults = fallbackToolResults;
+        streamState.finishReason =
+          fallbackResult.finishReason ?? streamState.finishReason;
+      }
+
+      // Reviewer follow-up: count *real* output chunks for the fallback
+      // success gate, mirroring the primary stream wrapper. A fallback
+      // that yields only the NoOutputSentinel must not be treated as
+      // success — that's the same masked-failure scenario as the primary.
+      let fallbackChunkCount = 0;
+      let fallbackRealOutputChunks = 0;
+      for await (const fallbackChunk of fallbackResult.stream) {
+        fallbackChunkCount++;
+        const isFallbackNoOutputSentinel =
+          fallbackChunk !== null &&
+          typeof fallbackChunk === "object" &&
+          "metadata" in fallbackChunk &&
+          (fallbackChunk as { metadata?: Record<string, unknown> }).metadata
+            ?.noOutput === true;
+        const fallbackHasTextContent =
+          fallbackChunk &&
+          "content" in fallbackChunk &&
+          typeof fallbackChunk.content === "string" &&
+          fallbackChunk.content.length > 0;
+        const fallbackHasMediaPayload =
+          fallbackChunk !== null &&
+          typeof fallbackChunk === "object" &&
+          "type" in fallbackChunk &&
+          ((fallbackChunk as { type?: unknown }).type === "audio" ||
+            (fallbackChunk as { type?: unknown }).type === "tts_audio" ||
+            (fallbackChunk as { type?: unknown }).type === "image");
+        if (
+          !isFallbackNoOutputSentinel &&
+          (fallbackHasTextContent || fallbackHasMediaPayload)
+        ) {
+          fallbackRealOutputChunks++;
+        }
+        if (
+          fallbackChunk &&
+          "content" in fallbackChunk &&
+          typeof fallbackChunk.content === "string"
+        ) {
+          appendContent(fallbackChunk.content);
+          this.emitter.emit("response:chunk", fallbackChunk.content);
+        }
+        yield fallbackChunk;
+      }
+
+      // Read after the drain: a background-loop provider (native Vertex+Claude)
+      // fills these while the stream is consumed, so the values taken before
+      // the loop are still empty for it. Without this, a fallback that ran
+      // tools reports none on the result and in the end-of-turn events, and
+      // the 0-output gate below counts tool calls that had not appeared yet.
+      const finalToolCalls = fallbackResult.toolCalls ?? [];
+      const finalToolResults = fallbackResult.toolResults ?? [];
+
+      if (
+        fallbackRealOutputChunks === 0 &&
+        finalToolCalls.length === 0 &&
+        finalToolResults.length === 0
+      ) {
+        throw new Error(
+          `Fallback provider ${fallbackRoute.provider} also returned 0 real output chunks (chunkCount=${fallbackChunkCount}, sentinel-only or empty)`,
+        );
+      }
+
+      streamState.toolCalls = finalToolCalls;
+      streamState.toolResults = finalToolResults;
+      streamState.finishReason =
+        fallbackResult.finishReason ?? streamState.finishReason;
+
+      // Fallback succeeded - likely guardrails blocked primary
+      metadata.fallbackProvider = fallbackRoute.provider;
+      metadata.fallbackModel = fallbackRoute.model;
+      metadata.guardrailsBlocked = true;
+    } catch (fallbackError) {
+      const fallbackErrorMsg =
+        fallbackError instanceof Error
+          ? fallbackError.message
+          : String(fallbackError);
+      metadata.error = `${errorMsg}; Fallback failed: ${fallbackErrorMsg}`;
+      logger.error("Fallback provider failed", {
+        fallbackProvider: fallbackRoute.provider,
+        error: fallbackErrorMsg,
+      });
+      throw fallbackError;
+    }
+  }
+
+  /**
+   * Store conversation memory after stream consumption is complete (called from finally block).
+   * Handles conversation memory storage in the background.
+   */
+  private async storeStreamConversationMemory(params: {
+    enhancedOptions: StreamOptions;
+    providerName: string;
+    originalPrompt: string | undefined;
+    accumulatedContent: string;
+    startTime: number;
+    eventSequence: Array<{
+      type: string;
+      seq: number;
+      timestamp: number;
+      [key: string]: unknown;
+    }>;
+    /** Tool names from THIS request's stream result, when the provider reports them. */
+    resultToolsUsed?: ReadonlyArray<string>;
+  }): Promise<void> {
+    const {
+      enhancedOptions,
+      providerName,
+      originalPrompt,
+      accumulatedContent,
+      startTime,
+      eventSequence,
+      resultToolsUsed,
+    } = params;
+
+    // Logger Guard: the full options object (history + tool outputs) can be
+    // enormous — an eager JSON.stringify here threw RangeError: Invalid
+    // string length in production and killed the turn. Serialize lazily,
+    // bounded, and only when debug is actually enabled; sanitizeRecord
+    // redacts credentials/PII keys before anything reaches the sink.
+    if (logger.shouldLog("debug")) {
+      logger.debug(
+        "[NeuroLink.stream] Preparing to store conversation turn in memory",
+        {
+          options: safeDebugSerialize(sanitizeRecord(enhancedOptions)),
+          sessionId: (enhancedOptions.context as Record<string, unknown>)
+            ?.sessionId,
+        },
+      );
+    }
+
+    // Guard: skip storing if no meaningful content was produced (no text AND no tool activity)
+    const hasToolEvents = eventSequence.some(
+      (e) => e.type === "tool:start" || e.type === "tool:end",
+    );
+    if (!accumulatedContent.trim() && !hasToolEvents) {
+      logger.warn(
+        "[NeuroLink.stream] Skipping conversation turn storage — no text content or tool activity",
+        {
+          sessionId: (enhancedOptions.context as Record<string, unknown>)
+            ?.sessionId,
+        },
+      );
+      return;
+    }
+
+    // Logger Guard: see the matching block above — never eagerly stringify
+    // the full options object, and always redact before serializing.
+    if (logger.shouldLog("debug")) {
+      logger.debug("[NeuroLink.stream] Storing conversation turn in memory", {
+        options: safeDebugSerialize(sanitizeRecord(enhancedOptions)),
+        sessionId: (enhancedOptions.context as Record<string, unknown>)
+          ?.sessionId,
+        conversationMemoryExists: this.conversationMemory ? true : false,
+      });
+    }
+
+    // Store memory after stream consumption is complete
+    if (this.conversationMemory && enhancedOptions.context?.sessionId) {
+      const sessionId = (enhancedOptions.context as Record<string, unknown>)
+        ?.sessionId as string;
+      const userId = (enhancedOptions.context as Record<string, unknown>)
+        ?.userId as string;
+      let providerDetails: ProviderDetails | undefined;
+      if (enhancedOptions.model) {
+        providerDetails = {
+          provider: providerName,
+          model: enhancedOptions.model,
+        };
+      }
+
+      const memStoreStart = Date.now();
+      try {
+        const pendingSkillMessages = this.drainPendingSkillMessages(sessionId);
+        await this.conversationMemory.storeConversationTurn({
+          sessionId,
+          userId,
+          userMessage: originalPrompt ?? "",
+          aiResponse: accumulatedContent,
+          startTimeStamp: new Date(startTime),
+          providerDetails,
+          enableSummarization: enhancedOptions.enableSummarization,
+          events: eventSequence.length > 0 ? eventSequence : undefined,
+          requestId: (enhancedOptions.context as Record<string, unknown>)
+            ?.requestId as string | undefined,
+          ...(pendingSkillMessages.length > 0
+            ? { skillMessages: pendingSkillMessages }
+            : {}),
+          ...(enhancedOptions.modality
+            ? { modality: enhancedOptions.modality }
+            : {}),
+        });
+
+        this.recordMemorySpan(
+          "memory.store",
+          { "memory.operation": "store", "memory.path": "stream" },
+          Date.now() - memStoreStart,
+          SpanStatus.OK,
+        );
+
+        logger.debug(
+          "[NeuroLink.stream] Stored conversation turn with events",
+          {
+            sessionId,
+            eventCount: eventSequence.length,
+            eventTypes: [...new Set(eventSequence.map((e) => e.type))],
+          },
+        );
+      } catch (error) {
+        this.recordMemorySpan(
+          "memory.store",
+          { "memory.operation": "store", "memory.path": "stream" },
+          Date.now() - memStoreStart,
+          SpanStatus.ERROR,
+          error instanceof Error ? error.message : String(error),
+        );
+        logger.warn("Failed to store stream conversation turn", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    if (
+      this.shouldWriteMemory(
+        enhancedOptions.memory,
+        enhancedOptions.context?.userId,
+        accumulatedContent,
+      )
+    ) {
+      const streamSessionId = enhancedOptions.context?.sessionId;
+      // Tool names come from THIS request's stream result ONLY, as generate()
+      // reads them off its own result — an empty list is authoritative. The
+      // captured tool:start events are never consulted: they are collected
+      // by instance-wide listeners, so a stream that used no tools, running
+      // beside any other tool call on the same instance, would otherwise
+      // hand that tool's name to its shouldWrite / onBeforeStore.
+      // usage/finishReason stay unavailable.
+      const toolsUsed = [...new Set(resultToolsUsed ?? [])];
+      this.storeMemoryInBackground(
+        {
+          prompt: originalPrompt ?? "",
+          response: accumulatedContent.trim(),
+          userId: enhancedOptions.context?.userId as string,
+          ...(typeof streamSessionId === "string"
+            ? { sessionId: streamSessionId }
+            : {}),
+          provider: providerName,
+          model: enhancedOptions.model,
+          ...(toolsUsed.length > 0 ? { toolsUsed } : {}),
+        },
+        enhancedOptions.memory,
+        enhancedOptions.context as { traceName?: string; sessionId?: string },
+      );
+    }
   }
 
   /**
@@ -3716,14 +12994,16 @@ Current user's request: ${currentInput}`;
     const hasAudio = !!(
       options?.input?.audio &&
       options.input.audio.frames &&
-      typeof (options.input.audio.frames as unknown as Record<string, unknown>)[
-        Symbol.asyncIterator as unknown as string
-      ] !== "undefined"
+      typeof (options.input.audio.frames as AsyncIterable<Buffer>)[
+        Symbol.asyncIterator
+      ] === "function"
     );
+    // STT pre-recorded audio buffer counts as input — transcription will fill text.
+    const hasSttAudio = !!(options?.stt?.enabled && options?.stt?.audio);
 
-    if (!hasText && !hasAudio) {
+    if (!hasText && !hasAudio && !hasSttAudio) {
       throw new Error(
-        "Stream options must include either input.text or input.audio",
+        "Stream options must include either input.text, input.audio, or stt.audio",
       );
     }
   }
@@ -3747,57 +13027,460 @@ Current user's request: ${currentInput}`;
   }
 
   /**
-   * Create MCP stream
+   * Create the provider-backed MCP stream with the existing tool lifecycle.
+   * An explicit provider precedes a valid orchestration context preference;
+   * absent either, getBestProvider retains its normal automatic selection.
    */
-  private async createMCPStream(options: StreamOptions): Promise<{
-    stream: AsyncIterable<
-      | { content: string }
-      | { type: "audio"; audio: AudioChunk }
-      | { type: "image"; imageOutput: { base64: string } }
-    >;
-    provider: string;
-  }> {
-    // Simplified placeholder - in the actual implementation this would contain the complex MCP stream logic
-    const providerName = await getBestProvider(options.provider);
+  private async createMCPStream(options: StreamOptions): Promise<StreamResult> {
+    // Consume the validated orchestration choice after an explicit provider.
+    const requestedProvider =
+      options.provider && options.provider !== "auto"
+        ? options.provider
+        : this.getOrchestratedPreferredProvider(options);
+    const providerName = await getBestProvider(requestedProvider);
     const provider = await AIProviderFactory.createProvider(
       providerName,
       options.model,
       !options.disableTools, // Pass disableTools as inverse of enableMCP
-      this as unknown as UnknownRecord, // Pass SDK instance
+      this, // Pass SDK instance
       options.region, // Pass region parameter
+      this.resolveCredentials(options.credentials),
     );
+
+    // Runtime model-limit discovery must land BEFORE the stream budget
+    // check below — otherwise it computes against the static default
+    // window. Never rejects; failure degrades to static defaults.
+    await provider.ensureModelLimits?.();
+
+    // Propagate trace context for parent-child span hierarchy
+    provider.setTraceContext(this._metricsTraceContext);
 
     // Enable tool execution for the provider using BaseProvider method
     provider.setupToolExecutor(
       {
         customTools: this.getCustomTools(),
-        executeTool: this.executeTool.bind(this),
+        executeTool: (toolName: string, params: unknown) =>
+          this.executeTool(toolName, params, {
+            disableToolCache: options.disableToolCache,
+          }),
       },
       "NeuroLink.createMCPStream",
     );
 
     // 🔧 FIX: Get available tools and create tool-aware system prompt
     // Use SAME pattern as tryMCPGeneration (generate mode)
-    const availableTools = await this.getAllAvailableTools();
-    const enhancedSystemPrompt = this.createToolAwareSystemPrompt(
-      options.systemPrompt,
-      availableTools,
-    );
+    let availableTools = await this.getAllAvailableTools();
 
-    // Get conversation messages for context
-    const conversationMessages = await getConversationMessages(
-      this.conversationMemory,
-      {
-        ...options,
-        prompt: options.input.text,
-        context: options.context,
-      } as TextGenerationOptions,
-    );
+    // Apply per-call tool filtering for system prompt tool descriptions
+    availableTools = this.applyToolInfoFiltering(availableTools, options);
+
+    // M3: a provider whose descriptor declares toolSupport "none" can never
+    // call a tool in ANY form — not natively, not via prompt injection — so
+    // `availableTools` here is dead weight, not a signal. Left non-empty, it
+    // still drives createToolAwareSystemPrompt()'s prompt-injection branch
+    // (that branch triggers on `!provider.supportsTools()`, which is also
+    // true for these providers) and inflates the stream budget check below
+    // via `toolDefinitions`, so an image-generation-only provider like
+    // Recraft can fail a fabricated "exceeds model budget" check before its
+    // own request-kind routing (BaseProvider.stream() -> resolveRequestKind)
+    // ever runs. Clearing it here restores the provider's real outcome —
+    // its own refusal, a genuine vendor error, or success — as what
+    // surfaces, without touching the budget check for any text provider.
+    if (ProviderFactory.getDescriptor(providerName)?.toolSupport === "none") {
+      availableTools = [];
+    }
+
+    // Skip tool prompt injection if skipToolPromptInjection is true.
+    // For providers with native tool calling (instance truth via
+    // supportsTools()), the listing is skipped and only the short damping
+    // line is appended — full definitions ship natively via `tools`.
+    const enhancedSystemPrompt = options.skipToolPromptInjection
+      ? options.systemPrompt || ""
+      : this.createToolAwareSystemPrompt(
+          options.systemPrompt,
+          availableTools,
+          provider.supportsTools?.() ?? true,
+        );
+
+    // Get conversation messages for context.
+    // If the caller already supplied conversationMessages (e.g. proxy routes
+    // forwarding a multi-turn Claude request), honour them — including an
+    // explicit empty array, which signals "no prior context". Otherwise fall
+    // back to the conversation memory store (interactive CLI / SDK sessions).
+    const hasCallerConversationHistory =
+      options.conversationMessages !== undefined;
+    const resolvedConversationMessages = hasCallerConversationHistory
+      ? options.conversationMessages
+      : await getConversationMessages(this.conversationMemory, {
+          ...options,
+          prompt: options.input.text,
+          context: options.context,
+        } as TextGenerationOptions);
+    // Make the resolved messages the single source of truth so downstream
+    // consumers (compaction, fallback streams) reuse them instead of
+    // reloading from conversationMemory.
+    options.conversationMessages = resolvedConversationMessages;
+    let conversationMessages = resolvedConversationMessages;
+
+    // Pre-generation budget check for streaming
+    const streamBudget = checkContextBudget({
+      provider: providerName,
+      model: options.model,
+      maxTokens: options.maxTokens,
+      systemPrompt: enhancedSystemPrompt,
+      toolReplayMode: this.resolveToolReplayModeForBudget(options),
+      conversationMessages: conversationMessages as Array<{
+        role: string;
+        content: string;
+      }>,
+      currentPrompt: options.input.text,
+      toolDefinitions: availableTools,
+      compactionThreshold: options.compactionThreshold,
+    });
+
+    const streamMessageCount = conversationMessages?.length || 0;
+    const streamCompactionSessionId = this.getCompactionSessionId(options);
+    // Reviewer follow-up: gate the hard cap on the *actual compactable
+    // history* rather than `this.conversationMemory`. A configured-but-
+    // empty memory store leaves nothing to compact yet still satisfies
+    // `!this.conversationMemory === false`, so the previous check
+    // skipped the hard cap and dispatched the oversized payload.
+    const streamHasCompactableMessages = streamMessageCount > 0;
+
+    // Curator P1-2: pre-dispatch hard cap mirrors directProviderGeneration.
+    // When the budget check fails AND there's nothing to compact (no memory
+    // + no inline messages — only prompt + tools), throw before dispatch
+    // instead of wasting a roundtrip on a payload the provider will reject.
+    if (!streamBudget.withinBudget && !streamHasCompactableMessages) {
+      try {
+        this.emitter.emit("compaction.insufficient", {
+          stagesAttempted: ["pre-dispatch hard cap"],
+          finalTokens: streamBudget.estimatedInputTokens,
+          budget: streamBudget.availableInputTokens,
+          provider: providerName,
+          model: options.model,
+          phase: "pre-dispatch-no-recovery",
+          timestamp: Date.now(),
+        });
+      } catch {
+        /* listener errors are non-fatal */
+      }
+      throw new ContextBudgetExceededError(
+        `Stream context exceeds model budget and no compaction is possible ` +
+          `(no conversationMemory, no inline conversationMessages — only ` +
+          `prompt + tools). Estimated: ${streamBudget.estimatedInputTokens} ` +
+          `tokens, budget: ${streamBudget.availableInputTokens} tokens. ` +
+          `Reduce prompt or tool-definition size, or trim the request.`,
+        {
+          estimatedTokens: streamBudget.estimatedInputTokens,
+          availableTokens: streamBudget.availableInputTokens,
+          stagesUsed: [],
+          breakdown: streamBudget.breakdown,
+        },
+      );
+    }
+
+    if (
+      streamBudget.shouldCompact &&
+      (hasCallerConversationHistory || this.conversationMemory) &&
+      streamMessageCount >
+        (this.lastCompactionMessageCount.get(streamCompactionSessionId) ?? 0)
+    ) {
+      const compactor = new ContextCompactor(
+        {
+          provider: providerName,
+          summarizationProvider:
+            this.conversationMemoryConfig?.conversationMemory
+              ?.summarizationProvider,
+          summarizationModel:
+            this.conversationMemoryConfig?.conversationMemory
+              ?.summarizationModel,
+        },
+        this.contextCompactorDeps(
+          this.decisionSiteContext(options, streamCompactionSessionId),
+        ),
+      );
+      const compactionResult = await compactor.compact(
+        conversationMessages as import("./types/index.js").ChatMessage[],
+        resolveHistoryBudget(streamBudget, options.compactionThreshold),
+        this.conversationMemoryConfig?.conversationMemory,
+        (options.context as Record<string, unknown> | undefined)?.requestId as
+          | string
+          | undefined,
+        { currentRequest: options.input.text },
+      );
+      if (compactionResult.compacted) {
+        const repairedResult = repairToolPairs(compactionResult.messages);
+        conversationMessages = repairedResult.messages;
+        // Keep options.conversationMessages in sync so downstream consumers
+        // (e.g. handleStreamFallback) use the compacted history rather than
+        // re-reading from conversationMemory.
+        options.conversationMessages = conversationMessages;
+        this.lastCompactionMessageCount.set(
+          streamCompactionSessionId,
+          conversationMessages.length,
+        );
+      }
+
+      // POST-COMPACTION BUDGET RE-CHECK (mirrors tryMCPGeneration / directProviderGeneration)
+      const postCompactBudget = checkContextBudget({
+        provider: providerName,
+        model: options.model,
+        maxTokens: options.maxTokens,
+        systemPrompt: enhancedSystemPrompt,
+        toolReplayMode: this.resolveToolReplayModeForBudget(options),
+        conversationMessages: conversationMessages as Array<{
+          role: string;
+          content: string;
+        }>,
+        currentPrompt: options.input.text,
+        toolDefinitions: availableTools,
+      });
+
+      if (!postCompactBudget.withinBudget) {
+        logger.warn(
+          "[NeuroLink] Stream: post-compaction still over budget, emergency truncation",
+          {
+            estimatedTokens: postCompactBudget.estimatedInputTokens,
+            availableTokens: postCompactBudget.availableInputTokens,
+            overagePercent: Math.round(
+              (postCompactBudget.usageRatio - 1.0) * 100,
+            ),
+          },
+        );
+
+        // Curator P1-2: emit `compaction.insufficient` whenever a single
+        // round of compaction wasn't enough — even when emergency
+        // truncation will save the day. Lets cost / audit listeners track
+        // the "compaction was insufficient" signal separately from the
+        // eventual outcome.
+        try {
+          this.emitter.emit("compaction.insufficient", {
+            stagesAttempted: compactionResult.stagesUsed,
+            finalTokens: postCompactBudget.estimatedInputTokens,
+            budget: postCompactBudget.availableInputTokens,
+            provider: providerName,
+            model: options.model,
+            phase: "mid-compaction",
+            willEmergencyTruncate: true,
+            timestamp: Date.now(),
+          });
+        } catch {
+          /* listener errors are non-fatal */
+        }
+
+        conversationMessages = emergencyContentTruncation(
+          conversationMessages as import("./types/index.js").ChatMessage[],
+          postCompactBudget.availableInputTokens,
+          postCompactBudget.breakdown,
+          providerName,
+        );
+        // Keep options in sync after emergency truncation so fallback paths
+        // use the truncated history.
+        options.conversationMessages = conversationMessages;
+
+        const finalBudget = checkContextBudget({
+          provider: providerName,
+          model: options.model,
+          maxTokens: options.maxTokens,
+          systemPrompt: enhancedSystemPrompt,
+          toolReplayMode: this.resolveToolReplayModeForBudget(options),
+          conversationMessages: conversationMessages as Array<{
+            role: string;
+            content: string;
+          }>,
+          currentPrompt: options.input.text,
+          toolDefinitions: availableTools,
+        });
+
+        if (!finalBudget.withinBudget) {
+          // Clear watermark so handleContextOverflow recovery can re-compact
+          this.lastCompactionMessageCount.delete(streamCompactionSessionId);
+
+          // Curator P1-2: emit `compaction.insufficient` on the terminal
+          // failure path so cost / audit listeners can record the specific
+          // failure mode (compaction + emergency truncation both insufficient).
+          try {
+            this.emitter.emit("compaction.insufficient", {
+              stagesAttempted: compactionResult.stagesUsed,
+              finalTokens: finalBudget.estimatedInputTokens,
+              budget: finalBudget.availableInputTokens,
+              provider: providerName,
+              model: options.model,
+              phase: "post-emergency-truncation",
+              timestamp: Date.now(),
+            });
+          } catch {
+            /* listener errors are non-fatal */
+          }
+
+          throw new ContextBudgetExceededError(
+            `Stream context exceeds model budget after all compaction stages. ` +
+              `Estimated: ${finalBudget.estimatedInputTokens} tokens, ` +
+              `Budget: ${finalBudget.availableInputTokens} tokens.`,
+            {
+              estimatedTokens: finalBudget.estimatedInputTokens,
+              availableTokens: finalBudget.availableInputTokens,
+              stagesUsed: compactionResult.stagesUsed,
+              breakdown: finalBudget.breakdown,
+            },
+          );
+        }
+      }
+    }
+
+    // ─── ModelPool stream path ────────────────────────────────────────────────
+    // When a pool is configured, replaces the single provider.stream() call
+    // with a retry loop over pool members. Compaction/budget-check above ran
+    // once on the initially-selected `providerName`; the pool may redirect to
+    // a different provider, but those checks are conservative enough that the
+    // redirected provider will also accept the payload (if it has a smaller
+    // window, the budget check would have already thrown before we get here).
+    // On exhaustion, throws the last member error — does NOT fall through to
+    // the static provider path below.
+    if (this.modelPool) {
+      const streamPool = this.modelPool;
+      const maxStreamAttempts = streamPool.maxAttempts;
+      const streamTriedKeys = new Set<string>();
+      let streamLastError: Error | null = null;
+
+      for (let attempt = 0; attempt < maxStreamAttempts; attempt++) {
+        if (options.abortSignal?.aborted) {
+          throw new DOMException("The operation was aborted", "AbortError");
+        }
+
+        const streamMember = streamPool.selectNext(streamTriedKeys);
+        if (!streamMember) {
+          break;
+        }
+        streamTriedKeys.add(streamPool.memberKey(streamMember));
+
+        // Override provider/model/region from the pool member.
+        // When the member omits model/region, use undefined (provider default)
+        // rather than inheriting the caller's value for a different provider.
+        const poolStreamProviderName = streamMember.provider;
+        const poolStreamModel = streamMember.model ?? undefined;
+        const poolStreamRegion = streamMember.region ?? undefined;
+
+        logger.debug(
+          `[createMCPStream] ModelPool: attempting member ${poolStreamProviderName}`,
+          { model: poolStreamModel, attempt },
+        );
+
+        try {
+          const poolStreamProvider = await AIProviderFactory.createProvider(
+            poolStreamProviderName as AIProviderName,
+            poolStreamModel,
+            !options.disableTools,
+            this,
+            poolStreamRegion,
+            this.resolveCredentials(options.credentials),
+          );
+          poolStreamProvider.setTraceContext(this._metricsTraceContext);
+          poolStreamProvider.setupToolExecutor(
+            {
+              customTools: this.getCustomTools(),
+              executeTool: (toolName: string, params: unknown) =>
+                this.executeTool(toolName, params, {
+                  disableToolCache: options.disableToolCache,
+                }),
+            },
+            "NeuroLink.createMCPStream",
+          );
+
+          poolStreamProvider.setFileToolRootPolicy?.(
+            this.fileToolRootsFor(options),
+          );
+          const poolStreamResult = await poolStreamProvider.stream({
+            ...this.deferProviderStreamTTS(options),
+            provider: poolStreamProviderName as AIProviderName,
+            model: poolStreamModel,
+            region: poolStreamRegion,
+            systemPrompt: enhancedSystemPrompt,
+            conversationMessages,
+          });
+
+          logger.debug("[createMCPStream] ModelPool stream handle obtained", {
+            provider: poolStreamProviderName,
+          });
+
+          // Wrap the stream so we can record success/failure based on what
+          // actually happens during consumption, not merely on obtaining the
+          // handle.  Recording success at handle-acquisition time (before any
+          // tokens are delivered) would mean a mid-stream provider drop is
+          // never reflected as a cooldown.
+          const capturedMember = streamMember;
+          const wrappedStream = (async function* () {
+            try {
+              yield* poolStreamResult.stream;
+              streamPool.recordSuccess(capturedMember);
+            } catch (streamConsumeErr) {
+              streamPool.recordFailure(
+                capturedMember,
+                classifyProviderError(streamConsumeErr),
+              );
+              throw streamConsumeErr;
+            }
+          })();
+
+          return preserveLiveStreamAccessors(poolStreamResult, {
+            ...poolStreamResult,
+            stream: wrappedStream,
+            provider: poolStreamProviderName,
+            model: poolStreamResult.model || poolStreamModel,
+            toolCalls: poolStreamResult.toolCalls ?? [],
+            toolResults: poolStreamResult.toolResults ?? [],
+          });
+        } catch (poolStreamError) {
+          if (isAbortError(poolStreamError)) {
+            throw poolStreamError;
+          }
+          if (isNonRetryableForPool(poolStreamError)) {
+            const poolStreamErrMsg =
+              poolStreamError instanceof Error
+                ? poolStreamError.message
+                : String(poolStreamError);
+            streamPool.recordFailure(
+              streamMember,
+              classifyProviderError(poolStreamError),
+            );
+            // Wrap in a plain Error so runWithFallbackOrchestration /
+            // streamWithIterationFallback does not re-activate the modelChain
+            // layer on top of an already-exhausted pool.
+            throw new Error(`[ModelPool] non-retryable: ${poolStreamErrMsg}`, {
+              cause: poolStreamError,
+            });
+          }
+          streamPool.recordFailure(
+            streamMember,
+            classifyProviderError(poolStreamError),
+          );
+          streamLastError =
+            poolStreamError instanceof Error
+              ? poolStreamError
+              : new Error(String(poolStreamError));
+          logger.warn(
+            `[createMCPStream] ModelPool: member ${poolStreamProviderName} failed`,
+            { error: streamLastError.message },
+          );
+        }
+      }
+
+      // All pool stream members failed.
+      // Wrap in a plain Error (not a typed error class) so that the
+      // surrounding fallback orchestrator does not start a second retry layer
+      // over the already-exhausted pool.
+      throw new Error(
+        `[ModelPool] all stream members failed: ${streamLastError?.message ?? "no stream members available"}`,
+      );
+    }
+    // ─── End ModelPool stream path ────────────────────────────────────────────
 
     // 🔧 FIX: Pass enhanced system prompt to real streaming
     // Tools will be accessed through the streamText call in executeStream
+    provider.setFileToolRootPolicy?.(this.fileToolRootsFor(options));
     const streamResult = await provider.stream({
-      ...options,
+      ...this.deferProviderStreamTTS(options),
       systemPrompt: enhancedSystemPrompt, // Use enhanced prompt with tool descriptions
       conversationMessages,
     });
@@ -3807,26 +13490,32 @@ Current user's request: ${currentInput}`;
       systemPromptPassedLength: enhancedSystemPrompt.length,
     });
 
-    return { stream: streamResult.stream, provider: providerName };
+    // Preserve every live descriptor from the provider result. Internal model
+    // fallback can switch the descriptor's backing result only after iteration
+    // starts, so eagerly rebuilding selected fields here would re-freeze the
+    // rejected attempt before the caller drains a chunk.
+    return preserveLiveStreamAccessors(streamResult, {
+      ...streamResult,
+      provider: providerName,
+      model: streamResult.model || options.model,
+      toolCalls: streamResult.toolCalls ?? [],
+      toolResults: streamResult.toolResults ?? [],
+    });
   }
 
   /**
    * Process stream result
    */
   private async processStreamResult(
-    _stream: AsyncIterable<
-      | { content: string }
-      | { type: "audio"; audio: AudioChunk }
-      | { type: "image"; imageOutput: { base64: string } }
-    >,
+    _stream: AsyncIterable<ProviderStreamChunk>,
     _options: StreamOptions,
     _factoryResult: unknown,
   ): Promise<{
     content: string;
     usage?: TokenUsage;
     finishReason: string;
-    toolCalls: ToolCall[];
-    toolResults: ToolResult[];
+    toolCalls: StreamToolCall[];
+    toolResults: StreamToolResult[];
     analytics?: AnalyticsData;
     evaluation?: EvaluationData;
   }> {
@@ -3861,16 +13550,12 @@ Current user's request: ${currentInput}`;
       content: string;
       usage?: TokenUsage;
       finishReason: string;
-      toolCalls: ToolCall[];
-      toolResults: ToolResult[];
+      toolCalls: StreamToolCall[];
+      toolResults: StreamToolResult[];
       analytics?: AnalyticsData;
       evaluation?: EvaluationData;
     },
-    stream: AsyncIterable<
-      | { content: string }
-      | { type: "audio"; audio: AudioChunk }
-      | { type: "image"; imageOutput: { base64: string } }
-    >,
+    stream: AsyncIterable<ProviderStreamChunk>,
     config: {
       providerName: string;
       options: StreamOptions;
@@ -3886,29 +13571,117 @@ Current user's request: ${currentInput}`;
         timestamp: number;
         [key: string]: unknown;
       }>;
+      /** Provider result whose retry-aware descriptors stay live. */
+      sourceResult?: StreamResult;
     },
   ): StreamResult {
-    return {
+    const source = config.sourceResult;
+    const responseMetadata = {
+      streamId: config.streamId,
+      startTime: config.startTime,
+      responseTime: config.responseTime,
+      fallback: config.fallback || false,
+      guardrailsBlocked: config.guardrailsBlocked,
+      error: config.error,
+    };
+    const response: StreamResult = {
+      ...(source ?? {}),
       stream,
-      provider: config.providerName,
-      model: config.options.model,
+      provider: source?.provider ?? config.providerName,
+      model: source?.model ?? config.options.model,
       usage: streamResult.usage,
       finishReason: streamResult.finishReason,
-      toolCalls: streamResult.toolCalls,
-      toolResults: streamResult.toolResults,
       analytics: streamResult.analytics,
       evaluation: streamResult.evaluation,
       events:
         config.events && config.events.length > 0 ? config.events : undefined,
-      metadata: {
-        streamId: config.streamId,
-        startTime: config.startTime,
-        responseTime: config.responseTime,
-        fallback: config.fallback || false,
-        guardrailsBlocked: config.guardrailsBlocked,
-        error: config.error,
-      },
+      metadata: source ? undefined : Object.assign({}, responseMetadata),
     };
+    // Unresolved #1819 review comment: toolCalls/toolResults must stay bound
+    // to `streamResult`'s own live getters (defined in stream(), right after
+    // processStreamResult) rather than the plain values a
+    // `toolCalls: streamResult.toolCalls` literal above would have captured
+    // — that reads the getter once and freezes whatever streamState held
+    // before a top-level cross-provider fallback (handleStreamFallback) had
+    // a chance to reassign it. Copying the property DESCRIPTOR, not its
+    // current value, keeps every later read on `response` live too.
+    const toolCallsDescriptor = Object.getOwnPropertyDescriptor(
+      streamResult,
+      "toolCalls",
+    );
+    if (toolCallsDescriptor) {
+      Object.defineProperty(response, "toolCalls", toolCallsDescriptor);
+    }
+    const toolResultsDescriptor = Object.getOwnPropertyDescriptor(
+      streamResult,
+      "toolResults",
+    );
+    if (toolResultsDescriptor) {
+      Object.defineProperty(response, "toolResults", toolResultsDescriptor);
+    }
+    const finishReasonDescriptor = Object.getOwnPropertyDescriptor(
+      streamResult,
+      "finishReason",
+    );
+    if (finishReasonDescriptor) {
+      Object.defineProperty(response, "finishReason", finishReasonDescriptor);
+    }
+    if (!source) {
+      return response;
+    }
+    // NeuroLink grades the turn's terminal state itself (a normalized
+    // finishReason, stopReason for aborts and time limits), so those fields
+    // keep NeuroLink's own value here (finishReason through the descriptor
+    // copied above). Copying the provider's getter for them would report the
+    // raw vendor reason, e.g. Anthropic's end_turn, instead.
+    //
+    // toolCalls/toolResults are excluded for a different reason: `source`
+    // (the PRIMARY provider's own result) may itself define them as live
+    // getters over BaseProvider.withStreamModelFallback's `activeResult`
+    // (#1819) — which only ever tracks a SAME-PROVIDER model retry. Copying
+    // that descriptor here would silently re-point `response.toolCalls`/
+    // `toolResults` back at the primary attempt, undoing the descriptor
+    // copy above that binds them to `streamResult`'s `streamState`-backed
+    // getters — the ones that actually track a top-level cross-provider
+    // fallback.
+    const liveAccessorExclusions = new Set([
+      "finishReason",
+      "stopReason",
+      "rawFinishReason",
+      "toolCalls",
+      "toolResults",
+    ]);
+    for (const key of Object.getOwnPropertyNames(source)) {
+      const descriptor = Object.getOwnPropertyDescriptor(source, key);
+      if (
+        !liveAccessorExclusions.has(key) &&
+        descriptor &&
+        typeof descriptor.get === "function"
+      ) {
+        Object.defineProperty(response, key, descriptor);
+      }
+    }
+    Object.defineProperty(response, "metadata", {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        // A caller mutation (`result.metadata.x = 1`) must persist across
+        // reads. The previous `Object.assign(source.metadata ?? {},
+        // responseMetadata)` allocated a brand-new object every time
+        // `source.metadata` was undefined, so the mutation landed on a
+        // value discarded immediately after. Installing a persistent object
+        // into `source.metadata` the first time makes every later read
+        // return the SAME object, so mutations on it stick.
+        if (source.metadata === undefined) {
+          source.metadata = {};
+        }
+        return Object.assign(source.metadata, responseMetadata);
+      },
+      set: (value: StreamResult["metadata"]) => {
+        source.metadata = value;
+      },
+    });
+    return response;
   }
 
   /**
@@ -3922,9 +13695,37 @@ Current user's request: ${currentInput}`;
     enhancedOptions?: StreamOptions,
     _factoryResult?: unknown,
   ): Promise<StreamResult> {
+    // Curator P1-2: when the pre-dispatch hard cap or post-emergency
+    // truncation budget check throws ContextBudgetExceededError, the
+    // payload is too large for the model and a same-payload retry would
+    // just fail again at the provider — wasting the same tokens that
+    // the hard cap was meant to save. Rethrow so the caller sees the
+    // typed error instead of a fallback ProviderError that hides it.
+    if (error instanceof ContextBudgetExceededError) {
+      throw error;
+    }
+
     logger.error("Stream generation failed, attempting fallback", {
       error: error instanceof Error ? error.message : String(error),
     });
+
+    // S1 fix: Emit stream:error so the Pipeline B listener creates an error span.
+    // S8 fix: The old direct SpanSerializer.createGenerationSpan block is removed —
+    // the stream:error listener now handles span creation, avoiding duplication.
+    try {
+      this.emitter.emit("stream:error", {
+        content: error instanceof Error ? error.message : String(error),
+        metadata: {
+          errorName: error instanceof Error ? error.name : "UnknownError",
+          durationMs: Date.now() - startTime,
+          chunkCount: 0,
+        },
+        provider: options.provider || "unknown",
+        model: options.model || "unknown",
+      });
+    } catch {
+      /* non-blocking */
+    }
 
     const originalPrompt = options.input.text;
     const responseTime = Date.now() - startTime;
@@ -3932,12 +13733,18 @@ Current user's request: ${currentInput}`;
     const provider = await AIProviderFactory.createProvider(
       providerName,
       options.model,
+      true,
+      undefined,
+      undefined,
+      this.resolveCredentials(options.credentials),
     );
+    provider.setFileToolRootPolicy?.(this.fileToolRootsFor(options));
     const fallbackStreamResult = await provider.stream({
       input: { text: options.input.text },
       model: options.model,
       temperature: options.temperature,
       maxTokens: options.maxTokens,
+      conversationMessages: options.conversationMessages,
     });
 
     // Create a wrapper around the fallback stream that accumulates content
@@ -3958,8 +13765,63 @@ Current user's request: ${currentInput}`;
           yield chunk; // Preserve original streaming behavior
         }
       } finally {
+        if (fallbackAccumulatedContent.trim()) {
+          logger.info(
+            `[NeuroLink.handleStreamError] stream() - COMPLETE SUCCESS (fallback)`,
+            {
+              provider: providerName,
+              model: options.model,
+              responseTimeMs: Date.now() - startTime,
+              contentLength: fallbackAccumulatedContent.length,
+            },
+          );
+
+          // S6 fix: Emit stream:complete after successful fallback so Pipeline B records it.
+          // Also emit generation:end so advanced analytics tracks the successful fallback
+          // (stream:complete no longer records analytics — avoids double-counting elsewhere).
+          try {
+            const fallbackModel = options.model || "unknown";
+            const fallbackDuration = Date.now() - startTime;
+            self.emitter.emit("stream:complete", {
+              content: fallbackAccumulatedContent,
+              provider: providerName,
+              model: fallbackModel,
+              finishReason: "stop",
+              metadata: {
+                durationMs: fallbackDuration,
+                chunkCount: 0,
+                totalLength: fallbackAccumulatedContent.length,
+                isFallback: true,
+                finishReason: "stop",
+              },
+            });
+            self.emitter.emit("generation:end", {
+              provider: providerName,
+              model: fallbackModel,
+              responseTime: fallbackDuration,
+              timestamp: Date.now(),
+              result: {
+                content: fallbackAccumulatedContent,
+                usage: { input: 0, output: 0, total: 0 },
+                model: fallbackModel,
+                provider: providerName,
+                finishReason: "stop",
+              },
+              success: true,
+              streamed: true,
+            });
+          } catch {
+            /* non-blocking */
+          }
+        }
+
         // Store memory after fallback stream consumption is complete
-        if (self.conversationMemory && enhancedOptions?.context?.sessionId) {
+        // Guard: skip storing if fallback accumulated content is empty
+        if (
+          self.conversationMemory &&
+          enhancedOptions?.context?.sessionId &&
+          fallbackAccumulatedContent.trim()
+        ) {
           const sessionId = (
             enhancedOptions?.context as Record<string, unknown>
           )?.sessionId as string;
@@ -3973,17 +13835,46 @@ Current user's request: ${currentInput}`;
             };
           }
 
+          const memStoreStart = Date.now();
           try {
+            const fallbackSessionId =
+              sessionId || (options.context?.sessionId as string);
+            const pendingSkillMessages =
+              self.drainPendingSkillMessages(fallbackSessionId);
             await self.conversationMemory.storeConversationTurn({
-              sessionId: sessionId || (options.context?.sessionId as string),
+              sessionId: fallbackSessionId,
               userId: userId || (options.context?.userId as string),
               userMessage: originalPrompt ?? "",
               aiResponse: fallbackAccumulatedContent,
               startTimeStamp: new Date(startTime),
               providerDetails,
               enableSummarization: enhancedOptions?.enableSummarization,
+              requestId:
+                ((
+                  enhancedOptions?.context as
+                    | Record<string, unknown>
+                    | undefined
+                )?.requestId as string | undefined) ||
+                ((options.context as Record<string, unknown> | undefined)
+                  ?.requestId as string | undefined),
+              ...(pendingSkillMessages.length > 0
+                ? { skillMessages: pendingSkillMessages }
+                : {}),
             });
+            self.recordMemorySpan(
+              "memory.store",
+              { "memory.operation": "store", "memory.path": "fallback-stream" },
+              Date.now() - memStoreStart,
+              SpanStatus.OK,
+            );
           } catch (error) {
+            self.recordMemorySpan(
+              "memory.store",
+              { "memory.operation": "store", "memory.path": "fallback-stream" },
+              Date.now() - memStoreStart,
+              SpanStatus.ERROR,
+              error instanceof Error ? error.message : String(error),
+            );
             logger.warn("Failed to store fallback stream conversation turn", {
               error: error instanceof Error ? error.message : String(error),
             });
@@ -4138,8 +14029,12 @@ Current user's request: ${currentInput}`;
    * **Generation Events:**
    * - `generation:start` - Fired when text generation begins
    *   - `{ provider: string, timestamp: number }`
-   * - `generation:end` - Fired when text generation completes
-   *   - `{ provider: string, responseTime: number, toolsUsed?: string[], timestamp: number }`
+   * - `generation:end` - Fired when text generation completes (or fails / is aborted)
+   *   - `{ provider: string, responseTime: number, toolsUsed?: string[], timestamp: number, success?: boolean, aborted?: boolean, error?: string }`
+   *   - `success` is `false` for both failures and client aborts; `aborted: true`
+   *     distinguishes the latter so consumers can route cancellations
+   *     differently from real errors. Pipeline B's metrics span maps
+   *     `aborted: true` events to `SpanStatus.WARNING` (not ERROR).
    *
    * **Streaming Events:**
    * - `stream:start` - Fired when streaming begins
@@ -4189,12 +14084,257 @@ Current user's request: ${currentInput}`;
     return this.emitter;
   }
 
+  /**
+   * Whether a HITL confirmation is still awaiting a response on THIS instance.
+   *
+   * Emitting `hitl:confirmation-response` is not proof the decision landed. The
+   * forwarding listener for that event is installed once at construction, so
+   * `emitter.emit(...)` reports a listener was invoked even when nothing is
+   * waiting — the pending set lives one hop further in, on the HITL manager, and
+   * holds the `resolve`/`reject` of the suspended tool call. An instance built
+   * after the confirmation was issued (a session rebuilt from persisted state)
+   * therefore accepts the event and resolves nothing.
+   *
+   * Returns `false` in two different situations, which it deliberately does not
+   * distinguish: HITL was never configured on this instance, and the id is
+   * unknown or already settled. Both mean "emitting a response here achieves
+   * nothing", which is the question this answers. A caller that needs to tell a
+   * configuration mistake from an expired confirmation should check the HITL
+   * config separately rather than read that into this boolean.
+   *
+   * This is advisory, not atomic: it reports the state at the moment it is
+   * called. Nothing stops the confirmation timing out immediately afterwards, so
+   * emit on the answer without an `await` in between. Over the case it exists
+   * for — an instance rebuilt from persisted state, whose pending set is empty
+   * and can never repopulate for an id it never issued — absence cannot become
+   * presence, so the answer cannot go stale in the unsafe direction.
+   *
+   * @param confirmationId - The id from the `hitl:confirmation-request` event
+   * @returns `true` only if this instance is still holding that confirmation
+   *
+   * @example
+   * ```typescript
+   * if (!neurolink.hasPendingHITLConfirmation(confirmationId)) {
+   *   return refuse("This conversation has expired, so the action was not carried out.");
+   * }
+   * neurolink.getEventEmitter().emit("hitl:confirmation-response", { ... });
+   * ```
+   */
+  hasPendingHITLConfirmation(confirmationId: string): boolean {
+    return this.hitlManager?.hasPendingConfirmation(confirmationId) ?? false;
+  }
+
+  /**
+   * Returns the instance-level tool-dedup configuration, or `undefined` when
+   * toolDedup was not provided at construction time.
+   *
+   * The stored object is returned as-is whenever `toolDedup` was supplied,
+   * including when `enabled: false` — only the complete absence of a `toolDedup`
+   * option results in `undefined`.
+   *
+   * Called by `BaseProvider.applyToolFiltering` so the dedup pass uses the
+   * same config for every generate/stream call without threading an extra
+   * parameter through the full call stack.
+   */
+  getToolDedupConfig(): ToolDedupConfig | undefined {
+    return this.toolDedupConfig;
+  }
+
+  /**
+   * Returns the instance-level `tools` config (master switch, include/exclude
+   * lists, discovery mode), or `undefined` when not provided at construction.
+   *
+   * Called by `BaseProvider.applyToolFiltering` so the tool gate composes the
+   * instance policy with per-call options on every generate/stream call.
+   */
+  /**
+   * The policy an entry point bound to `options`, or — for an internal path
+   * that built its own options — the instance policy narrowed by any
+   * per-call `toolRoots`. Never trusts a public field.
+   */
+  private fileToolRootsFor(options: object): FileToolRootPolicy {
+    return (
+      boundFileToolRoots(options) ??
+      this.resolveFileToolRoots((options as { toolRoots?: string[] }).toolRoots)
+    );
+  }
+
+  /**
+   * A worker's tool config: it inherits this instance's file-tool roots, and a
+   * worker-level `fileRoots` may only narrow them (throws otherwise).
+   */
+  private workerToolsConfig(
+    override: ToolConfig | undefined,
+  ): ToolConfig | undefined {
+    const hostRoots = this.toolsConfig?.fileRoots;
+    if (override?.fileRoots === undefined) {
+      return hostRoots === undefined
+        ? override
+        : { ...override, fileRoots: hostRoots };
+    }
+    const narrowed = resolveFileToolRootPolicy({
+      perCall: override.fileRoots,
+      instance: hostRoots,
+    }).roots;
+    return { ...override, fileRoots: narrowed ? [...narrowed] : [] };
+  }
+
+  /** File-tool roots for one call: per-call roots narrow the instance's `tools.fileRoots`. */
+  private resolveFileToolRoots(
+    perCall: readonly string[] | undefined,
+  ): FileToolRootPolicy {
+    return resolveFileToolRootPolicy({
+      perCall,
+      instance: this.toolsConfig?.fileRoots,
+    });
+  }
+
+  getToolsConfig(): ToolConfig | undefined {
+    return this.toolsConfig;
+  }
+
+  /**
+   * Tools discovered via `search_tools` for a session (`tools.discovery`
+   * mode). Pinned tools are sent in full on every subsequent call of that
+   * session instead of being deferred — discovery cost is paid once.
+   * Reading refreshes the session's recency (LRU), so active conversations
+   * are never the ones evicted at the session cap.
+   */
+  getDiscoveryPins(sessionKey: string): ReadonlySet<string> {
+    const pins = this.discoveryPins.get(sessionKey);
+    if (!pins) {
+      return new Set<string>();
+    }
+    // Map iteration order is insertion order — re-inserting on access turns
+    // the eviction below into LRU rather than FIFO.
+    this.discoveryPins.delete(sessionKey);
+    this.discoveryPins.set(sessionKey, pins);
+    return pins;
+  }
+
+  /**
+   * Pin discovered tools to a session (called by the `search_tools`
+   * meta-tool on hydration). Append-only within a session; the map is
+   * bounded by evicting the least-recently-used session past 1000 sessions.
+   */
+  pinDiscoveredTools(sessionKey: string, toolNames: string[]): void {
+    let pins = this.discoveryPins.get(sessionKey);
+    if (!pins) {
+      pins = new Set<string>();
+    } else {
+      this.discoveryPins.delete(sessionKey);
+    }
+    this.discoveryPins.set(sessionKey, pins);
+    for (const name of toolNames) {
+      pins.add(name);
+    }
+    if (this.discoveryPins.size > 1000) {
+      const oldest = this.discoveryPins.keys().next().value;
+      if (oldest !== undefined) {
+        this.discoveryPins.delete(oldest);
+      }
+    }
+  }
+
+  /**
+   * Curator P1-1: synchronous credential health check for a single provider.
+   *
+   * Drives a tiny real call against the provider (1-token completion or
+   * `/models` listing depending on provider) to confirm the configured
+   * credentials are valid. Useful at startup so a service can refuse to
+   * boot if its primary provider's credentials are broken instead of
+   * discovering the problem on first user request.
+   *
+   * @example
+   * ```ts
+   * const health = await neurolink.checkCredentials({ provider: "litellm" });
+   * if (health.status !== "ok") {
+   *   throw new Error(`provider not ready: ${health.detail}`);
+   * }
+   * ```
+   *
+   * @param input - the provider to check
+   * @returns `{ provider, status, detail }`. Possible status values:
+   *   - `"ok"` — credentials valid and provider reachable
+   *   - `"missing"` — required env / credentials not configured
+   *   - `"expired"` — credentials present but rejected (401/403)
+   *   - `"denied"` — credentials valid but team not whitelisted for any model
+   *   - `"network"` — provider unreachable (timeout, ECONNREFUSED, DNS)
+   *   - `"unknown"` — other error; consult `detail`
+   */
+  async checkCredentials(input: { provider: string; model?: string }): Promise<{
+    provider: string;
+    status: "ok" | "missing" | "expired" | "denied" | "network" | "unknown";
+    detail: string;
+  }> {
+    const { provider, model } = input;
+    const probeText = "ping";
+    try {
+      // 1-token probe is cheap, exercises auth + routing without much cost.
+      await this.generate({
+        provider: provider as never,
+        ...(model && { model }),
+        input: { text: probeText },
+        maxTokens: 16,
+        disableTools: true,
+      } as GenerateOptions);
+      return { provider, status: "ok", detail: "credentials valid" };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const lower = msg.toLowerCase();
+      if (err instanceof ModelAccessDeniedError) {
+        return {
+          provider,
+          status: "denied",
+          detail: msg,
+        };
+      }
+      if (
+        lower.includes("authentication") ||
+        lower.includes("401") ||
+        lower.includes("invalid api key") ||
+        lower.includes("incorrect api key") ||
+        lower.includes("api_key_invalid") ||
+        lower.includes("token has expired") ||
+        lower.includes("expired credentials")
+      ) {
+        return { provider, status: "expired", detail: msg };
+      }
+      if (
+        lower.includes("not configured") ||
+        lower.includes("missing api") ||
+        lower.includes("api key is required") ||
+        lower.includes("no api key") ||
+        lower.includes("application default credentials") ||
+        lower.includes("google_application_credentials") ||
+        lower.includes("project_id") ||
+        lower.includes("default credentials") ||
+        lower.includes("service account")
+      ) {
+        return { provider, status: "missing", detail: msg };
+      }
+      if (
+        lower.includes("econnrefused") ||
+        lower.includes("enotfound") ||
+        lower.includes("could not resolve") ||
+        lower.includes("timeout") ||
+        lower.includes("network") ||
+        lower.includes("cannot connect")
+      ) {
+        return { provider, status: "network", detail: msg };
+      }
+      return { provider, status: "unknown", detail: msg };
+    }
+  }
+
   // ========================================
   // ENHANCED: Tool Event Emission API
   // ========================================
 
-  // TODO: Add ToolExecutionEvent utility methods in future version
-  // Will provide structured event format for consistent tool event processing
+  // Speculative, not a gap: ToolExecutionEvent already exists
+  // (src/lib/types/tools.ts) and is already surfaced via
+  // StreamResult.toolEvents. Dedicated utility methods are a possible
+  // future convenience, not planned work.
 
   /**
    * Emit tool start event with execution tracking
@@ -4208,7 +14348,7 @@ Current user's request: ${currentInput}`;
     input: unknown,
     startTime: number = Date.now(),
   ): string {
-    const executionId = `${toolName}-${startTime}-${Math.random().toString(36).substr(2, 9)}`;
+    const executionId = createToolExecutionId(toolName, startTime);
 
     // Create execution context for tracking
     const context: ToolExecutionContext = {
@@ -4226,12 +14366,14 @@ Current user's request: ${currentInput}`;
     this.currentStreamToolExecutions.push(context);
 
     // Emit event (NeuroLinkEvents format for compatibility)
-    this.emitter.emit("tool:start", {
-      tool: toolName,
-      input,
-      timestamp: startTime,
-      executionId,
-    });
+    this.emitter.emit(
+      "tool:start",
+      createToolEventPayload(toolName, {
+        input,
+        timestamp: startTime,
+        executionId,
+      }),
+    );
 
     logger.debug(`tool:start emitted for ${toolName}`, {
       toolName,
@@ -4307,14 +14449,18 @@ Current user's request: ${currentInput}`;
     this.toolExecutionHistory.push(summary);
 
     // Emit event (NeuroLinkEvents format for compatibility)
-    this.emitter.emit("tool:end", {
-      tool: toolName,
-      result,
-      error,
-      timestamp: endTime,
-      duration,
-      executionId: finalExecutionId,
-    });
+    this.emitter.emit(
+      "tool:end",
+      createToolEventPayload(toolName, {
+        result,
+        error,
+        success,
+        responseTime: duration,
+        timestamp: endTime,
+        duration,
+        executionId: finalExecutionId,
+      }),
+    );
 
     logger.debug(`tool:end emitted for ${toolName}`, {
       toolName,
@@ -4347,8 +14493,9 @@ Current user's request: ${currentInput}`;
     this.currentStreamToolExecutions = [];
   }
 
-  // TODO: Add getToolExecutionEvents() method in future version
-  // Will return properly formatted ToolExecutionEvent objects for structured event processing
+  // Speculative, not a gap: the same structured events a
+  // getToolExecutionEvents() method would return are already available via
+  // StreamResult.toolEvents.
 
   // ========================================
   // Tool Registration API
@@ -4359,7 +14506,11 @@ Current user's request: ${currentInput}`;
    * @param name - Unique name for the tool
    * @param tool - Tool in MCPExecutableTool format (unified MCP protocol type)
    */
-  registerTool(name: string, tool: MCPExecutableTool): void {
+  registerTool(
+    name: string,
+    tool: MCPExecutableTool,
+    options?: ToolRegistrationOptions,
+  ): void {
     this.invalidateToolCache(); // Invalidate cache when a tool is registered
     // Emit tool registration start event
     this.emitter.emit("tools-register:start", {
@@ -4413,17 +14564,87 @@ Current user's request: ${currentInput}`;
         })(),
       };
 
+      // Wrap execute with per-tool timeout if specified at registration.
+      // Uses AbortSignal.timeout() composed with any parent signal from the AI SDK.
+      // This ensures the timeout works regardless of the execution path
+      // (direct executeTool() or AI SDK generateText() tool calling).
+      if (
+        options?.timeout !== undefined &&
+        options.timeout > 0 &&
+        Number.isFinite(options.timeout) &&
+        typeof convertedTool.execute === "function"
+      ) {
+        const originalExecute = convertedTool.execute;
+        const toolTimeout = options.timeout;
+        const toolName = name;
+        convertedTool.execute = async (...args: unknown[]) => {
+          const timeoutSignal = AbortSignal.timeout(toolTimeout);
+          // Compose with any parent abortSignal from ToolExecutionOptions
+          const execOptions = args[1] as
+            | { abortSignal?: AbortSignal }
+            | undefined;
+          const parentSignal = execOptions?.abortSignal;
+          const composedSignal = parentSignal
+            ? AbortSignal.any([parentSignal, timeoutSignal])
+            : timeoutSignal;
+
+          // Replace the abortSignal in execution options
+          const augmentedContext = {
+            ...execOptions,
+            abortSignal: composedSignal,
+          };
+
+          return Promise.race([
+            originalExecute(args[0], augmentedContext),
+            new Promise<never>((_, reject) => {
+              composedSignal.addEventListener(
+                "abort",
+                () => {
+                  if (timeoutSignal.aborted) {
+                    reject(ErrorFactory.toolTimeout(toolName, toolTimeout));
+                  } else {
+                    reject(
+                      new DOMException(
+                        "The operation was aborted",
+                        "AbortError",
+                      ),
+                    );
+                  }
+                },
+                { once: true },
+              );
+            }),
+          ]);
+        };
+      }
+
       // SMART DEFAULTS: Use utility to eliminate boilerplate creation
-      const mcpServerInfo = createCustomToolServerInfo(name, convertedTool);
+      const mcpServerInfo = createCustomToolServerInfo(
+        name,
+        convertedTool,
+        options?.timeout,
+        options?.maxRetries,
+        options?.totalTimeoutMs,
+      );
 
       // Register with toolRegistry using MCPServerInfo directly
       this.toolRegistry.registerServer(mcpServerInfo);
+
+      // Re-registration replaces options wholesale: omitting `cacheable`
+      // clears a previous `cacheable: false`. A caller replacing a tool whose
+      // results are live state must repeat the flag.
+      if (options?.cacheable === false) {
+        this.uncacheableTools.add(name);
+      } else {
+        this.uncacheableTools.delete(name);
+      }
 
       // Emit tool registration success event
       this.emitter.emit("tools-register:end", {
         toolName: name,
         success: true,
         timestamp: Date.now(),
+        timeoutMs: options?.timeout,
       });
     } catch (error) {
       logger.error(`Failed to register tool ${name}:`, error);
@@ -4500,9 +14721,102 @@ Current user's request: ${currentInput}`;
     const serverId = `custom-tool-${name}`;
     const removed = this.toolRegistry.unregisterServer(serverId);
     if (removed) {
+      this.uncacheableTools.delete(name);
       logger.info(`Unregistered custom tool: ${name}`);
     }
     return removed;
+  }
+
+  // ==================== MCP Enhancement Public APIs ====================
+
+  /**
+   * Register a global tool middleware that runs on every tool execution.
+   * Middleware receives the tool, params, context, and a next() function.
+   * @param middleware - The middleware function to register
+   * @returns this (for chaining)
+   */
+  useToolMiddleware(
+    middleware: import("./types/index.js").ToolMiddleware,
+  ): this {
+    this.mcpToolMiddlewares.push(middleware);
+    logger.debug(
+      `[NeuroLink] Registered tool middleware (total: ${this.mcpToolMiddlewares.length})`,
+    );
+    return this;
+  }
+
+  /**
+   * Get all registered tool middlewares
+   */
+  getToolMiddlewares(): import("./types/index.js").ToolMiddleware[] {
+    return [...this.mcpToolMiddlewares];
+  }
+
+  /**
+   * Flush any pending batched tool calls immediately
+   */
+  async flushToolBatch(): Promise<void> {
+    if (this.mcpToolBatcher) {
+      await this.mcpToolBatcher.flush();
+    }
+  }
+
+  /**
+   * Get the current MCP enhancements configuration
+   */
+  getMCPEnhancementsConfig(): MCPEnhancementsConfig | undefined {
+    return this.mcpEnhancementsConfig;
+  }
+
+  /**
+   * Update agentic loop report metadata for a conversation session.
+   * Upserts a report entry by reportId — updates existing or adds new.
+   * Only supported when using Redis conversation memory.
+   *
+   * @param sessionId The session identifier
+   * @param report The agentic loop report metadata to upsert
+   * @param userId Optional user identifier
+   * @throws Error if conversation memory is not initialized or is not Redis-backed
+   *
+   * @example
+   * ```typescript
+   * await neurolink.updateAgenticLoopReport("session-123", {
+   *   reportId: "report-abc",
+   *   reportType: "META",
+   *   reportStatus: "INPROGRESS",
+   * });
+   * ```
+   */
+  async updateAgenticLoopReport(
+    sessionId: string,
+    report: import("./types/index.js").AgenticLoopReportMetadata,
+    userId?: string,
+  ): Promise<void> {
+    if (!this.conversationMemory) {
+      throw new ConversationMemoryError(
+        "Conversation memory is not initialized. Enable conversationMemory in NeuroLink options.",
+        "CONFIG_ERROR",
+      );
+    }
+
+    // Check if the memory manager is Redis-backed (has updateAgenticLoopReport method)
+    if (
+      !("updateAgenticLoopReport" in this.conversationMemory) ||
+      typeof this.conversationMemory.updateAgenticLoopReport !== "function"
+    ) {
+      throw new ConversationMemoryError(
+        "updateAgenticLoopReport is only supported with Redis conversation memory.",
+        "CONFIG_ERROR",
+      );
+    }
+
+    await withTimeout(
+      (
+        this
+          .conversationMemory as import("./core/redisConversationMemoryManager.js").RedisConversationMemoryManager
+      ).updateAgenticLoopReport(sessionId, userId, report),
+      5000,
+    );
   }
 
   /**
@@ -4551,7 +14865,12 @@ Current user's request: ${currentInput}`;
       toolMap.set(tool.name, {
         name: tool.name,
         description: tool.description || "",
-        inputSchema: tool.inputSchema || tool.parameters || {},
+        inputSchema:
+          typeof tool.inputSchema === "object" && tool.inputSchema !== null
+            ? tool.inputSchema
+            : typeof tool.parameters === "object" && tool.parameters !== null
+              ? tool.parameters
+              : {},
         execute: async (params: unknown, context?: unknown) => {
           // CONTEXT MERGING: Combine all available contexts for maximum information
           const storedContext = this.toolExecutionContext || {};
@@ -4591,6 +14910,46 @@ Current user's request: ${currentInput}`;
           );
         },
       });
+    }
+
+    // Inject file reference tools so they reach the Vercel AI SDK's tools parameter.
+    // These tools are bound to this.fileRegistry and allow the LLM to read/search
+    // files on demand instead of having all file content dumped into the prompt.
+    //
+    // createFileTools() returns Vercel AI SDK tool() objects with Zod `parameters`.
+    // We pass `parameters` as `inputSchema` so processCustomTools() in ToolsManager
+    // recognises it as a Zod schema (priority 2) and serialises it correctly for
+    // every provider — including Vertex AI which rejects bare `{}` schemas.
+    // Cache to avoid redundant allocations per generate/stream call (FRT-6).
+    if (!this.cachedFileTools) {
+      this.cachedFileTools = createFileTools(this.fileRegistry);
+    }
+    const fileTools = this.cachedFileTools;
+    for (const [toolName, toolDef] of Object.entries(fileTools)) {
+      if (!toolMap.has(toolName)) {
+        const toolDefRecord = toolDef as Record<string, unknown>;
+        const toolParams =
+          toolDefRecord.inputSchema ?? toolDefRecord.parameters;
+        toolMap.set(toolName, {
+          name: toolName,
+          description: toolDef.description || `File tool: ${toolName}`,
+          inputSchema:
+            typeof toolParams === "object" && toolParams !== null
+              ? toolParams
+              : { type: "object", properties: {} },
+          execute: async (params: unknown) => {
+            return await (
+              toolDef.execute as (
+                params: unknown,
+                ctx: unknown,
+              ) => Promise<unknown>
+            )(params, {
+              toolCallId: `file-tool-${Date.now()}`,
+              messages: [],
+            });
+          },
+        });
+      }
     }
 
     return toolMap;
@@ -4705,9 +15064,20 @@ Current user's request: ${currentInput}`;
     toolName: string,
     params: unknown = {},
     options?: {
+      /** Bound on ONE attempt. */
       timeout?: number;
       maxRetries?: number;
+      /**
+       * Bound on the WHOLE execution — every attempt plus the delays between
+       * them. Defaults to `timeout * (maxRetries + 1)`, which is what the
+       * retry loop already spent, so omitting it changes nothing.
+       */
+      totalTimeoutMs?: number;
       retryDelayMs?: number;
+      /** Disable tool result caching for this call */
+      disableToolCache?: boolean;
+      /** Bypass the request batcher for this call */
+      bypassBatcher?: boolean;
       authContext?: {
         userId?: string;
         sessionId?: string;
@@ -4716,22 +15086,226 @@ Current user's request: ${currentInput}`;
       };
     },
   ): Promise<T> {
-    const functionTag = "NeuroLink.executeTool";
-    const executionStartTime = Date.now();
+    if (this.mcpToolBatcher && !options?.bypassBatcher) {
+      return this.mcpToolBatcher.execute(toolName, params) as Promise<T>;
+    }
 
-    // Debug: Log tool execution attempt
-    logger.debug(`[${functionTag}] Tool execution requested:`, {
+    const executionContext = this.createToolExecutionContext(
       toolName,
-      params: isNonNullObject(params)
-        ? transformParamsForLogging(params)
-        : params,
-      hasExternalManager: !!this.externalServerManager,
-    });
+      params,
+      options,
+    );
+    return tracers.mcp.startActiveSpan(
+      toolSpanName(toolName),
+      {
+        attributes: {
+          "tool.name": toolName,
+          "tool.type": executionContext.toolType,
+          "tool.input_size": executionContext.inputSize,
+        },
+      },
+      (toolSpan) => {
+        observe(toolSpan, "tool", { input: params });
+        return this.executeToolWithSpan<T>(
+          toolName,
+          params,
+          options,
+          executionContext,
+          toolSpan,
+        );
+      },
+    ) as Promise<T>;
+  }
 
-    // 🔧 PARAMETER TRACE: Log tool execution details for debugging
+  private createToolExecutionContext(
+    toolName: string,
+    params: unknown,
+    options:
+      | {
+          timeout?: number;
+          maxRetries?: number;
+          retryDelayMs?: number;
+          disableToolCache?: boolean;
+          bypassBatcher?: boolean;
+          authContext?: {
+            userId?: string;
+            sessionId?: string;
+            user?: Record<string, unknown>;
+            [key: string]: unknown;
+          };
+        }
+      | undefined,
+  ): {
+    functionTag: string;
+    executionStartTime: number;
+    executionId: string;
+    externalTool:
+      | ReturnType<NeuroLink["externalServerManager"]["getAllTools"]>[number]
+      | undefined;
+    toolType: "mcp" | "custom" | "external";
+    inputSize: number;
+    options: typeof options;
+    hitlState: HITLExecutionState;
+  } {
+    const externalTool = this.externalServerManager
+      .getAllTools()
+      .find((tool) => tool.name === toolName);
+    const toolType = externalTool
+      ? "mcp"
+      : this.getCustomTools().has(toolName)
+        ? "custom"
+        : "external";
+    const inputStr = params ? stringifyContentSafe(params) : "";
+
+    const executionStartTime = Date.now();
+    // Per-invocation id so consumers can correlate a tool:start with its matching
+    // tool:end even when the same tool runs multiple times concurrently.
+    const executionId = `${toolName}-${executionStartTime}-${Math.random()
+      .toString(36)
+      .slice(2, 11)}`;
+
+    return {
+      functionTag: "NeuroLink.executeTool",
+      executionStartTime,
+      executionId,
+      externalTool,
+      toolType,
+      inputSize: inputStr.length,
+      options,
+      hitlState: { triggered: false },
+    };
+  }
+
+  private async executeToolWithSpan<T>(
+    toolName: string,
+    params: unknown,
+    options:
+      | {
+          timeout?: number;
+          maxRetries?: number;
+          retryDelayMs?: number;
+          disableToolCache?: boolean;
+          bypassBatcher?: boolean;
+          authContext?: {
+            userId?: string;
+            sessionId?: string;
+            user?: Record<string, unknown>;
+            [key: string]: unknown;
+          };
+        }
+      | undefined,
+    executionContext: ReturnType<NeuroLink["createToolExecutionContext"]>,
+    toolSpan: ReturnType<typeof tracers.mcp.startSpan>,
+  ): Promise<T> {
+    try {
+      const prepared = await this.prepareToolExecutionState(
+        toolName,
+        params,
+        options,
+        executionContext,
+      );
+      const result = await this.runPreparedToolExecution<T>(
+        toolName,
+        params,
+        prepared,
+        executionContext,
+        toolSpan,
+      );
+      const failed =
+        isNonNullObject(result) &&
+        "isError" in result &&
+        result.isError === true;
+      observe(toolSpan, "tool", {
+        output: result,
+        ...(failed && {
+          level: "ERROR",
+          statusMessage: extractMcpErrorText(result),
+        }),
+      });
+      return result;
+    } catch (outerError) {
+      const errMsg =
+        outerError instanceof Error ? outerError.message : String(outerError);
+      observe(toolSpan, "tool", { level: "ERROR", statusMessage: errMsg });
+      if (!(outerError instanceof NeuroLinkError)) {
+        toolSpan.recordException(
+          outerError instanceof Error ? outerError : new Error(errMsg),
+        );
+        toolSpan.setStatus({ code: SpanStatusCode.ERROR, message: errMsg });
+      }
+      throw outerError;
+    } finally {
+      toolSpan.end();
+    }
+  }
+
+  private async prepareToolExecutionState(
+    toolName: string,
+    params: unknown,
+    options:
+      | {
+          timeout?: number;
+          maxRetries?: number;
+          /** Ceiling on the whole execution across every attempt. */
+          totalTimeoutMs?: number;
+          retryDelayMs?: number;
+          disableToolCache?: boolean;
+          bypassBatcher?: boolean;
+          authContext?: {
+            userId?: string;
+            sessionId?: string;
+            user?: Record<string, unknown>;
+            [key: string]: unknown;
+          };
+        }
+      | undefined,
+    executionContext: ReturnType<NeuroLink["createToolExecutionContext"]>,
+  ): Promise<{
+    finalOptions: {
+      timeout: number;
+      maxRetries: number;
+      totalTimeout: number;
+      retryDelayMs: number;
+      authContext:
+        | {
+            userId?: string;
+            sessionId?: string;
+            user?: Record<string, unknown>;
+            [key: string]: unknown;
+          }
+        | undefined;
+      disableToolCache: boolean | undefined;
+    };
+    startMemory: {
+      rss: number;
+      heapTotal: number;
+      heapUsed: number;
+      external: number;
+    };
+    circuitBreaker: CircuitBreaker;
+    breakerKey: string;
+    metrics: {
+      totalExecutions: number;
+      successfulExecutions: number;
+      failedExecutions: number;
+      averageExecutionTime: number;
+      lastExecutionTime: number;
+      errorCategories: Record<string, number>;
+    };
+  }> {
+    logger.debug(
+      `[${executionContext.functionTag}] Tool execution requested:`,
+      {
+        toolName,
+        params: isNonNullObject(params)
+          ? transformParamsForLogging(params)
+          : params,
+        hasExternalManager: !!this.externalServerManager,
+      },
+    );
     logger.debug(`Tool execution detailed analysis`, {
       toolName,
-      executionStartTime,
+      executionStartTime: executionContext.executionStartTime,
       paramsAnalysis: {
         type: typeof params,
         isNull: params === null,
@@ -4753,86 +15327,168 @@ Current user's request: ${currentInput}`;
       options,
       hasExternalManager: !!this.externalServerManager,
     });
+    this.emitter.emit(
+      "tool:start",
+      createToolEventPayload(toolName, {
+        timestamp: executionContext.executionStartTime,
+        input: params,
+        executionId: executionContext.executionId,
+      }),
+    );
 
-    // Emit tool start event (NeuroLink format - keep existing)
-    this.emitter.emit("tool:start", {
-      toolName,
-      timestamp: executionStartTime,
-      input: params, // Enhanced: add input parameters
-    });
-
-    // ADD: Bedrock-compatible tool:start event (positional parameters)
-    this.emitter.emit("tool:start", toolName, params);
-
-    // Set default options
+    const toolInfo = this.toolRegistry.getToolInfo(toolName);
+    const attemptTimeout =
+      options?.timeout ??
+      toolInfo?.tool?.timeoutMs ??
+      TOOL_TIMEOUTS.EXECUTION_BATCH_MS;
+    const maxRetries =
+      options?.maxRetries ??
+      toolInfo?.tool?.maxRetries ??
+      RETRY_ATTEMPTS.DEFAULT;
+    const retryDelayMs = options?.retryDelayMs || RETRY_DELAYS.BASE_MS;
     const finalOptions = {
-      timeout: options?.timeout || TOOL_TIMEOUTS.EXECUTION_DEFAULT_MS, // 30 second default timeout
-      maxRetries: options?.maxRetries || RETRY_ATTEMPTS.DEFAULT, // Default 2 retries for retriable errors
-      retryDelayMs: options?.retryDelayMs || RETRY_DELAYS.BASE_MS, // 1 second delay between retries
-      authContext: options?.authContext, // Pass through authentication context
+      timeout: attemptTimeout,
+      maxRetries,
+      // Ceiling on the whole execution, not one attempt. The default is what
+      // the retry loop already spent, and that is BOTH terms: every attempt at
+      // full length PLUS the fixed wait between them. Omitting the delays
+      // makes the default ceiling shorter than the envelope it is meant to
+      // reproduce, so `attemptTimeout = min(timeout, remaining)` clamps a
+      // later attempt below its configured timeout — the opposite of the
+      // "unchanged unless you ask for less" contract this default exists to
+      // keep. Before any of this the total was unbounded and merely implied:
+      // a tool that reliably hung burned every attempt at full length, and
+      // the surfaced error reported the per-attempt bound beside the
+      // whole-execution elapsed time, which reads as a timeout that was never
+      // enforced.
+      totalTimeout:
+        options?.totalTimeoutMs ??
+        toolInfo?.tool?.totalTimeoutMs ??
+        attemptTimeout * (maxRetries + 1) + retryDelayMs * maxRetries,
+      retryDelayMs,
+      authContext: options?.authContext,
+      disableToolCache: options?.disableToolCache,
     };
 
-    // Track memory usage for tool execution
     const { MemoryManager } = await import("./utils/performance.js");
     const startMemory = MemoryManager.getMemoryUsageMB();
+    const breakerServerId =
+      executionContext.externalTool?.serverId ||
+      toolInfo?.tool?.serverId ||
+      "unknown";
+    const breakerKey = `${breakerServerId}.${toolName}`;
 
-    // Get or create circuit breaker for this tool
-    if (!this.toolCircuitBreakers.has(toolName)) {
-      this.toolCircuitBreakers.set(
-        toolName,
-        new CircuitBreaker(
-          CIRCUIT_BREAKER.FAILURE_THRESHOLD,
-          CIRCUIT_BREAKER_RESET_MS,
-        ),
+    let circuitBreaker = this.toolCircuitBreakers.get(breakerKey);
+    if (!circuitBreaker) {
+      circuitBreaker = new CircuitBreaker(
+        CIRCUIT_BREAKER.FAILURE_THRESHOLD,
+        CIRCUIT_BREAKER_RESET_MS,
       );
+      this.toolCircuitBreakers.set(breakerKey, circuitBreaker);
     }
-    const circuitBreaker = this.toolCircuitBreakers.get(toolName);
 
-    // Initialize metrics for this tool if not exists
-    if (!this.toolExecutionMetrics.has(toolName)) {
-      this.toolExecutionMetrics.set(toolName, {
+    let metrics = this.toolExecutionMetrics.get(toolName);
+    if (!metrics) {
+      metrics = {
         totalExecutions: 0,
         successfulExecutions: 0,
         failedExecutions: 0,
         averageExecutionTime: 0,
         lastExecutionTime: 0,
-      });
+        errorCategories: {},
+      };
+      this.toolExecutionMetrics.set(toolName, metrics);
     }
-    const metrics = this.toolExecutionMetrics.get(toolName);
-    if (metrics) {
-      metrics.totalExecutions++;
-    }
+    metrics.totalExecutions++;
 
+    return {
+      finalOptions,
+      startMemory,
+      circuitBreaker,
+      breakerKey,
+      metrics,
+    };
+  }
+
+  private async runPreparedToolExecution<T>(
+    toolName: string,
+    params: unknown,
+    prepared: Awaited<ReturnType<NeuroLink["prepareToolExecutionState"]>>,
+    executionContext: ReturnType<NeuroLink["createToolExecutionContext"]>,
+    toolSpan: ReturnType<typeof tracers.mcp.startSpan>,
+  ): Promise<T> {
+    let toolRetryCount = 0;
     try {
-      mcpLogger.debug(`[${functionTag}] Executing tool: ${toolName}`, {
-        toolName,
-        params,
-        options: finalOptions,
-        circuitBreakerState: circuitBreaker?.getState(),
-      });
-
-      // Execute with circuit breaker, timeout, and retry logic
-      if (!circuitBreaker) {
-        throw new Error(
-          `Circuit breaker not initialized for tool: ${toolName}`,
-        );
-      }
-      const result: T = await circuitBreaker.execute(async () => {
-        return await withRetry(
+      mcpLogger.debug(
+        `[${executionContext.functionTag}] Executing tool: ${toolName}`,
+        {
+          toolName,
+          params,
+          options: prepared.finalOptions,
+          circuitBreakerState: prepared.circuitBreaker.getState(),
+        },
+      );
+      const maxAttempts = prepared.finalOptions.maxRetries + 1;
+      const totalTimeout = prepared.finalOptions.totalTimeout;
+      const budgetStart = Date.now();
+      const deadline = budgetStart + totalTimeout;
+      let attemptNumber = 0;
+      const result: T = await prepared.circuitBreaker.execute(async () => {
+        return withRetry(
           async () => {
-            return await withTimeout(
-              this.executeToolInternal<T>(toolName, params, finalOptions),
-              finalOptions.timeout,
-              ErrorFactory.toolTimeout(toolName, finalOptions.timeout),
+            attemptNumber++;
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) {
+              throw ErrorFactory.toolTimeout(
+                toolName,
+                totalTimeout,
+                undefined,
+                {
+                  attempt: attemptNumber,
+                  maxAttempts,
+                  attemptTimeoutMs: prepared.finalOptions.timeout,
+                  totalTimeoutMs: totalTimeout,
+                  elapsedMs: Date.now() - budgetStart,
+                  exhausted: true,
+                },
+              );
+            }
+            // Clamping to what is left is what makes the ceiling hard. Gating
+            // retries alone would not: the last attempt could start just under
+            // the deadline and still run a full attempt timeout past it.
+            const attemptTimeout = Math.min(
+              prepared.finalOptions.timeout,
+              remaining,
+            );
+            return withTimeout(
+              this.executeToolInternal<T>(
+                toolName,
+                params,
+                prepared.finalOptions,
+                executionContext.hitlState,
+              ),
+              attemptTimeout,
+              ErrorFactory.toolTimeout(toolName, attemptTimeout, undefined, {
+                attempt: attemptNumber,
+                maxAttempts,
+                attemptTimeoutMs: prepared.finalOptions.timeout,
+                totalTimeoutMs: totalTimeout,
+                elapsedMs: Date.now() - budgetStart,
+              }),
             );
           },
           {
-            maxAttempts: finalOptions.maxRetries + 1, // +1 for initial attempt
-            delayMs: finalOptions.retryDelayMs,
-            isRetriable: isRetriableError,
+            maxAttempts,
+            delayMs: prepared.finalOptions.retryDelayMs,
+            // Stop when there is not enough budget left for the retry delay
+            // plus any real work after it.
+            isRetriable: (error: Error) =>
+              Date.now() + prepared.finalOptions.retryDelayMs < deadline &&
+              isRetriableError(error),
             onRetry: (attempt, error) => {
+              toolRetryCount = attempt;
               mcpLogger.warn(
-                `[${functionTag}] Retrying tool execution (attempt ${attempt})`,
+                `[${executionContext.functionTag}] Retrying tool execution (attempt ${attempt})`,
                 {
                   toolName,
                   error: error.message,
@@ -4843,129 +15499,342 @@ Current user's request: ${currentInput}`;
           },
         );
       });
+      toolSpan.setAttribute("tool.retry_count", toolRetryCount);
 
-      // Update success metrics
-      const executionTime = Date.now() - executionStartTime;
-      if (metrics) {
-        metrics.successfulExecutions++;
-        metrics.lastExecutionTime = executionTime;
-        metrics.averageExecutionTime =
-          (metrics.averageExecutionTime * (metrics.successfulExecutions - 1) +
-            executionTime) /
-          metrics.successfulExecutions;
-      }
-
-      // Track memory usage
-      const endMemory = MemoryManager.getMemoryUsageMB();
-      const memoryDelta = endMemory.heapUsed - startMemory.heapUsed;
-
-      if (memoryDelta > 20) {
-        mcpLogger.warn(
-          `Tool '${toolName}' used excessive memory: ${memoryDelta}MB`,
-          {
-            toolName,
-            memoryDelta,
-            executionTime,
-          },
-        );
-      }
-
-      mcpLogger.debug(`[${functionTag}] Tool executed successfully`, {
+      return await this.handleSuccessfulToolExecution(
         toolName,
-        executionTime,
-        memoryDelta,
-        circuitBreakerState: circuitBreaker?.getState(),
-      });
-
-      // Emit tool end event using the helper method
-      this.emitToolEndEvent(toolName, executionStartTime, true, result);
-
-      return result;
-    } catch (error) {
-      // Update failure metrics
-      if (metrics) {
-        metrics.failedExecutions++;
-      }
-      const executionTime = Date.now() - executionStartTime;
-
-      // Create structured error
-      let structuredError: NeuroLinkError;
-
-      if (error instanceof NeuroLinkError) {
-        structuredError = error;
-      } else if (error instanceof Error) {
-        // Categorize the error based on the message
-        if (error.message.includes("timeout")) {
-          structuredError = ErrorFactory.toolTimeout(
-            toolName,
-            finalOptions.timeout,
-          );
-        } else if (error.message.includes("not found")) {
-          const availableTools = await this.getAllAvailableTools();
-          structuredError = ErrorFactory.toolNotFound(
-            toolName,
-            extractToolNames(availableTools.map((t) => ({ name: t.name }))),
-          );
-        } else if (
-          error.message.includes("validation") ||
-          error.message.includes("parameter")
-        ) {
-          structuredError = ErrorFactory.invalidParameters(
-            toolName,
-            error,
-            params,
-          );
-        } else if (
-          error.message.includes("network") ||
-          error.message.includes("connection")
-        ) {
-          structuredError = ErrorFactory.networkError(toolName, error);
-        } else {
-          structuredError = ErrorFactory.toolExecutionFailed(toolName, error);
-        }
-      } else {
-        structuredError = ErrorFactory.toolExecutionFailed(
-          toolName,
-          new Error(String(error)),
-        );
-      }
-
-      // ADD: Centralized error event emission
-      this.emitter.emit("error", structuredError);
-
-      // Emit tool end event using the helper method
-      this.emitToolEndEvent(
-        toolName,
-        executionStartTime,
-        false,
-        undefined,
-        structuredError,
+        result,
+        prepared,
+        executionContext,
+        toolSpan,
       );
-
-      // Add execution context to structured error
-      structuredError = new NeuroLinkError({
-        ...structuredError,
-        context: {
-          ...structuredError.context,
-          executionTime,
-          params,
-          options: finalOptions,
-          circuitBreakerState: circuitBreaker?.getState(),
-          circuitBreakerFailures: circuitBreaker?.getFailureCount(),
-          metrics: { ...metrics },
-        },
-      });
-
-      // Log structured error
-      logStructuredError(structuredError);
-
-      throw structuredError;
+    } catch (error) {
+      // Ensure retry count is recorded even on failure
+      toolSpan.setAttribute("tool.retry_count", toolRetryCount);
+      return this.handleFailedToolExecution(
+        toolName,
+        params,
+        error,
+        prepared,
+        executionContext,
+        toolSpan,
+      );
     }
   }
 
+  private async handleSuccessfulToolExecution<T>(
+    toolName: string,
+    result: T,
+    prepared: Awaited<ReturnType<NeuroLink["prepareToolExecutionState"]>>,
+    executionContext: ReturnType<NeuroLink["createToolExecutionContext"]>,
+    toolSpan: ReturnType<typeof tracers.mcp.startSpan>,
+  ): Promise<T> {
+    const executionTime = Date.now() - executionContext.executionStartTime;
+    prepared.metrics.successfulExecutions++;
+    prepared.metrics.lastExecutionTime = executionTime;
+    prepared.metrics.averageExecutionTime =
+      (prepared.metrics.averageExecutionTime *
+        (prepared.metrics.successfulExecutions - 1) +
+        executionTime) /
+      prepared.metrics.successfulExecutions;
+
+    const { MemoryManager } = await import("./utils/performance.js");
+    const endMemory = MemoryManager.getMemoryUsageMB();
+    const memoryDelta = endMemory.heapUsed - prepared.startMemory.heapUsed;
+    if (memoryDelta > 20) {
+      mcpLogger.warn(
+        `Tool '${toolName}' used excessive memory: ${memoryDelta}MB`,
+        {
+          toolName,
+          memoryDelta,
+          executionTime,
+        },
+      );
+    }
+
+    mcpLogger.debug(
+      `[${executionContext.functionTag}] Tool executed successfully`,
+      {
+        toolName,
+        executionTime,
+        memoryDelta,
+        circuitBreakerState: prepared.circuitBreaker.getState(),
+      },
+    );
+
+    const resultObj =
+      result && typeof result === "object"
+        ? (result as Record<string, unknown>)
+        : undefined;
+    const isToolError =
+      (resultObj && "isError" in resultObj && resultObj.isError === true) ||
+      (resultObj && "success" in resultObj && resultObj.success === false);
+
+    const contentArr = isToolError
+      ? (resultObj?.content as
+          | Array<{ type?: string; text?: string }>
+          | undefined)
+      : undefined;
+    const errorText = isToolError
+      ? contentArr
+          ?.filter((content) => content.type === "text" && content.text)
+          .map((content) => content.text)
+          .join(" ") ||
+        (typeof resultObj?.error === "string"
+          ? resultObj.error
+          : "Unknown error")
+      : undefined;
+
+    if (isToolError) {
+      try {
+        await prepared.circuitBreaker.execute(async () => {
+          throw new Error(`Tool ${toolName} returned isError:true`);
+        });
+      } catch {
+        // Expected — intentionally records the failure
+      }
+      mcpLogger.debug(
+        `[${executionContext.functionTag}] Circuit breaker failure recorded for isError result`,
+        {
+          toolName,
+          circuitBreakerState: prepared.circuitBreaker.getState(),
+          circuitBreakerFailures: prepared.circuitBreaker.getFailureCount(),
+        },
+      );
+
+      const errorCategory = classifyMcpErrorMessage(
+        errorText ?? "Unknown error",
+      );
+      const prefix = `[TOOL_ERROR: ${toolName} failed (${errorCategory})] `;
+
+      if (resultObj && Array.isArray(contentArr)) {
+        const clonedContent = contentArr.map((content) => ({ ...content }));
+        for (const content of clonedContent) {
+          if (content.type === "text" && content.text) {
+            content.text = prefix + content.text;
+            break;
+          }
+        }
+        resultObj.content = clonedContent;
+      }
+
+      toolSpan.setAttribute(
+        "tool.error.message",
+        (errorText ?? "Unknown error").substring(0, 500),
+      );
+      toolSpan.setAttribute("tool.error.category", errorCategory);
+      toolSpan.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: `MCP tool returned isError: ${(errorText ?? "Unknown error").substring(0, 200)}`,
+      });
+
+      prepared.metrics.failedExecutions++;
+      const prevSuccessful = prepared.metrics.successfulExecutions;
+      prepared.metrics.successfulExecutions = Math.max(
+        0,
+        prepared.metrics.successfulExecutions - 1,
+      );
+      prepared.metrics.averageExecutionTime =
+        prevSuccessful > 1
+          ? (prepared.metrics.averageExecutionTime * prevSuccessful -
+              executionTime) /
+            (prevSuccessful - 1)
+          : 0;
+      const mappedCategory = mcpCategoryToErrorCategory(errorCategory);
+      prepared.metrics.errorCategories[mappedCategory] =
+        (prepared.metrics.errorCategories[mappedCategory] || 0) + 1;
+    }
+
+    this.emitToolEndEvent(
+      toolName,
+      executionContext.executionStartTime,
+      !isToolError,
+      result,
+      isToolError && errorText ? new Error(errorText) : undefined,
+      executionContext.executionId,
+    );
+    toolSpan.setAttribute(
+      "tool.result.status",
+      isToolError ? "error" : "success",
+    );
+    toolSpan.setAttribute("tool.duration_ms", executionTime);
+
+    return result;
+  }
+
+  private async handleFailedToolExecution<T>(
+    toolName: string,
+    params: unknown,
+    error: unknown,
+    prepared: Awaited<ReturnType<NeuroLink["prepareToolExecutionState"]>>,
+    executionContext: ReturnType<NeuroLink["createToolExecutionContext"]>,
+    toolSpan: ReturnType<typeof tracers.mcp.startSpan>,
+  ): Promise<T> {
+    prepared.metrics.failedExecutions++;
+    const executionTime = Date.now() - executionContext.executionStartTime;
+
+    if (error instanceof CircuitBreakerOpenError) {
+      mcpLogger.warn(
+        `[${executionContext.functionTag}] Tool blocked by circuit breaker: ${toolName}`,
+        {
+          toolName,
+          breakerState: error.breakerState,
+          retryAfter: error.retryAfter,
+          retryAfterMs: error.retryAfterMs,
+          failureCount: error.failureCount,
+          executionTime,
+        },
+      );
+      prepared.metrics.errorCategories[ErrorCategory.EXECUTION] =
+        (prepared.metrics.errorCategories[ErrorCategory.EXECUTION] || 0) + 1;
+
+      this.emitToolEndEvent(
+        toolName,
+        executionContext.executionStartTime,
+        false,
+        undefined,
+        new Error(
+          `Circuit breaker open for ${toolName} (state=${error.breakerState}, failures=${error.failureCount})`,
+        ),
+        executionContext.executionId,
+      );
+      toolSpan.setAttribute("tool.result.status", "circuit_breaker_open");
+      toolSpan.setAttribute("tool.duration_ms", executionTime);
+      toolSpan.setAttribute("tool.circuit_breaker.state", error.breakerState);
+      toolSpan.setAttribute(
+        "tool.circuit_breaker.retry_after_ms",
+        error.retryAfterMs,
+      );
+      toolSpan.setAttribute(
+        "tool.circuit_breaker.failure_count",
+        error.failureCount,
+      );
+      toolSpan.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: `Circuit breaker open for ${toolName}: ${error.message}`,
+      });
+
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text" as const,
+            text:
+              `TOOL TEMPORARILY UNAVAILABLE: "${toolName}" has been disabled after ` +
+              `${error.failureCount} failures. ` +
+              `This is a circuit breaker protection — do NOT retry this tool. ` +
+              `It will become available again after ${Math.ceil(error.retryAfterMs / 1000)} seconds ` +
+              `(at ${error.retryAfter}). ` +
+              `Instead, inform the user that the operation failed and suggest trying again later.`,
+          },
+        ],
+      } as T;
+    }
+
+    let structuredError: NeuroLinkError;
+    if (error instanceof NeuroLinkError) {
+      structuredError = error;
+    } else if (error instanceof Error) {
+      if (error.message.includes("timeout")) {
+        structuredError = ErrorFactory.toolTimeout(
+          toolName,
+          prepared.finalOptions.timeout,
+        );
+      } else if (error.message.includes("not found")) {
+        const availableTools = await this.getAllAvailableTools();
+        structuredError = ErrorFactory.toolNotFound(
+          toolName,
+          extractToolNames(availableTools.map((tool) => ({ name: tool.name }))),
+        );
+      } else if (
+        error.message.includes("validation") ||
+        error.message.includes("parameter")
+      ) {
+        structuredError = ErrorFactory.invalidParameters(
+          toolName,
+          error,
+          params,
+        );
+      } else if (
+        error.message.includes("network") ||
+        error.message.includes("connection")
+      ) {
+        structuredError = ErrorFactory.networkError(toolName, error);
+      } else {
+        structuredError = ErrorFactory.toolExecutionFailed(toolName, error);
+      }
+    } else {
+      structuredError = ErrorFactory.toolExecutionFailed(
+        toolName,
+        new Error(String(error)),
+      );
+    }
+
+    const category = structuredError.category || ErrorCategory.EXECUTION;
+    prepared.metrics.errorCategories[category] =
+      (prepared.metrics.errorCategories[category] || 0) + 1;
+
+    this.emitToolEndEvent(
+      toolName,
+      executionContext.executionStartTime,
+      false,
+      undefined,
+      structuredError,
+      executionContext.executionId,
+    );
+    // Gate on listenerCount: Node EventEmitter rethrows the original error
+    // from emit("error", e) when no listener is registered, which would
+    // short-circuit the surrounding flow and surface as an unhandled
+    // rejection. Same pattern as handleGenerateTextInternalFailure.
+    if (this.emitter.listenerCount("error") > 0) {
+      this.emitter.emit("error", structuredError);
+    }
+
+    structuredError = new NeuroLinkError({
+      ...structuredError,
+      context: {
+        ...structuredError.context,
+        executionTime,
+        params,
+        options: prepared.finalOptions,
+        circuitBreakerState: prepared.circuitBreaker.getState(),
+        circuitBreakerFailures: prepared.circuitBreaker.getFailureCount(),
+        metrics: { ...prepared.metrics },
+      },
+    });
+
+    logStructuredError(structuredError);
+    toolSpan.setAttribute("tool.result.status", "error");
+    toolSpan.setAttribute("tool.duration_ms", executionTime);
+    toolSpan.recordException(structuredError);
+    toolSpan.setStatus({
+      code: SpanStatusCode.ERROR,
+      message: structuredError.message,
+    });
+
+    throw structuredError;
+  }
+
   /**
-   * Internal tool execution method (extracted for better error handling)
+   * Internal tool execution method with MCP enhancements wired in:
+   * - ToolCache: check/store cached results for non-destructive tools
+   * - ToolRouter: route to best server when same tool exists on multiple servers
+   * - Annotations: skip cache for destructive tools, retry safe tools on failure
+   * - Middleware: apply global middleware chain before execution
    */
+  private toolCacheRepeatKey(
+    toolName: string,
+    params: unknown,
+  ): string | undefined {
+    try {
+      return `${toolName}:${JSON.stringify(params) ?? ""}`;
+    } catch {
+      // Unserializable args (circular refs) — no repeat tracking; the
+      // ToolResultCache's own keying handles (or rejects) them as before.
+      return undefined;
+    }
+  }
+
   private async executeToolInternal<T = unknown>(
     toolName: string,
     params: unknown,
@@ -4973,6 +15842,7 @@ Current user's request: ${currentInput}`;
       timeout: number;
       maxRetries: number;
       retryDelayMs: number;
+      disableToolCache?: boolean;
       authContext?: {
         userId?: string;
         sessionId?: string;
@@ -4980,112 +15850,309 @@ Current user's request: ${currentInput}`;
         [key: string]: unknown;
       };
     },
+    HITLState?: HITLExecutionState,
   ): Promise<T> {
     const functionTag = "NeuroLink.executeToolInternal";
 
-    // Check external MCP servers
-    const externalTools = this.externalServerManager.getAllTools();
-    const externalTool = externalTools.find((tool) => tool.name === toolName);
+    // === MCP ENHANCEMENT: Infer annotations for cache/retry decisions ===
+    const toolAnnotations = this.getToolAnnotationsForExecution(toolName);
+    const isCacheEnabled =
+      this.mcpToolResultCache &&
+      !options.disableToolCache &&
+      !this._disableToolCacheForCurrentRequest &&
+      !this.uncacheableTools.has(toolName) &&
+      !toolAnnotations?.destructiveHint;
+    const toolResultCache = this.mcpToolResultCache;
 
-    logger.debug(`[${functionTag}] External MCP tool search:`, {
-      toolName,
-      externalToolsCount: externalTools.length,
-      foundTool: !!externalTool,
-      isAvailable: externalTool?.isAvailable,
-      serverId: externalTool?.serverId,
-    });
+    // === MCP ENHANCEMENT: Cache check (before execution) ===
+    // Scope cache key by auth context to prevent cross-user cache leaks
+    const cacheParams =
+      options.authContext || this.toolExecutionContext
+        ? {
+            __args: params,
+            __ctx: options.authContext ?? this.toolExecutionContext,
+          }
+        : params;
+    const repeatKey = this._generationTurnActive
+      ? this.toolCacheRepeatKey(toolName, cacheParams)
+      : undefined;
+    const isRepeatCallThisRequest =
+      repeatKey !== undefined &&
+      this._toolCacheKeysServedThisRequest.has(repeatKey);
+    if (repeatKey !== undefined) {
+      this._toolCacheKeysServedThisRequest.add(repeatKey);
+    }
+    if (isCacheEnabled && toolResultCache && !isRepeatCallThisRequest) {
+      const cached = toolResultCache.getCachedResult(toolName, cacheParams);
+      if (cached !== undefined) {
+        logger.debug(`[${functionTag}] Cache HIT for tool: ${toolName}`);
+        return cached as T;
+      }
+    } else if (isRepeatCallThisRequest) {
+      logger.debug(
+        `[${functionTag}] Repeat call within this request — bypassing tool cache for: ${toolName}`,
+      );
+    }
 
-    if (externalTool && externalTool.isAvailable) {
-      try {
-        mcpLogger.debug(
-          `[${functionTag}] Executing external MCP tool: ${toolName} from ${externalTool.serverId}`,
-        );
+    // === MCP ENHANCEMENT: Middleware chain wrapper ===
+    const executeWithMiddleware = async (
+      executeFn: () => Promise<T>,
+    ): Promise<T> => {
+      if (this.mcpToolMiddlewares.length === 0) {
+        return executeFn();
+      }
 
-        const result = await this.externalServerManager.executeTool(
-          externalTool.serverId,
-          toolName,
-          params as JsonObject,
-          { timeout: options.timeout },
-        );
+      // Build middleware chain: each middleware calls next() to proceed
+      let index = 0;
+      const next = async (): Promise<unknown> => {
+        if (index < this.mcpToolMiddlewares.length) {
+          const middleware = this.mcpToolMiddlewares[index++];
+          // Cast to MCPServerTool — middleware only inspects name/description/annotations
+          const toolStub = {
+            name: toolName,
+            description: "",
+            inputSchema: {},
+            annotations: toolAnnotations,
+            execute: async () => ({}),
+          } as MCPServerTool;
+          // Provide minimal context — elicitation is optional for most middleware
+          const middlewareContext: Partial<
+            import("./types/index.js").EnhancedExecutionContext
+          > = {
+            toolMeta: { name: toolName, annotations: toolAnnotations },
+          };
+          return middleware(
+            toolStub,
+            params,
+            middlewareContext as import("./types/index.js").EnhancedExecutionContext,
+            next,
+          );
+        }
+        return executeFn();
+      };
 
-        logger.debug(
-          `[${functionTag}] External MCP tool execution successful:`,
-          {
+      return (await next()) as T;
+    };
+
+    // === Execute the tool (with middleware wrapper) ===
+    const executeCore = async (): Promise<T> => {
+      // Check external MCP servers
+      const externalTools = this.externalServerManager.getAllTools();
+
+      // === MCP ENHANCEMENT: ToolRouter for multi-server routing ===
+      const matchingTools = externalTools.filter(
+        (tool) => tool.name === toolName && tool.isAvailable,
+      );
+
+      let externalTool: ExternalMCPToolInfo | undefined;
+
+      if (matchingTools.length > 1 && this.mcpToolRouter) {
+        // Multiple servers have this tool — use router to pick the best one
+        try {
+          const mcpTool: MCPTool = {
+            name: toolName,
+            description: matchingTools[0].description ?? "",
+            serverId: matchingTools[0].serverId,
+            inputSchema: {},
+          };
+          const decision: RoutingDecision = this.mcpToolRouter.route(mcpTool);
+          externalTool =
+            matchingTools.find((t) => t.serverId === decision.serverId) ||
+            matchingTools[0];
+          logger.debug(
+            `[${functionTag}] Router selected server: ${decision.serverId}`,
+            {
+              strategy: decision.strategy,
+              confidence: decision.confidence,
+            },
+          );
+        } catch (routerError) {
+          logger.warn(
+            `[${functionTag}] Router failed, falling back to first match`,
+            { error: routerError },
+          );
+          externalTool = matchingTools[0];
+        }
+      } else {
+        externalTool = matchingTools[0];
+      }
+
+      logger.debug(`[${functionTag}] External MCP tool search:`, {
+        toolName,
+        externalToolsCount: externalTools.length,
+        foundTool: !!externalTool,
+        isAvailable: externalTool?.isAvailable,
+        serverId: externalTool?.serverId,
+      });
+
+      if (externalTool && externalTool.isAvailable) {
+        try {
+          mcpLogger.debug(
+            `[${functionTag}] Executing external MCP tool: ${toolName} from ${externalTool.serverId}`,
+          );
+
+          const result = await this.externalServerManager.executeTool(
+            externalTool.serverId,
+            toolName,
+            params as JsonObject,
+            { timeout: options.timeout },
+          );
+
+          logger.debug(
+            `[${functionTag}] External MCP tool execution successful:`,
+            {
+              toolName,
+              serverId: externalTool.serverId,
+              resultType: typeof result,
+            },
+          );
+
+          return result as T;
+        } catch (error) {
+          logger.error(`[${functionTag}] External MCP tool execution failed:`, {
             toolName,
             serverId: externalTool.serverId,
-            resultType: typeof result,
-          },
+            error: error instanceof Error ? error.message : String(error),
+          });
+          throw ErrorFactory.toolExecutionFailed(
+            toolName,
+            error instanceof Error ? error : new Error(String(error)),
+            externalTool.serverId,
+          );
+        }
+      }
+
+      // Execute via tool registry (custom/built-in tools)
+      try {
+        const storedContext = this.toolExecutionContext || {};
+        const passedAuthContext = options.authContext || {};
+
+        // This instance's roots, on the private channel (overwrites the caller's).
+        const context = bindFileToolRoots(
+          { ...storedContext, ...passedAuthContext, hitlState: HITLState },
+          this.resolveFileToolRoots(undefined),
         );
 
-        return result as T;
-      } catch (error) {
-        logger.error(`[${functionTag}] External MCP tool execution failed:`, {
+        logger.debug(`[Using merged context for unified registry tool:`, {
           toolName,
-          serverId: externalTool.serverId,
-          error: error instanceof Error ? error.message : String(error),
+          storedContextKeys: Object.keys(storedContext),
+          finalContextKeys: Object.keys(context),
         });
+
+        const result = (await this.toolRegistry.executeTool(
+          toolName,
+          params,
+          context,
+        )) as T;
+
+        // Check if result indicates a failure and emit error event
+        if (
+          result &&
+          typeof result === "object" &&
+          "success" in result &&
+          result.success === false
+        ) {
+          const errorMessage =
+            (result as { error?: string }).error || "Tool execution failed";
+          const errorToEmit = new Error(errorMessage);
+          // Gate on listenerCount — see handleGenerateTextInternalFailure for
+          // the rationale (Node EventEmitter rethrows on no listener).
+          if (this.emitter.listenerCount("error") > 0) {
+            this.emitter.emit("error", errorToEmit);
+          }
+        }
+
+        return result;
+      } catch (error) {
+        const errorToEmit =
+          error instanceof Error ? error : new Error(String(error));
+        if (this.emitter.listenerCount("error") > 0) {
+          this.emitter.emit("error", errorToEmit);
+        }
+
+        // Check if tool was not found
+        if (error instanceof Error && error.message.includes("not found")) {
+          const availableTools = await this.getAllAvailableTools();
+          throw ErrorFactory.toolNotFound(
+            toolName,
+            availableTools.map((t) => t.name),
+          );
+        }
+
         throw ErrorFactory.toolExecutionFailed(
           toolName,
           error instanceof Error ? error : new Error(String(error)),
-          externalTool.serverId,
         );
       }
-    }
+    };
 
+    // Execute with middleware chain
     try {
-      const storedContext = this.toolExecutionContext || {};
-      const passedAuthContext = options.authContext || {};
+      const result = await executeWithMiddleware(executeCore);
 
-      const context = {
-        ...storedContext,
-        ...passedAuthContext,
-      };
-
-      logger.debug(`[Using merged context for unified registry tool:`, {
-        toolName,
-        storedContextKeys: Object.keys(storedContext),
-        finalContextKeys: Object.keys(context),
-      });
-
-      const result = (await this.toolRegistry.executeTool(
-        toolName,
-        params,
-        context,
-      )) as T;
-
-      // ADD: Check if result indicates a failure and emit error event
-      if (
-        result &&
-        typeof result === "object" &&
-        "success" in result &&
-        result.success === false
-      ) {
-        const errorMessage =
-          (result as { error?: string }).error || "Tool execution failed";
-        const errorToEmit = new Error(errorMessage);
-        this.emitter.emit("error", errorToEmit);
+      // === MCP ENHANCEMENT: Cache store (after successful execution) ===
+      if (isCacheEnabled && toolResultCache && result !== undefined) {
+        toolResultCache.cacheResult(toolName, cacheParams, result);
+        logger.debug(`[${functionTag}] Cached result for tool: ${toolName}`);
       }
 
       return result;
     } catch (error) {
-      const errorToEmit =
-        error instanceof Error ? error : new Error(String(error));
-      this.emitter.emit("error", errorToEmit);
-
-      // Check if tool was not found
-      if (error instanceof Error && error.message.includes("not found")) {
-        const availableTools = await this.getAllAvailableTools();
-        throw ErrorFactory.toolNotFound(
-          toolName,
-          availableTools.map((t) => t.name),
+      // === MCP ENHANCEMENT: Retry safe tools on failure ===
+      const toolStubForRetry = toolAnnotations
+        ? ({
+            name: toolName,
+            description: "",
+            annotations: toolAnnotations,
+            execute: async () => ({}),
+          } as MCPServerTool)
+        : undefined;
+      if (
+        toolStubForRetry &&
+        isSafeToRetry(toolStubForRetry) &&
+        error instanceof Error &&
+        isRetriableError(error)
+      ) {
+        logger.debug(
+          `[${functionTag}] Tool ${toolName} is safe to retry, attempting once more`,
         );
+        try {
+          const retryResult = await executeWithMiddleware(executeCore);
+
+          // Cache the retry result
+          if (isCacheEnabled && toolResultCache && retryResult !== undefined) {
+            toolResultCache.cacheResult(toolName, cacheParams, retryResult);
+          }
+
+          return retryResult;
+        } catch {
+          // Retry failed, throw original error
+        }
       }
 
-      throw ErrorFactory.toolExecutionFailed(
-        toolName,
-        error instanceof Error ? error : new Error(String(error)),
-      );
+      throw error;
     }
+  }
+
+  /**
+   * Get tool annotations for execution decisions (cache, retry).
+   * Checks cached tool list first, falls back to inference from tool name.
+   */
+  private getToolAnnotationsForExecution(
+    toolName: string,
+  ): MCPToolAnnotations | undefined {
+    // Check tool cache for stored annotations
+    if (this.toolCache?.tools) {
+      const tool = this.toolCache.tools.find((t) => t.name === toolName);
+      if (tool?.annotations) {
+        return tool.annotations as MCPToolAnnotations;
+      }
+    }
+    // Fallback: infer from tool name if annotations are enabled
+    if (this.mcpEnhancementsConfig?.annotations?.autoInfer !== false) {
+      return inferAnnotations({ name: toolName, description: "" });
+    }
+    return undefined;
   }
 
   /**
@@ -5197,20 +16264,17 @@ Current user's request: ${currentInput}`;
       const externalMCPToolsRaw = this.externalServerManager.getAllTools();
       for (const tool of externalMCPToolsRaw) {
         if (!allTools.has(tool.name)) {
-          const optimizedTool = optimizeToolForCollection(
-            tool as unknown as ToolInfo,
-            {
-              category: detectCategory({
-                existingCategory:
-                  typeof tool.metadata?.category === "string"
-                    ? tool.metadata.category
-                    : undefined,
-                isExternal: true,
-                serverId: tool.serverId,
-              }),
-              inputSchema: {},
-            },
-          );
+          const optimizedTool = optimizeToolForCollection(tool as ToolInfo, {
+            category: detectCategory({
+              existingCategory:
+                typeof tool.metadata?.category === "string"
+                  ? tool.metadata.category
+                  : undefined,
+              isExternal: true,
+              serverId: tool.serverId,
+            }),
+            inputSchema: {},
+          });
           allTools.set(tool.name, optimizedTool);
         }
       }
@@ -5241,8 +16305,25 @@ Current user's request: ${currentInput}`;
         }
       }
 
-      // Return canonical ToolInfo[]; defer presentation transforms to call sites
-      const tools: ToolInfo[] = uniqueTools;
+      // === MCP ENHANCEMENT: Auto-infer annotations for all tools ===
+      if (this.mcpEnhancementsConfig?.annotations?.autoInfer !== false) {
+        for (const tool of uniqueTools) {
+          if (!tool.annotations) {
+            tool.annotations = inferAnnotations({
+              name: tool.name,
+              description: tool.description || "",
+            });
+          }
+        }
+      }
+
+      // Return canonical ToolInfo[]; defer presentation transforms to call sites.
+      // Name-sorted: external MCP discovery completes in parallel, so Map
+      // insertion order varies across restarts — downstream consumers (tool
+      // listings, prompt construction, budget accounting) need a stable order.
+      const tools: ToolInfo[] = uniqueTools.sort((a, b) =>
+        a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
+      );
 
       // Update the cache
       this.toolCache = {
@@ -5264,6 +16345,10 @@ Current user's request: ${currentInput}`;
   /**
    * Get comprehensive status of all AI providers
    * Primary method for provider health checking and diagnostics
+   *
+   * Bedrock and SageMaker are never called live: their entries come back as
+   * `status: "not-configured"` with `configured: true` and the reason in
+   * `error`. Use `testProvider()` to check either one explicitly.
    */
   async getProviderStatus(options?: {
     quiet?: boolean;
@@ -5288,19 +16373,14 @@ Current user's request: ${currentInput}`;
     void AIProviderFactory;
     void hasProviderEnvVars;
 
-    const providers = [
-      "openai",
-      "bedrock",
-      "vertex",
-      "googleVertex",
-      "anthropic",
-      "azure",
-      "google-ai",
-      "huggingface",
-      "ollama",
-      "mistral",
-      "litellm",
-    ] as const;
+    // Derived from the descriptor registry instead of a hand-maintained
+    // list — covers all real providers (was previously hardcoded to 11,
+    // including "googleVertex" as a duplicate entry alongside "vertex";
+    // that alias remains resolvable via PROVIDER_ALIAS_INDEX/CLI choices,
+    // it just no longer gets its own separate status-check entry).
+    const providers = ProviderFactory.getAllDescriptors().map(
+      (d) => d.name,
+    ) as readonly string[];
 
     // Test providers with controlled concurrency
     // This reduces total time from 16s (sequential) to ~3s (parallel) while preventing resource exhaustion
@@ -5324,10 +16404,33 @@ Current user's request: ${currentInput}`;
             };
           }
 
+          // These probes are billable generate() calls signed with ambient AWS
+          // credentials, against models the account may not be allowed to
+          // call, so they are never made here.
+          if (providerName === "bedrock" || providerName === "sagemaker") {
+            return {
+              provider: providerName,
+              status: "not-configured" as const,
+              configured: true,
+              authenticated: false,
+              error: `Live status check is skipped for ${providerName}`,
+              responseTime: Date.now() - startTime,
+            };
+          }
+
           // Special handling for Ollama
           if (providerName === "ollama") {
+            let ollamaAttempt: OllamaDiagnosticPermit | undefined;
+            let ollamaOutcome: OllamaDiagnosticOutcome = "not-run";
             try {
-              const response = await fetch("http://localhost:11434/api/tags", {
+              const ollamaContext = captureOllamaDiagnosticContext();
+              const gate = beginOllamaDiagnostic(ollamaContext);
+              if (gate.kind === "suppressed") {
+                throw new Error(gate.reason);
+              }
+              ollamaAttempt = gate;
+              ollamaOutcome = "transport-failure";
+              const response = await fetch(ollamaContext.url, {
                 method: "GET",
                 signal: AbortSignal.timeout(PROVIDER_TIMEOUTS.AUTH_MS),
               });
@@ -5336,9 +16439,9 @@ Current user's request: ${currentInput}`;
                 throw new Error("Ollama service not responding");
               }
 
+              ollamaOutcome = "protocol-failure";
               const responseData = await response.json();
               const models = responseData?.models;
-              const defaultOllamaModel = "llama3.2:latest";
 
               // Runtime-safe guard: ensure models is an array with valid objects
               if (!Array.isArray(models)) {
@@ -5352,24 +16455,21 @@ Current user's request: ${currentInput}`;
                 throw new Error("Invalid models format from Ollama API");
               }
 
+              ollamaOutcome = "success";
               // Filter and validate models before comparison
               const validModels = models.filter(
                 (m): m is { name: string } =>
                   m && typeof m === "object" && typeof m.name === "string",
               );
 
-              const modelIsAvailable = validModels.some(
-                (m) => m.name === defaultOllamaModel,
-              );
-
-              if (modelIsAvailable) {
+              if (validModels.length > 0) {
                 return {
                   provider: providerName,
                   status: "working" as const,
                   configured: true,
                   authenticated: true,
                   responseTime: Date.now() - startTime,
-                  model: defaultOllamaModel,
+                  model: validModels[0].name,
                 };
               } else {
                 return {
@@ -5377,7 +16477,7 @@ Current user's request: ${currentInput}`;
                   status: "failed" as const,
                   configured: true,
                   authenticated: false,
-                  error: `Ollama service running but model '${defaultOllamaModel}' not found`,
+                  error: "Ollama service running but no models installed",
                   responseTime: Date.now() - startTime,
                 };
               }
@@ -5389,24 +16489,50 @@ Current user's request: ${currentInput}`;
                 authenticated: false,
                 error:
                   error instanceof Error
-                    ? error.message
+                    ? getOllamaDiagnosticErrorMessage(error)
                     : "Ollama service not running",
                 responseTime: Date.now() - startTime,
               };
+            } finally {
+              if (ollamaAttempt) {
+                completeOllamaDiagnostic(ollamaAttempt, ollamaOutcome);
+              }
             }
           }
 
-          // Test other providers with actual generation call
+          // Test other providers with actual generation call. The losing
+          // side of the race is aborted in `finally` below — previously the
+          // timeout promise alone rejected while the still-running
+          // testProviderConnection() call (and the provider request inside
+          // it) kept executing to completion unobserved, wasting quota and
+          // holding the connection open past the 5s status check.
           const testTimeout = 5000;
-          const testPromise = this.testProviderConnection(providerName);
+          const abortController = new AbortController();
+          const testPromise = this.testProviderConnection(
+            providerName,
+            abortController.signal,
+          );
+          let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
           const timeoutPromise = new Promise<never>((_, reject) => {
-            setTimeout(
-              () => reject(new Error("Provider test timeout (5s)")),
-              testTimeout,
-            );
+            timeoutHandle = setTimeout(() => {
+              reject(new Error("Provider test timeout (5s)"));
+            }, testTimeout);
           });
 
-          await Promise.race([testPromise, timeoutPromise]);
+          try {
+            await Promise.race([testPromise, timeoutPromise]);
+          } finally {
+            // Runs on both outcomes: clears the timer so it can't fire after
+            // a fast success, and aborts the signal so a timed-out
+            // generate() call stops instead of finishing unobserved.
+            clearTimeout(timeoutHandle);
+            // The aborted generate() resolves/rejects after the race is
+            // decided; swallow that settlement so it can't surface as an
+            // unhandledRejection, mirroring raceWithAbort's handling of the
+            // losing side.
+            testPromise.catch(() => undefined);
+            abortController.abort();
+          }
 
           return {
             provider: providerName,
@@ -5466,9 +16592,15 @@ Current user's request: ${currentInput}`;
   }
 
   /**
-   * Internal method to test provider connection with minimal generation call
+   * Internal method to test provider connection with minimal generation call.
+   * `signal` lets a caller (getProviderStatus's per-provider race) cancel the
+   * underlying request once it has already lost the race against its
+   * timeout, instead of leaving it running unobserved.
    */
-  private async testProviderConnection(providerName: string): Promise<void> {
+  private async testProviderConnection(
+    providerName: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
     const { AIProviderFactory } = await import("./core/factory.js");
 
     const provider = await AIProviderFactory.createProvider(
@@ -5480,6 +16612,7 @@ Current user's request: ${currentInput}`;
       prompt: "test",
       maxTokens: 1,
       disableTools: true,
+      abortSignal: signal,
     });
   }
 
@@ -5829,6 +16962,7 @@ Current user's request: ${currentInput}`;
       successRate: number;
       averageExecutionTime: number;
       lastExecutionTime: number;
+      errorCategories: Record<string, number>;
     }
   > {
     const metrics: Record<
@@ -5840,12 +16974,14 @@ Current user's request: ${currentInput}`;
         successRate: number;
         averageExecutionTime: number;
         lastExecutionTime: number;
+        errorCategories: Record<string, number>;
       }
     > = {};
 
     for (const [toolName, toolMetrics] of this.toolExecutionMetrics.entries()) {
       metrics[toolName] = {
         ...toolMetrics,
+        errorCategories: { ...toolMetrics.errorCategories },
         successRate:
           toolMetrics.totalExecutions > 0
             ? toolMetrics.successfulExecutions / toolMetrics.totalExecutions
@@ -5854,6 +16990,20 @@ Current user's request: ${currentInput}`;
     }
 
     return metrics;
+  }
+
+  /**
+   * NL-004: Set model alias/deprecation configuration.
+   * Models in the alias map will be warned, redirected, or blocked based on their action.
+   * @param config - Model alias configuration with aliases map
+   */
+  setModelAliasConfig(
+    config: import("./types/index.js").ModelAliasConfig,
+  ): void {
+    this.modelAliasConfig = config;
+    logger.info(
+      `[ModelAlias] Configured ${Object.keys(config.aliases).length} model aliases`,
+    );
   }
 
   /**
@@ -5935,6 +17085,7 @@ Current user's request: ${currentInput}`;
           successRate: number;
           averageExecutionTime: number;
           lastExecutionTime: number;
+          errorCategories: Record<string, number>;
         };
         circuitBreaker: {
           state: "closed" | "open" | "half-open";
@@ -5955,6 +17106,7 @@ Current user's request: ${currentInput}`;
           successRate: number;
           averageExecutionTime: number;
           lastExecutionTime: number;
+          errorCategories: Record<string, number>;
         };
         circuitBreaker: {
           state: "closed" | "open" | "half-open";
@@ -5969,10 +17121,18 @@ Current user's request: ${currentInput}`;
     // Get all tool names from toolRegistry
     const allTools = await this.toolRegistry.listTools();
     const allToolNames = new Set(allTools.map((tool) => tool.name));
+    // Build a lookup from tool name to serverId for composite breaker keys
+    const toolServerIdMap = new Map<string, string>();
+    for (const tool of allTools) {
+      if (!toolServerIdMap.has(tool.name)) {
+        toolServerIdMap.set(tool.name, tool.serverId || "unknown");
+      }
+    }
 
     for (const toolName of allToolNames) {
       const metrics = this.toolExecutionMetrics.get(toolName);
-      const circuitBreaker = this.toolCircuitBreakers.get(toolName);
+      const breakerKey = `${toolServerIdMap.get(toolName) || "unknown"}.${toolName}`;
+      const circuitBreaker = this.toolCircuitBreakers.get(breakerKey);
 
       const successRate = metrics
         ? metrics.totalExecutions > 0
@@ -6007,6 +17167,28 @@ Current user's request: ${currentInput}`;
         recommendations.push("Optimize tool performance or increase timeout");
       }
 
+      if (metrics && metrics.errorCategories) {
+        const categories = metrics.errorCategories;
+        if (categories[ErrorCategory.TIMEOUT] > 0) {
+          issues.push(`Timeout errors: ${categories[ErrorCategory.TIMEOUT]}`);
+          recommendations.push(
+            "Consider increasing the tool timeout configuration",
+          );
+        }
+        if (categories[ErrorCategory.VALIDATION] > 0) {
+          issues.push(
+            `Validation errors: ${categories[ErrorCategory.VALIDATION]}`,
+          );
+          recommendations.push("Review input schemas and parameter validation");
+        }
+        if (categories[ErrorCategory.NETWORK] > 0) {
+          issues.push(`Network errors: ${categories[ErrorCategory.NETWORK]}`);
+          recommendations.push(
+            "Check network connectivity and endpoint availability",
+          );
+        }
+      }
+
       tools[toolName] = {
         name: toolName,
         isHealthy,
@@ -6015,6 +17197,9 @@ Current user's request: ${currentInput}`;
           successRate,
           averageExecutionTime: metrics?.averageExecutionTime || 0,
           lastExecutionTime: metrics?.lastExecutionTime || 0,
+          errorCategories: metrics?.errorCategories
+            ? { ...metrics.errorCategories }
+            : {},
         },
         circuitBreaker: {
           state: circuitBreaker?.getState() || "closed",
@@ -6071,7 +17256,13 @@ Current user's request: ${currentInput}`;
     );
 
     if (!this.conversationMemory) {
-      throw new Error("Conversation memory is not enabled");
+      throw new NeuroLinkError({
+        code: ERROR_CODES.MISSING_CONFIGURATION,
+        message: "Conversation memory is not enabled",
+        category: ErrorCategory.VALIDATION,
+        severity: ErrorSeverity.HIGH,
+        retriable: false,
+      });
     }
 
     return await this.conversationMemory.getStats();
@@ -6092,11 +17283,24 @@ Current user's request: ${currentInput}`;
     );
 
     if (!this.conversationMemory) {
-      throw new Error("Conversation memory is not enabled");
+      throw new NeuroLinkError({
+        code: ERROR_CODES.MISSING_CONFIGURATION,
+        message: "Conversation memory is not enabled",
+        category: ErrorCategory.VALIDATION,
+        severity: ErrorSeverity.HIGH,
+        retriable: false,
+      });
     }
 
     if (!sessionId || typeof sessionId !== "string") {
-      throw new Error("Session ID must be a non-empty string");
+      throw new NeuroLinkError({
+        code: ERROR_CODES.INVALID_PARAMETERS,
+        message: "Session ID must be a non-empty string",
+        category: ErrorCategory.VALIDATION,
+        severity: ErrorSeverity.MEDIUM,
+        retriable: false,
+        context: { sessionId },
+      });
     }
 
     try {
@@ -6135,9 +17339,16 @@ Current user's request: ${currentInput}`;
     );
 
     if (!this.conversationMemory) {
-      throw new Error("Conversation memory is not enabled");
+      throw new NeuroLinkError({
+        code: ERROR_CODES.MISSING_CONFIGURATION,
+        message: "Conversation memory is not enabled",
+        category: ErrorCategory.VALIDATION,
+        severity: ErrorSeverity.HIGH,
+        retriable: false,
+      });
     }
 
+    this.lastCompactionMessageCount.delete(sessionId);
     return await this.conversationMemory.clearSession(sessionId);
   }
 
@@ -6154,10 +17365,212 @@ Current user's request: ${currentInput}`;
     );
 
     if (!this.conversationMemory) {
+      throw new NeuroLinkError({
+        code: ERROR_CODES.MISSING_CONFIGURATION,
+        message: "Conversation memory is not enabled",
+        category: ErrorCategory.VALIDATION,
+        severity: ErrorSeverity.HIGH,
+        retriable: false,
+      });
+    }
+
+    this.lastCompactionMessageCount.clear();
+    await this.conversationMemory.clearAllSessions();
+  }
+
+  /**
+   * List all conversation sessions with metadata (public API)
+   * @param userId - Optional user ID to filter sessions (required for Redis storage)
+   * @returns Array of session list items with metadata
+   */
+  async listSessions(userId?: string): Promise<SessionListItem[]> {
+    // First ensure memory is initialized
+    const initId = `list-sessions-init-${Date.now()}`;
+    await this.initializeConversationMemoryForGeneration(
+      initId,
+      Date.now(),
+      process.hrtime.bigint(),
+    );
+
+    if (!this.conversationMemory) {
       throw new Error("Conversation memory is not enabled");
     }
 
-    await this.conversationMemory.clearAllSessions();
+    // Check if listSessions is available on the memory manager
+    if (!this.conversationMemory.listSessions) {
+      logger.warn("listSessions not available on current memory manager");
+      return [];
+    }
+
+    const MEMORY_OPERATION_TIMEOUT = 30000; // 30 seconds
+
+    try {
+      const sessions = await withTimeout(
+        this.conversationMemory.listSessions(userId),
+        MEMORY_OPERATION_TIMEOUT,
+        new Error("listSessions operation timed out after 30s"),
+      );
+
+      logger.debug("Listed conversation sessions", {
+        userId,
+        sessionCount: sessions.length,
+      });
+
+      return sessions;
+    } catch (error) {
+      logger.error("Failed to list conversation sessions", {
+        userId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return [];
+    }
+  }
+
+  /**
+   * Export a single session with full history and metadata (public API)
+   * @param sessionId - The session ID to export
+   * @param options - Export options
+   * @returns Session export object with full history
+   */
+  async exportSession(
+    sessionId: string,
+    options: { includeMetadata?: boolean; format?: "json" | "csv" } = {},
+  ): Promise<SessionExport | null> {
+    // First ensure memory is initialized
+    const initId = `export-session-init-${Date.now()}`;
+    await this.initializeConversationMemoryForGeneration(
+      initId,
+      Date.now(),
+      process.hrtime.bigint(),
+    );
+
+    if (!this.conversationMemory) {
+      throw new Error("Conversation memory is not enabled");
+    }
+
+    if (!sessionId || typeof sessionId !== "string") {
+      throw new Error("Session ID must be a non-empty string");
+    }
+
+    const MEMORY_OPERATION_TIMEOUT = 30000; // 30 seconds
+
+    try {
+      const messages = await withTimeout(
+        this.conversationMemory.buildContextMessages(sessionId),
+        MEMORY_OPERATION_TIMEOUT,
+        new Error("buildContextMessages operation timed out after 30s"),
+      );
+
+      if (messages.length === 0) {
+        logger.debug("No messages found for session export", { sessionId });
+        return null;
+      }
+
+      const sessionResult = this.conversationMemory.getSession(sessionId);
+      const session = await withTimeout(
+        sessionResult instanceof Promise
+          ? sessionResult
+          : Promise.resolve(sessionResult),
+        MEMORY_OPERATION_TIMEOUT,
+        new Error("getSession operation timed out after 30s"),
+      );
+      const now = new Date().toISOString();
+
+      const exportData: SessionExport = {
+        sessionId,
+        title: sessionId, // Use sessionId as title if not available
+        userId: session?.userId,
+        createdAt: session?.createdAt
+          ? new Date(session.createdAt).toISOString()
+          : now,
+        updatedAt: session?.lastActivity
+          ? new Date(session.lastActivity).toISOString()
+          : now,
+        messages,
+      };
+
+      if (options.includeMetadata) {
+        exportData.exportMetadata = {
+          exportedAt: now,
+          exportFormat: options.format || "json",
+        };
+      }
+
+      logger.debug("Exported conversation session", {
+        sessionId,
+        messageCount: messages.length,
+      });
+
+      return exportData;
+    } catch (error) {
+      logger.error("Failed to export conversation session", {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Export all sessions for a user (public API)
+   * @param userId - Optional user ID (required for Redis storage)
+   * @param options - Export options
+   * @returns Array of session exports
+   */
+  async exportAllSessions(
+    userId?: string,
+    options: { includeMetadata?: boolean; format?: "json" | "csv" } = {},
+  ): Promise<SessionExport[]> {
+    // First ensure memory is initialized
+    const initId = `export-all-init-${Date.now()}`;
+    await this.initializeConversationMemoryForGeneration(
+      initId,
+      Date.now(),
+      process.hrtime.bigint(),
+    );
+
+    if (!this.conversationMemory) {
+      throw new Error("Conversation memory is not enabled");
+    }
+
+    const MEMORY_OPERATION_TIMEOUT = 30000; // 30 seconds
+    const EXPORT_SESSION_TIMEOUT = 60000; // 60 seconds for full export
+
+    try {
+      // Get all session IDs
+      const sessions = await withTimeout(
+        this.listSessions(userId),
+        MEMORY_OPERATION_TIMEOUT,
+        new Error("listSessions operation timed out after 30s"),
+      );
+      const exports: SessionExport[] = [];
+
+      for (const session of sessions) {
+        const exportData = await withTimeout(
+          this.exportSession(session.id, options),
+          EXPORT_SESSION_TIMEOUT,
+          new Error(
+            `exportSession operation timed out after 60s for session ${session.id}`,
+          ),
+        );
+        if (exportData) {
+          exports.push(exportData);
+        }
+      }
+
+      logger.debug("Exported all conversation sessions", {
+        userId,
+        sessionCount: exports.length,
+      });
+
+      return exports;
+    } catch (error) {
+      logger.error("Failed to export all conversation sessions", {
+        userId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return [];
+    }
   }
   /**
    * Store tool executions in conversation memory if enabled and Redis is configured
@@ -6199,12 +17612,19 @@ Current user's request: ${currentInput}`;
       return;
     }
 
-    // Type guard to ensure it's Redis conversation memory manager
-    const redisMemory = this
-      .conversationMemory as RedisConversationMemoryManager;
+    // Any backend that implements storeToolExecution — no longer a Redis cast.
+    // The in-memory manager implements it too, so tool activity becomes
+    // tool_call/tool_result messages regardless of STORAGE_TYPE.
+    const memory = this.conversationMemory;
+    if (!memory?.storeToolExecution) {
+      logger.debug(
+        "Tool execution storage not supported by this memory backend",
+      );
+      return;
+    }
 
     try {
-      await redisMemory.storeToolExecution(
+      await memory.storeToolExecution(
         sessionId,
         userId,
         toolCalls,
@@ -6222,17 +17642,378 @@ Current user's request: ${currentInput}`;
   }
 
   /**
-   * Check if tool execution storage is available
-   * @returns boolean indicating if Redis storage is configured and available
+   * Check if tool execution storage is available.
+   *
+   * Now capability-based rather than Redis-specific: any configured memory
+   * backend implementing `storeToolExecution` qualifies. The old check
+   * required `STORAGE_TYPE === "redis"` AND a Redis manager by class name, so
+   * in-memory sessions reported false and silently skipped tool persistence.
+   *
+   * @returns whether the active memory backend can persist tool executions
    */
   isToolExecutionStorageAvailable(): boolean {
-    const isRedisStorage = process.env.STORAGE_TYPE === "redis";
-    const hasRedisConversationMemory =
-      this.conversationMemory &&
-      this.conversationMemory.constructor.name ===
-        "RedisConversationMemoryManager";
+    return typeof this.conversationMemory?.storeToolExecution === "function";
+  }
 
-    return !!(isRedisStorage && hasRedisConversationMemory);
+  /**
+   * Get the raw messages array for a session.
+   * Returns the full messages list without context filtering or summarization.
+   * @param sessionId - The session ID to retrieve messages for
+   * @returns Array of ChatMessage objects, or empty array if session doesn't exist
+   */
+  async getSessionMessages(
+    sessionId: string,
+    userId?: string,
+  ): Promise<ChatMessage[]> {
+    const initId = `get-msgs-init-${Date.now()}`;
+    await this.initializeConversationMemoryForGeneration(
+      initId,
+      Date.now(),
+      process.hrtime.bigint(),
+    );
+
+    if (!this.conversationMemory) {
+      throw new NeuroLinkError({
+        code: ERROR_CODES.MISSING_CONFIGURATION,
+        message: "Conversation memory is not enabled",
+        category: ErrorCategory.VALIDATION,
+        severity: ErrorSeverity.HIGH,
+        retriable: false,
+      });
+    }
+
+    if (!sessionId || typeof sessionId !== "string") {
+      throw new NeuroLinkError({
+        code: ERROR_CODES.INVALID_PARAMETERS,
+        message: "Session ID must be a non-empty string",
+        category: ErrorCategory.VALIDATION,
+        severity: ErrorSeverity.MEDIUM,
+        retriable: false,
+        context: { sessionId },
+      });
+    }
+
+    return await this.conversationMemory.getSessionMessages(sessionId, userId);
+  }
+
+  /**
+   * Record one finished turn from a transport that does not go through
+   * generate()/stream() — a voice call — into the same conversation memory
+   * typed chat uses: same key, same manager, same summarization and title
+   * handling, same optional long-term memory write.
+   *
+   * Identity is never defaulted: `userId` is required, because typed chat falls
+   * back to a shared placeholder user when it is missing and a spoken turn must
+   * never be filed there. Recording the same `turnId` twice stores it once, so
+   * a caller can retry after an ambiguous failure.
+   *
+   * A turn with a blank user message, or a blank response and no tool events,
+   * is not stored (an empty assistant message makes some providers reject the
+   * next request); the result says which. Storage failures throw — the caller
+   * decides whether to retry or to carry on without the turn.
+   *
+   * @throws NeuroLinkError (INVALID_PARAMETERS) for a bad sessionId or userId
+   * @throws NeuroLinkError (MISSING_CONFIGURATION) when conversation memory is not enabled
+   * @throws ConversationMemoryError (STORAGE_ERROR) when the store rejects the write
+   */
+  async recordConversationTurn(
+    options: RecordConversationTurnOptions,
+  ): Promise<RecordConversationTurnResult> {
+    const { sessionId, userId, turnId } = options;
+    NeuroLink.assertConversationIdentity(sessionId, userId);
+    const identity = { sessionId, userId, ...(turnId ? { turnId } : {}) };
+
+    if (!options.userMessage.trim()) {
+      return { recorded: false, reason: "empty-user-message", ...identity };
+    }
+    const hasToolEvents = (options.events ?? []).some(
+      (event) => event.type === "tool:start" || event.type === "tool:end",
+    );
+    if (!options.aiResponse.trim() && !hasToolEvents) {
+      return { recorded: false, reason: "empty-response", ...identity };
+    }
+
+    await this.initializeConversationMemoryForGeneration(
+      options.requestId ?? `record-turn-${Date.now()}`,
+      Date.now(),
+      process.hrtime.bigint(),
+    );
+    if (!this.conversationMemory) {
+      throw new NeuroLinkError({
+        code: ERROR_CODES.MISSING_CONFIGURATION,
+        message: "Conversation memory is not enabled",
+        category: ErrorCategory.VALIDATION,
+        severity: ErrorSeverity.HIGH,
+        retriable: false,
+      });
+    }
+
+    if (await this.isOwnedByAnotherUser(sessionId, userId)) {
+      throw new NeuroLinkError({
+        code: ERROR_CODES.INVALID_PARAMETERS,
+        message: "The conversation belongs to another user",
+        category: ErrorCategory.VALIDATION,
+        severity: ErrorSeverity.MEDIUM,
+        retriable: false,
+      });
+    }
+
+    const memStoreStart = Date.now();
+    try {
+      await this.conversationMemory.storeConversationTurn({
+        sessionId,
+        userId,
+        userMessage: options.userMessage,
+        aiResponse: options.aiResponse,
+        startTimeStamp: options.startTime,
+        ...(options.provider && options.model
+          ? {
+              providerDetails: {
+                provider: options.provider,
+                model: options.model,
+              },
+            }
+          : {}),
+        enableSummarization: options.enableSummarization,
+        events: options.events?.length ? options.events : undefined,
+        requestId: options.requestId,
+        ...(options.modality ? { modality: options.modality } : {}),
+        ...(turnId ? { turnId } : {}),
+        ...(options.interrupted ? { interrupted: true } : {}),
+        ...(options.callEnded ? { callEnded: true } : {}),
+      });
+      this.recordMemorySpan(
+        "memory.store",
+        { "memory.operation": "store", "memory.path": "record" },
+        Date.now() - memStoreStart,
+        SpanStatus.OK,
+      );
+    } catch (error) {
+      this.recordMemorySpan(
+        "memory.store",
+        { "memory.operation": "store", "memory.path": "record" },
+        Date.now() - memStoreStart,
+        SpanStatus.ERROR,
+        error instanceof Error ? error.message : String(error),
+      );
+      throw error;
+    }
+
+    if (this.shouldWriteMemory(options.memory, userId, options.aiResponse)) {
+      this.storeMemoryInBackground(
+        {
+          prompt: options.userMessage,
+          response: options.aiResponse.trim(),
+          userId,
+          sessionId,
+          provider: options.provider ?? "",
+          model: options.model,
+        },
+        options.memory,
+        { sessionId },
+      );
+    }
+
+    return { recorded: true, ...identity };
+  }
+
+  /**
+   * The most recent user/assistant messages of a conversation, bounded, for
+   * seeding a model that has no history of its own — a voice model at call
+   * start. Summaries, pinned skills, tool traffic and blank messages are left
+   * out; the oldest messages are dropped first when `maxChars` would be
+   * exceeded. Best effort: a missing conversation, disabled memory or a read
+   * failure yields an empty seed and never throws, because a call must start
+   * either way.
+   */
+  async getConversationSeed(
+    options: ConversationSeedOptions,
+  ): Promise<ConversationSeedMessage[]> {
+    const { sessionId, userId } = options;
+    const maxTurns = Math.max(0, Math.floor(options.maxTurns ?? 10));
+    const maxChars = Math.max(0, Math.floor(options.maxChars ?? 6000));
+    try {
+      NeuroLink.assertConversationIdentity(sessionId, userId);
+      const stored = await this.getSessionMessages(sessionId, userId);
+      const spoken: ConversationSeedMessage[] = [];
+      for (const message of stored) {
+        if (
+          (message.role !== "user" && message.role !== "assistant") ||
+          message.metadata?.isSummary ||
+          message.metadata?.isSkill ||
+          typeof message.content !== "string" ||
+          !message.content.trim()
+        ) {
+          continue;
+        }
+        spoken.push({
+          role: message.role,
+          content: message.content,
+          ...(message.metadata?.modality
+            ? { modality: message.metadata.modality }
+            : {}),
+        });
+      }
+      const recent = spoken.slice(-(maxTurns * 2));
+      let used = 0;
+      let firstKept = recent.length;
+      for (let index = recent.length - 1; index >= 0; index -= 1) {
+        used += recent[index].content.length;
+        if (used > maxChars) {
+          break;
+        }
+        firstKept = index;
+      }
+      return recent.slice(firstKept);
+    } catch (error) {
+      logger.warn("[NeuroLink] getConversationSeed failed, starting unseeded", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return [];
+    }
+  }
+
+  /**
+   * Whether a conversation already holds messages under this user. A client
+   * may name the conversation a call appends to; the server accepts the name
+   * only when this is true for the user the session is verified as.
+   */
+  async conversationExists(options: {
+    sessionId: string;
+    userId: string;
+  }): Promise<boolean> {
+    NeuroLink.assertConversationIdentity(options.sessionId, options.userId);
+    const stored = await this.getSessionMessages(
+      options.sessionId,
+      options.userId,
+    );
+    if (stored.length === 0) {
+      return false;
+    }
+    return !(await this.isOwnedByAnotherUser(
+      options.sessionId,
+      options.userId,
+    ));
+  }
+
+  /**
+   * Whether a stored conversation is owned by someone other than `userId`.
+   *
+   * The Redis manager includes the user in the key, so a different user simply
+   * never finds the conversation. The in-process manager keys sessions by id
+   * alone and only records the owner, so ownership is checked here: a session
+   * that exists with no recorded owner, or another one, is not `userId`'s.
+   */
+  private async isOwnedByAnotherUser(
+    sessionId: string,
+    userId: string,
+  ): Promise<boolean> {
+    const memory = this.conversationMemory;
+    if (!memory || memory.isRedisConfigured) {
+      return false;
+    }
+    const session = await memory.getSession(sessionId);
+    return session !== undefined && session.userId !== userId;
+  }
+
+  /** Shared identity check for the voice-memory methods. */
+  private static assertConversationIdentity(
+    sessionId: unknown,
+    userId: unknown,
+  ): void {
+    const problem =
+      typeof sessionId !== "string" || !sessionId.trim()
+        ? "sessionId must be a non-empty string"
+        : sessionId.includes(":")
+          ? 'sessionId must not contain ":"'
+          : typeof userId !== "string" || !userId.trim()
+            ? "userId must be a non-empty string"
+            : undefined;
+    if (problem) {
+      throw new NeuroLinkError({
+        code: ERROR_CODES.INVALID_PARAMETERS,
+        message: problem,
+        category: ErrorCategory.VALIDATION,
+        severity: ErrorSeverity.MEDIUM,
+        retriable: false,
+      });
+    }
+  }
+
+  /**
+   * Replace the entire messages array for a session.
+   * @param sessionId - The session ID to update
+   * @param messages - The new messages array
+   * @param userId - Optional user ID for scoped Redis key lookup
+   */
+  async setSessionMessages(
+    sessionId: string,
+    messages: ChatMessage[],
+    userId?: string,
+  ): Promise<void> {
+    const initId = `set-msgs-init-${Date.now()}`;
+    await this.initializeConversationMemoryForGeneration(
+      initId,
+      Date.now(),
+      process.hrtime.bigint(),
+    );
+
+    if (!this.conversationMemory) {
+      throw new NeuroLinkError({
+        code: ERROR_CODES.MISSING_CONFIGURATION,
+        message: "Conversation memory is not enabled",
+        category: ErrorCategory.VALIDATION,
+        severity: ErrorSeverity.HIGH,
+        retriable: false,
+      });
+    }
+
+    if (!sessionId || typeof sessionId !== "string") {
+      throw new NeuroLinkError({
+        code: ERROR_CODES.INVALID_PARAMETERS,
+        message: "Session ID must be a non-empty string",
+        category: ErrorCategory.VALIDATION,
+        severity: ErrorSeverity.MEDIUM,
+        retriable: false,
+        context: { sessionId },
+      });
+    }
+
+    await this.conversationMemory.setSessionMessages(
+      sessionId,
+      messages,
+      userId,
+    );
+  }
+
+  /**
+   * Modify the last assistant message in a session using a transformer function.
+   * Convenience wrapper around getSessionMessages/setSessionMessages.
+   * @param sessionId - The session ID to modify
+   * @param transformer - Function that receives the last assistant message content and returns the modified content
+   * @param userId - Optional user ID for scoped Redis key lookup
+   * @returns true if a message was modified, false if no assistant message was found
+   */
+  async modifyLastAssistantMessage(
+    sessionId: string,
+    transformer: (content: string) => string,
+    userId?: string,
+  ): Promise<boolean> {
+    const messages = await this.getSessionMessages(sessionId, userId);
+
+    // Find the last assistant message (searching from the end)
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "assistant") {
+        messages[i] = {
+          ...messages[i],
+          content: transformer(messages[i].content),
+        };
+        await this.setSessionMessages(sessionId, messages, userId);
+        return true;
+      }
+    }
+
+    return false;
   }
 
   // ===== EXTERNAL MCP SERVER METHODS =====
@@ -6269,18 +18050,48 @@ Current user's request: ${currentInput}`;
           },
         );
 
+        // === MCP ENHANCEMENT: Lazy-init ToolRouter when 2+ servers exist ===
+        if (this.mcpEnhancementsConfig?.router?.enabled !== false) {
+          const servers = this.externalServerManager.listServers();
+          if (servers.length >= 2 && !this.mcpToolRouter) {
+            this.mcpToolRouter = new ToolRouter({
+              strategy:
+                this.mcpEnhancementsConfig?.router?.strategy ?? "least-loaded",
+              enableAffinity:
+                this.mcpEnhancementsConfig?.router?.enableAffinity ?? false,
+            });
+            // Register all existing servers
+            for (const server of servers) {
+              this.mcpToolRouter.registerServer(server.id || serverId);
+            }
+            logger.debug(
+              "[NeuroLink] ToolRouter auto-initialized (2+ external servers)",
+            );
+          } else if (this.mcpToolRouter) {
+            this.mcpToolRouter.registerServer(serverId);
+          }
+        }
+
         // Emit server added event
         this.emitter.emit("externalMCP:serverAdded", {
           serverId,
+          serverName: config.name || serverId,
           config,
           toolCount: result.metadata?.toolsDiscovered || 0,
           timestamp: Date.now(),
         });
       } else {
+        // Single ERROR record for a failed registration — the inner layers
+        // (client factory, server manager) log at debug so one root cause no
+        // longer fans out into 5 ERROR lines. Carry enough context here to
+        // diagnose without the inner lines.
         mcpLogger.error(
           `[NeuroLink] Failed to add external MCP server: ${serverId}`,
           {
             error: result.error,
+            transport: config.transport,
+            command: config.command,
+            url: config.url ? redactUrlCredentials(config.url) : undefined,
           },
         );
       }
@@ -6308,6 +18119,9 @@ Current user's request: ${currentInput}`;
     try {
       mcpLogger.info(`[NeuroLink] Removing external MCP server: ${serverId}`);
 
+      // Capture the configured name before removal destroys the instance
+      const serverName = this.externalServerManager.getServerName(serverId);
+
       const result = await this.externalServerManager.removeServer(serverId);
 
       if (result.success) {
@@ -6318,8 +18132,15 @@ Current user's request: ${currentInput}`;
         // Emit server removed event
         this.emitter.emit("externalMCP:serverRemoved", {
           serverId,
+          serverName,
           timestamp: Date.now(),
         });
+      } else if (result.error?.includes("not found")) {
+        // Expected no-op: consumers commonly call remove as cleanup after a
+        // failed add, when the server never registered. Not an error.
+        mcpLogger.debug(
+          `[NeuroLink] Remove skipped — external MCP server not registered: ${serverId}`,
+        );
       } else {
         mcpLogger.error(
           `[NeuroLink] Failed to remove external MCP server: ${serverId}`,
@@ -6343,6 +18164,10 @@ Current user's request: ${currentInput}`;
    * List all external MCP servers
    * @returns Array of server health information
    */
+  getExternalMCPServerHealth(): ExternalMCPServerHealth[] {
+    return this.externalServerManager.getServerStatuses();
+  }
+
   listExternalMCPServers(): Array<{
     serverId: string;
     status: string;
@@ -6388,14 +18213,70 @@ Current user's request: ${currentInput}`;
    */
   async executeExternalMCPTool(
     serverId: string,
-    toolName: string,
+    requestedToolName: string,
     parameters: JsonObject,
     options?: { timeout?: number },
   ): Promise<unknown> {
+    // Falls back to the requested name so the catch block below still has
+    // something meaningful to log if resolution itself is what throws.
+    let toolName = requestedToolName;
     try {
+      // Direct-boundary name repair (see resolveDirectMcpToolName): an exact
+      // match returns requestedToolName unchanged, so every existing caller
+      // — including the AI-SDK generation path's createExternalMCPTool,
+      // which always calls with an already-discovered name — is unaffected.
+      toolName = this.resolveDirectMcpToolName(serverId, requestedToolName);
+
       mcpLogger.debug(
         `[NeuroLink] Executing external MCP tool: ${toolName} on ${serverId}`,
       );
+
+      // BZ-664: Check existing ToolResultCache before executing to avoid
+      // duplicate identical calls within the same session.
+      //
+      // Safety guards aligned with executeToolInternal():
+      // - Skip destructive tools (destructiveHint annotation)
+      // - Scope cache key by serverId (two servers can expose same tool name)
+      //   and toolExecutionContext (prevents cross-session/user leaks)
+      const toolAnnotations = this.getToolAnnotationsForExecution(toolName);
+      const cacheEnabled =
+        !!this.mcpToolResultCache &&
+        !this._disableToolCacheForCurrentRequest &&
+        !toolAnnotations?.destructiveHint;
+      const cacheKeyArgs = {
+        __serverId: serverId,
+        __args: parameters,
+        ...(this.toolExecutionContext
+          ? { __ctx: this.toolExecutionContext }
+          : {}),
+      };
+      // Same repeat-within-request bypass as executeToolInternal: a model
+      // re-calling the identical tool+args in one turn wants fresh state.
+      const externalRepeatKey = this._generationTurnActive
+        ? this.toolCacheRepeatKey(toolName, cacheKeyArgs)
+        : undefined;
+      const isExternalRepeatThisRequest =
+        externalRepeatKey !== undefined &&
+        this._toolCacheKeysServedThisRequest.has(externalRepeatKey);
+      if (externalRepeatKey !== undefined) {
+        this._toolCacheKeysServedThisRequest.add(externalRepeatKey);
+      }
+      if (
+        cacheEnabled &&
+        this.mcpToolResultCache &&
+        !isExternalRepeatThisRequest
+      ) {
+        const cached = this.mcpToolResultCache.getCachedResult(
+          toolName,
+          cacheKeyArgs,
+        );
+        if (cached !== undefined) {
+          mcpLogger.debug(
+            `[NeuroLink] Tool result cache HIT: ${toolName} on ${serverId}`,
+          );
+          return cached;
+        }
+      }
 
       const result = await this.externalServerManager.executeTool(
         serverId,
@@ -6404,8 +18285,38 @@ Current user's request: ${currentInput}`;
         options,
       );
 
+      // BZ-664: Store result in cache after successful execution.
+      // Only cache SUCCESSFUL results. Caching an error result (isError:true /
+      // success:false — e.g. an upstream 403/timeout surfaced as a tool error)
+      // replays that identical failure to every caller with the same args for
+      // the whole TTL, turning a single transient upstream error into a storm
+      // of cached failures and preventing a retry from re-hitting the server
+      // once it recovers. Errors must always re-execute. (Detection mirrors the
+      // isToolError check used elsewhere in this file.)
+      const resultObj =
+        result && typeof result === "object"
+          ? (result as Record<string, unknown>)
+          : undefined;
+      const isErrorResult = Boolean(
+        (resultObj && "isError" in resultObj && resultObj.isError === true) ||
+        (resultObj && "success" in resultObj && resultObj.success === false),
+      );
+      // Also skip an `undefined` result: the cache read side treats `undefined`
+      // as a miss (`cached !== undefined`), so storing it is a dead entry that can
+      // never be read back — keep write/read symmetric with the other cache sites.
+      if (
+        cacheEnabled &&
+        this.mcpToolResultCache &&
+        !isErrorResult &&
+        result !== undefined
+      ) {
+        this.mcpToolResultCache.cacheResult(toolName, cacheKeyArgs, result);
+      }
+
       mcpLogger.debug(
-        `[NeuroLink] External MCP tool executed successfully: ${toolName}`,
+        `[NeuroLink] External MCP tool ${
+          isErrorResult ? "returned error" : "executed successfully"
+        }: ${toolName}`,
       );
       return result;
     } catch (error) {
@@ -6415,6 +18326,84 @@ Current user's request: ${currentInput}`;
       );
       throw error;
     }
+  }
+
+  /**
+   * Resolve a tool name for a direct external MCP execution
+   * (`executeExternalMCPTool`) against the server's currently discovered
+   * tools.
+   *
+   * `experimental_repairToolCall` only runs inside the AI-SDK's own
+   * streamText/generateText loop (see toolCallRepair.ts), so a near-miss
+   * tool name reaching `executeExternalMCPTool` directly previously had no
+   * recovery at all — just the generic `Tool 'x' not found for server 'y'`
+   * `Error` that `ToolDiscoveryService.executeTool` throws deeper in the
+   * stack. This reuses the same name-matching policy
+   * (`resolveToolName`: case-insensitive exact → unambiguous substring →
+   * Levenshtein) so a repair here is accepted under exactly the rules
+   * already proven for the generation path.
+   *
+   * Exact match is a zero-risk fast path: it is returned unchanged before
+   * any resolution attempt, so every existing caller that already sends a
+   * valid name — including the AI-SDK path's `createExternalMCPTool`, which
+   * always executes with a name it just discovered — sees no behaviour
+   * change.
+   *
+   * Deliberately does NOT attempt a repair when the server is unknown or
+   * not connected: `ExternalServerManager.executeTool` throws distinct,
+   * more accurate errors for those states ("Server 'x' not found" /
+   * "not in connected state"), and resolving against an empty tool list
+   * here would replace those with a misleading "tool not found" instead.
+   */
+  private resolveDirectMcpToolName(
+    serverId: string,
+    requestedName: string,
+  ): string {
+    const server = this.getExternalMCPServer(serverId);
+    if (!server || server.status !== "connected" || !server.client) {
+      return requestedName;
+    }
+
+    const availableNames = this.getExternalMCPServerTools(serverId).map(
+      (tool) => tool.name,
+    );
+    if (availableNames.includes(requestedName)) {
+      return requestedName;
+    }
+
+    const resolution = resolveToolName(requestedName, availableNames);
+    if (!resolution) {
+      throw new ExternalMcpToolNotFoundError(
+        requestedName,
+        serverId,
+        rankToolNameCandidates(requestedName, availableNames),
+      );
+    }
+
+    // Recorded on a short-lived span rather than the method's return value:
+    // executeExternalMCPTool returns the raw upstream tool result verbatim
+    // (widely consumed as-is, e.g. by createExternalMCPTool's execute()),
+    // so wrapping it to carry resolution metadata would be a breaking
+    // change for every existing direct caller.
+    tracers.mcp.startActiveSpan(
+      "mcp.toolNameRepair",
+      {
+        attributes: {
+          "mcp.server_id": serverId,
+          "mcp.tool_name.requested": requestedName,
+          "mcp.tool_name.resolved": resolution.name,
+          "mcp.tool_name.repair_strategy": resolution.strategy,
+          ...(resolution.score !== undefined
+            ? { "mcp.tool_name.repair_score": resolution.score }
+            : {}),
+        },
+      },
+      (span) => span.end(),
+    );
+    mcpLogger.info(
+      `[NeuroLink] Repaired external MCP tool name at direct execution boundary: "${requestedName}" → "${resolution.name}" (${resolution.strategy}) on server '${serverId}'`,
+    );
+    return resolution.name;
   }
 
   /**
@@ -6443,7 +18432,10 @@ Current user's request: ${currentInput}`;
     config: MCPServerInfo,
   ): Promise<BatchOperationResult> {
     try {
-      const { MCPClientFactory } = await import("./mcp/mcpClientFactory.js");
+      const { MCPClientFactory } = await withTimeout(
+        import("./mcp/mcpClientFactory.js"),
+        10000,
+      );
 
       const testResult = await MCPClientFactory.testConnection(config, 10000);
 
@@ -6496,6 +18488,346 @@ Current user's request: ${currentInput}`;
       );
       throw error;
     }
+  }
+
+  // ===== MCP ENHANCEMENTS SDK METHODS =====
+
+  /**
+   * Get the global elicitation manager for interactive tool input
+   * Elicitation allows tools to request additional information from users during execution
+   * @returns The global ElicitationManager instance
+   * @example
+   * ```typescript
+   * const elicitationManager = neurolink.getElicitationManager();
+   *
+   * // Register a handler for confirmations
+   * elicitationManager.registerHandler(async (request) => {
+   *   if (request.type === 'confirmation') {
+   *     const answer = await askUser(request.message);
+   *     return { confirmed: answer === 'yes' };
+   *   }
+   * });
+   * ```
+   */
+  async getElicitationManager() {
+    // Dynamically import to avoid circular dependencies
+    const mod = (await withTimeout(
+      import("./mcp/elicitation/index.js"),
+      10000,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    )) as any;
+    return mod.globalElicitationManager;
+  }
+
+  /**
+   * Register an elicitation handler for interactive tool input
+   * Handlers are called when tools need user input during execution
+   * @param handler - Function to handle elicitation requests
+   * @example
+   * ```typescript
+   * neurolink.registerElicitationHandler(async (request) => {
+   *   switch (request.type) {
+   *     case 'confirmation':
+   *       return { confirmed: await confirmWithUser(request.message) };
+   *     case 'text':
+   *       return { value: await promptUser(request.message) };
+   *     case 'select':
+   *       return { value: await selectFromOptions(request.options) };
+   *   }
+   * });
+   * ```
+   */
+  async registerElicitationHandler(
+    handler: (request: unknown) => Promise<unknown>,
+  ): Promise<void> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const elicitationManager = (await this.getElicitationManager()) as any;
+    elicitationManager.registerHandler(handler);
+  }
+
+  /**
+   * Get the multi-server manager for load balancing and coordination
+   * Allows managing multiple MCP servers with failover and load balancing
+   * @returns The global MultiServerManager instance
+   * @example
+   * ```typescript
+   * const multiServer = neurolink.getMultiServerManager();
+   *
+   * // Create a server group with load balancing
+   * await multiServer.createServerGroup('ai-tools', {
+   *   servers: ['openai-server', 'anthropic-server'],
+   *   strategy: 'round-robin'
+   * });
+   * ```
+   */
+  async getMultiServerManager() {
+    const mod = (await withTimeout(
+      import("./mcp/multiServerManager.js"),
+      10000,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    )) as any;
+    return mod.globalMultiServerManager;
+  }
+
+  /**
+   * Get the enhanced tool discovery service
+   * Provides advanced search, filtering, and compatibility checking for tools
+   * @returns EnhancedToolDiscovery instance
+   * @example
+   * ```typescript
+   * const discovery = neurolink.getEnhancedToolDiscovery();
+   *
+   * // Search for tools by criteria
+   * const results = await discovery.searchTools({
+   *   category: 'data-processing',
+   *   capabilities: ['streaming', 'batch'],
+   *   minReliability: 0.9
+   * });
+   * ```
+   */
+  async getEnhancedToolDiscovery() {
+    const mod = (await withTimeout(
+      import("./mcp/enhancedToolDiscovery.js"),
+      10000,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    )) as any;
+    return new mod.EnhancedToolDiscovery(this.toolRegistry);
+  }
+
+  /**
+   * Get the MCP registry client for discovering servers from registries
+   * Supports multiple registry sources (official, community, custom)
+   * @returns The global MCPRegistryClient instance
+   * @example
+   * ```typescript
+   * const registryClient = neurolink.getMCPRegistryClient();
+   *
+   * // Search for servers
+   * const servers = await registryClient.searchServers({
+   *   query: 'database',
+   *   categories: ['data', 'storage']
+   * });
+   *
+   * // Get a well-known server config
+   * const githubServer = registryClient.getWellKnownServer('github');
+   * ```
+   */
+  async getMCPRegistryClient() {
+    const mod = (await withTimeout(
+      import("./mcp/mcpRegistryClient.js"),
+      10000,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    )) as any;
+    return mod.globalMCPRegistryClient;
+  }
+
+  /**
+   * Expose a NeuroLink agent as an MCP tool
+   * This allows agents to be called by other systems via MCP
+   * @param agent - The agent to expose (must include id, name, description, and execute)
+   * @param options - Exposure configuration options (prefix, defaultAnnotations, etc.)
+   * @returns The exposed tool definition
+   * @example
+   * ```typescript
+   * const agent = {
+   *   id: 'my-agent',
+   *   name: 'My Agent',
+   *   description: 'An agent that processes data',
+   *   execute: async (params) => { ... }
+   * };
+   * const tool = await neurolink.exposeAgentAsTool(agent, {
+   *   prefix: 'agent_'
+   * });
+   * ```
+   */
+  async exposeAgentAsTool(
+    agent: {
+      id: string;
+      name: string;
+      description: string;
+      execute: (params: unknown, context?: unknown) => Promise<unknown>;
+    },
+    options?: {
+      prefix?: string;
+      includeMetadataInDescription?: boolean;
+      wrapWithContext?: boolean;
+      executionTimeout?: number;
+      enableLogging?: boolean;
+    },
+  ) {
+    const agentExposure = await withTimeout(
+      import("./mcp/agentExposure.js"),
+      10000,
+    );
+    return agentExposure.exposeAgentAsTool(agent, options);
+  }
+
+  /**
+   * Expose a workflow as an MCP tool
+   * This allows workflows to be called by other systems via MCP
+   * @param workflow - The workflow to expose (must include id, name, description, and execute)
+   * @param options - Exposure configuration options (prefix, defaultAnnotations, etc.)
+   * @returns The exposed tool definition
+   * @example
+   * ```typescript
+   * const workflow = {
+   *   id: 'data-pipeline',
+   *   name: 'Data Pipeline',
+   *   description: 'Runs the data processing pipeline',
+   *   execute: async (params) => { ... }
+   * };
+   * const tool = await neurolink.exposeWorkflowAsTool(workflow, {
+   *   prefix: 'workflow_'
+   * });
+   * ```
+   */
+  async exposeWorkflowAsTool(
+    workflow: {
+      id: string;
+      name: string;
+      description: string;
+      execute: (params: unknown, context?: unknown) => Promise<unknown>;
+      steps?: Array<{ id: string; name: string; description?: string }>;
+    },
+    options?: {
+      prefix?: string;
+      includeMetadataInDescription?: boolean;
+      wrapWithContext?: boolean;
+      executionTimeout?: number;
+      enableLogging?: boolean;
+    },
+  ) {
+    const agentExposure = await withTimeout(
+      import("./mcp/agentExposure.js"),
+      10000,
+    );
+    return agentExposure.exposeWorkflowAsTool(workflow, options);
+  }
+
+  /**
+   * Get the tool integration manager for middleware and elicitation
+   * Provides advanced tool wrapping with confirmation, timeout, retry, etc.
+   * @returns The global ToolIntegrationManager instance
+   * @example
+   * ```typescript
+   * const integration = neurolink.getToolIntegrationManager();
+   *
+   * // Register a tool with middleware
+   * integration.registerTool(myTool, {
+   *   timeout: 30000,
+   *   retries: 3,
+   *   requireConfirmation: true
+   * });
+   * ```
+   */
+  async getToolIntegrationManager() {
+    const mod = (await withTimeout(
+      import("./mcp/toolIntegration.js"),
+      10000,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    )) as any;
+    return mod.globalToolIntegrationManager;
+  }
+
+  /**
+   * Convert NeuroLink tools to MCP format
+   * Useful for exposing local tools to external MCP clients
+   * @param tools - Array of NeuroLink tool definitions
+   * @param options - Conversion options
+   * @returns Array of MCP-formatted tools
+   * @example
+   * ```typescript
+   * const mcpTools = neurolink.convertToolsToMCPFormat([
+   *   { name: 'myTool', description: 'Does something', execute: async () => {} }
+   * ]);
+   * ```
+   */
+  async convertToolsToMCPFormat(
+    tools: Array<{
+      name: string;
+      description: string;
+      execute?: (params: unknown) => unknown;
+    }>,
+    options: { namespacePrefix?: string } = {},
+  ) {
+    const mod = (await withTimeout(
+      import("./mcp/toolConverter.js"),
+      10000,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    )) as any;
+    // Ensure all tools have an execute function (required by NeuroLinkTool)
+    const normalizedTools = tools.map((tool) => ({
+      ...tool,
+      execute:
+        tool.execute ??
+        (async () => ({
+          success: false,
+          error: "No execute function provided",
+        })),
+    }));
+    return mod.batchConvertToMCP(normalizedTools, options);
+  }
+
+  /**
+   * Convert MCP tools to NeuroLink format
+   * Useful for importing tools from external MCP servers
+   * @param tools - Array of MCP tool definitions
+   * @param options - Conversion options
+   * @returns Array of NeuroLink-formatted tools
+   * @example
+   * ```typescript
+   * const neurolinkTools = neurolink.convertToolsFromMCPFormat(externalTools, {
+   *   removeNamespacePrefix: 'external_'
+   * });
+   * ```
+   */
+  async convertToolsFromMCPFormat(
+    tools: Array<{ name: string; description: string; inputSchema?: unknown }>,
+    options: { removeNamespacePrefix?: string } = {},
+  ) {
+    const mod = (await withTimeout(
+      import("./mcp/toolConverter.js"),
+      10000,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    )) as any;
+    return mod.batchConvertToNeuroLink(tools, options);
+  }
+
+  /**
+   * Get tool annotations and safety information
+   * Provides insights about tool behavior, safety levels, and retry-ability
+   * @param toolName - Name of the tool to analyze
+   * @returns Tool annotation summary
+   * @example
+   * ```typescript
+   * const annotations = await neurolink.getToolAnnotations('deleteFile');
+   * // Returns: { destructive: true, requiresConfirmation: true, safeToRetry: false }
+   * ```
+   */
+  async getToolAnnotations(toolName: string) {
+    const { inferAnnotations, mergeAnnotations, getAnnotationSummary } =
+      await withTimeout(import("./mcp/toolAnnotations.js"), 10000);
+    const toolInfo = this.toolRegistry.getToolInfo(toolName);
+    if (!toolInfo) {
+      return null;
+    }
+    // Check for explicit annotations set on the tool first
+    const explicitAnnotations = (toolInfo.tool as Record<string, unknown>)
+      .annotations as Record<string, unknown> | undefined;
+    // Infer annotations from the tool name/description as fallback
+    const inferredAnnotations = inferAnnotations({
+      name: toolInfo.tool.name,
+      description: toolInfo.tool.description ?? "",
+    });
+    // Merge: inferred first, then explicit overrides (explicit takes precedence)
+    const annotations = mergeAnnotations(
+      inferredAnnotations,
+      explicitAnnotations,
+    );
+    return {
+      annotations,
+      summary: getAnnotationSummary(annotations),
+    };
   }
 
   /**
@@ -6622,13 +18954,13 @@ Current user's request: ${currentInput}`;
   ): Promise<void> {
     try {
       // Import the integration module
-      const { initializeConversationMemory } = await import(
-        "./core/conversationMemoryInitializer.js"
-      );
+      const { initializeConversationMemory } =
+        await import("./core/conversationMemoryInitializer.js");
 
       // Use the integration module to create the appropriate memory manager
       const memoryManager = await initializeConversationMemory(
         this.conversationMemoryConfig,
+        this.emitter,
       );
       // Assign to conversationMemory with proper type to handle both memory manager types
       this.conversationMemory = memoryManager;
@@ -6675,6 +19007,2421 @@ Current user's request: ${currentInput}`;
     }
   }
 
+  // ========================================
+  // Evaluation & Scoring API
+  // ========================================
+
+  /**
+   * Create an evaluation pipeline with the specified configuration or preset.
+   * Pipelines orchestrate multiple scorers to evaluate AI responses comprehensively.
+   *
+   * @param configOrPreset - Pipeline configuration object or preset name
+   * @returns Initialized evaluation pipeline
+   *
+   * @example Using a preset
+   * ```typescript
+   * const neurolink = new NeuroLink();
+   * const pipeline = await neurolink.createEvaluationPipeline('rag');
+   * const result = await pipeline.execute({
+   *   query: 'What is the capital of France?',
+   *   response: 'Paris is the capital of France.',
+   *   context: ['France is a country in Europe. Paris is its capital.']
+   * });
+   * console.log(result.overallScore, result.passed);
+   * ```
+   *
+   * @example Using custom configuration
+   * ```typescript
+   * const pipeline = await neurolink.createEvaluationPipeline({
+   *   name: 'custom-quality',
+   *   scorers: [
+   *     { id: 'toxicity', config: { threshold: 0.9 } },
+   *     { id: 'hallucination', config: { weight: 1.5 } },
+   *     { id: 'answer-relevancy' }
+   *   ],
+   *   aggregation: { method: 'weighted' },
+   *   passThreshold: 0.8
+   * });
+   * ```
+   */
+  async createEvaluationPipeline(
+    configOrPreset:
+      | import("./types/index.js").PipelineConfig
+      | "safety"
+      | "rag"
+      | "quality"
+      | "comprehensive"
+      | "minimal"
+      | "summarization"
+      | "customerSupport"
+      | "codeGeneration",
+  ): Promise<
+    import("./evaluation/pipeline/evaluationPipeline.js").EvaluationPipeline
+  > {
+    const { EvaluationPipeline, getPreset } = await withTimeout(
+      import("./evaluation/pipeline/index.js"),
+      10000,
+      ErrorFactory.evaluationTimeout("evaluation module load", 10000),
+    );
+
+    let config: import("./types/index.js").PipelineConfig;
+
+    if (typeof configOrPreset === "string") {
+      // It's a preset name
+      config = getPreset(configOrPreset);
+    } else {
+      // It's a custom configuration
+      config = configOrPreset;
+    }
+
+    const pipeline = new EvaluationPipeline(config);
+    // Note: withTimeout races the promise but does not abort in-flight LLM calls.
+    // Full AbortController propagation into pipeline/scorer internals is planned.
+    await withTimeout(
+      pipeline.initialize(),
+      30000,
+      ErrorFactory.evaluationTimeout("pipeline initialization", 30000),
+    );
+
+    logger.debug(
+      `[NeuroLink] Created evaluation pipeline: ${config.name ?? "custom"}`,
+    );
+
+    return pipeline;
+  }
+
+  /**
+   * Run the `decide` inference type: evaluate a `state` against a batch of
+   * named, typed questions and get one typed answer each.
+   *
+   * This is NOT {@link NeuroLink.evaluate}, which scores an already-generated
+   * response with RAGAS scorers. `decide` calls a decision model — one that
+   * emits no text at all and returns calibrated, typed judgements your code
+   * can branch on.
+   *
+   * **Batch, never fan out.** On a decision model, latency is flat in
+   * question count (measured: 1 question 393ms, 400 questions 465ms) while
+   * concurrent requests queue. Put every question you might need into one
+   * call — speculative questions are nearly free, a second round trip is not.
+   *
+   * A `choice` answer carries the full probability distribution, so one
+   * question over N options also ranks all N.
+   *
+   * @example
+   * ```typescript
+   * const result = await neurolink.decide({
+   *   state: ticketText,
+   *   questions: {
+   *     team: {
+   *       type: "choice",
+   *       instructions: "Which team should handle this?",
+   *       criteria: { billing: "Payments", technical: "Bugs", sales: "Pricing" },
+   *     },
+   *     urgent: { type: "boolean", instructions: "Is this urgent?" },
+   *   },
+   * });
+   * const team = readDecisionChoice(result.answers, "team");
+   * if (team && team.confidence > 0.7) { assign(team.choice); }
+   * ```
+   *
+   * @throws when no decision provider is configured, or the call fails
+   */
+  async decide(options: DecisionOptions): Promise<DecisionResult> {
+    const { sessionId, requestId }: DecisionCallerOptions = options;
+    this.holdTelemetry();
+    return setLangfuseContext(
+      {
+        ...options.context,
+        sessionId: sessionId ?? options.context?.sessionId,
+        requestId: requestId ?? options.context?.requestId,
+      },
+      () => this.runDecide(options),
+    );
+  }
+
+  /**
+   * The provider a decision call will go to, resolved exactly as `decide()`
+   * resolves it: an explicit name (or alias) wins, else the first configured
+   * decision provider counting SDK credentials as well as the environment.
+   */
+  private resolveDecisionProviderName(
+    provider: string | undefined,
+    credentials: NeurolinkCredentials | undefined,
+  ): string | undefined {
+    return (
+      provider ??
+      resolveDefaultDecisionProvider(this.resolveCredentials(credentials))
+    );
+  }
+
+  /**
+   * The model `decide()` sends when the caller names none: the one the
+   * provider factory registered — `<PROVIDER>_MODEL` as it read at
+   * registration, else the descriptor default. `decisionLimits()` must
+   * report this same value rather than re-read the environment, or a
+   * `LAYA_MODEL` changed after registration would size a state against one
+   * checkpoint's window while the pre-flight check applies another's.
+   * Before registration has run the registry is empty, and the factory will
+   * read the environment when it does — so that read is returned here.
+   */
+  private registeredDecisionModel(descriptor: ProviderDescriptor): string {
+    const registered = ProviderFactory.getProviderInfo(
+      descriptor.name,
+    )?.defaultModel;
+    if (registered) {
+      return registered;
+    }
+    const envModel = descriptor.envVars.model
+      ? process.env[descriptor.envVars.model]
+      : undefined;
+    return envModel || descriptor.defaultModel;
+  }
+
+  /**
+   * What the decision provider can read, resolved for one model — the same
+   * figures the pre-flight refusal compares against, so a host can size the
+   * questions it adds through `decisionHooks` (or a state it is about to
+   * send) before the call instead of after the refusal.
+   *
+   * Provider resolution is `decide()`'s; the model is `query.model`, else
+   * the model `decide()` would send (see `registeredDecisionModel`); the
+   * per-model entry is flattened over the base. `enforcedLocally` says
+   * whether NeuroLink refuses an over-limit request itself (Laya) or only
+   * reports the server's ceiling (TypeSafe, whose limits are advisory).
+   *
+   * Returns null when no decision provider is configured and none is named —
+   * parity with `tryDecide` — and for a provider that declares no limits.
+   * A named provider is read whether or not it is configured: its limits are
+   * facts about the model, not about this host's credentials.
+   */
+  decisionLimits(query?: DecisionLimitsQuery): DecisionLimitsReading | null {
+    const requested = this.resolveDecisionProviderName(
+      query?.provider,
+      query?.credentials,
+    );
+    if (!requested) {
+      return null;
+    }
+    const canonical =
+      PROVIDER_ALIAS_INDEX.get(requested.toLowerCase()) ?? requested;
+    const descriptor = PROVIDER_DESCRIPTORS_BY_NAME.get(
+      canonical as AIProviderName,
+    );
+    if (!descriptor) {
+      return null;
+    }
+    const model = query?.model ?? this.registeredDecisionModel(descriptor);
+    return resolveDecisionLimitsReading(descriptor, model);
+  }
+
+  /**
+   * `decisionHooks.hookTimeoutMs`, validated once per instance. A timer
+   * honours delays from 1 to 2^31 − 1 ms and fires at once for anything
+   * else — so `Infinity`, meant to lift the bound, would instead time every
+   * hook out immediately, as would 0, NaN or a negative. Such a value falls
+   * back to the default with one warning.
+   */
+  private decisionHookTimeout(): number {
+    if (this.decisionHookTimeoutMs !== undefined) {
+      return this.decisionHookTimeoutMs;
+    }
+    const configured = this.decisionHooks?.hookTimeoutMs;
+    let resolved = DEFAULT_DECISION_HOOK_TIMEOUT_MS;
+    if (configured !== undefined) {
+      if (
+        typeof configured === "number" &&
+        Number.isFinite(configured) &&
+        configured > 0 &&
+        configured <= MAX_DECISION_HOOK_TIMEOUT_MS
+      ) {
+        resolved = configured;
+      } else {
+        logger.warn(
+          `[Decision] decisionHooks.hookTimeoutMs must be a finite number from 1 to ${MAX_DECISION_HOOK_TIMEOUT_MS} ms; using the default ${DEFAULT_DECISION_HOOK_TIMEOUT_MS} ms`,
+          { configured: String(configured) },
+        );
+      }
+    }
+    this.decisionHookTimeoutMs = resolved;
+    return resolved;
+  }
+
+  /**
+   * `EventEmitter.emit` runs listeners synchronously and rethrows whatever
+   * they throw. A decision event is observe-only, so a throwing listener
+   * must not be able to change the turn's routing or compaction outcome.
+   */
+  private emitDecisionEvent(
+    name: "decision:before" | "decision:after",
+    payload: DecisionBeforeEvent | DecisionAfterEvent,
+  ): void {
+    try {
+      this.emitter.emit(name, payload);
+    } catch (error) {
+      logger.warn(`[Decision] a ${name} listener threw`, {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * The one path every fail-open decision takes — a host's own `tryDecide`
+   * and all five built-in sites (routing, tool routing, both compaction
+   * stages, RAG planning) end up here.
+   *
+   * For a request stamped with a {@link DecisionSite} this is also where the
+   * host's `decisionHooks` ride along:
+   *
+   * 1. `extendQuestions` may add questions; a throw is logged and ignored.
+   * 2. Each host question is validated (invalid ones dropped, with a warning)
+   *    and namespaced `host__N` on the wire, so it can never collide with
+   *    NeuroLink's own ids (`difficulty`, `server__N`, `msg__N`, …).
+   * 3. Additions are capped at the provider's `maxQuestions` minus
+   *    NeuroLink's own count. Without the cap a host adding one question too
+   *    many would have the WHOLE request refused, and NeuroLink's own routing
+   *    would silently degrade to the heuristic — the host's problem would
+   *    become NeuroLink's. A provider that declares no `maxQuestions`
+   *    (TypeSafe) takes every well-formed addition. For the same reason a
+   *    question the provider cannot answer (a type it does not list, a choice
+   *    or score past its cap) is dropped on its own.
+   * 4. Answers are split: the consumer sees only its own ids, exactly as it
+   *    would without hooks; `onAnswers` gets the host's answers under the
+   *    host's original ids plus the full result.
+   *
+   * The request's `images`, `video` and `audio` ride along untouched — `merged` and
+   * the wire call spread the request, and only `state`, the questions and
+   * the result are cloned — so an XOR request keeps its Buffers and its
+   * result keeps `mediaBytes`.
+   *
+   * `decision:before` / `decision:after` fire once per site call on the
+   * instance emitter, observe-only, whether or not the call produced a
+   * result. Without hooks and listeners, the decision payload — state and
+   * questions — is exactly what the consumer built; the outer request's
+   * per-call `credentials` are still forwarded, so the account and base URL
+   * on the wire can differ from the instance's.
+   *
+   * Fail-open by construction, in three layers. Without a decision provider
+   * no hook runs and no event is emitted: the call goes to `tryRunDecide`
+   * alone, which records the WARNING `decide` observation it always did, and
+   * the consumer gets the null it always got. Everything a host can reach
+   * (its hook's return value, the event payloads, the answer split,
+   * `onAnswers`) runs inside one `try`; whatever a host throws, the consumer
+   * gets what `tryRunDecide` alone would have given it. And every
+   * host-facing value is a `structuredClone`, so a hook or listener that
+   * edits what it is handed edits neither the wire request nor the
+   * consumer's own question objects.
+   *
+   * `outer` is what the surrounding `generate()` / `stream()` supplies —
+   * per-call credentials, abort signal, ids — and wins over the same fields
+   * on the request.
+   */
+  private async siteDecide(
+    request: DecisionCallerOptions,
+    outer?: DecisionSiteContext,
+  ): Promise<DecisionResult | null> {
+    const merged: DecisionCallerOptions = {
+      ...request,
+      credentials: outer?.credentials ?? request.credentials,
+      // Either cancellation must win: the outer call's abort and the site's
+      // own deadline are independent limits.
+      signal:
+        outer?.signal && request.signal
+          ? AbortSignal.any([outer.signal, request.signal])
+          : (outer?.signal ?? request.signal),
+      sessionId: outer?.sessionId ?? request.sessionId,
+      requestId: outer?.requestId ?? request.requestId,
+    };
+    const site = merged.site;
+    if (!site) {
+      return this.tryRunDecide(merged);
+    }
+    // No host hook or event without a decision provider: a hook must not sit
+    // on the request path of a tenant that has no decision model to reach, and
+    // an event for a call that could never be made would only mislead. The
+    // plain call still runs, so the WARNING observation it records is kept.
+    if (
+      !this.resolveDecisionProviderName(merged.provider, merged.credentials)
+    ) {
+      return this.tryRunDecide(merged);
+    }
+
+    // Wire id → the host's own id, so answers can be handed back under the
+    // ids the host used, and NeuroLink's consumers never see a host id. A Map,
+    // so a host id such as `__proto__` is an ordinary key.
+    const hostIdByWireId = new Map<string, string>();
+    // Set once the wire call has returned, so the catch below knows whether
+    // to fall back to a fresh call or to hand over what was already obtained.
+    let obtained: DecisionResult | null | undefined;
+    try {
+      const ownQuestions = merged.questions;
+      const ownCount = Object.keys(ownQuestions).length;
+      const hooks = this.decisionHooks;
+      const hookTimeoutMs = this.decisionHookTimeout();
+
+      // Host-facing copies of the consumer's state and questions, made once
+      // and only when something will receive them. The consumer's question
+      // objects are often module-level rubric constants; a listener that
+      // edited one in place would otherwise rewrite every later call.
+      let hostView:
+        | { state: DecisionState; questions: DecisionQuestionMap }
+        | undefined;
+      const hostFacing = (): {
+        state: DecisionState;
+        questions: DecisionQuestionMap;
+      } => {
+        hostView ??= {
+          state: structuredClone(merged.state),
+          questions: structuredClone(ownQuestions),
+        };
+        return hostView;
+      };
+      const hookContext = (): DecisionHookContext => ({
+        site,
+        ...hostFacing(),
+        sessionId: merged.sessionId,
+        requestId: merged.requestId,
+      });
+
+      let questions: DecisionQuestionMap = ownQuestions;
+      if (hooks?.extendQuestions) {
+        let proposed: DecisionQuestionMap | undefined;
+        try {
+          proposed =
+            (await withTimeout(
+              Promise.resolve(hooks.extendQuestions(hookContext())),
+              hookTimeoutMs,
+              new Error(`extendQuestions exceeded ${hookTimeoutMs}ms`),
+            )) ?? undefined;
+        } catch (error) {
+          logger.warn(
+            `[Decision] extendQuestions hook failed for site "${site}" — proceeding with NeuroLink's own questions`,
+            { error: error instanceof Error ? error.message : String(error) },
+          );
+        }
+        const proposedEntries = proposed ? Object.entries(proposed) : [];
+        if (proposedEntries.length > 0) {
+          const limits = this.decisionLimits({
+            provider: merged.provider,
+            model: merged.model,
+            credentials: merged.credentials,
+          });
+          // A provider without a question-count cap (TypeSafe) takes
+          // every well-formed addition; its token/byte limits still apply
+          // and are what `decisionLimits()` reports for sizing.
+          const room =
+            limits?.maxQuestions !== undefined
+              ? Math.max(0, limits.maxQuestions - ownCount)
+              : Number.POSITIVE_INFINITY;
+          const combined: Record<string, DecisionQuestion> = {
+            ...ownQuestions,
+          };
+          let invalidCount = 0;
+          let unsupportedCount = 0;
+          let overflowCount = 0;
+          for (const [hostId, proposal] of proposedEntries) {
+            // The wire carries a snapshot of the host's question, never the
+            // host's object: validated as a copy, sent as that copy.
+            const question = snapshotDecisionQuestion(proposal);
+            if (question === undefined) {
+              invalidCount += 1;
+              continue;
+            }
+            // A question the provider cannot read would have the whole
+            // request refused, NeuroLink's own questions with it.
+            if (unsupportedDecisionQuestion(question, limits) !== undefined) {
+              unsupportedCount += 1;
+              continue;
+            }
+            if (hostIdByWireId.size >= room) {
+              overflowCount += 1;
+              continue;
+            }
+            const wireId = decisionKey(
+              HOST_DECISION_NAMESPACE,
+              hostIdByWireId.size,
+            );
+            combined[wireId] = question;
+            hostIdByWireId.set(wireId, hostId);
+          }
+          if (invalidCount > 0) {
+            logger.warn(
+              `[Decision] dropped ${invalidCount} malformed host question(s) for site "${site}"`,
+            );
+          }
+          if (unsupportedCount > 0) {
+            logger.warn(
+              `[Decision] dropped ${unsupportedCount} host question(s) for site "${site}" that ${limits?.provider ?? "the decision provider"} cannot answer`,
+            );
+          }
+          if (overflowCount > 0 && limits) {
+            logger.warn(
+              `[Decision] dropped ${overflowCount} host question(s) for site "${site}": ${limits.provider} accepts ${limits.maxQuestions} per request and NeuroLink asks ${ownCount}`,
+            );
+          }
+          questions = combined;
+        }
+      }
+      const hostQuestionCount = hostIdByWireId.size;
+
+      if (this.emitter.listenerCount("decision:before") > 0) {
+        const beforeEvent: DecisionBeforeEvent = {
+          site,
+          state: hostFacing().state,
+          questions:
+            hostQuestionCount === 0
+              ? hostFacing().questions
+              : structuredClone(questions),
+          hostQuestionCount,
+          sessionId: merged.sessionId,
+          requestId: merged.requestId,
+        };
+        this.emitDecisionEvent("decision:before", beforeEvent);
+      }
+
+      const startedAt = Date.now();
+      const result = await this.tryRunDecide({ ...merged, questions });
+      obtained = result;
+
+      // Null-prototype maps: a host id such as `__proto__` or `constructor`
+      // must land as an own key, not fall into the prototype and vanish.
+      const ownAnswers: Record<string, DecisionAnswer> = Object.create(null);
+      const hostAnswers: Record<string, DecisionAnswer> = Object.create(null);
+      if (result) {
+        for (const [id, answer] of Object.entries(result.answers)) {
+          const hostId = hostIdByWireId.get(id);
+          if (hostId === undefined) {
+            ownAnswers[id] = answer;
+          } else {
+            hostAnswers[hostId] = answer;
+          }
+        }
+      }
+
+      // Everything host-facing — the event and the hook — gets its own copy,
+      // so a listener that edits an answer cannot change what NeuroLink's
+      // consumer reads from the same call.
+      const hostFacingResult = result ? structuredClone(result) : null;
+      const afterEvent: DecisionAfterEvent = {
+        site,
+        answers: structuredClone(ownAnswers),
+        hostAnswers: structuredClone(hostAnswers),
+        latencyMs: result?.latencyMs ?? Date.now() - startedAt,
+        provider:
+          result?.provider ??
+          this.resolveDecisionProviderName(merged.provider, merged.credentials),
+        model: result?.model,
+        result: hostFacingResult,
+        sessionId: merged.sessionId,
+        requestId: merged.requestId,
+      };
+      this.emitDecisionEvent("decision:after", afterEvent);
+
+      if (!result || !hostFacingResult) {
+        return null;
+      }
+
+      if (hooks?.onAnswers) {
+        try {
+          await withTimeout(
+            Promise.resolve(
+              hooks.onAnswers({
+                ...hookContext(),
+                answers: structuredClone(hostAnswers),
+                result: hostFacingResult,
+              }),
+            ),
+            hookTimeoutMs,
+            new Error(`onAnswers exceeded ${hookTimeoutMs}ms`),
+          );
+        } catch (error) {
+          logger.warn(`[Decision] onAnswers hook failed for site "${site}"`, {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+
+      // The consumer's result: untouched when nothing was added, so the
+      // no-hooks path returns the very object the provider produced.
+      return hostQuestionCount === 0
+        ? result
+        : { ...result, answers: ownAnswers };
+    } catch (error) {
+      logger.warn(
+        `[Decision] site "${site}" hook or event handling threw — ${
+          obtained === undefined
+            ? "deciding with NeuroLink's own questions"
+            : "handing the consumer the answers already obtained"
+        }`,
+        { error: error instanceof Error ? error.message : String(error) },
+      );
+      if (obtained === undefined) {
+        return this.tryRunDecide(merged);
+      }
+      return obtained ? stripHostAnswers(obtained, hostIdByWireId) : null;
+    }
+  }
+
+  /**
+   * `decide()` proper. A request stamped with a site — every built-in
+   * consumer's, and a host-wired consumer's — adds `decision.site` and
+   * `decision.host_question_count` (the `host__N` ids the funnel namespaced)
+   * to both spans, so a trace can tell a routing decision from a compaction
+   * one and see how many questions the host rode along with.
+   */
+  private async runDecide(options: DecisionOptions): Promise<DecisionResult> {
+    // SDK config counts as much as the environment: credentials given to the
+    // constructor or to this call can configure a provider on their own.
+    const providerName = this.resolveDecisionProviderName(
+      options.provider,
+      options.credentials,
+    );
+    const questionIds = Object.keys(options.questions);
+    const questionCount = questionIds.length;
+    const decisionDescriptor = providerName
+      ? PROVIDER_DESCRIPTORS_BY_NAME.get(
+          (PROVIDER_ALIAS_INDEX.get(providerName.toLowerCase()) ??
+            providerName) as AIProviderName,
+        )
+      : undefined;
+    const requestedModel =
+      options.model ??
+      (decisionDescriptor && this.registeredDecisionModel(decisionDescriptor));
+    const stamped: DecisionCallerOptions = options;
+    const hostQuestionCount = questionIds.filter(isHostDecisionKey).length;
+    const siteSpanAttributes = stamped.site
+      ? {
+          "decision.site": stamped.site,
+          "decision.host_question_count": hostQuestionCount,
+        }
+      : {};
+
+    // Observability parity with generate()/stream(): an OTEL span for the
+    // trace view, a serialized span for the in-process metrics aggregator,
+    // and a cost figure. Without these a decision model is invisible — and
+    // "invisible" is the failure mode that matters here, because every
+    // internal consumer is fail-open, so a decision path that has silently
+    // stopped working looks exactly like one that was never configured.
+    return withSpan(
+      {
+        name: "decide",
+        tracer: tracers.decision,
+        expectedFailure: () => !providerName,
+        attributes: {
+          "gen_ai.system": providerName,
+          "gen_ai.operation.name": "decide",
+          "ai.provider": providerName,
+          "decision.question_count": questionCount,
+          "decision.images.count": options.images?.length ?? 0,
+          "decision.audio.count": options.audio === undefined ? 0 : 1,
+          ...siteSpanAttributes,
+        },
+      },
+      async (otelSpan) => {
+        observe(otelSpan, "generation", {
+          model: requestedModel,
+          input: { state: options.state, questions: options.questions },
+          metadata: {
+            provider: providerName,
+            ...(stamped.site && {
+              site: stamped.site,
+              host_question_count: hostQuestionCount,
+            }),
+          },
+        });
+        if (!providerName) {
+          const reason = `No decision provider is configured. Set ${describeDecisionProviderKeys()} (in the environment or in \`credentials\`), or pass \`provider\` explicitly.`;
+          observe(otelSpan, "generation", {
+            level: "WARNING",
+            statusMessage: reason,
+          });
+          throw new Error(reason);
+        }
+        const { traceId, parentSpanId } = getActiveTraceContext();
+        const startedAt = Date.now();
+        let span = SpanSerializer.createSpan(
+          SpanType.MODEL_DECISION,
+          `decision.${providerName}`,
+          {
+            "ai.provider": providerName,
+            "ai.model": options.model ?? "",
+            "decision.question_count": questionCount,
+            "decision.images.count": options.images?.length ?? 0,
+            "decision.audio.count": options.audio === undefined ? 0 : 1,
+            ...siteSpanAttributes,
+          },
+          parentSpanId,
+          traceId,
+        );
+
+        try {
+          // enableMCP: false — a decision model has no tools and never will.
+          const provider = await AIProviderFactory.createProvider(
+            providerName,
+            options.model,
+            false,
+            this,
+            undefined,
+            this.resolveCredentials(options.credentials),
+          );
+
+          if (typeof provider.decide !== "function") {
+            throw new Error(
+              `Provider "${providerName}" does not serve the decide inference type.`,
+            );
+          }
+
+          const result = await provider.decide({
+            state: options.state,
+            questions: options.questions,
+            images: options.images,
+            video: options.video,
+            audio: options.audio,
+            model: options.model,
+            signal: options.signal,
+            timeoutMs: options.timeoutMs,
+          });
+
+          const answerCount = Object.keys(result.answers).length;
+          // `providerName` is what the caller passed, so it can be an alias
+          // (`jev`, `scaledown-classify`). The pricing table is keyed by the
+          // canonical id and does not read the decide catalog, so an alias
+          // priced the decision at 0.
+          const pricedProvider =
+            PROVIDER_ALIAS_INDEX.get(providerName.toLowerCase()) ??
+            providerName;
+          const cost = calculateCost(pricedProvider, result.model, {
+            input: result.usage.inputTokens,
+            output: result.usage.outputTokens,
+            total: result.usage.inputTokens + result.usage.outputTokens,
+          });
+
+          otelSpan.setAttribute("gen_ai.response.model", result.model);
+          otelSpan.setAttribute(
+            "gen_ai.usage.input_tokens",
+            result.usage.inputTokens,
+          );
+          otelSpan.setAttribute(
+            "gen_ai.usage.output_tokens",
+            result.usage.outputTokens,
+          );
+          otelSpan.setAttribute("decision.answer_count", answerCount);
+          otelSpan.setAttribute("decision.media.bytes", result.mediaBytes ?? 0);
+          otelSpan.setAttribute("ai.cost.total", cost);
+          if (result.upstreamMs !== undefined) {
+            otelSpan.setAttribute("decision.upstream_ms", result.upstreamMs);
+          }
+          if (result.requestId) {
+            otelSpan.setAttribute("gen_ai.response.id", result.requestId);
+          }
+          observe(otelSpan, "generation", {
+            model: result.model,
+            output: result.answers,
+            usageDetails: usageDetails({
+              input: result.usage.inputTokens,
+              output: result.usage.outputTokens,
+            }),
+            costDetails: { total: cost },
+          });
+
+          span.durationMs = Date.now() - startedAt;
+          span = SpanSerializer.updateAttributes(span, {
+            // The key names the cost aggregator reads. `ai.model` is
+            // overwritten with the RESOLVED model (e.g. "jev-1.13.0"), not
+            // the alias that was sent, so spend is attributed to what
+            // actually ran.
+            "ai.model": result.model,
+            "ai.tokens.input": result.usage.inputTokens,
+            "ai.tokens.output": result.usage.outputTokens,
+            "ai.cost.input": cost,
+            "ai.cost.output": 0,
+            "ai.cost.total": cost,
+            "decision.answer_count": answerCount,
+            "decision.media.bytes": result.mediaBytes ?? 0,
+            "decision.latency_ms": result.latencyMs,
+            ...(result.upstreamMs !== undefined
+              ? { "decision.upstream_ms": result.upstreamMs }
+              : {}),
+          });
+          // BOTH aggregators, exactly as the generate path does. They are
+          // in-process stores that are never exported: what Langfuse and the
+          // OTLP exporters receive for this decision is the `decide`
+          // generation span. The instance one is what
+          // `neurolink.getMetrics()` / `getSpans()` read; the global one is
+          // what `getMetricsAggregator()` readers see. Recording to only the
+          // global one would make a decision invisible to the very API a
+          // caller would use to check whether it ran.
+          const ended = SpanSerializer.endSpan(span, SpanStatus.OK);
+          this.metricsAggregator.recordSpan(ended);
+          getMetricsAggregator().recordSpan(ended);
+          return result;
+        } catch (error) {
+          span.durationMs = Date.now() - startedAt;
+          const ended = SpanSerializer.endSpan(
+            span,
+            SpanStatus.ERROR,
+            error instanceof Error ? error.message : String(error),
+          );
+          this.metricsAggregator.recordSpan(ended);
+          getMetricsAggregator().recordSpan(ended);
+          throw error;
+        }
+      },
+    );
+  }
+
+  /**
+   * Fail-open {@link NeuroLink.decide}: returns null on any failure instead
+   * of throwing.
+   *
+   * This is the contract every internal consumer relies on. A decision model
+   * that is unconfigured, slow, rate-limited or down must never change
+   * NeuroLink's observable behaviour — the caller falls back to whatever it
+   * did before the decision was available.
+   *
+   * It also takes more questions than a provider's per-request cap: the map is
+   * split at the cap, the batches run a few at a time, and the answers come
+   * back joined. A batch that fails costs only its own answers, which every
+   * consumer already reads as "no decision"; null comes back only when every
+   * batch failed. `decide()` itself stays strict and refuses an over-cap request.
+   *
+   * A request stamped with a `site` — every built-in consumer stamps its own,
+   * so a `RAGPipeline` or `ClassifierRouter` a host wired to this method gets
+   * the same treatment as NeuroLink's internal ones — also runs the host's
+   * `decisionHooks` and emits `decision:before` / `decision:after`.
+   */
+  async tryDecide(
+    options: DecisionCallerOptions,
+  ): Promise<DecisionResult | null> {
+    this.holdTelemetry();
+    return this.siteDecide(options);
+  }
+
+  // ==========================================================================
+  // TRANSCRIBE — the speech-to-text inference type
+  // ==========================================================================
+
+  /**
+   * Transcribe a recording to text through any STT provider, with the
+   * optional layers that make self-hosted engines usable: a dictionary of
+   * names and jargon (sent to the engine as context, then repaired after the
+   * fact behind a `tryDecide` guard), an LLM rewrite, a second-opinion
+   * engine, and a fallback engine for audio the primary cannot read.
+   *
+   * The provider defaults to `NEUROLINK_STT_PROVIDER`, then the first
+   * configured STT provider, then the built-in local engine, so an instance
+   * with no STT configuration still transcribes. Per-call
+   * `credentials.stt` beats the instance's, which beats the environment.
+   *
+   * @example
+   * ```typescript
+   * const result = await neurolink.transcribe({
+   *   audio: "./meeting.wav",
+   *   dictionary: [{ term: "NeuroLink", heardAs: ["neural link"] }],
+   * });
+   * console.log(result.text, result.engine.provider, result.steps);
+   * ```
+   *
+   * @throws STTError when the audio cannot be read, the provider is unknown,
+   *   or the engine fails with no fallback that covers errors
+   */
+  async transcribe(options: TranscribeOptions): Promise<TranscribeResult> {
+    const [deps, { runTranscribe }] = await Promise.all([
+      this.buildTranscribeDeps(options.credentials?.stt),
+      import("./voice/transcribe.js"),
+    ]);
+    return runTranscribe(options, deps);
+  }
+
+  /**
+   * Transcribe a live stream of PCM16LE frames. Engines with a native stream
+   * use it; every other engine is streamed through the chunked adapter
+   * (energy-gated utterances, rolling re-transcription, LocalAgreement
+   * commits). Emits `interim`, `final`, `corrected` and the other
+   * {@link TranscribeStreamEvent}s; the same correction, fallback and
+   * provider rules as {@link NeuroLink.transcribe} apply per utterance.
+   *
+   * @example
+   * ```typescript
+   * for await (const event of neurolink.transcribeStream({ audio: micFrames })) {
+   *   if (event.type === "final") console.log(event.text);
+   * }
+   * ```
+   */
+  async *transcribeStream(
+    options: TranscribeStreamOptions,
+  ): AsyncIterable<TranscribeStreamEvent> {
+    const [deps, { runTranscribeStream }] = await Promise.all([
+      this.buildTranscribeDeps(options.credentials?.stt),
+      import("./voice/transcribeStream.js"),
+    ]);
+    yield* runTranscribeStream(options, deps);
+  }
+
+  /**
+   * Instance `credentials.stt` with a per-call `stt` slice merged on top,
+   * provider by provider and field by field (a per-call `apiKey` keeps the
+   * instance's `baseURL`). Undefined when neither has one.
+   */
+  private resolveSTTCredentials(
+    callCredentials?: STTCredentials,
+  ): STTCredentials | undefined {
+    const instance = this.credentials?.stt;
+    if (!instance || !callCredentials) {
+      return callCredentials ?? instance;
+    }
+    const merged: Record<string, unknown> = { ...instance };
+    for (const [key, callSlice] of Object.entries(callCredentials)) {
+      const instanceSlice: unknown = merged[key];
+      merged[key] =
+        instanceSlice &&
+        typeof instanceSlice === "object" &&
+        callSlice &&
+        typeof callSlice === "object"
+          ? { ...instanceSlice, ...callSlice }
+          : (callSlice ?? instanceSlice);
+    }
+    return merged as STTCredentials;
+  }
+
+  /**
+   * The STT provider for a call: an explicit name (or alias) as its
+   * canonical name, a name only a caller-registered handler knows as is, and
+   * no name as the default provider for these credentials.
+   */
+  private resolveSTTProvider(
+    name: string | undefined,
+    credentials: STTCredentials | undefined,
+  ): string {
+    const trimmed = name?.trim();
+    if (!trimmed) {
+      return resolveDefaultSTTProvider(credentials);
+    }
+    return resolveSTTProviderName(trimmed) ?? trimmed;
+  }
+
+  /**
+   * Everything the transcribe orchestration needs from this instance: STT
+   * handlers with the request's credentials applied, provider resolution,
+   * the fail-open decision model and a rewrite model.
+   */
+  private async buildTranscribeDeps(
+    callCredentials?: STTCredentials,
+  ): Promise<TranscribeDeps> {
+    await ProviderRegistry.registerAllProviders();
+    const [{ STTProcessor }, { createSTTHandler }, { STTError }] =
+      await Promise.all([
+        import("./utils/sttProcessor.js"),
+        import("./voice/index.js"),
+        import("./voice/errors.js"),
+      ]);
+    const credentials = this.resolveSTTCredentials(callCredentials);
+
+    const resolveProvider = (name?: string): string => {
+      const resolved = this.resolveSTTProvider(name, credentials);
+      if (
+        resolveSTTProviderName(resolved) === undefined &&
+        !STTProcessor.supports(resolved) &&
+        !resolveCallSTTEndpoints(credentials)[resolved.trim().toLowerCase()]
+      ) {
+        throw STTError.unknownProvider(
+          resolved,
+          listConfiguredSTTProviders(credentials),
+          describeSTTProviderKeys(),
+        );
+      }
+      return resolved;
+    };
+
+    // Same precedence as STTProcessor.resolveHandler, synchronously: a
+    // credentials slice for the provider builds a handler from it; else the
+    // registered handler; else, for a shipped provider, one from the env.
+    const getHandler = (name: string) => {
+      if (resolveCallSTTEndpoints(credentials)[name.trim().toLowerCase()]) {
+        return createSTTHandler(name, credentials);
+      }
+      const descriptor = getSTTProviderDescriptor(name);
+      if (!descriptor) {
+        return STTProcessor.getHandler(name);
+      }
+      if (credentials?.[descriptor.credentialsKey] !== undefined) {
+        return createSTTHandler(descriptor.name, credentials);
+      }
+      return (
+        STTProcessor.getHandler(descriptor.name) ??
+        createSTTHandler(descriptor.name)
+      );
+    };
+
+    return {
+      ...this.buildSTTCorrectionDeps(),
+      transcribe: (audio, provider, options) =>
+        STTProcessor.transcribe(audio, provider, options, credentials),
+      resolveProvider,
+      getHandler,
+      attachmentPolicy: this.attachmentPolicy,
+    };
+  }
+
+  /**
+   * The correction layer's two model calls: `decide` is {@link tryDecide}
+   * (fail-open — `null` on any failure), `rewrite` a plain text call with
+   * tools and memory off (`onPartial`, when given, receives the finished
+   * text once — see the note inside on why it is not streamed) and aborted
+   * at its timeout.
+   */
+  private buildSTTCorrectionDeps(): STTCorrectionDeps {
+    return {
+      decide: async (o) => {
+        // The correction layer builds plain JSON states and question maps;
+        // the decision provider validates them on its side.
+        const result = await this.tryDecide({
+          state: o.state as DecisionCallerOptions["state"],
+          questions: o.questions as DecisionCallerOptions["questions"],
+          ...(o.timeoutMs !== undefined ? { timeoutMs: o.timeoutMs } : {}),
+        });
+        return result ? { answers: result.answers } : null;
+      },
+      rewrite: async (o) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), o.timeoutMs);
+        // A server runs many transcriptions with one rewrite model, so the
+        // model is configurable once, in the environment; a request's own
+        // `correction.rewrite.provider/model` still wins.
+        const provider =
+          o.provider ?? process.env.NEUROLINK_STT_REWRITE_PROVIDER?.trim();
+        const model =
+          o.model ?? process.env.NEUROLINK_STT_REWRITE_MODEL?.trim();
+        const request = {
+          input: { text: o.user },
+          systemPrompt: o.system,
+          ...(provider ? { provider } : {}),
+          ...(model ? { model } : {}),
+          maxTokens: o.maxTokens,
+          temperature: 0,
+          disableTools: true,
+          memory: { enabled: false },
+          abortSignal: controller.signal,
+        };
+        try {
+          // Always `generate()`. Measured on the same rewrite against the same
+          // model: generate 0.7 s; stream() 3.4 s with the first chunk at
+          // 3.3 s — the stream path's setup costs more than the whole answer
+          // and delivers it in one burst anyway, so a "streamed" rewrite only
+          // risked the 12 s timeout. `onPartial` still fires once with the
+          // full text so a live caller replaces the sentence the same way.
+          const generated = await this.generate(request);
+          const text = generated.content ?? "";
+          if (o.onPartial && text) {
+            o.onPartial(text);
+          }
+          return text;
+        } finally {
+          clearTimeout(timer);
+        }
+      },
+      render: async (o) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), o.timeoutMs);
+        // Output rendering is translation, often worth a stronger model than
+        // the rewrite; it has its own setting and falls back to the rewrite's.
+        const provider =
+          o.provider ??
+          (process.env.NEUROLINK_STT_OUTPUT_PROVIDER?.trim() ||
+            process.env.NEUROLINK_STT_REWRITE_PROVIDER?.trim());
+        const model =
+          o.model ??
+          (process.env.NEUROLINK_STT_OUTPUT_MODEL?.trim() ||
+            process.env.NEUROLINK_STT_REWRITE_MODEL?.trim());
+        try {
+          const generated = await this.generate({
+            input: { text: o.user },
+            systemPrompt: o.system,
+            schema: o.schema,
+            ...(provider ? { provider } : {}),
+            ...(model ? { model } : {}),
+            maxTokens: o.maxTokens,
+            temperature: 0,
+            disableTools: true,
+            memory: { enabled: false },
+            abortSignal: controller.signal,
+          });
+          return generated.structuredData ?? generated.content ?? "";
+        } finally {
+          clearTimeout(timer);
+        }
+      },
+    };
+  }
+
+  /**
+   * `tryDecide` without the site handling: the try/catch around the call.
+   * Dispatches through `this.decide`, so a subclass override or an instance
+   * patch on the public method sees every decision — the funnel's routing,
+   * tool routing and compaction calls included, not only a host's own.
+   */
+  private async tryRunDecide(
+    options: DecisionOptions,
+  ): Promise<DecisionResult | null> {
+    try {
+      const result = await this.decideInBatches(options);
+      if (logger.shouldLog("debug")) {
+        logger.debug(
+          `decide: ${Object.keys(result.answers).length} answers in ${result.latencyMs}ms` +
+            (result.upstreamMs ? ` (upstream ${result.upstreamMs}ms)` : ""),
+          {
+            provider: result.provider,
+            model: result.model,
+            requestId: result.requestId,
+            usage: result.usage,
+          },
+        );
+      }
+      return result;
+    } catch (error) {
+      logger.debug(
+        `decide unavailable: ${error instanceof Error ? error.message : String(error)} — falling back`,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * One `decide()` call, or, when the question map is longer than the resolved
+   * provider's cap, several run a few at a time with their results joined. The
+   * provider is resolved here exactly as `decide()` resolves it, so the cap that
+   * is read is the cap of the provider that will answer.
+   */
+  private async decideInBatches(
+    options: DecisionOptions,
+  ): Promise<DecisionResult> {
+    const providerName =
+      options.provider ??
+      resolveDefaultDecisionProvider(
+        this.resolveCredentials(options.credentials),
+      );
+    // The name a caller passes may be an alias (`jev` for `typesafe`), so it is
+    // resolved to the canonical provider before its descriptor is read.
+    const canonical = providerName
+      ? PROVIDER_ALIAS_INDEX.get(providerName.toLowerCase())
+      : undefined;
+    const cap = canonical
+      ? PROVIDER_DESCRIPTORS_BY_NAME.get(canonical)?.decisionLimits
+          ?.maxQuestions
+      : undefined;
+    const batches = splitDecisionRequest(options, cap);
+    if (batches.length === 1) {
+      return this.decide(options);
+    }
+
+    const answered: DecisionResult[] = [];
+    let firstFailure: unknown;
+    for (
+      let from = 0;
+      from < batches.length;
+      from += MAX_PARALLEL_DECISION_BATCHES
+    ) {
+      const settled = await Promise.allSettled(
+        batches
+          .slice(from, from + MAX_PARALLEL_DECISION_BATCHES)
+          .map((batch) => this.decide(batch)),
+      );
+      for (const outcome of settled) {
+        if (outcome.status === "fulfilled") {
+          answered.push(outcome.value);
+        } else {
+          firstFailure ??= outcome.reason;
+        }
+      }
+    }
+
+    const [first, ...rest] = answered;
+    if (first === undefined) {
+      throw firstFailure instanceof Error
+        ? firstFailure
+        : new Error(String(firstFailure));
+    }
+    if (rest.length + 1 < batches.length) {
+      logger.debug(
+        `decide: ${batches.length - answered.length} of ${batches.length} batches failed; using the answers of the rest`,
+      );
+    }
+    return mergeDecisionResults([first, ...rest]);
+  }
+
+  /**
+   * Evaluate an AI response using the specified pipeline or scorers.
+   * This is a convenience method that creates a pipeline and executes it in one call.
+   *
+   * @param input - Scorer input containing query, response, and optional context
+   * @param options - Evaluation options including pipeline preset or custom scorers
+   * @returns Evaluation pipeline result with scores and pass/fail status
+   *
+   * @example Using a preset
+   * ```typescript
+   * const neurolink = new NeuroLink();
+   * const result = await neurolink.evaluate(
+   *   {
+   *     query: 'Explain quantum computing',
+   *     response: 'Quantum computing uses qubits...'
+   *   },
+   *   { pipeline: 'quality' }
+   * );
+   * console.log(`Score: ${result.overallScore}, Passed: ${result.passed}`);
+   * ```
+   *
+   * @example Using specific scorers
+   * ```typescript
+   * const result = await neurolink.evaluate(
+   *   {
+   *     query: 'What causes rain?',
+   *     response: 'Rain is caused by water vapor...',
+   *     context: ['The water cycle involves evaporation...']
+   *   },
+   *   { scorers: ['hallucination', 'faithfulness', 'answer-relevancy'] }
+   * );
+   * ```
+   *
+   * @example Full RAG evaluation
+   * ```typescript
+   * const result = await neurolink.evaluate(
+   *   {
+   *     query: 'Who wrote Hamlet?',
+   *     response: 'Shakespeare wrote Hamlet in 1600.',
+   *     context: ['William Shakespeare wrote Hamlet around 1600-1601.'],
+   *     groundTruth: 'William Shakespeare'
+   *   },
+   *   { pipeline: 'rag' }
+   * );
+   * ```
+   */
+  async evaluate(
+    input: import("./types/index.js").ScorerInput,
+    options?: {
+      /** Pipeline preset to use */
+      pipeline?:
+        | "safety"
+        | "rag"
+        | "quality"
+        | "comprehensive"
+        | "minimal"
+        | "summarization"
+        | "customerSupport"
+        | "codeGeneration";
+      /** Specific scorers to use (alternative to pipeline) */
+      scorers?: string[];
+      /** Pass threshold override (0-1) */
+      passThreshold?: number;
+      /** Execution mode */
+      executionMode?: "parallel" | "sequential";
+      /** Correlation ID for tracing */
+      correlationId?: string;
+      /** Overall evaluation timeout in milliseconds */
+      timeoutMs?: number;
+    },
+  ): Promise<import("./types/index.js").PipelineResult> {
+    const { EvaluationPipeline, getPreset } = await withTimeout(
+      import("./evaluation/pipeline/index.js"),
+      10000,
+      ErrorFactory.evaluationTimeout("evaluation module load", 10000),
+    );
+
+    let config: import("./types/index.js").PipelineConfig;
+
+    // Fail fast on conflicting or empty evaluator selection
+    if (options?.pipeline && options?.scorers) {
+      throw new Error(
+        "Cannot specify both 'pipeline' and 'scorers' options. Use one or the other.",
+      );
+    }
+    if (options?.scorers && options.scorers.length === 0) {
+      throw new Error(
+        "The 'scorers' array must not be empty. Provide at least one scorer ID or omit the option to use the default 'quality' preset.",
+      );
+    }
+
+    if (options?.pipeline) {
+      // Use preset
+      config = { ...getPreset(options.pipeline) };
+    } else if (options?.scorers && options.scorers.length > 0) {
+      // Use custom scorers
+      config = {
+        name: "SDK Evaluation",
+        description: "Evaluation from NeuroLink SDK",
+        scorers: options.scorers.map((id) => ({ id })),
+        executionMode: options.executionMode ?? "parallel",
+        passThreshold: options.passThreshold ?? 0.7,
+      };
+    } else {
+      // Default to quality preset
+      config = getPreset("quality");
+    }
+
+    // Apply overrides
+    if (options?.passThreshold !== undefined) {
+      config.passThreshold = options.passThreshold;
+    }
+    if (options?.executionMode !== undefined) {
+      config.executionMode = options.executionMode;
+    }
+
+    const pipeline = new EvaluationPipeline(config);
+    await withTimeout(
+      pipeline.initialize(),
+      30000,
+      ErrorFactory.evaluationTimeout("pipeline initialization", 30000),
+    );
+
+    const executionTimeoutMs = options?.timeoutMs ?? 60000;
+    const result = await withTimeout(
+      pipeline.execute(input, {
+        correlationId: options?.correlationId,
+      }),
+      executionTimeoutMs,
+      ErrorFactory.evaluationTimeout("pipeline execution", executionTimeoutMs),
+    );
+
+    logger.debug(`[NeuroLink] Evaluation completed`, {
+      pipeline: config.name,
+      overallScore: result.overallScore,
+      passed: result.passed,
+      scorerCount: result.scores.length,
+    });
+
+    return result;
+  }
+
+  /**
+   * Score a response using a single scorer.
+   * Useful for quick, targeted evaluations without the overhead of a full pipeline.
+   *
+   * @param scorerId - The ID of the scorer to use (e.g., 'toxicity', 'hallucination')
+   * @param input - Scorer input containing query, response, and optional context
+   * @param config - Optional scorer configuration overrides
+   * @returns Score result with value, reasoning, and pass/fail status
+   *
+   * @example Basic scoring
+   * ```typescript
+   * const neurolink = new NeuroLink();
+   * const result = await neurolink.score('toxicity', {
+   *   query: '',
+   *   response: 'This is a helpful response about cooking recipes.'
+   * });
+   * console.log(`Toxicity Score: ${result.score}/10, Passed: ${result.passed}`);
+   * ```
+   *
+   * @example Hallucination detection
+   * ```typescript
+   * const result = await neurolink.score('hallucination', {
+   *   query: 'What year was the Eiffel Tower built?',
+   *   response: 'The Eiffel Tower was built in 1889.',
+   *   context: ['The Eiffel Tower was constructed from 1887-1889.']
+   * });
+   * console.log(`Score: ${result.score}, Reasoning: ${result.reasoning}`);
+   * ```
+   *
+   * @example With custom threshold
+   * ```typescript
+   * const result = await neurolink.score(
+   *   'faithfulness',
+   *   {
+   *     query: 'Summarize the article',
+   *     response: 'The article discusses...',
+   *     context: ['Article content here...']
+   *   },
+   *   { threshold: 0.85, weight: 1.5 }
+   * );
+   * ```
+   */
+  async score(
+    scorerId: string,
+    input: import("./types/index.js").ScorerInput,
+    config?: import("./types/index.js").ScorerConfig,
+  ): Promise<import("./types/index.js").ScoreResult> {
+    const { ScorerRegistry } = await withTimeout(
+      import("./evaluation/scorers/index.js"),
+      10000,
+      ErrorFactory.evaluationTimeout("scorer module load", 10000),
+    );
+
+    // Ensure built-in scorers are registered
+    await withTimeout(
+      ScorerRegistry.registerBuiltInScorers(),
+      30000,
+      ErrorFactory.evaluationTimeout("scorer bootstrap", 30000),
+    );
+
+    // Get the scorer
+    const scorer = await withTimeout(
+      ScorerRegistry.getScorer(scorerId, config),
+      30000,
+      ErrorFactory.evaluationTimeout(`scorer load: ${scorerId}`, 30000),
+    );
+
+    if (!scorer) {
+      throw ErrorFactory.scorerNotFound(scorerId);
+    }
+
+    // Validate input
+    const validation = scorer.validateInput(input);
+    if (!validation.valid) {
+      throw ErrorFactory.evaluationValidationFailed(
+        scorerId,
+        validation.errors,
+      );
+    }
+
+    // Execute scoring
+    const result = await withTimeout(
+      scorer.score(input),
+      60000,
+      ErrorFactory.evaluationTimeout("scorer execution", 60000),
+    );
+
+    logger.debug(`[NeuroLink] Scoring completed`, {
+      scorerId,
+      score: result.score,
+      passed: result.passed,
+      computeTime: result.computeTime,
+    });
+
+    return result;
+  }
+
+  /**
+   * Get a list of all available scorers and their metadata.
+   * Useful for discovering what evaluation capabilities are available.
+   *
+   * @param options - Filter options
+   * @returns Array of scorer metadata
+   *
+   * @example List all scorers
+   * ```typescript
+   * const neurolink = new NeuroLink();
+   * const scorers = await neurolink.getAvailableScorers();
+   * for (const scorer of scorers) {
+   *   console.log(`${scorer.id}: ${scorer.description} (${scorer.type})`);
+   * }
+   * ```
+   *
+   * @example Filter by category
+   * ```typescript
+   * const safetyScorers = await neurolink.getAvailableScorers({
+   *   category: 'safety'
+   * });
+   * console.log('Safety scorers:', safetyScorers.map(s => s.id));
+   * ```
+   *
+   * @example Filter by type
+   * ```typescript
+   * const ruleBasedScorers = await neurolink.getAvailableScorers({
+   *   type: 'rule'
+   * });
+   * ```
+   */
+  async getAvailableScorers(options?: {
+    /** Filter by category */
+    category?: import("./types/index.js").ScorerCategory;
+    /** Filter by type */
+    type?: import("./types/index.js").ScorerType;
+  }): Promise<import("./types/index.js").ScorerMetadata[]> {
+    const { ScorerRegistry } = await withTimeout(
+      import("./evaluation/scorers/index.js"),
+      10000,
+      ErrorFactory.evaluationTimeout("scorer module load", 10000),
+    );
+
+    // Ensure built-in scorers are registered
+    await withTimeout(
+      ScorerRegistry.registerBuiltInScorers(),
+      30000,
+      ErrorFactory.evaluationTimeout("scorer bootstrap", 30000),
+    );
+
+    let scorers = ScorerRegistry.list();
+
+    // Apply filters
+    if (options?.category) {
+      scorers = scorers.filter((s) => s.category === options.category);
+    }
+    if (options?.type) {
+      scorers = scorers.filter((s) => s.type === options.type);
+    }
+
+    return scorers;
+  }
+
+  /**
+   * Get a list of available evaluation pipeline presets.
+   * Presets are pre-configured pipelines for common evaluation scenarios.
+   *
+   * @returns Array of preset names
+   *
+   * @example
+   * ```typescript
+   * const neurolink = new NeuroLink();
+   * const presets = await neurolink.getEvaluationPresets();
+   * console.log('Available presets:', presets);
+   * // Output: ['safety', 'rag', 'quality', 'comprehensive', 'minimal', ...]
+   * ```
+   */
+  async getEvaluationPresets(): Promise<string[]> {
+    const { getPresetNames } = await withTimeout(
+      import("./evaluation/pipeline/index.js"),
+      10000,
+      ErrorFactory.evaluationTimeout("evaluation module load", 10000),
+    );
+    return getPresetNames();
+  }
+
+  /**
+   * Get details of a specific evaluation preset.
+   *
+   * @param presetName - Name of the preset
+   * @returns Pipeline configuration for the preset
+   *
+   * @example
+   * ```typescript
+   * const neurolink = new NeuroLink();
+   * const ragPreset = await neurolink.getEvaluationPreset('rag');
+   * console.log('RAG preset scorers:', ragPreset.scorers.map(s => s.id));
+   * console.log('Pass threshold:', ragPreset.passThreshold);
+   * ```
+   */
+  async getEvaluationPreset(
+    presetName:
+      | "safety"
+      | "rag"
+      | "quality"
+      | "comprehensive"
+      | "minimal"
+      | "summarization"
+      | "customerSupport"
+      | "codeGeneration",
+  ): Promise<import("./types/index.js").PipelineConfig> {
+    const { getPreset } = await withTimeout(
+      import("./evaluation/pipeline/index.js"),
+      10000,
+      ErrorFactory.evaluationTimeout("evaluation module load", 10000),
+    );
+    return getPreset(presetName);
+  }
+
+  // ============================================================================
+  // MULTI-AGENT ORCHESTRATION METHODS
+  // ============================================================================
+
+  /**
+   * Create an Agent instance for multi-agent orchestration.
+   *
+   * Agents are specialized AI entities with defined instructions, tools, and behavior.
+   * They can be composed into networks for complex task orchestration.
+   *
+   * @param definition - Agent definition specifying behavior and capabilities
+   * @returns A new Agent instance
+   *
+   * @example
+   * ```typescript
+   * const researcher = neurolink.createAgent({
+   *   id: 'researcher',
+   *   name: 'Research Agent',
+   *   description: 'Searches and analyzes information from various sources',
+   *   instructions: 'You are a research assistant. Search thoroughly and cite sources.',
+   *   tools: ['websearchGrounding', 'readFile'],
+   *   model: 'gpt-4o'
+   * });
+   *
+   * const result = await researcher.execute('Find recent AI breakthroughs');
+   * ```
+   *
+   * @see {@link AgentDefinition} for definition options
+   * @see {@link Agent} for agent methods
+   * @since 8.38.0
+   */
+  async createAgent(
+    definition: AgentDefinition,
+  ): Promise<import("./agent/agent.js").Agent> {
+    const { Agent } = await import("./agent/agent.js");
+    logger.debug("[NeuroLink] Creating agent", {
+      id: definition.id,
+      name: definition.name,
+      tools: definition.tools?.length || 0,
+    });
+    return new Agent(definition, this);
+  }
+
+  /**
+   * Create an AgentNetwork for multi-agent orchestration.
+   *
+   * Networks coordinate multiple agents, workflows, and tools with intelligent
+   * LLM-powered routing. The router agent analyzes tasks and delegates to
+   * the most appropriate primitive.
+   *
+   * @param config - Network configuration with agents, workflows, and routing settings
+   * @returns A new AgentNetwork instance
+   *
+   * @example
+   * ```typescript
+   * const network = neurolink.createNetwork({
+   *   name: 'Content Team',
+   *   description: 'Collaborative content creation pipeline',
+   *   agents: [
+   *     {
+   *       id: 'researcher',
+   *       name: 'Researcher',
+   *       description: 'Finds and verifies information',
+   *       instructions: 'Research topics thoroughly...',
+   *     },
+   *     {
+   *       id: 'writer',
+   *       name: 'Writer',
+   *       description: 'Creates engaging content',
+   *       instructions: 'Write clear, engaging content...',
+   *     },
+   *     {
+   *       id: 'editor',
+   *       name: 'Editor',
+   *       description: 'Reviews and improves content',
+   *       instructions: 'Review for clarity and accuracy...',
+   *     }
+   *   ],
+   *   router: {
+   *     model: 'gpt-4o',
+   *     confidenceThreshold: 0.7
+   *   }
+   * });
+   *
+   * const result = await network.execute({
+   *   message: 'Write an article about quantum computing'
+   * });
+   * ```
+   *
+   * @see {@link AgentNetworkConfig} for configuration options
+   * @see {@link AgentNetwork} for network methods
+   * @since 8.38.0
+   */
+  async createNetwork(
+    config: AgentNetworkConfig,
+  ): Promise<import("./agent/agentNetwork.js").AgentNetwork> {
+    const { AgentNetwork } = await import("./agent/agentNetwork.js");
+    logger.debug("[NeuroLink] Creating agent network", {
+      name: config.name,
+      agentCount: config.agents.length,
+      workflowCount: config.workflows?.length || 0,
+      toolCount: config.tools?.length || 0,
+    });
+    return new AgentNetwork(config, this);
+  }
+
+  /**
+   * Create a worker-mode NeuroLink instance for sub-agent execution.
+   *
+   * Worker mode is the framework-provided version of the config block every
+   * consumer used to copy by hand: conversation memory OFF, orchestration
+   * OFF, observability inherited from this instance (worker spans join the
+   * host's tracer provider), credentials inherited, the host's tool registry shared (so
+   * worker tool calls reuse the host's connections), and an internal log
+   * bridge attached with a caller-supplied tag.
+   *
+   * Dispose the worker (`worker.dispose()`) when done — `runIsolatedAgent`
+   * does this automatically in a `finally`.
+   *
+   * @param options - Worker options (log tag/sink, registry sharing, config)
+   * @returns A new worker-mode NeuroLink instance
+   * @see {@link WorkerInstanceOptions}
+   */
+  createWorkerInstance(options?: WorkerInstanceOptions): NeuroLink {
+    const tag = options?.logTag ?? "worker";
+    const hostEmitter = this.emitter;
+    const configOverrides = (options?.config ?? {}) as Record<string, unknown>;
+
+    const workerConfig = {
+      ...(this.credentials ? { credentials: this.credentials } : {}),
+      ...configOverrides,
+      // Worker-mode fields always win over the config merge.
+      conversationMemory: { enabled: false },
+      enableOrchestration: false,
+      observability: this.observabilityConfig,
+      ...(options?.shareToolRegistry !== false && {
+        toolRegistry: this.toolRegistry,
+      }),
+    } as NeurolinkConstructorConfig;
+
+    const workerTools = this.workerToolsConfig(
+      configOverrides.tools as ToolConfig | undefined,
+    );
+    const worker = new NeuroLink(
+      workerTools ? { ...workerConfig, tools: workerTools } : workerConfig,
+    );
+
+    // The cacheable:false flag lives BESIDE the registry, not in it, so a
+    // shared registry alone would re-enable caching on the worker for exactly
+    // the tools whose results are live state (tasks_list, command_status,
+    // collect_results). The worker inherits the host's full uncacheable set.
+    if (options?.shareToolRegistry !== false) {
+      for (const uncacheableName of this.uncacheableTools) {
+        worker.uncacheableTools.add(uncacheableName);
+      }
+    }
+
+    // Constructing an instance rebinds the process-global logger sink to the
+    // new instance's emitter — restore the host as the active sink so host
+    // log bridges keep flowing while workers come and go.
+    logger.setEventEmitter(hostEmitter);
+
+    if (options?.onLog) {
+      const onLog = options.onLog;
+      const forward = (raw: unknown) => {
+        try {
+          const entry = (raw ?? {}) as {
+            level?: unknown;
+            message?: unknown;
+            timestamp?: unknown;
+            data?: unknown;
+          };
+          onLog({
+            tag,
+            level: String(entry.level ?? "info"),
+            message: String(entry.message ?? ""),
+            timestamp:
+              typeof entry.timestamp === "number"
+                ? entry.timestamp
+                : Date.now(),
+            data: entry.data,
+          });
+        } catch {
+          // Log-bridge listener errors never disrupt the worker.
+        }
+      };
+      // Bridge the WORKER's own scoped sink, not the host's process-wide one.
+      // Subscribing to hostEmitter would deliver every log event in the
+      // process — host, sibling workers, MCP — stamped with this worker's
+      // tag. The scoped registration delivers only events logged inside the
+      // worker's own generate/stream/generateText calls.
+      const bridgeEmitter: LogEventEmitter = {
+        emit: (event: string, ...args: unknown[]) => {
+          if (event === "log-event") {
+            forward(args[0]);
+          }
+          return true;
+        },
+      };
+      const workerLogInstanceId = worker.logInstanceId;
+      logger.addScopedEventEmitter(workerLogInstanceId, bridgeEmitter);
+      // Tracked on the HOST so that disposing the host — not just the
+      // worker — is enough to remove this bridge if the caller never
+      // disposes the worker itself. See `ownedWorkerLogBridgeDetachers`.
+      const detachBridge = (): void => {
+        logger.removeScopedEventEmitter(workerLogInstanceId, bridgeEmitter);
+        this.ownedWorkerLogBridgeDetachers.delete(detachBridge);
+      };
+      this.ownedWorkerLogBridgeDetachers.add(detachBridge);
+      const originalDispose = worker.dispose.bind(worker);
+      worker.dispose = async () => {
+        detachBridge();
+        await originalDispose();
+      };
+    }
+
+    logger.debug("[NeuroLink] Created worker instance", {
+      tag,
+      sharedToolRegistry: options?.shareToolRegistry !== false,
+    });
+    return worker;
+  }
+
+  /**
+   * Run an isolated sub-agent: a worker instance (see
+   * {@link createWorkerInstance}) executes a tool-using research pass under
+   * the turn budget (wrap-up nudge, stall watchdog, honest `stopReason`),
+   * then an extraction pass ALWAYS runs tools-off on its own timeout with a
+   * structured-recovery ladder and corrective re-asks. A non-empty execution
+   * record never produces an empty result (mechanical digest fallback), a
+   * parent `abortSignal` stops everything cleanly, and `options.leg` enables
+   * leashed mode with TTL'd resume handles ({@link continueAgent} /
+   * {@link stopAgent}).
+   *
+   * @param definition - Agent definition (+ optional structured extraction)
+   * @param input - Task input: string or structured object
+   * @param options - Run options (abort, overrides, tool context, events, leg)
+   * @returns The run outcome
+   * @see {@link IsolatedAgentDefinition}
+   * @see {@link AgentRunOptions}
+   * @see {@link AgentRunOutcome}
+   */
+  async runIsolatedAgent(
+    definition: IsolatedAgentDefinition,
+    input: string | Record<string, unknown>,
+    options?: AgentRunOptions,
+  ): Promise<AgentRunOutcome> {
+    const { runIsolatedAgent } = await import("./agent/isolatedAgentRunner.js");
+    return runIsolatedAgent(this, definition, input, options);
+  }
+
+  /**
+   * Resume a leashed isolated-agent run by handle. `guidance`, when given,
+   * is appended as a user turn before the next leg — the supervisor's
+   * re-steering channel. An expired handle returns its tombstoned final
+   * outcome exactly once.
+   *
+   * @param handle - Handle from an `in_progress` {@link AgentRunOutcome}
+   * @param guidance - Optional supervisor guidance for the next leg
+   * @returns The next leg's outcome (or the final outcome)
+   */
+  async continueAgent(
+    handle: string,
+    guidance?: string,
+  ): Promise<AgentRunOutcome> {
+    const { continueIsolatedAgent } =
+      await import("./agent/isolatedAgentRunner.js");
+    return continueIsolatedAgent(this, handle, guidance);
+  }
+
+  /**
+   * Stop a leashed isolated-agent run: dispose its worker and return the
+   * final outcome (mechanical digest over everything gathered so far).
+   *
+   * @param handle - Handle from an `in_progress` {@link AgentRunOutcome}
+   * @returns The final outcome
+   */
+  async stopAgent(handle: string): Promise<AgentRunOutcome> {
+    const { stopIsolatedAgent } =
+      await import("./agent/isolatedAgentRunner.js");
+    return stopIsolatedAgent(this, handle);
+  }
+
+  /**
+   * Register an isolated agent as a delegation tool on THIS instance, so
+   * its existing generate() loop can delegate — no second router generate.
+   * Framework policy (per-turn caps, depth withholding, a process-wide
+   * concurrency pool with queue timeout) is enforced in the loop itself,
+   * and every refusal carries its recovery instruction in the error text.
+   *
+   * @param definition - Agent definition (+ optional structured extraction)
+   * @param options - Registration options (name, caps, depth, pool, leg)
+   * @returns The registered tool name
+   * @see {@link AgentToolRegistrationOptions}
+   */
+  async registerAgentTool(
+    definition: IsolatedAgentDefinition,
+    options?: AgentToolRegistrationOptions,
+  ): Promise<{ name: string }> {
+    const { registerAgentTool } = await import("./agent/agentToolRegistrar.js");
+    const registered = registerAgentTool(this, definition, options);
+    this.hasAgentTools = true;
+    return registered;
+  }
+
+  /**
+   * Register the task CHECKLIST toolset — `tasks_create`, `tasks_update`,
+   * `tasks_list` — on this instance (TodoWrite-style planning for a
+   * long-running run). Opt-in and idempotent: existing callers see no new
+   * tools until they ask for them.
+   *
+   * The checklist is session state, not conversation state: it lives outside
+   * the message list, so summarization/compaction cannot lose it, and every
+   * tool result returns the whole list so the model re-anchors for free after
+   * a compaction. Read the same state from host code with
+   * {@link getTaskState} — that is all a completeness gate needs.
+   *
+   * Sessions come from the tool execution context. Call
+   * `setToolContext({ sessionId })` (or run the agent through
+   * `runIsolatedAgent`, which stamps one) so the checklist has a stable
+   * identity; a model tool call with no session anywhere falls back to a
+   * single default checklist per instance rather than one per call. A DIRECT
+   * `executeTool("tasks_create", …)` call should pass
+   * `authContext: { sessionId }` — the tool registry otherwise mints a fresh
+   * id for that one call.
+   *
+   * @see {@link getTaskState} for the host-side read
+   */
+  registerTaskTools(): void {
+    if (this.hasTaskChecklistTools) {
+      return;
+    }
+    const tools = createChecklistTools(this);
+    for (const [toolName, toolDef] of Object.entries(tools)) {
+      // Never cacheable: every one of these reads or mutates live checklist
+      // state, so a cached `tasks_list` would report a list that has already
+      // moved on — the exact silent staleness the checklist exists to prevent.
+      this.registerTool(toolName, toolDef, { cacheable: false });
+    }
+    this.hasTaskChecklistTools = true;
+    logger.info(
+      `[NeuroLink] Registered ${Object.keys(tools).length} task checklist tools`,
+    );
+  }
+
+  /**
+   * Read a session's task checklist — synchronous, so a completeness gate is
+   * one line of host code:
+   * `getTaskState(id).items.filter(i => i.status === "pending")`.
+   *
+   * Never throws: an unknown session simply has an empty checklist. Omit
+   * `sessionId` to read the session the tools would currently write to (the
+   * instance's tool-context session, or its default checklist).
+   */
+  getTaskState(sessionId?: string): ChecklistState {
+    return getChecklistState(sessionId ?? resolveChecklistSessionId(this));
+  }
+
+  /**
+   * Drop a session's checklist. Returns whether there was one to drop.
+   * Omit `sessionId` to clear the session the tools currently write to.
+   */
+  clearTaskState(sessionId?: string): boolean {
+    return clearChecklistState(sessionId ?? resolveChecklistSessionId(this));
+  }
+
+  // ========================================
+  // Async Delegation API (N2)
+  // ========================================
+
+  /**
+   * Register the background-delegation toolset — `delegate_task` and
+   * `collect_results` — on this instance. Opt-in and idempotent: existing
+   * callers see no new tools until they ask for them.
+   *
+   * Delegation through {@link registerAgentTool} is synchronous — the loop
+   * blocks on each worker. These tools make it asynchronous: `delegate_task`
+   * returns a `workerId` at once and the agent keeps working, then
+   * `collect_results` claims whichever worker finished FIRST. Concurrency is
+   * bounded by the same process-wide pool `registerAgentTool` uses (raised,
+   * never lowered, by `maxConcurrent`), each worker's FULL report is banked to
+   * a file via {@link bankArtifact}, and the outstanding counts ride along in
+   * every `tasks_list` result so the agent learns a worker landed without
+   * polling.
+   *
+   * @param options - Depth ceiling, pool raise, and queue wait
+   * @see {@link spawnDelegate} for the host-side spawn
+   * @see {@link collectDelegates} for the host-side collect
+   */
+  registerDelegationTools(options?: DelegateRegistrationOptions): void {
+    configureDelegation(this, options);
+    if (this.hasBackgroundDelegationTools) {
+      return;
+    }
+    const tools = createDelegationTools(this);
+    for (const [toolName, toolDef] of Object.entries(tools)) {
+      // Never cacheable: `delegate_task` starts a new worker every call and
+      // `collect_results` claims each outcome exactly once. A cached result
+      // would spawn nothing and hand the same worker back twice.
+      this.registerTool(toolName, toolDef, { cacheable: false });
+    }
+    this.hasBackgroundDelegationTools = true;
+    logger.info(
+      `[NeuroLink] Registered ${Object.keys(tools).length} background delegation tools`,
+    );
+  }
+
+  /**
+   * Start a background worker and get its handle immediately — before it has
+   * run anything, and long before it finishes.
+   *
+   * The worker runs through {@link runIsolatedAgent}: a fresh session on a
+   * worker instance sharing THIS instance's tool registry (so live MCP
+   * connections are reused), waste detection, honest stop reasons. Its
+   * complete report is banked when it settles; the outcome you collect carries
+   * a bounded summary plus the read-back call for the rest.
+   *
+   * @example
+   * ```typescript
+   * const a = await neurolink.spawnDelegate({ task: "Audit the auth changes" });
+   * const b = await neurolink.spawnDelegate({ task: "Review the migrations" });
+   * // …keep working…
+   * const first = await neurolink.collectDelegates({ mode: "any" });
+   * ```
+   *
+   * @param options - Task, scope, context, tool allowlist, budgets
+   * @returns The worker id, spawn time, and whether it is queued for a slot
+   * @throws when the task is empty or the caller is at the depth ceiling
+   */
+  async spawnDelegate(options: DelegateSpawnOptions): Promise<DelegateHandle> {
+    return spawnBackgroundDelegate(this, options);
+  }
+
+  /**
+   * Claim finished background workers — in COMPLETION order, which has nothing
+   * to do with spawn order. Each outcome is handed out exactly once.
+   *
+   * @param request - `{ mode: "any" | "all" }` or `{ workerId }`, plus `waitMs`
+   * @returns Claimed outcomes plus what is still pending/ready
+   */
+  async collectDelegates(
+    request: DelegateCollectRequest,
+  ): Promise<DelegateCollectResult> {
+    return collectBackgroundDelegates(this, request);
+  }
+
+  /**
+   * Cancel background workers: one by id, or every outstanding worker this
+   * instance spawned. Cancelled workers still settle into a claimable outcome
+   * saying so.
+   *
+   * @param workerId - Cancel just this worker; omit to cancel all
+   * @returns How many workers were cancelled
+   */
+  async cancelDelegates(workerId?: string): Promise<number> {
+    return cancelBackgroundDelegates(this, workerId);
+  }
+
+  // ========================================
+  // Artifact Banking API (N3)
+  // ========================================
+
+  /**
+   * This instance's artifact store, created on first use.
+   *
+   * Until now a store existed only when `mcp.outputLimits.strategy` was set to
+   * `"externalize"`, so a caller that just wanted to bank a worker report had
+   * to configure MCP output limits it did not use. This creates one on demand
+   * and registers `retrieve_context` alongside it, so a banked payload is
+   * readable by the model, not only by host code.
+   *
+   * Already-configured instances get the store they already had — the MCP
+   * output normalizer and banking deliberately share one store, so an
+   * externalized tool output and a banked report read back the same way.
+   *
+   * @returns The artifact store backing {@link bankArtifact} / {@link readArtifact}
+   */
+  getArtifactStore(): ArtifactStore {
+    if (!this.mcpArtifactStore) {
+      this.mcpArtifactStore = this.createConfiguredArtifactStore();
+    }
+    // A no-op when the constructor already registered it.
+    this.registerMemoryRetrievalTools();
+    return this.mcpArtifactStore;
+  }
+
+  /**
+   * Replace this instance's artifact store.
+   *
+   * Everything that writes or reads artifacts follows the swap: banking,
+   * `retrieve_context`, host-side `readArtifact`, and the MCP output
+   * normalizer — which is rebuilt here because it captured the previous store
+   * at construction. Assigning the field alone would miss it, and
+   * externalized tool outputs would keep landing in the old backend while
+   * read-backs looked in the new one.
+   *
+   * Call it before the first bank or externalized tool output: artifacts
+   * already in the previous store are not migrated, and their ids stop
+   * resolving through this instance. `artifacts.store` in the constructor
+   * config is the same thing without the ordering concern.
+   *
+   * Ownership: a store you hand in — here or via `artifacts.store` — stays
+   * yours to close. NeuroLink closes only the stores it built itself, when
+   * they are replaced here and on `shutdown()`.
+   *
+   * @param store - Any {@link ArtifactStore}
+   */
+  setArtifactStore(store: ArtifactStore): void {
+    const previous = this.mcpArtifactStore;
+    if (previous === store) {
+      return;
+    }
+    if (previous) {
+      logger.warn(
+        "[NeuroLink] Artifact store replaced — artifacts already written to " +
+          "the previous store will not resolve through this instance",
+      );
+      if (this.ownsArtifactStore && previous.close) {
+        void previous.close().catch((error: unknown) => {
+          logger.warn("[NeuroLink] Previous artifact store close failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+      }
+    }
+    this.mcpArtifactStore = store;
+    this.ownsArtifactStore = false;
+    this.installOutputNormalizer(store);
+    this.registerMemoryRetrievalTools();
+  }
+
+  /**
+   * Build the store the `artifacts` config (or `STORAGE_TYPE`) asks for. The
+   * Redis connection falls back to conversation memory's, so one
+   * `STORAGE_TYPE=redis` moves sessions and artifacts together.
+   */
+  private createConfiguredArtifactStore(): ArtifactStore {
+    const injected = this.artifactsConfig?.store !== undefined;
+    const store = createArtifactStore(
+      this.artifactsConfig,
+      this.conversationMemoryConfig?.conversationMemory?.redisConfig,
+    );
+    // An injected store is returned as-is by the factory and stays the
+    // caller's; anything else was built here and is this instance's to close.
+    this.ownsArtifactStore = !injected;
+    logger.debug("[NeuroLink] Artifact store initialized", {
+      backend: injected
+        ? "custom"
+        : resolveArtifactStorageType(this.artifactsConfig),
+    });
+    return store;
+  }
+
+  /**
+   * (Re)build the MCP output normalizer over `artifactStore`. A no-op unless
+   * `mcp.outputLimits` was configured — without it nothing is externalized.
+   */
+  private installOutputNormalizer(
+    artifactStore: ArtifactStore | undefined,
+  ): void {
+    if (!this.mcpOutputNormalizerConfig) {
+      return;
+    }
+    this.externalServerManager.setOutputNormalizer(
+      new McpOutputNormalizer(this.mcpOutputNormalizerConfig, artifactStore),
+    );
+    logger.debug("[NeuroLink] MCP output normalizer initialized", {
+      ...this.mcpOutputNormalizerConfig,
+      hasArtifactStore: artifactStore !== undefined,
+    });
+  }
+
+  /**
+   * Bank a payload to a file and get back a pointer to it.
+   *
+   * The payload is stored WHOLE. What you put in the conversation is the
+   * returned `preview` (a bounded head slice) and `readBackHint` (the literal
+   * `retrieve_context` call that fetches the rest) — so a 4 MB worker report
+   * costs a few hundred tokens of context and loses nothing, and compaction
+   * can drop the preview without destroying evidence.
+   *
+   * @example
+   * ```typescript
+   * const ref = await neurolink.bankArtifact(fullReport, {
+   *   kind: "worker-report",
+   *   label: "delegate:auth-review",
+   *   sessionId: "review-1421",
+   * });
+   * // Hand the model ref.preview + ref.readBackHint, never fullReport.
+   * ```
+   *
+   * @param payload  Complete text or JSON. Never truncated.
+   * @param options  `kind` and `label` are required; see {@link BankArtifactOptions}
+   * @returns Id, bounded preview, byte size, and the read-back call
+   */
+  async bankArtifact(
+    payload: string,
+    options: BankArtifactOptions,
+  ): Promise<BankedArtifactRef> {
+    return bankArtifactPayload(this, payload, options);
+  }
+
+  /**
+   * Read a banked payload back from host code — the programmatic twin of the
+   * model's `retrieve_context({ artifactId })` call.
+   *
+   * Omit `page` for the complete payload; pass `{ offset, limit }` to walk a
+   * large one in windows. Returns null when the id is unknown or expired.
+   *
+   * @param id    `artifactId` from a {@link BankedArtifactRef}
+   * @param page  Optional character window
+   */
+  async readArtifact(
+    id: string,
+    page?: ArtifactPageRequest,
+  ): Promise<string | null> {
+    return readBankedArtifact(this, id, page);
+  }
+
+  // ========================================
+  // Background Command API (N4)
+  // ========================================
+
+  /**
+   * Register the background-command toolset — `run_command_bg`,
+   * `command_status`, `command_output`, `command_kill` — on this instance, and
+   * declare what may be executed. Opt-in and idempotent: existing callers see
+   * no new tools until they ask for them.
+   *
+   * A reviewing agent needs to run real commands — a build, a test suite, a
+   * linter whose output is the evidence for a finding — without blocking its
+   * own loop and without losing a byte of what they printed. These tools start
+   * a command detached, write both streams to files as they arrive, and bank
+   * the COMPLETE files as artifacts when the command settles; the conversation
+   * gets a bounded tail plus the read-back call.
+   *
+   * The policy is not optional. `allowedExecutables` is matched exactly
+   * against `argv[0]`, `cwdRoot` is a realpath-checked sandbox, there is never
+   * a shell, and a command that outlives `defaultTimeoutMs` is killed.
+   *
+   * @param policy - What may run, where, for how long, and how loudly
+   * @see {@link startBackgroundCommand} for the host-side start
+   * @see {@link registerGitTools} for read-only git without a general policy
+   */
+  registerBackgroundCommandTools(policy: BackgroundCommandPolicy): void {
+    setCommandPolicy(this, policy);
+    if (this.hasBackgroundCommandTools) {
+      return;
+    }
+    const tools = createBackgroundCommandTools(this);
+    for (const [toolName, toolDef] of Object.entries(tools)) {
+      // Never cacheable: every one of these reads or changes live process
+      // state. A cached `command_status` would report a build that has already
+      // finished as still running, for the whole TTL.
+      this.registerTool(toolName, toolDef, { cacheable: false });
+    }
+    this.hasBackgroundCommandTools = true;
+    logger.info(
+      `[NeuroLink] Registered ${Object.keys(tools).length} background command tools`,
+    );
+  }
+
+  /**
+   * Declare (or replace) what this instance may execute, without registering
+   * the model-facing tools. Host code that only drives
+   * {@link startBackgroundCommand} itself needs nothing more than this.
+   *
+   * @param policy - What may run, where, for how long, and how loudly
+   */
+  setBackgroundCommandPolicy(policy: BackgroundCommandPolicy): void {
+    setCommandPolicy(this, policy);
+  }
+
+  /**
+   * Start a command in the background and get its task id immediately.
+   *
+   * @example
+   * ```typescript
+   * const { taskId } = await neurolink.startBackgroundCommand(
+   *   ["pnpm", "run", "lint"],
+   *   { cwd: repoRoot },
+   * );
+   * // …keep working…
+   * const status = await neurolink.awaitBackgroundCommand(taskId);
+   * const full = await neurolink.readArtifact(status.stdout!.artifactId);
+   * ```
+   *
+   * @param argv - Executable first, one entry per argument. Never a command string.
+   * @param options - cwd (sandboxed), timeout, byte cap, env, label, session
+   * @returns The task id, the argv that ran, and when it started
+   * @throws when no policy is set, argv is malformed, the executable is not
+   *         allowlisted, the policy vetoes it, or the cwd escapes the sandbox
+   */
+  async startBackgroundCommand(
+    argv: string[],
+    options: BackgroundCommandOptions,
+  ): Promise<BackgroundCommandHandle> {
+    return startCommand(this, argv, options);
+  }
+
+  /**
+   * Everything known about one command right now — synchronous, so a
+   * mid-loop monitor costs nothing.
+   *
+   * @param taskId - Task id from {@link startBackgroundCommand}
+   * @throws when the task id is unknown to this instance
+   */
+  getBackgroundCommandStatus(taskId: string): BackgroundCommandStatus {
+    return getCommandStatus(this, taskId);
+  }
+
+  /**
+   * Wait for a command to settle. `timeoutMs` bounds the WAIT, not the
+   * command: when it elapses the current status is returned rather than
+   * thrown, so a caller can poll in bounded steps and never lose the job.
+   *
+   * @param taskId - Task id from {@link startBackgroundCommand}
+   * @param opts - `timeoutMs` to bound the wait
+   */
+  async awaitBackgroundCommand(
+    taskId: string,
+    opts?: { timeoutMs?: number },
+  ): Promise<BackgroundCommandStatus> {
+    return awaitCommand(this, taskId, opts);
+  }
+
+  /**
+   * Kill a running command — SIGTERM, then SIGKILL five seconds later — and
+   * resolve with its settled status. Whatever it printed first is still
+   * banked: killing a command discards the process, never its output.
+   *
+   * @param taskId - Task id from {@link startBackgroundCommand}
+   * @param signal - Signal to send first. Default SIGTERM
+   */
+  async killBackgroundCommand(
+    taskId: string,
+    signal?: NodeJS.Signals,
+  ): Promise<BackgroundCommandStatus> {
+    return killCommand(this, taskId, signal);
+  }
+
+  /**
+   * Read one character window of a command's output straight from its log
+   * file — while it is still running, or long after it finished. Offsets,
+   * `totalSize` and `hasMore` match `retrieve_context` exactly.
+   *
+   * @param taskId - Task id from {@link startBackgroundCommand}
+   * @param page - Which stream, and which window of it
+   */
+  async readBackgroundCommandOutput(
+    taskId: string,
+    page: BackgroundCommandPageRequest,
+  ): Promise<BackgroundCommandOutputPage> {
+    return readCommandOutput(this, taskId, page);
+  }
+
+  // ========================================
+  // Read-only Git Toolset (N4.4)
+  // ========================================
+
+  /**
+   * Register the read-only git toolset — `git_log`, `git_show`, `git_diff`,
+   * `git_blame`, `git_merge_base`, `git_ls_files` — on this instance. Opt-in
+   * and idempotent.
+   *
+   * These are BOUNDED tools, not a shell: the model supplies values (a ref, a
+   * path, a line range), never flags, and each tool assembles a fixed argv
+   * from them. That is what keeps them read-only — a free-form argument string
+   * would carry `--output=<file>` and `diff.external` straight through.
+   *
+   * Registering them widens nothing else: they run under a private
+   * one-executable policy rooted at `repoRoot`, so `run_command_bg` still
+   * cannot execute git, and no general command policy is required.
+   *
+   * @param options - Repository root, plus timeout / byte-cap / preview bounds
+   */
+  registerGitTools(options: GitToolsetOptions): void {
+    configureGitTools(this, options);
+    if (this.hasGitTools) {
+      return;
+    }
+    const tools = createGitTools(this);
+    for (const [toolName, toolDef] of Object.entries(tools)) {
+      // Never cacheable: the working tree moves under these answers.
+      this.registerTool(toolName, toolDef, { cacheable: false });
+    }
+    this.hasGitTools = true;
+    logger.info(
+      `[NeuroLink] Registered ${Object.keys(tools).length} read-only git tools`,
+    );
+  }
+
+  /**
+   * Run one read-only git command from host code, with the same bounding the
+   * tools get: the complete stdout is banked, the result carries a preview and
+   * the read-back call.
+   *
+   * @param args - Git arguments, e.g. `["log", "--oneline"]`. Assembled by the
+   *               caller, which is responsible for every value in them
+   * @param sessionId - Session the command belongs to
+   * @throws when {@link registerGitTools} has not been called
+   */
+  async runGitCommand(
+    args: string[],
+    sessionId?: string,
+  ): Promise<GitToolResult> {
+    return runGitArgs(this, args, sessionId);
+  }
+
+  /**
+   * Execute an agent network with the given input.
+   *
+   * @param network - The agent network to execute
+   * @param input - Execution input (message and context)
+   * @param options - Optional execution options
+   * @returns Network execution result with content, trace, and usage
+   *
+   * @see {@link NetworkExecutionInput} for input options
+   * @see {@link NetworkExecutionResult} for result structure
+   * @since 8.38.0
+   */
+  async executeNetwork(
+    network: import("./agent/agentNetwork.js").AgentNetwork,
+    input: NetworkExecutionInput,
+    options?: NetworkExecutionOptions,
+  ): Promise<NetworkExecutionResult> {
+    logger.debug("[NeuroLink] Executing agent network", {
+      networkId: network.id,
+      networkName: network.name,
+      hasContext: !!input.context,
+    });
+    return network.execute(input, options);
+  }
+
+  /**
+   * Stream agent network execution with real-time events.
+   *
+   * @param network - The agent network to stream
+   * @param input - Execution input (message and context)
+   * @param options - Optional execution options
+   * @returns Async iterable of network stream chunks
+   *
+   * @see {@link NetworkStreamChunk} for chunk types
+   * @since 8.38.0
+   */
+  async *streamNetwork(
+    network: import("./agent/agentNetwork.js").AgentNetwork,
+    input: NetworkExecutionInput,
+    options?: NetworkExecutionOptions,
+  ): AsyncIterable<NetworkStreamChunk> {
+    logger.debug("[NeuroLink] Streaming agent network", {
+      networkId: network.id,
+      networkName: network.name,
+      hasContext: !!input.context,
+    });
+    yield* network.stream(input, options);
+  }
+
+  // ============================================================================
+  // ADVANCED ORCHESTRATION METHODS
+  // ============================================================================
+
+  /**
+   * Create a NetworkOrchestrator for managing multiple agent networks.
+   *
+   * @param config - Orchestrator configuration options
+   * @returns A new NetworkOrchestrator instance
+   * @since 8.38.0
+   */
+  async createOrchestrator(
+    config?: import("./types/index.js").OrchestratorConfig,
+  ): Promise<import("./agent/orchestration/index.js").NetworkOrchestrator> {
+    const { NetworkOrchestrator } =
+      await import("./agent/orchestration/index.js");
+    logger.debug("[NeuroLink] Creating network orchestrator", {
+      maxConcurrentExecutions: config?.maxConcurrentExecutions,
+      defaultMode: config?.defaultMode,
+    });
+    return new NetworkOrchestrator(this, config);
+  }
+
+  /**
+   * Create an AgentCoordinator for managing agent coordination strategies.
+   *
+   * @param config - Coordinator configuration options
+   * @returns A new AgentCoordinator instance
+   * @since 8.38.0
+   */
+  async createCoordinator(
+    config?: import("./types/index.js").CoordinatorConfig,
+  ): Promise<import("./agent/coordination/index.js").AgentCoordinator> {
+    const { AgentCoordinator } = await import("./agent/coordination/index.js");
+    logger.debug("[NeuroLink] Creating agent coordinator", {
+      strategy: config?.strategy,
+      maxConcurrency: config?.maxConcurrency,
+    });
+    return new AgentCoordinator(config);
+  }
+
+  /**
+   * Create a MessageBus for inter-agent communication.
+   *
+   * @param config - Message bus configuration options
+   * @returns A new MessageBus instance
+   * @since 8.38.0
+   */
+  async createMessageBus(
+    config?: import("./types/index.js").MessageBusConfig,
+  ): Promise<import("./agent/communication/index.js").MessageBus> {
+    const { MessageBus } = await import("./agent/communication/index.js");
+    logger.debug("[NeuroLink] Creating message bus", {
+      maxHistorySize: config?.maxHistorySize,
+    });
+    return new MessageBus(config);
+  }
+
   /**
    * Dispose of all resources and cleanup connections
    * Call this method when done using the NeuroLink instance to prevent resource leaks
@@ -6683,14 +21430,47 @@ Current user's request: ${currentInput}`;
   async dispose(): Promise<void> {
     logger.debug("[NeuroLink] Starting disposal of resources...");
 
+    // Clear per-session compaction watermarks
+    this.lastCompactionMessageCount.clear();
+
     const cleanupErrors: Error[] = [];
 
     try {
+      // 0. Kill host-owned background work: a disposed instance must not
+      // leave child processes or delegate workers running.
+      try {
+        await killAllCommands(this);
+        await cancelBackgroundDelegates(this);
+      } catch (error) {
+        const err =
+          error instanceof Error
+            ? error
+            : new Error(`Background work cleanup error: ${String(error)}`);
+        cleanupErrors.push(err);
+        logger.warn("[NeuroLink] Error stopping background work:", error);
+      }
+
+      // 0b. The memory condenser is a child instance this one created; it
+      // goes with the host.
+      try {
+        await this.releaseMemoryCondenser();
+      } catch (error) {
+        cleanupErrors.push(
+          error instanceof Error ? error : new Error(String(error)),
+        );
+      }
+
+      // 0c. Persisted attachments go with the instance (private tmpdir).
+      try {
+        await this.fileRegistry.clear();
+      } catch (error) {
+        logger.warn("[NeuroLink] File registry cleanup failed:", error);
+      }
+
       // 1. Flush and shutdown OpenTelemetry
       try {
         logger.debug("[NeuroLink] Flushing and shutting down OpenTelemetry...");
-        await flushOpenTelemetry();
-        await shutdownOpenTelemetry();
+        await this.releaseTelemetryHold();
         logger.debug("[NeuroLink] OpenTelemetry shutdown successfully");
       } catch (error) {
         const err =
@@ -6722,12 +21502,36 @@ Current user's request: ${currentInput}`;
         }
       }
 
-      // 3. Clear all event listeners to prevent memory leaks
+      // 3. Release the artifact store this instance built (a pooled Redis
+      // connection, for one). Same ownership rule as shutdown(): an injected
+      // store is the caller's to close. Without this step every
+      // construct / use / dispose cycle left the pooled reference acquired.
+      if (this.ownsArtifactStore && this.mcpArtifactStore?.close) {
+        try {
+          await this.mcpArtifactStore.close();
+          logger.debug("[NeuroLink] Artifact store closed");
+        } catch (error) {
+          const err =
+            error instanceof Error
+              ? error
+              : new Error(`Artifact store close error: ${String(error)}`);
+          cleanupErrors.push(err);
+          logger.warn("[NeuroLink] Error closing artifact store:", error);
+        }
+      }
+
+      // 4. Clear all event listeners to prevent memory leaks
       if (this.emitter) {
         try {
           logger.debug("[NeuroLink] Removing all event listeners...");
           this.emitter.removeAllListeners();
-          logger.clearEventEmitter();
+          // Clear only if this instance's emitter is the active log sink —
+          // disposing a worker instance must not yank the host's bridge.
+          logger.clearEventEmitter(this.emitter);
+          // Scoped sinks live on the process-global logger, keyed by this
+          // instance's id — they outlive `this.emitter` and must be dropped
+          // explicitly or the sink (and its closure) leaks for the process.
+          logger.clearScopedEventEmitters(this.logInstanceId);
           logger.debug("[NeuroLink] Event listeners removed successfully");
         } catch (error) {
           const err =
@@ -6739,7 +21543,30 @@ Current user's request: ${currentInput}`;
         }
       }
 
-      // 4. Clear all circuit breakers
+      // 4a. Detach any worker log bridges this instance created (via
+      // createWorkerInstance({ onLog })) that the caller never disposed
+      // individually. Their scoped sink lives on the process-global logger
+      // keyed by the WORKER's id, so it would otherwise outlive this host.
+      if (this.ownedWorkerLogBridgeDetachers.size > 0) {
+        try {
+          const count = this.ownedWorkerLogBridgeDetachers.size;
+          for (const detach of [...this.ownedWorkerLogBridgeDetachers]) {
+            detach();
+          }
+          logger.debug(
+            `[NeuroLink] Detached ${count} undisposed worker log bridge(s)`,
+          );
+        } catch (error) {
+          const err =
+            error instanceof Error
+              ? error
+              : new Error(`Worker log bridge cleanup error: ${String(error)}`);
+          cleanupErrors.push(err);
+          logger.warn("[NeuroLink] Error detaching worker log bridges:", error);
+        }
+      }
+
+      // 5. Clear all circuit breakers
       if (this.toolCircuitBreakers && this.toolCircuitBreakers.size > 0) {
         try {
           logger.debug(
@@ -6757,7 +21584,7 @@ Current user's request: ${currentInput}`;
         }
       }
 
-      // 5. Clear all Maps and caches
+      // 6. Clear all Maps and caches
       try {
         logger.debug("[NeuroLink] Clearing maps and caches...");
 
@@ -6783,6 +21610,16 @@ Current user's request: ${currentInput}`;
           this.toolCache.timestamp = 0;
         }
 
+        // Cleanup MCP enhancement modules
+        this.mcpToolResultCache?.destroy();
+        this.mcpToolRouter?.destroy();
+        this.mcpToolBatcher?.destroy();
+        this.mcpToolResultCache = undefined;
+        this.mcpToolRouter = undefined;
+        this.mcpToolBatcher = undefined;
+        this.mcpEnhancedDiscovery = undefined;
+        this.mcpToolMiddlewares = [];
+
         logger.debug("[NeuroLink] Maps and caches cleared successfully");
       } catch (error) {
         const err =
@@ -6793,11 +21630,29 @@ Current user's request: ${currentInput}`;
         logger.warn("[NeuroLink] Error clearing caches:", error);
       }
 
-      // 6. Reset initialization flags
+      // 5b. Shutdown TaskManager
+      if (this._taskManager) {
+        try {
+          logger.debug("[NeuroLink] Shutting down TaskManager...");
+          await withTimeout(
+            this._taskManager.shutdown(),
+            5000,
+            new Error("TaskManager shutdown timed out"),
+          );
+        } catch (error) {
+          logger.warn("[NeuroLink] TaskManager shutdown error:", error);
+        } finally {
+          this._taskManager = undefined;
+        }
+      }
+
+      // 7. Reset initialization flags
       try {
         logger.debug("[NeuroLink] Resetting initialization state...");
         this.mcpInitialized = false;
+        this.mcpInitPromise = null;
         this.conversationMemoryNeedsInit = false;
+        this.credentials = undefined;
         logger.debug("[NeuroLink] Initialization state reset successfully");
       } catch (error) {
         const err =
@@ -6808,7 +21663,7 @@ Current user's request: ${currentInput}`;
         logger.warn("[NeuroLink] Error resetting state:", error);
       }
 
-      // 6. Log completion
+      // 7. Log completion
       if (cleanupErrors.length === 0) {
         logger.debug("[NeuroLink] ✅ Resource disposal completed successfully");
       } else {
@@ -6839,12 +21694,367 @@ Current user's request: ${currentInput}`;
   }
 
   /**
+   * Manually trigger context compaction for a session.
+   * Runs the full 4-stage compaction pipeline.
+   */
+  async compactSession(
+    sessionId: string,
+    config?: CompactionConfig,
+  ): Promise<CompactionResult | null> {
+    if (!this.conversationMemory) {
+      return null;
+    }
+
+    const messages =
+      await this.conversationMemory.buildContextMessages(sessionId);
+    if (!messages || messages.length === 0) {
+      return null;
+    }
+
+    const compactor = new ContextCompactor(
+      {
+        ...config,
+        summarizationProvider:
+          config?.summarizationProvider ??
+          this.conversationMemoryConfig?.conversationMemory
+            ?.summarizationProvider,
+        summarizationModel:
+          config?.summarizationModel ??
+          this.conversationMemoryConfig?.conversationMemory?.summarizationModel,
+      },
+      this.contextCompactorDeps({ sessionId }),
+    );
+    // Use actual context window to determine target, not arbitrary heuristic
+    const budgetInfo = checkContextBudget({
+      provider: config?.provider || "openai",
+      conversationMessages: messages as Array<{
+        role: string;
+        content: string;
+      }>,
+      toolReplayMode: this.resolveToolReplayModeForBudget({}),
+    });
+    // Target 60% of available input tokens — leave room for new messages
+    const targetTokens = Math.floor(budgetInfo.availableInputTokens * 0.6);
+    const result = await compactor.compact(
+      messages,
+      targetTokens,
+      this.conversationMemoryConfig?.conversationMemory,
+    );
+
+    if (result.compacted) {
+      repairToolPairs(result.messages);
+    }
+
+    return result;
+  }
+
+  /**
+   * Get context usage statistics for a session.
+   * Returns token counts, usage ratio, and breakdown by category.
+   */
+  async getContextStats(
+    sessionId: string,
+    provider?: string,
+    model?: string,
+  ): Promise<{
+    estimatedInputTokens: number;
+    availableInputTokens: number;
+    usageRatio: number;
+    shouldCompact: boolean;
+    messageCount: number;
+  } | null> {
+    if (!this.conversationMemory) {
+      return null;
+    }
+
+    const messages =
+      await this.conversationMemory.buildContextMessages(sessionId);
+    if (!messages || messages.length === 0) {
+      return null;
+    }
+
+    const budgetResult = checkContextBudget({
+      provider: provider || "openai",
+      model,
+      conversationMessages: messages as Array<{
+        role: string;
+        content: string;
+      }>,
+      toolReplayMode: this.resolveToolReplayModeForBudget({}),
+    });
+
+    return {
+      estimatedInputTokens: budgetResult.estimatedInputTokens,
+      availableInputTokens: budgetResult.availableInputTokens,
+      usageRatio: budgetResult.usageRatio,
+      shouldCompact: budgetResult.shouldCompact,
+      messageCount: messages.length,
+    };
+  }
+
+  /**
+   * Check if a session needs compaction.
+   */
+  needsCompaction(
+    sessionId: string,
+    provider?: string,
+    model?: string,
+  ): boolean {
+    if (!this.conversationMemory) {
+      return false;
+    }
+
+    const session = (
+      this.conversationMemory as ConversationMemoryManager
+    ).getSession?.(sessionId);
+    if (!session) {
+      return false;
+    }
+
+    const budgetResult = checkContextBudget({
+      provider: provider || "openai",
+      model,
+      conversationMessages: session.messages as Array<{
+        role: string;
+        content: string;
+      }>,
+      toolReplayMode: this.resolveToolReplayModeForBudget({}),
+    });
+
+    return budgetResult.shouldCompact;
+  }
+
+  // ============================================================================
+  // Authentication Methods
+  // ============================================================================
+
+  /**
+   * Set the authentication provider for the NeuroLink instance
+   *
+   * @param config - Auth provider or configuration to create one
+   */
+  async setAuthProvider(config: NeuroLinkAuthConfig): Promise<void> {
+    // Clear any pending lazy-init promise so it does not race with this call.
+    this.authInitPromise = undefined;
+
+    await this.initializeAuthProviderFromConfig(config);
+  }
+
+  private async initializeAuthProviderFromConfig(
+    config: NeuroLinkAuthConfig,
+  ): Promise<void> {
+    let provider: AuthProvider;
+    let providerType: string;
+
+    // Duck-type check: direct AuthProvider instance
+    if (
+      "authenticateToken" in config &&
+      typeof (config as AuthProvider).authenticateToken === "function"
+    ) {
+      provider = config as AuthProvider;
+      providerType = provider.type;
+    } else if ("provider" in config) {
+      provider = (config as { provider: AuthProvider }).provider;
+      providerType = provider.type;
+    } else {
+      const typedConfig = config as {
+        type: AuthProviderType;
+        config: AuthProviderConfig;
+      };
+      const { AuthProviderFactory } =
+        await import("./auth/AuthProviderFactory.js");
+      provider = await AuthProviderFactory.createProvider(
+        typedConfig.type,
+        typedConfig.config,
+      );
+      providerType = typedConfig.type;
+    }
+
+    this.authProvider = provider;
+    logger.info(`Auth provider set: ${providerType}`);
+    this.emitter.emit("auth:provider:set", {
+      type: provider.type,
+      timestamp: Date.now(),
+    });
+  }
+
+  /**
+   * Get the currently configured authentication provider
+   */
+  getAuthProvider(): AuthProvider | undefined {
+    return this.authProvider;
+  }
+
+  /**
+   * Lazily initialize the auth provider from pendingAuthConfig.
+   * Called on first use (generate/stream with auth token) to avoid
+   * async work in the synchronous constructor.
+   */
+  private async ensureAuthProvider(): Promise<void> {
+    if (this.authProvider || !this.pendingAuthConfig) {
+      return;
+    }
+    const pendingAuthConfig = this.pendingAuthConfig;
+    this.authInitPromise ??= (async () => {
+      try {
+        await this.initializeAuthProviderFromConfig(pendingAuthConfig);
+        this.pendingAuthConfig = undefined;
+      } finally {
+        if (
+          this.authInitPromise &&
+          (this.pendingAuthConfig === undefined ||
+            this.pendingAuthConfig === pendingAuthConfig)
+        ) {
+          this.authInitPromise = undefined;
+        }
+      }
+    })();
+    await this.authInitPromise;
+  }
+
+  /**
+   * Set the current authentication context for request handling.
+   *
+   * Delegates to the global AuthContextHolder so that auth state is NOT
+   * stored as an instance field (which would leak between concurrent requests
+   * sharing the same NeuroLink singleton). Prefer `runWithAuthContext()` from
+   * `authContext.ts` for proper request-scoped context via AsyncLocalStorage.
+   *
+   * @param context - The authenticated user context
+   */
+  async setAuthContext(context: AuthenticatedContext): Promise<void> {
+    const { globalAuthContext } = await import("./auth/authContext.js");
+    globalAuthContext.set(context);
+    logger.debug("Auth context set", {
+      userId: context.user.id,
+      provider: context.provider,
+      sessionId: context.session?.id,
+    });
+  }
+
+  /**
+   * Get the current authentication context.
+   *
+   * Checks AsyncLocalStorage first, then falls back to the global holder.
+   */
+  async getAuthContext(): Promise<AuthenticatedContext | undefined> {
+    const { getAuthContext: getCtx } = await import("./auth/authContext.js");
+    return getCtx();
+  }
+
+  /**
+   * Clear the current authentication context
+   */
+  async clearAuthContext(): Promise<void> {
+    const { globalAuthContext } = await import("./auth/authContext.js");
+    const userId = globalAuthContext.get()?.user.id;
+    globalAuthContext.clear();
+    if (userId) {
+      logger.debug(`Auth context cleared for user: ${userId}`);
+    }
+  }
+
+  /**
    * Get the external server manager instance
    * Used internally by server adapters for external MCP server management
    * @returns The ExternalServerManager instance
    */
   getExternalServerManager(): ExternalServerManager {
     return this.externalServerManager;
+  }
+
+  // ==========================================================================
+  // Dynamic Argument Resolution
+  // ==========================================================================
+
+  private buildResolutionContext(
+    signal?: AbortSignal,
+    inlineContext?: Record<string, unknown>,
+  ): DynamicResolutionContext {
+    return {
+      requestContext: inlineContext || {},
+      signal,
+    };
+  }
+
+  /**
+   * Resolve dynamic arguments in GenerateOptions, mutating the options in place.
+   * Only resolves fields that are functions; static values pass through unchanged.
+   */
+  private async resolveDynamicOptions(
+    options: Record<string, unknown>,
+  ): Promise<void> {
+    const dynamicFields = [
+      "model",
+      "provider",
+      "temperature",
+      "maxTokens",
+      "systemPrompt",
+      "timeout",
+      "thinkingLevel",
+      "disableTools",
+      "enableAnalytics",
+      "enableEvaluation",
+    ] as const;
+
+    const hasDynamic =
+      dynamicFields.some((f) => typeof options[f] === "function") ||
+      typeof options.tools === "function";
+    if (!hasDynamic) {
+      return;
+    }
+
+    const inlineCtx = options.dynamicContext as
+      | Record<string, unknown>
+      | undefined;
+
+    await this.resolveDynamicFields(options, dynamicFields, inlineCtx);
+  }
+
+  private async resolveDynamicFields(
+    options: Record<string, unknown>,
+    dynamicFields: readonly string[],
+    inlineContext?: Record<string, unknown>,
+  ): Promise<void> {
+    const resolutionContext = this.buildResolutionContext(
+      options.abortSignal as AbortSignal | undefined,
+      inlineContext,
+    );
+
+    logger.debug("[NeuroLink] Resolving dynamic arguments");
+
+    await Promise.all(
+      dynamicFields.map(async (field) => {
+        if (typeof options[field] === "function") {
+          const result = await resolveDynamicArgument(
+            options[field],
+            resolutionContext,
+          );
+          options[field] = result.value;
+          logger.debug(
+            `[NeuroLink] Resolved dynamic ${field}: ${result.resolutionType}`,
+          );
+        }
+      }),
+    );
+
+    // Handle dynamic tools → enabledToolNames mapping.
+    // Per DynamicOptions.tools: DynamicArgument<string[]>, the resolver
+    // must return an array of tool names. Anything else is a contract
+    // violation — fail fast rather than silently disabling tooling.
+    if (typeof options.tools === "function") {
+      const result = await resolveDynamicArgument(
+        options.tools,
+        resolutionContext,
+      );
+      if (!Array.isArray(result.value)) {
+        throw new TypeError(
+          `Dynamic tools resolver must return string[] (tool names), got ${typeof result.value === "object" ? "object" : typeof result.value}`,
+        );
+      }
+      options.enabledToolNames = result.value;
+      delete options.tools;
+    }
   }
 }
 

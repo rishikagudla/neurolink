@@ -1,0 +1,47 @@
+{
+  // Typecheck the scripts and tools that CI actually depends on.
+  //
+  // The root tsconfig excludes `tools` and `scripts` wholesale, and ESLint
+  // ignores `scripts/**`. That blind spot is not theoretical: the provider
+  // onboarding gate shipped with a cast asserting a field
+  // (`OpenAICompatCatalogEntry.provider`) that does not exist, so its catalog
+  // lookup silently produced {undefined} and half the gate never ran. Nothing
+  // could have caught it, because the file that gates a required CI check was
+  // itself unchecked.
+  //
+  // Scope is deliberately narrow: only the files reachable from a workflow, via
+  // a package.json script, where a defect can gate or break a release. The wider
+  // tools/ tree has ~109 pre-existing errors and is a separate cleanup — the
+  // point here is to cover the surface that CI trusts, not to boil the ocean.
+  //
+  // test/helpers/** is included for the same reason. It is shared test
+  // infrastructure that every suite imports, and test/ is excluded from the
+  // root tsconfig as well, so nothing typechecks it. Both of the test bugs
+  // found while auditing this repo lived in exactly these files: harness.ts
+  // (a SIGKILL escalation gated on proc.killed, which reports signal delivery
+  // rather than exit) and distFreshness.ts (imported relatively by a script run
+  // from a mkdtemp directory, so a test silently never ran for two weeks).
+  // It costs nothing today: all 18 files typecheck clean.
+  //
+  // Add a file here whenever a workflow starts depending on a new one.
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "noEmit": true },
+  "include": [
+    "scripts/build-validations.ts",
+    "scripts/check-banned-deps.ts",
+    "scripts/check-docs-api.ts",
+    "scripts/check-shipped-types.ts",
+    "scripts/env-validation.ts",
+    "scripts/security-check.ts",
+    "scripts/lib/gitleaksRun.ts",
+    "scripts/lib/secretPlaceholder.ts",
+    "tools/verify-provider-onboarding.ts",
+    "tools/check-model-liveness.ts",
+    "tools/testing/proxyLifecycleBenchmark.ts",
+    "tools/testing/proxyRollingHandoffBenchmark.ts",
+    "tools/testing/proxyTransportBenchmark.ts",
+    "tools/testing/proxyUsageStatsBenchmark.ts",
+    "test/helpers/**/*.ts"
+  ],
+  "exclude": []
+}

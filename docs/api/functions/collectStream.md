@@ -1,0 +1,30 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / collectStream
+
+# Function: collectStream()
+
+> **collectStream**(`stream`): `Promise`\<[`ClientStreamResult`](../type-aliases/ClientStreamResult.md)\>
+
+Collect streaming events into a single result
+
+## Parameters
+
+### stream
+
+`AsyncIterable`\<[`ClientStreamEvent`](../type-aliases/ClientStreamEvent.md)\>
+
+## Returns
+
+`Promise`\<[`ClientStreamResult`](../type-aliases/ClientStreamResult.md)\>
+
+## Example
+
+```typescript
+const result = await collectStream(
+  createAsyncStream(fetch("/api/stream", { method: "POST" })),
+);
+console.log(result.content);
+```

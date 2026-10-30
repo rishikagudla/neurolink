@@ -6,20 +6,16 @@
 
 import * as core from "@actions/core";
 import type {
-  ActionInputs,
-  ActionProviderKeys,
-  ActionInputValidation,
   ActionAWSConfig,
   ActionGoogleCloudConfig,
-} from "../types/actionTypes.js";
+  ActionInputValidation,
+  ActionInputs,
+  ActionProviderKeys,
+  ProviderKeyMap,
+} from "../types/index.js";
 import { AIProviderName } from "../constants/enums.js";
 import { ErrorFactory } from "../utils/errorHandling.js";
-
-/**
- * Provider to required keys mapping (verified providers only)
- * Uses string keys since they can be from different config objects
- */
-type ProviderKeyMap = Record<string, string[]>;
+import { DEFAULT_NEUROLINK_CLI_VERSION } from "./cliVersion.js";
 
 const PROVIDER_KEY_MAP: ProviderKeyMap = {
   [AIProviderName.OPENAI]: ["openaiApiKey"],
@@ -278,7 +274,10 @@ export function parseActionInputs(): ActionInputs {
       10,
     ),
     debug: core.getBooleanInput("debug"),
-    neurolinkVersion: core.getInput("neurolink_version") || "latest",
+    // Empty means the pinned version this action was released with; `latest`
+    // is an explicit opt-in to a moving target (see ./cliVersion.ts).
+    neurolinkVersion:
+      core.getInput("neurolink_version") || DEFAULT_NEUROLINK_CLI_VERSION,
     workingDirectory: core.getInput("working_directory") || ".",
   };
 }

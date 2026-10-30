@@ -1,15 +1,51 @@
+import chalk from "chalk";
+// `@types/yargs` is pinned to the v17 line while the runtime `yargs` dependency
+// is v18 — a real, currently unfixable skew. DefinitelyTyped has no v18 types
+// package, and yargs 18's package.json `exports` map gives the main entry no
+// `types` condition, so there is no way to get types straight from the
+// runtime package either. `@types/yargs` therefore stays load-bearing here
+// until DefinitelyTyped (or yargs itself) ships v18-compatible types. This
+// file is the canonical place for that note, not the only import site —
+// yargs is imported across roughly two dozen files in this codebase.
 import yargs from "yargs";
 import { hideBin } from "yargs/helpers";
-import chalk from "chalk";
 import packageJson from "../../package.json" with { type: "json" };
-import { CLICommandFactory } from "./factories/commandFactory.js";
 import { globalSession } from "../lib/session/globalSessionState.js";
-import { handleError } from "./errorHandler.js";
 import { logger } from "../lib/utils/logger.js";
+import { handleError } from "./errorHandler.js";
+import { CLICommandFactory } from "./factories/commandFactory.js";
 import { SetupCommandFactory } from "./factories/setupCommandFactory.js";
+import { AuthCommandFactory } from "./factories/authCommandFactory.js";
 import { ServerCommandFactory } from "./commands/server.js";
 import { ServeCommandFactory } from "./commands/serve.js";
 import { ragCommand } from "./commands/rag.js";
+import { ObservabilityCommandFactory } from "./commands/observability.js";
+import { TelemetryCommandFactory } from "./commands/telemetry.js";
+import {
+  proxyStartCommand,
+  proxyStatusCommand,
+  proxyTelemetryCommand,
+  proxySetupCommand,
+  proxyGuardCommand,
+  proxyInstallCommand,
+  proxyUninstallCommand,
+} from "./commands/proxy.js";
+import { proxyAnalyzeCommand } from "./commands/proxyAnalyze.js";
+import { proxyRestartCommand } from "./commands/proxyRestart.js";
+import { proxyPolyfillCommand } from "./commands/proxyPolyfill.js";
+import { proxyShareCommand } from "./commands/proxyShare.js";
+import { proxyPeerCommand } from "./commands/proxyPeer.js";
+import { proxyExposeCommand } from "./commands/proxyExpose.js";
+import { proxyReplayCommand } from "./commands/proxyReplay.js";
+import { EvaluateCommandFactory } from "./commands/evaluate.js";
+import { DecideCommandFactory } from "./commands/decide.js";
+import { TranscribeCommandFactory } from "./commands/transcribe.js";
+import { TaskCommandFactory } from "./commands/task.js";
+import { AutoresearchCommandFactory } from "./commands/autoresearch.js";
+import { voiceServerCommand } from "./commands/voiceServer.js";
+import { DocsCommandFactory } from "./commands/docs.js";
+import { UsageCommandFactory } from "./commands/usage.js";
+import { VoicesCommandFactory } from "./commands/voices.js";
 
 // Enhanced CLI with Professional UX
 export function initializeCliParser() {
@@ -25,7 +61,15 @@ export function initializeCliParser() {
       .strictCommands()
       .demandCommand(1, "")
       .recommendCommands()
-      .epilogue("For more info: https://github.com/juspay/neurolink")
+      .epilogue(
+        "For more info: https://github.com/juspay/neurolink\n\n" +
+          "Anthropic Subscription Tiers:\n" +
+          "  free  - Limited free tier access\n" +
+          "  pro   - Professional tier ($20/mo)\n" +
+          "  max   - Maximum tier with highest limits\n" +
+          "  api   - Direct API access (pay-per-use)\n\n" +
+          "Use 'neurolink auth login anthropic' to configure authentication",
+      )
       .showHelpOnFail(true, "Specify --help for available options")
       .middleware((argv: { noColor?: boolean; [key: string]: unknown }) => {
         // Handle no-color option globally
@@ -45,6 +89,10 @@ export function initializeCliParser() {
           // Always set to false when debug is not enabled (including when not provided)
           process.env.NEUROLINK_DEBUG = "false";
         }
+
+        // With --format json, stdout carries the payload; a debug or info
+        // line there would make it unparseable, so diagnostics go to stderr.
+        logger.setDiagnosticsToStderr(argv.format === "json");
 
         // Keep existing quiet middleware
         if (
@@ -97,9 +145,7 @@ export function initializeCliParser() {
           if (!alreadyExitedByHandleError) {
             process.stderr.write(
               chalk.red(
-                `CLI Error: ${
-                  err.message || msg || "An unexpected error occurred."
-                }\n`,
+                `CLI Error: ${err.message || msg || "An unexpected error occurred."}\n`,
               ),
             );
             // If it's a yargs internal parsing error, show help.
@@ -149,9 +195,19 @@ export function initializeCliParser() {
 
       // Generate Command (Primary) - Using CLICommandFactory
       .command(CLICommandFactory.createGenerateCommand())
+      // Docs MCP Server Command
+      .command(DocsCommandFactory.createDocsCommand())
+
+      .command(UsageCommandFactory.createUsageCommands())
 
       // Stream Text Command - Using CLICommandFactory
       .command(CLICommandFactory.createStreamCommand())
+
+      // Decide Command - typed, calibrated judgements (no free text)
+      .command(DecideCommandFactory.createDecideCommand())
+
+      // Transcribe Command - audio in, text out (the transcribe inference type)
+      .command(TranscribeCommandFactory.createTranscribeCommand())
 
       // Batch Processing Command - Using CLICommandFactory
       .command(CLICommandFactory.createBatchCommand())
@@ -177,11 +233,17 @@ export function initializeCliParser() {
       // Memory Command Group - Using CLICommandFactory
       .command(CLICommandFactory.createMemoryCommands())
 
+      // Skills Command Group - Using CLICommandFactory
+      .command(CLICommandFactory.createSkillsCommands())
+
       // Get Best Provider Command - Using CLICommandFactory
       .command(CLICommandFactory.createBestProviderCommand())
 
       // Validate Command (alias for config validate)
       .command(CLICommandFactory.createValidateCommand())
+
+      // Voices Command - TTS voice discovery for --tts-voice
+      .command(VoicesCommandFactory.createVoicesCommand())
 
       // Completion Command - Using CLICommandFactory
       .command(CLICommandFactory.createCompletionCommand())
@@ -195,6 +257,12 @@ export function initializeCliParser() {
       // Loop Command - Using CLICommandFactory
       .command(CLICommandFactory.createLoopCommand())
 
+      // Agent Commands - Using CLICommandFactory (Multi-Agent Orchestration)
+      .command(CLICommandFactory.createAgentCommands())
+
+      // Network Commands - Using CLICommandFactory (Agent Network Orchestration)
+      .command(CLICommandFactory.createNetworkCommands())
+
       // Setup Commands - Using SetupCommandFactory
       .command(SetupCommandFactory.createSetupCommands())
 
@@ -206,5 +274,53 @@ export function initializeCliParser() {
 
       // RAG Document Processing Commands
       .command(ragCommand)
+
+      // Observability Commands
+      .command(ObservabilityCommandFactory.createObservabilityCommands())
+
+      // Telemetry Commands
+      .command(TelemetryCommandFactory.createTelemetryCommands())
+
+      // Auth Commands - Authentication management
+      .command(AuthCommandFactory.createAuthCommands())
+
+      // Proxy Commands - Claude multi-account proxy
+      .command({
+        command: "proxy",
+        describe: "Manage Claude multi-account proxy server",
+        builder: (yargs) =>
+          yargs
+            .command(proxyStartCommand)
+            .command(proxyStatusCommand)
+            .command(proxyRestartCommand)
+            .command(proxyPolyfillCommand)
+            .command(proxyShareCommand)
+            .command(proxyPeerCommand)
+            .command(proxyExposeCommand)
+            .command(proxyAnalyzeCommand)
+            .command(proxyReplayCommand)
+            .command(proxyTelemetryCommand)
+            .command(proxySetupCommand)
+            .command(proxyGuardCommand)
+            .command(proxyInstallCommand)
+            .command(proxyUninstallCommand)
+            .demandCommand(
+              1,
+              "Please specify a proxy subcommand: start, status, restart, polyfill capture, share <create|provision|url|list|status|pause|resume|revoke|topup|set|link|rotate|level|note|notes|receipts|delete>, peer <add|request|sync|receipts|net|redeem|list|status|test|remove|pause|resume|set>, expose, analyze, replay <export|compare>, telemetry <setup|start|stop|status|logs|import-dashboard>, setup, guard, install, or uninstall",
+            ),
+        handler: () => {},
+      })
+
+      // Evaluate Command Group - Using EvaluateCommandFactory
+      .command(EvaluateCommandFactory.createEvaluateCommand())
+
+      // Task Command Group - Scheduled and self-running tasks
+      .command(TaskCommandFactory.createTaskCommands())
+
+      // AutoResearch Command Group - Automated AI-driven research experiments
+      .command(AutoresearchCommandFactory.createAutoresearchCommands())
+
+      // Real-time voice server (Soniox STT + Cartesia TTS + Cobra VAD)
+      .command(voiceServerCommand)
   ); // Close the main return statement
 }

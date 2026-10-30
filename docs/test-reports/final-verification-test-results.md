@@ -1,12 +1,19 @@
 # Final Verification Test Results
 
+> **⚠️ HISTORICAL DOCUMENT (August 2025)**
+>
+> This audit was conducted when NeuroLink shipped 9 providers. At audit time, v9.62.0 (May 2026) shipped 24 providers including DeepSeek, NVIDIA NIM, LM Studio, llama.cpp, plus voice (TTS/STT/realtime). References to "9 providers" or "8/9 working" in this file reflect the state at time of analysis.
+>
+> For current capabilities see [README on GitHub](https://github.com/juspay/neurolink/blob/main/README.md) and [Provider Capabilities Audit](https://github.com/juspay/neurolink/blob/main/docs/reference/provider-capabilities-audit.md).
+
+
 **Date:** 2025-07-10  
 **Testing Phase:** Post-Implementation Verification  
 **Status:** All 5 critical fixes implemented
 
 ## Test Environment
 
-- **Working Directory:** `/Users/sachinsharma/Developer/temp/neurolink-fork/neurolink`
+- **Working Directory:** `$WORKSPACE/neurolink-fork/neurolink`
 - **Branch:** release
 - **Build Status:** CLI compiled successfully
 - **MCP Config:** 2 external servers configured (filesystem, github)

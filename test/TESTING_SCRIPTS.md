@@ -13,12 +13,12 @@ This directory contains automated testing scripts for validating NeuroLink funct
 
 ```bash
 # Test a single provider
-npx tsx test/continuous-test-suite.ts --provider openai
-npx tsx test/continuous-test-suite.ts --provider anthropic
-npx tsx test/continuous-test-suite.ts --provider vertex
+pnpm exec tsx test/continuous-test-suite.ts --provider openai
+pnpm exec tsx test/continuous-test-suite.ts --provider anthropic
+pnpm exec tsx test/continuous-test-suite.ts --provider vertex
 
 # Run from project root
-npx tsx test/continuous-test-suite.ts --provider <provider-name>
+pnpm exec tsx test/continuous-test-suite.ts --provider <provider-name>
 ```
 
 #### Supported Providers
@@ -34,6 +34,18 @@ npx tsx test/continuous-test-suite.ts --provider <provider-name>
 - `ollama` - Ollama (local models)
 - `litellm` - LiteLLM proxy
 - `sagemaker` - AWS SageMaker
+- `openrouter` - OpenRouter (300+ models)
+- `openai-compatible` - Any OpenAI-compatible endpoint
+- `deepseek` - DeepSeek (V3, R1)
+- `nvidia-nim` - NVIDIA NIM (Llama 3.3 70B, 400+ models)
+- `lm-studio` - LM Studio (local)
+- `llamacpp` - llama.cpp (local GGUF)
+
+Voice providers (tested via dedicated suites, see below):
+
+- `openai-tts`, `elevenlabs`, `google-tts`, `azure-tts` (TTS — `pnpm test:tts`)
+- `whisper`, `deepgram`, `azure-stt`, `google-stt` (STT — `pnpm test:voice`)
+- `openai-realtime`, `gemini-live` (realtime — `pnpm test:voice-server`)
 
 #### Test Coverage
 
@@ -239,10 +251,10 @@ Test one provider comprehensively:
 
 ```bash
 # Test OpenAI thoroughly
-npx tsx test/continuous-test-suite.ts --provider openai
+pnpm exec tsx test/continuous-test-suite.ts --provider openai
 
 # Test Vertex AI thoroughly
-npx tsx test/continuous-test-suite.ts --provider vertex
+pnpm exec tsx test/continuous-test-suite.ts --provider vertex
 ```
 
 ### 3. Full Suite (15-20 minutes)
@@ -300,7 +312,7 @@ cat /tmp/neurolink-sequential-tests/test-openai.log
 cat /tmp/neurolink-sequential-tests/test-vertex.log
 
 # Single provider test (run manually with output)
-npx tsx test/continuous-test-suite.ts --provider openai 2>&1 | tee test-output.log
+pnpm exec tsx test/continuous-test-suite.ts --provider openai 2>&1 | tee test-output.log
 ```
 
 ### Common Issues
@@ -374,7 +386,7 @@ Error: Cannot find module 'dist/cli/index.js'
 
 ```bash
 # Test specific provider you're working on
-npx tsx test/continuous-test-suite.ts --provider <your-provider>
+pnpm exec tsx test/continuous-test-suite.ts --provider <your-provider>
 ```
 
 ### CI/CD Integration
@@ -446,8 +458,8 @@ await testNewFeature(provider);
 
 ## 🔗 Related Documentation
 
-- [`../COMPREHENSIVE_REFACTORING_PLAN.md`](../COMPREHENSIVE_REFACTORING_PLAN.md) - Architecture and refactoring details
-- [`../PHASE_1_COMPLETION.md`](../PHASE_1_COMPLETION.md) - Phase 1 completion status
+- `../COMPREHENSIVE_REFACTORING_PLAN.md` - Architecture and refactoring details
+- `../PHASE_1_COMPLETION.md` - Phase 1 completion status
 - [`../CLAUDE.md`](../CLAUDE.md) - Developer guide for Claude Code
 - [`../README.md`](../README.md) - Main project documentation
 

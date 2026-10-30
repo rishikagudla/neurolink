@@ -5,21 +5,20 @@
  * with enhanced error handling, retry logic, and NeuroLink-specific features.
  */
 
-import {
+import type {
   SageMakerRuntimeClient as AWSClient,
-  InvokeEndpointCommand,
-  InvokeEndpointWithResponseStreamCommand,
-  type InvokeEndpointCommandInput,
-  type InvokeEndpointWithResponseStreamCommandInput,
-  type InvokeEndpointCommandOutput,
-  type InvokeEndpointWithResponseStreamCommandOutput,
+  InvokeEndpointCommandInput,
+  InvokeEndpointWithResponseStreamCommandInput,
+  InvokeEndpointCommandOutput,
+  InvokeEndpointWithResponseStreamCommandOutput,
 } from "@aws-sdk/client-sagemaker-runtime";
 
 import type {
   SageMakerConfig,
   InvokeEndpointParams,
   InvokeEndpointResponse,
-} from "../../types/providers.js";
+  ConnectionResult,
+} from "../../types/index.js";
 import {
   handleSageMakerError,
   SageMakerError,
@@ -27,46 +26,102 @@ import {
   getRetryDelay,
 } from "./errors.js";
 import { logger } from "../../utils/logger.js";
-import type { ConnectionResult } from "../../types/typeAliases.js";
+import { isAbortError } from "../../utils/errorHandling.js";
+import { tryImport } from "../../utils/tryImport.js";
+
+/**
+ * Lazily load `@aws-sdk/client-sagemaker-runtime`.
+ *
+ * The package is an optional dependency: importing it only happens here, on
+ * first actual endpoint invocation, so constructing a SageMakerRuntimeClient
+ * (e.g. while the CLI builds its command tree at startup) never requires the
+ * SDK to be installed. If it's missing, surface a comprehensible, actionable
+ * error instead of a raw resolution failure.
+ */
+async function loadSageMakerRuntime(): Promise<
+  typeof import("@aws-sdk/client-sagemaker-runtime")
+> {
+  return tryImport<typeof import("@aws-sdk/client-sagemaker-runtime")>(
+    "@aws-sdk/client-sagemaker-runtime",
+    "SageMaker inference",
+  );
+}
 
 /**
  * Enhanced SageMaker Runtime client with retry logic and error handling
  */
 export class SageMakerRuntimeClient {
-  private client: AWSClient | null;
+  private client: AWSClient | null = null;
+  private sdkModule: typeof import("@aws-sdk/client-sagemaker-runtime") | null =
+    null;
   private config: SageMakerConfig;
   private isDisposed: boolean = false;
 
   constructor(config: SageMakerConfig) {
     this.config = config;
 
-    // Initialize AWS SDK client with configuration
-    this.client = new AWSClient({
-      region: config.region,
-      credentials: {
-        accessKeyId: config.accessKeyId,
-        secretAccessKey: config.secretAccessKey,
-        sessionToken: config.sessionToken,
-      },
-      maxAttempts: config.maxRetries || 3,
-      requestHandler: {
-        requestTimeout: config.timeout || 30000,
-        httpsAgent: {
-          // Keep connections alive for better performance
-          keepAlive: true,
-          maxSockets: 50,
-        },
-      },
-      ...(config.endpoint && { endpoint: config.endpoint }),
-    });
-
-    logger.debug("SageMaker Runtime client initialized", {
+    logger.debug("SageMaker Runtime client configured", {
       region: config.region,
       timeout: config.timeout,
       maxRetries: config.maxRetries,
       hasSessionToken: !!config.sessionToken,
       customEndpoint: !!config.endpoint,
     });
+  }
+
+  /**
+   * Lazily load (and cache) the `@aws-sdk/client-sagemaker-runtime` module.
+   */
+  private async getSdk(): Promise<
+    typeof import("@aws-sdk/client-sagemaker-runtime")
+  > {
+    if (!this.sdkModule) {
+      this.sdkModule = await loadSageMakerRuntime();
+    }
+    return this.sdkModule;
+  }
+
+  /**
+   * Lazily construct (and cache) the underlying AWS SDK client.
+   */
+  private async getClient(): Promise<AWSClient> {
+    if (this.isDisposed) {
+      throw new SageMakerError(
+        "Cannot perform operation on disposed SageMaker client",
+        {
+          code: "VALIDATION_ERROR",
+          statusCode: 400,
+        },
+      );
+    }
+
+    if (!this.client) {
+      const { SageMakerRuntimeClient: AWSClientCtor } = await this.getSdk();
+      this.client = new AWSClientCtor({
+        region: this.config.region,
+        credentials: {
+          accessKeyId: this.config.accessKeyId,
+          secretAccessKey: this.config.secretAccessKey,
+          sessionToken: this.config.sessionToken,
+        },
+        maxAttempts: this.config.maxRetries || 3,
+        requestHandler: {
+          requestTimeout: this.config.timeout || 30000,
+          httpsAgent: {
+            // Keep connections alive for better performance
+            keepAlive: true,
+            maxSockets: 50,
+          },
+        },
+        ...(this.config.endpoint && { endpoint: this.config.endpoint }),
+      });
+
+      logger.debug("SageMaker Runtime AWS SDK client initialized", {
+        region: this.config.region,
+      });
+    }
+
+    return this.client;
   }
 
   /**
@@ -92,6 +147,8 @@ export class SageMakerRuntimeClient {
             : params.Body?.length || 0,
       });
 
+      const { InvokeEndpointCommand } = await this.getSdk();
+
       // Prepare the command input
       const input: InvokeEndpointCommandInput = {
         EndpointName: params.EndpointName,
@@ -105,12 +162,14 @@ export class SageMakerRuntimeClient {
       };
 
       const command = new InvokeEndpointCommand(input);
-      const client = this.client;
-      if (!client) {
-        throw new Error("SageMaker client has been disposed");
-      }
+      const client = await this.getClient();
       const response = (await this.executeWithRetry(
-        () => client.send(command),
+        // The signal goes to the transport, not just to whatever loop is
+        // above us: without it an aborted call keeps its HTTP request in
+        // flight until the endpoint answers. An AbortError matches none of
+        // RETRYABLE_ERROR_CONDITIONS, so executeWithRetry surfaces it rather
+        // than re-issuing a request the caller has already abandoned.
+        () => client.send(command, { abortSignal: params.abortSignal }),
         params.EndpointName,
       )) as InvokeEndpointCommandOutput;
 
@@ -129,6 +188,16 @@ export class SageMakerRuntimeClient {
         CustomAttributes: response.CustomAttributes,
       };
     } catch (error) {
+      // The signal now reaches the transport, so this catch sees real
+      // AbortErrors for the first time — and must not wrap them.
+      // SageMakerError's constructor overwrites `.name`, and its generic
+      // fallback stamps `statusCode: 500`, which the retry classifier reads as
+      // "transient, try again". That fabricated status is what turned a
+      // cancellation into three attempts and 22 seconds.
+      if (isAbortError(error)) {
+        throw error;
+      }
+
       const duration = Date.now() - startTime;
       logger.error("SageMaker endpoint invocation failed", {
         endpointName: params.EndpointName,
@@ -165,6 +234,8 @@ export class SageMakerRuntimeClient {
             : params.Body?.length || 0,
       });
 
+      const { InvokeEndpointWithResponseStreamCommand } = await this.getSdk();
+
       // Prepare the command input for streaming
       const input: InvokeEndpointWithResponseStreamCommandInput = {
         EndpointName: params.EndpointName,
@@ -176,12 +247,11 @@ export class SageMakerRuntimeClient {
       };
 
       const command = new InvokeEndpointWithResponseStreamCommand(input);
-      const client = this.client;
-      if (!client) {
-        throw new Error("SageMaker client has been disposed");
-      }
+      const client = await this.getClient();
       const response = (await this.executeWithRetry(
-        () => client.send(command),
+        // As above — an abort must tear down the response stream's connection,
+        // not merely stop the consumer reading from it.
+        () => client.send(command, { abortSignal: params.abortSignal }),
         params.EndpointName,
       )) as InvokeEndpointWithResponseStreamCommandOutput;
 
@@ -212,6 +282,16 @@ export class SageMakerRuntimeClient {
         InvokedProductionVariant: response.InvokedProductionVariant,
       };
     } catch (error) {
+      // The signal now reaches the transport, so the streaming catch sees real
+      // AbortErrors for the first time — and must not wrap them.
+      // SageMakerError's constructor overwrites `.name`, and its generic
+      // fallback stamps `statusCode: 500`, which the retry classifier reads as
+      // "transient, try again". That fabricated status is what turned a
+      // cancellation into three attempts and 22 seconds.
+      if (isAbortError(error)) {
+        throw error;
+      }
+
       const duration = Date.now() - startTime;
       logger.error("SageMaker streaming invocation failed", {
         endpointName: params.EndpointName,
@@ -517,6 +597,7 @@ export class SageMakerRuntimeClient {
     // Clear our client reference to enable garbage collection
     // Note: AWS SDK v3 handles all internal resource cleanup automatically
     this.client = null;
+    this.sdkModule = null;
 
     logger.debug("SageMaker Runtime client disposed", {
       note: "AWS SDK v3 handles internal resource cleanup automatically",

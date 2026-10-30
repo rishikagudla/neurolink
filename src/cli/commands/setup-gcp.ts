@@ -19,40 +19,11 @@ import inquirer from "inquirer";
 import chalk from "chalk";
 import ora from "ora";
 import { logger } from "../../lib/utils/logger.js";
-
-interface GCPSetupOptions {
-  checkOnly?: boolean;
-  interactive?: boolean;
-}
-
-interface GCPSetupArgv {
-  check?: boolean;
-  nonInteractive?: boolean;
-}
-
-interface AuthMethodStatus {
-  method1: {
-    complete: boolean;
-    hasCredentials: boolean;
-    missingVars: string[];
-  };
-  method2: {
-    complete: boolean;
-    hasServiceAccountKey: boolean;
-    missingVars: string[];
-  };
-  method3: {
-    complete: boolean;
-    hasClientEmail: boolean;
-    hasPrivateKey: boolean;
-    missingVars: string[];
-  };
-  common: {
-    hasProject: boolean;
-    hasLocation: boolean;
-    missingVars: string[];
-  };
-}
+import type {
+  GcpAuthMethodStatus,
+  ProviderSetupArgv,
+  ProviderSetupOptions,
+} from "../../lib/types/index.js";
 
 enum AuthMethod {
   FILE_PATH = "file-path",
@@ -66,9 +37,9 @@ const AUTH_METHOD_NAMES = {
   [AuthMethod.INDIVIDUAL_VARS]: "Method 3: Individual Vars",
 };
 
-export async function handleGCPSetup(argv: GCPSetupArgv): Promise<void> {
+export async function handleGCPSetup(argv: ProviderSetupArgv): Promise<void> {
   try {
-    const options: GCPSetupOptions = {
+    const options: ProviderSetupOptions = {
       checkOnly: argv.check || false,
       interactive: !argv.nonInteractive,
     };
@@ -179,7 +150,7 @@ export async function handleGCPSetup(argv: GCPSetupArgv): Promise<void> {
 /**
  * Detect the current status of all authentication methods
  */
-function detectAuthMethodStatus(): AuthMethodStatus {
+function detectAuthMethodStatus(): GcpAuthMethodStatus {
   const hasCredentials = !!process.env.GOOGLE_APPLICATION_CREDENTIALS;
   const hasServiceAccountKey = !!process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
   const hasClientEmail = !!process.env.GOOGLE_AUTH_CLIENT_EMAIL;
@@ -187,7 +158,7 @@ function detectAuthMethodStatus(): AuthMethodStatus {
   const hasProject = !!process.env.GOOGLE_VERTEX_PROJECT;
   const hasLocation = !!process.env.GOOGLE_VERTEX_LOCATION;
 
-  const status: AuthMethodStatus = {
+  const status: GcpAuthMethodStatus = {
     method1: {
       complete: hasCredentials && hasProject,
       hasCredentials,
@@ -246,7 +217,7 @@ function detectAuthMethodStatus(): AuthMethodStatus {
 /**
  * Display the current authentication status
  */
-function displayAuthStatus(status: AuthMethodStatus): void {
+function displayAuthStatus(status: GcpAuthMethodStatus): void {
   if (status.method1.complete) {
     logger.always(chalk.green("✔ Method 1: Complete"));
   } else if (status.method1.hasCredentials) {
@@ -287,7 +258,7 @@ function displayAuthStatus(status: AuthMethodStatus): void {
 /**
  * Check if any authentication method is complete
  */
-function getCompleteMethod(status: AuthMethodStatus): AuthMethod | null {
+function getCompleteMethod(status: GcpAuthMethodStatus): AuthMethod | null {
   if (status.method1.complete) {
     return AuthMethod.FILE_PATH;
   }
@@ -303,7 +274,9 @@ function getCompleteMethod(status: AuthMethodStatus): AuthMethod | null {
 /**
  * Let user select authentication method
  */
-async function selectAuthMethod(status: AuthMethodStatus): Promise<AuthMethod> {
+async function selectAuthMethod(
+  status: GcpAuthMethodStatus,
+): Promise<AuthMethod> {
   // Check for partially filled methods
   const partiallyFilledMethods: {
     method: AuthMethod;
@@ -369,7 +342,7 @@ async function selectAuthMethod(status: AuthMethodStatus): Promise<AuthMethod> {
   // Present method selection
   const { method } = await inquirer.prompt([
     {
-      type: "list",
+      type: "select",
       name: "method",
       message: "Which authentication method would you like to use?",
       choices: [
@@ -397,7 +370,7 @@ async function selectAuthMethod(status: AuthMethodStatus): Promise<AuthMethod> {
  */
 async function promptForMissingValues(
   method: AuthMethod,
-  status: AuthMethodStatus,
+  status: GcpAuthMethodStatus,
 ): Promise<{
   credentialsPath?: string;
   serviceAccountKey?: string;
@@ -427,9 +400,7 @@ async function promptForMissingValues(
         );
 
         if (fs.existsSync(adcPath)) {
-          logger.always(
-            chalk.green("✔ Found Application Default Credentials"),
-          );
+          logger.always(chalk.green("✔ Found Application Default Credentials"));
           logger.always(chalk.blue(`   Location: ${adcPath}`));
           config.credentialsPath = adcPath;
         } else {
@@ -629,6 +600,27 @@ function validateServiceAccountJSON(input: string): boolean | string {
 }
 
 /**
+ * Quote a value for a double-quoted .env entry.
+ *
+ * Line breaks are folded first, whichever way they were typed (a real CR/LF,
+ * or the two characters `\n` a key copied out of a service-account JSON file
+ * carries), and written back as the `\n` escape the .env loaders expand. That
+ * has to come before the backslashes are escaped, or a pasted `\n` would be
+ * doubled into `\\n` and the key would stop being a key. Every other backslash
+ * is then escaped before the quote is: an unescaped one in front of a `"`
+ * cancels the quote's own escape, closes the value early and lets the rest of
+ * the input run as part of the .env line.
+ */
+function quoteEnvValue(value: string): string {
+  const escaped = value
+    .replace(/\\r\\n|\\n|\\r|\r\n|\r/g, "\n")
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, "\\n");
+  return `"${escaped}"`;
+}
+
+/**
  * Update .env file with selected authentication method
  */
 async function updateEnvFile(
@@ -705,10 +697,10 @@ async function updateEnvFile(
           existingVars.set("GOOGLE_AUTH_CLIENT_EMAIL", config.clientEmail);
         }
         if (config.privateKey) {
-          const escaped = config.privateKey
-            .replace(/\r?\n/g, "\\n")
-            .replace(/"/g, '\\"');
-          existingVars.set("GOOGLE_AUTH_PRIVATE_KEY", `"${escaped}"`);
+          existingVars.set(
+            "GOOGLE_AUTH_PRIVATE_KEY",
+            quoteEnvValue(config.privateKey),
+          );
         }
         break;
     }

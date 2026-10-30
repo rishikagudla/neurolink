@@ -3,8 +3,13 @@ name: Single Commit Per Branch Enforcement
 on:
   push:
     branches-ignore: [release, main, develop]
+  # Unfiltered by base branch, for the same reason as ci.yml: the
+  # pull_request path below is the only one that knows the PR's real base
+  # (github.base_ref). Filtered to [release, main], a stacked PR fell through
+  # to the push path, which assumed origin/release and therefore counted the
+  # PARENT branch's commit as one of this branch's own — reporting two commits
+  # for a single-commit PR and failing a policy it had not broken.
   pull_request:
-    branches: [release, main]
     types: [opened, synchronize, reopened]
 
 concurrency:
@@ -23,42 +28,109 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Validate Single Commit Policy
         id: validate
+        env:
+          # Passed through env, never interpolated into the script body: an
+          # expression is substituted into the script TEXT before the shell
+          # parses it, so a backtick or $( ) in any of these executes on the
+          # runner. Reachable by anyone who can open a PR — a commit subject is
+          # free text, and git accepts backticks, $( ) and ; in branch names.
+          # https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#understanding-the-risk-of-script-injections
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+          REF_NAME: ${{ github.ref_name }}
+          HEAD_REPO_ID: ${{ github.event.pull_request.head.repo.id }}
+          BASE_REPO_ID: ${{ github.event.repository.id }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # Needed by the `gh pr list` base lookup on the push path below.
+          GH_TOKEN: ${{ github.token }}
         run: |
           # Determine the base branch and current branch
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            BASE_BRANCH="origin/${{ github.base_ref }}"
-            BRANCH_NAME="${{ github.head_ref }}"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # Authoritative: the event carries the PR's real base branch.
+            BASE_KNOWN=true
+            BASE_BRANCH="origin/$BASE_REF"
+            BRANCH_NAME="$HEAD_REF"
             
             # Handle external vs internal contributors differently using repository IDs for security
-            if [ "${{ github.event.pull_request.head.repo.id }}" != "${{ github.event.repository.id }}" ]; then
+            if [ "$HEAD_REPO_ID" != "$BASE_REPO_ID" ]; then
               # External contributor - use the PR head SHA directly
               CURRENT_BRANCH="HEAD"
               echo "📡 External contributor detected"
-              echo "🔍 Head repository ID: ${{ github.event.pull_request.head.repo.id }}"
-              echo "🔍 Base repository ID: ${{ github.event.repository.id }}"
-              echo "🔍 Using PR head SHA: ${{ github.event.pull_request.head.sha }}"
+              echo "🔍 Head repository ID: $HEAD_REPO_ID"
+              echo "🔍 Base repository ID: $BASE_REPO_ID"
+              echo "🔍 Using PR head SHA: $HEAD_SHA"
               
               # For external PRs, checkout the actual PR commit (not the merge commit)
               echo "🔄 Checking out PR head commit for validation..."
-              git checkout "${{ github.event.pull_request.head.sha }}"
+              git checkout "$HEAD_SHA"
               CURRENT_BRANCH="HEAD"
             else
               # Internal branch - can checkout the actual branch
               echo "🏠 Internal contributor detected"
               echo "🔄 Switching to actual PR head branch for validation..."
-              git checkout "origin/${{ github.head_ref }}"
-              CURRENT_BRANCH="origin/${{ github.head_ref }}"
+              git checkout "origin/$HEAD_REF"
+              CURRENT_BRANCH="origin/$HEAD_REF"
             fi
           else
+            # A push event carries no base branch. Assuming release is right
+            # for the ordinary case and wrong for a stacked branch, where it
+            # counts the parent's commits as this branch's own. So the base is
+            # read from the branch's open pull request when exactly one can be
+            # identified, and treated as UNKNOWN otherwise — never guessed into
+            # a verdict.
+            BASE_KNOWN=false
             BASE_BRANCH="origin/release"
+
+            # Three outcomes have to stay distinguishable here, because two of
+            # them look identical if you only check whether the output is
+            # empty: the lookup succeeded and found one PR, it succeeded and
+            # found none, or it FAILED. Swallowing a failure with `|| true`
+            # turns an auth or API error into "no pull request", which then
+            # silently produces a policy verdict measured against the wrong
+            # base. So the exit status is captured separately from the output.
+            PR_LOOKUP_OK=true
+            PR_JSON=$(gh pr list --head "$REF_NAME" --state open \
+              --json headRefName,baseRefName 2>/dev/null) || PR_LOOKUP_OK=false
+
+            if [ "$PR_LOOKUP_OK" != "true" ]; then
+              echo "⚠️  Could not query pull requests for this branch (auth or"
+              echo "    API failure). Treating the base as unknown rather than"
+              echo "    assuming release, so no verdict is reached on a base"
+              echo "    that was never confirmed."
+            else
+              # `--head` filters by name and can match a PREFIX, and a branch
+              # may legitimately have several open pull requests that share it
+              # while targeting different bases. Either way `.[0]` would pick
+              # one arbitrarily, so require exactly one EXACT head match.
+              MATCHES=$(printf '%s' "$PR_JSON" \
+                | jq --arg ref "$REF_NAME" '[.[] | select(.headRefName == $ref)]')
+              MATCH_COUNT=$(printf '%s' "$MATCHES" | jq 'length')
+
+              if [ "$MATCH_COUNT" -eq 1 ]; then
+                BASE_KNOWN=true
+                BASE_BRANCH="origin/$(printf '%s' "$MATCHES" | jq -r '.[0].baseRefName')"
+                echo "🔗 Resolved base branch from the branch's one open PR: $BASE_BRANCH"
+              elif [ "$MATCH_COUNT" -eq 0 ]; then
+                echo "ℹ️  No open pull request for this branch yet, so the real"
+                echo "    base is unknown. Assuming release for reporting, but"
+                echo "    enforcement is deferred to the pull_request run."
+              else
+                echo "⚠️  $MATCH_COUNT open pull requests share this head branch"
+                echo "    while targeting different bases, so the intended base"
+                echo "    is ambiguous. Treating it as unknown; each pull"
+                echo "    request is still enforced against its own base by the"
+                echo "    pull_request run."
+              fi
+            fi
             CURRENT_BRANCH="HEAD"
-            BRANCH_NAME="${{ github.ref_name }}"
+            BRANCH_NAME="$REF_NAME"
           fi
 
           echo "🔍 Validating single commit policy..."
@@ -72,6 +144,7 @@ jobs:
           COMMIT_COUNT=$(git rev-list --count $CURRENT_BRANCH ^$BASE_BRANCH 2>/dev/null || echo "0")
 
           echo "commits_ahead=$COMMIT_COUNT" >> $GITHUB_OUTPUT
+          echo "base_known=$BASE_KNOWN" >> $GITHUB_OUTPUT
           echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
           echo "base_branch=$BASE_BRANCH" >> $GITHUB_OUTPUT
 
@@ -98,6 +171,21 @@ jobs:
             echo "commit_hash=$COMMIT_HASH" >> $GITHUB_OUTPUT
             echo "commit_author=$COMMIT_AUTHOR" >> $GITHUB_OUTPUT
             
+          elif [ "$BASE_KNOWN" != "true" ]; then
+            # More than one commit ahead of a base we GUESSED. On a stacked
+            # branch that is the correct and expected state: the extra commits
+            # belong to the parent branch, not to this one. Failing here would
+            # report a policy violation the branch has not committed, which is
+            # exactly what this workflow used to do to every stacked PR on its
+            # first push — before its pull request existed to be read.
+            echo "⚠️  $COMMIT_COUNT commits ahead of the ASSUMED base"
+            echo "    ($BASE_BRANCH), and no open pull request was found to"
+            echo "    confirm the real one. Not treating this as a violation."
+            echo "    The pull_request run enforces the policy against the"
+            echo "    branch's actual base, so nothing merges unchecked."
+            echo "status=base_unknown" >> $GITHUB_OUTPUT
+            echo "📋 Commits ahead of the assumed base:"
+            git log --oneline $CURRENT_BRANCH ^$BASE_BRANCH
           else
             echo "❌ POLICY VIOLATION: Branch contains $COMMIT_COUNT commits"
             echo "status=violation" >> $GITHUB_OUTPUT
@@ -109,8 +197,14 @@ jobs:
 
       - name: Validate Commit Message Format
         if: steps.validate.outputs.status == 'compliant'
+        env:
+          # A commit subject is free text. Interpolated directly it became a
+          # shell fragment: a subject containing backticks ran their contents
+          # on the runner and the step died with exit 127 -- reported as
+          # "commit message doesn't follow semantic format", which is both a
+          # false verdict and a command execution.
+          COMMIT_MSG: ${{ steps.validate.outputs.commit_message }}
         run: |
-          COMMIT_MSG="${{ steps.validate.outputs.commit_message }}"
           echo "🔍 Validating commit message format: '$COMMIT_MSG'"
 
           # Check semantic commit format: type(scope): description  
@@ -128,10 +222,65 @@ jobs:
 
           echo "✅ Commit message format is valid"
 
+      - name: Reject CI-Skip Directives
+        if: steps.validate.outputs.status == 'compliant'
+        env:
+          COMMIT_HASH: ${{ steps.validate.outputs.commit_hash }}
+        run: |
+          # The format check above reads only the subject line (%s). GitHub reads
+          # the WHOLE message, body included, so a skip directive quoted in a body
+          # -- e.g. while documenting semantic-release's own commit template --
+          # silently suppresses every push/pull_request workflow for the
+          # resulting push. That has already happened once on `release`: the
+          # merge ran no CI at all, and nothing reported it, because a skipped
+          # run looks identical to a run that was never required.
+          #
+          # What this step can and cannot do. GitHub skips THIS WHOLE WORKFLOW
+          # when the head commit of a pull request holds a directive, so on
+          # that path no step runs, no check is reported, and the required
+          # checks stay Pending, which is what blocks the merge. This step can
+          # never print the remediation below for that case; it is a backstop
+          # for the cases GitHub does not skip. Do not move it to
+          # pull_request_target to close the gap: that trigger runs with the
+          # base repository's token, and this workflow checks out the PR head.
+          FULL_MSG=$(git log -1 --pretty=format:%B "$COMMIT_HASH")
+          SKIP_RE='\[(skip ci|ci skip|no ci|skip actions|actions skip)\]'
+
+          if printf '%s\n' "$FULL_MSG" | grep -qiE "$SKIP_RE"; then
+            echo "❌ POLICY VIOLATION: commit message contains a CI-skip directive"
+            echo ""
+            echo "Offending line(s):"
+            printf '%s\n' "$FULL_MSG" | grep -niE "$SKIP_RE" | sed 's/^/    /'
+            echo ""
+            echo "GitHub honours [skip ci], [ci skip], [no ci], [skip actions] and"
+            echo "[actions skip] anywhere in a commit message -- subject or body."
+            echo "Merging this would push a commit that runs none of the push or"
+            echo "pull_request workflows, including the checks required to protect"
+            echo "this branch."
+            echo ""
+            echo "🔧 TO FIX:"
+            echo "  If you were quoting the directive rather than intending it,"
+            echo "  break up the literal text -- write 'skip-ci' or 'skip<space>ci'"
+            echo "  instead -- or move the explanation to the pull request body,"
+            echo "  which GitHub does not scan."
+            echo ""
+            echo "    git commit --amend"
+            echo "    git push --force-with-lease"
+            echo ""
+            echo "  If you genuinely need to skip CI, say so on the pull request"
+            echo "  and have someone merge it deliberately -- it should not be a"
+            echo "  side effect of how a commit message happens to be worded."
+            exit 1
+          fi
+
+          echo "✅ No CI-skip directives in commit message"
+
       - name: Check for Merge Commits
         if: steps.validate.outputs.status == 'compliant'
+        env:
+          OUT_BASE_BRANCH: ${{ steps.validate.outputs.base_branch }}
         run: |
-          BASE_BRANCH="${{ steps.validate.outputs.base_branch }}"
+          BASE_BRANCH="$OUT_BASE_BRANCH"
 
           # Check for merge commits in the branch
           MERGE_COMMITS=$(git rev-list --merges HEAD ^$BASE_BRANCH)
@@ -150,9 +299,12 @@ jobs:
 
       - name: Provide Squash Instructions
         if: steps.validate.outputs.status == 'violation'
+        env:
+          OUT_COMMIT_COUNT: ${{ steps.validate.outputs.commits_ahead }}
+          OUT_BRANCH_NAME: ${{ steps.validate.outputs.branch_name }}
         run: |
-          COMMIT_COUNT="${{ steps.validate.outputs.commits_ahead }}"
-          BRANCH_NAME="${{ steps.validate.outputs.branch_name }}"
+          COMMIT_COUNT="$OUT_COMMIT_COUNT"
+          BRANCH_NAME="$OUT_BRANCH_NAME"
 
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "🚫 SINGLE COMMIT POLICY VIOLATION"
@@ -186,10 +338,13 @@ jobs:
 
       - name: Check Comment Permissions
         if: steps.validate.outputs.status == 'compliant'
+        env:
+          HEAD_REPO_ID_CHECK: ${{ github.event.pull_request.head.repo.id }}
+          BASE_REPO_ID_CHECK: ${{ github.event.repository.id }}
         id: check-permissions
         run: |
           # Check if this is an external contributor PR using repository IDs for security
-          if [ "${{ github.event.pull_request.head.repo.id }}" != "${{ github.event.repository.id }}" ]; then
+          if [ "$HEAD_REPO_ID_CHECK" != "$BASE_REPO_ID_CHECK" ]; then
             echo "🔒 External contributor PR detected - comment posting will be skipped due to GitHub security restrictions"
             echo "can_comment=false" >> $GITHUB_OUTPUT
           else
@@ -199,7 +354,7 @@ jobs:
 
       - name: Find existing comment
         if: steps.validate.outputs.status == 'compliant' && steps.check-permissions.outputs.can_comment == 'true'
-        uses: peter-evans/find-comment@v3
+        uses: peter-evans/find-comment@b30e6a3c0ed37e7c023ccd3f1db5c6c0b0c23aad # v4.0.0
         id: find-comment
         continue-on-error: true
         with:
@@ -209,7 +364,7 @@ jobs:
 
       - name: Post Minimal Success Comment
         if: steps.validate.outputs.status == 'compliant' && steps.check-permissions.outputs.can_comment == 'true'
-        uses: peter-evans/create-or-update-comment@v4
+        uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9 # v5.0.0
         continue-on-error: true
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -242,12 +397,14 @@ jobs:
 
       - name: Generate Policy Summary
         if: always()
+        env:
+          OUT_STATUS: ${{ steps.validate.outputs.status }}
         run: |
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "🔒 NEUROLINK SINGLE COMMIT POLICY ENFORCEMENT SUMMARY"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-          STATUS="${{ steps.validate.outputs.status }}"
+          STATUS="$OUT_STATUS"
           case $STATUS in
             "compliant")
               echo "✅ STATUS: POLICY COMPLIANT"

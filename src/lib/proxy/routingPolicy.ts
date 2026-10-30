@@ -1,0 +1,103 @@
+import type {
+  ClaudeProxyModelTier,
+  FallbackEntry,
+  ParsedClaudeRequest,
+  ProxyTranslationAttempt,
+  ProxyTranslationPlan,
+} from "../types/index.js";
+import { parseRetryAfterHeaderValue } from "../utils/retryAfter.js";
+
+export function inferClaudeProxyModelTier(
+  modelName: string,
+): ClaudeProxyModelTier {
+  const normalized = modelName.toLowerCase();
+  if (normalized.includes("opus")) {
+    return "opus";
+  }
+  if (normalized.includes("sonnet")) {
+    return "sonnet";
+  }
+  if (normalized.includes("haiku")) {
+    return "haiku";
+  }
+  return "other";
+}
+
+/**
+ * Build a translation plan for a Claude-compatible proxy request.
+ * The plan lists the primary provider followed by eligible fallback targets.
+ * All configured fallback entries are always eligible — no contract-based gating.
+ * An "auto-provider" entry is appended only when explicitly enabled by the
+ * caller. This keeps an empty fallback chain from silently escaping to an
+ * unrelated provider.
+ */
+export function buildProxyTranslationPlan(
+  primary: { provider: string; model?: string },
+  fallbackChain: FallbackEntry[],
+  requestedModel: string,
+  _parsed?: ParsedClaudeRequest,
+  allowAutoFallback = false,
+): ProxyTranslationPlan {
+  const attempts: ProxyTranslationAttempt[] = [
+    {
+      provider: primary.provider,
+      model: primary.model,
+      label: `${primary.provider}/${primary.model ?? "unknown"}`,
+    },
+  ];
+
+  for (const fallback of fallbackChain) {
+    if (
+      fallback.provider === primary.provider &&
+      fallback.model === primary.model
+    ) {
+      continue;
+    }
+
+    attempts.push({
+      provider: fallback.provider,
+      model: fallback.model,
+      ...(fallback.reasoningEffort !== undefined
+        ? { reasoningEffort: fallback.reasoningEffort }
+        : {}),
+      label: `${fallback.provider}/${fallback.model}`,
+    });
+  }
+
+  // A provider chosen by the translation layer is an explicit opt-in. It is
+  // intentionally not a default when configured entries are absent or deduped.
+  if (
+    allowAutoFallback &&
+    (fallbackChain.length === 0 || attempts.length === 1)
+  ) {
+    attempts.push({ label: "auto-provider" });
+  }
+
+  return {
+    requestedModel,
+    modelTier: inferClaudeProxyModelTier(requestedModel),
+    attempts,
+    skipped: [],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Retry-after parsing helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse the retry-after header from an upstream 429 response.
+ *
+ * @param retryAfterHeader - The raw Retry-After header string or null
+ * @returns Milliseconds to wait (minimum 1000ms if valid), or 0 if no valid header present
+ */
+export function parseRetryAfterMs(retryAfterHeader: string | null): number {
+  if (!retryAfterHeader) {
+    return 0;
+  }
+  const delay = parseRetryAfterHeaderValue(retryAfterHeader);
+  if (delay !== undefined) {
+    return Math.max(1000, delay);
+  }
+  return 0;
+}

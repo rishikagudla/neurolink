@@ -346,15 +346,20 @@ class AdaptiveRateLimiter extends RateLimiter {
 For multi-instance deployments:
 
 ```typescript
-import { Redis } from "ioredis";
+import { createClient, type RedisClientType } from "redis";
 
 class RedisRateLimiter {
-  private redis: Redis;
+  private redis: RedisClientType;
   private key: string;
   private limit: number;
   private window: number; // seconds
 
-  constructor(redis: Redis, key: string, limit: number, window: number = 60) {
+  constructor(
+    redis: RedisClientType,
+    key: string,
+    limit: number,
+    window: number = 60,
+  ) {
     this.redis = redis;
     this.key = key;
     this.limit = limit;
@@ -366,15 +371,15 @@ class RedisRateLimiter {
     const windowStart = now - this.window * 1000;
 
     // Remove old entries
-    await this.redis.zremrangebyscore(this.key, 0, windowStart);
+    await this.redis.zRemRangeByScore(this.key, 0, windowStart);
 
     // Count current requests
-    const count = await this.redis.zcard(this.key);
+    const count = await this.redis.zCard(this.key);
 
     if (count >= this.limit) {
-      const oldestEntry = await this.redis.zrange(this.key, 0, 0, "WITHSCORES");
-      const waitTime = oldestEntry[1]
-        ? parseInt(oldestEntry[1]) + this.window * 1000 - now
+      const [oldestEntry] = await this.redis.zRangeWithScores(this.key, 0, 0);
+      const waitTime = oldestEntry?.score
+        ? oldestEntry.score + this.window * 1000 - now
         : 1000;
 
       console.log(`⏳ Rate limit: waiting ${waitTime}ms`);
@@ -383,7 +388,9 @@ class RedisRateLimiter {
     }
 
     // Add current request
-    await this.redis.zadd(this.key, now, `${now}-${Math.random()}`);
+    await this.redis.zAdd(this.key, [
+      { score: now, value: `${now}-${Math.random()}` },
+    ]);
     await this.redis.expire(this.key, this.window * 2);
 
     return fn();

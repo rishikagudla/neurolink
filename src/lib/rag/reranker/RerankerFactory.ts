@@ -6,88 +6,18 @@
  */
 
 import { BaseFactory } from "../../core/infrastructure/index.js";
-import type { AIProvider } from "../../types/providers.js";
-import { logger } from "../../utils/logger.js";
-import { RAGErrorCodes, RerankerError } from "../errors/RAGError.js";
 import type {
+  AIProvider,
   RerankerOptions,
   RerankResult,
   VectorQueryResult,
-} from "../types.js";
-
-/**
- * Supported reranker types
- */
-export type RerankerType =
-  | "llm"
-  | "cross-encoder"
-  | "cohere"
-  | "simple"
-  | "batch";
-
-/**
- * Reranker interface - all rerankers implement this
- */
-export interface Reranker {
-  /** Reranker type identifier */
-  readonly type: RerankerType;
-
-  /**
-   * Rerank results based on query relevance
-   * @param results - Vector search results to rerank
-   * @param query - Original search query
-   * @param options - Reranking options
-   * @returns Reranked results with scores
-   */
-  rerank(
-    results: VectorQueryResult[],
-    query: string,
-    options?: RerankerOptions,
-  ): Promise<RerankResult[]>;
-}
-
-/**
- * Reranker configuration
- */
-export interface RerankerConfig {
-  /** Reranker type */
-  type: RerankerType;
-  /** Model name for LLM-based rerankers */
-  model?: string;
-  /** Provider for the model */
-  provider?: string;
-  /** Number of results to return after reranking */
-  topK?: number;
-  /** Scoring weights */
-  weights?: {
-    semantic?: number;
-    vector?: number;
-    position?: number;
-  };
-  /** API key for external services (e.g., Cohere) */
-  apiKey?: string;
-}
-
-/**
- * Reranker metadata for discovery and documentation
- */
-export interface RerankerMetadata {
-  /** Human-readable description */
-  description: string;
-  /** Default configuration */
-  defaultConfig: Partial<RerankerConfig>;
-  /** Supported configuration options */
-  supportedOptions: string[];
-  /** Recommended use cases */
-  useCases: string[];
-  /** Alternative names for this reranker */
-  aliases: string[];
-  /** Whether this reranker requires an AI model */
-  requiresModel: boolean;
-  /** Whether this reranker requires external API */
-  requiresExternalAPI: boolean;
-}
-
+  Reranker,
+  RerankerConfig,
+  RerankerMetadata,
+  RerankerType,
+} from "../../types/index.js";
+import { logger } from "../../utils/logger.js";
+import { RAGErrorCodes, RerankerError } from "../errors/RAGError.js";
 /**
  * Default reranker metadata entries
  */
@@ -314,7 +244,9 @@ export class RerankerFactory extends BaseFactory<Reranker, RerankerConfig> {
     CrossEncoderClass: typeof import("./reranker.js").CrossEncoderReranker,
     config?: RerankerConfig,
   ): Reranker {
-    const encoder = new CrossEncoderClass(config?.model);
+    const encoder = new CrossEncoderClass(
+      typeof config?.model === "string" ? config.model : undefined,
+    );
     return {
       type: "cross-encoder" as RerankerType,
       async rerank(
@@ -351,7 +283,9 @@ export class RerankerFactory extends BaseFactory<Reranker, RerankerConfig> {
     CohereClass: typeof import("./reranker.js").CohereRelevanceScorer,
     config?: RerankerConfig,
   ): Reranker {
-    const scorer = new CohereClass(config?.model);
+    const scorer = new CohereClass(
+      typeof config?.model === "string" ? config.model : undefined,
+    );
     return {
       type: "cohere" as RerankerType,
       async rerank(
@@ -507,7 +441,10 @@ export class RerankerFactory extends BaseFactory<Reranker, RerankerConfig> {
   /**
    * Get metadata for a reranker
    */
-  getRerankerMetadata(typeOrAlias: string): RerankerMetadata | undefined {
+  async getRerankerMetadata(
+    typeOrAlias: string,
+  ): Promise<RerankerMetadata | undefined> {
+    await this.ensureInitialized();
     const resolvedName = this.resolveName(typeOrAlias) as RerankerType;
     return this.metadataMap.get(resolvedName);
   }
@@ -515,8 +452,10 @@ export class RerankerFactory extends BaseFactory<Reranker, RerankerConfig> {
   /**
    * Get default configuration for a reranker
    */
-  getDefaultConfig(typeOrAlias: string): Partial<RerankerConfig> | undefined {
-    const metadata = this.getRerankerMetadata(typeOrAlias);
+  async getDefaultConfig(
+    typeOrAlias: string,
+  ): Promise<Partial<RerankerConfig> | undefined> {
+    const metadata = await this.getRerankerMetadata(typeOrAlias);
     return metadata?.defaultConfig;
   }
 
@@ -531,14 +470,16 @@ export class RerankerFactory extends BaseFactory<Reranker, RerankerConfig> {
   /**
    * Get all aliases mapped to their types
    */
-  getTypeAliases(): Map<string, string> {
+  async getTypeAliases(): Promise<Map<string, string>> {
+    await this.ensureInitialized();
     return this.getAliases();
   }
 
   /**
    * Check if a type exists
    */
-  hasType(typeOrAlias: string): boolean {
+  async hasType(typeOrAlias: string): Promise<boolean> {
+    await this.ensureInitialized();
     const resolved = this.resolveName(typeOrAlias);
     return this.has(resolved);
   }
@@ -546,7 +487,8 @@ export class RerankerFactory extends BaseFactory<Reranker, RerankerConfig> {
   /**
    * Get rerankers suitable for a use case
    */
-  getRerankersForUseCase(useCase: string): RerankerType[] {
+  async getRerankersForUseCase(useCase: string): Promise<RerankerType[]> {
+    await this.ensureInitialized();
     const matches: RerankerType[] = [];
     const useCaseLower = useCase.toLowerCase();
 
@@ -565,7 +507,8 @@ export class RerankerFactory extends BaseFactory<Reranker, RerankerConfig> {
   /**
    * Get rerankers that don't require external APIs
    */
-  getLocalRerankers(): RerankerType[] {
+  async getLocalRerankers(): Promise<RerankerType[]> {
+    await this.ensureInitialized();
     const matches: RerankerType[] = [];
 
     for (const [type, metadata] of this.metadataMap) {
@@ -580,7 +523,8 @@ export class RerankerFactory extends BaseFactory<Reranker, RerankerConfig> {
   /**
    * Get rerankers that don't require AI models
    */
-  getModelFreeRerankers(): RerankerType[] {
+  async getModelFreeRerankers(): Promise<RerankerType[]> {
+    await this.ensureInitialized();
     const matches: RerankerType[] = [];
 
     for (const [type, metadata] of this.metadataMap) {
@@ -595,7 +539,8 @@ export class RerankerFactory extends BaseFactory<Reranker, RerankerConfig> {
   /**
    * Get all reranker metadata
    */
-  getAllMetadata(): Map<RerankerType, RerankerMetadata> {
+  async getAllMetadata(): Promise<Map<RerankerType, RerankerMetadata>> {
+    await this.ensureInitialized();
     return new Map(this.metadataMap);
   }
 
@@ -636,7 +581,7 @@ export async function getAvailableRerankerTypes(): Promise<RerankerType[]> {
  */
 export function getRerankerMetadata(
   typeOrAlias: string,
-): RerankerMetadata | undefined {
+): Promise<RerankerMetadata | undefined> {
   return rerankerFactory.getRerankerMetadata(typeOrAlias);
 }
 
@@ -645,6 +590,6 @@ export function getRerankerMetadata(
  */
 export function getRerankerDefaultConfig(
   typeOrAlias: string,
-): Partial<RerankerConfig> | undefined {
+): Promise<Partial<RerankerConfig> | undefined> {
   return rerankerFactory.getDefaultConfig(typeOrAlias);
 }

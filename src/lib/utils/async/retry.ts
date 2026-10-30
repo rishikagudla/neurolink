@@ -5,55 +5,20 @@
  */
 
 import { delay } from "./delay.js";
-
-/**
- * Configuration options for retry operations.
- */
-export interface RetryOptions {
-  /**
-   * Maximum number of retry attempts (not including the initial attempt).
-   * @default 3
-   */
-  maxRetries: number;
-
-  /**
-   * Initial delay between retries in milliseconds.
-   * @default 1000
-   */
-  baseDelayMs: number;
-
-  /**
-   * Maximum delay cap in milliseconds.
-   * @default 30000
-   */
-  maxDelayMs: number;
-
-  /**
-   * Multiplier for exponential backoff.
-   * @default 2
-   */
-  backoffMultiplier?: number;
-
-  /**
-   * Function to determine if a retry should be attempted.
-   * Return false to stop retrying immediately.
-   */
-  shouldRetry?: (error: Error, attempt: number) => boolean;
-
-  /**
-   * Callback invoked before each retry attempt.
-   * Useful for logging or metrics.
-   */
-  onRetry?: (error: Error, attempt: number, delayMs: number) => void;
-}
+import type { RetryOptions } from "../../types/index.js";
 
 /**
  * Default retry configuration.
  */
-export const DEFAULT_RETRY_OPTIONS: RetryOptions = {
-  maxRetries: 3,
-  baseDelayMs: 1000,
-  maxDelayMs: 30000,
+export const DEFAULT_RETRY_OPTIONS: Required<
+  Pick<
+    RetryOptions,
+    "maxAttempts" | "initialDelay" | "maxDelay" | "backoffMultiplier"
+  >
+> = {
+  maxAttempts: 3,
+  initialDelay: 1000,
+  maxDelay: 30000,
   backoffMultiplier: 2,
 };
 
@@ -162,25 +127,25 @@ export async function retry<T>(
   fn: () => Promise<T>,
   options: Partial<RetryOptions> = {},
 ): Promise<T> {
-  const config: RetryOptions = {
+  const config = {
     ...DEFAULT_RETRY_OPTIONS,
     ...options,
   };
 
   const {
-    maxRetries,
-    baseDelayMs,
-    maxDelayMs,
-    backoffMultiplier = 2,
-    shouldRetry = () => true,
+    maxAttempts,
+    initialDelay,
+    maxDelay,
+    backoffMultiplier,
+    retryCondition = () => true,
     onRetry,
   } = config;
 
   let lastError: Error = new Error("Retry failed");
-  let currentDelay = baseDelayMs;
+  let currentDelay = initialDelay;
 
   // Total attempts = initial attempt + retries
-  const totalAttempts = maxRetries + 1;
+  const totalAttempts = maxAttempts + 1;
 
   for (let attempt = 1; attempt <= totalAttempts; attempt++) {
     try {
@@ -199,16 +164,16 @@ export async function retry<T>(
       }
 
       // Check if we should retry this error
-      if (!shouldRetry(err, attempt)) {
+      if (!retryCondition(err)) {
         throw err;
       }
 
       // Calculate delay with exponential backoff (capped at maxDelay)
-      const delayMs = Math.min(currentDelay, maxDelayMs);
+      const delayMs = Math.min(currentDelay, maxDelay);
 
       // Notify about retry
       if (onRetry) {
-        onRetry(err, attempt, delayMs);
+        onRetry(attempt, err);
       }
 
       // Wait before next attempt

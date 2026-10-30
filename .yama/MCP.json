@@ -1,0 +1,21 @@
+{
+  "servers": {
+    "github": {
+      "transport": "http",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "description": "GitHub hosted MCP server — pull request data, files, review comments",
+      "headers": {
+        "Authorization": "Bearer ${YAMA_GITHUB_TOKEN}"
+      },
+      "timeout": 30000
+    },
+    "code-review-graph": {
+      "transport": "stdio",
+      "command": "code-review-graph",
+      "args": ["serve"],
+      "description": "Tree-sitter code graph — blast radius, callers/dependents, flows, architecture overview. Installed from requirements-code-review-graph.txt with `uv pip install --require-hashes` (yama-review.yml); locally, put the same install's bin directory on PATH.",
+      "cwd": "..",
+      "timeout": 60000
+    }
+  }
+}

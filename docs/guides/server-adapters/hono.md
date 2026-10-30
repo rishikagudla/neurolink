@@ -192,6 +192,14 @@ const server = await createServer(neurolink, {
 });
 ```
 
+### Request body limits
+
+`bodyParser.jsonLimit` bounds JSON bodies and `bodyParser.maxSize` bounds url-encoded forms. Both default to `10mb`, as on the Express, Fastify and Koa adapters, and raising either one is honoured. Uploads (`multipart/form-data`, `application/octet-stream`, `audio/*`) are bounded by `bodyParser.rawMaxSize`, which defaults to `maxSize` when that is set and to `64mb` otherwise.
+
+A JSON or url-encoded form body over its limit is answered `413` with `error.code` set to `PAYLOAD_TOO_LARGE`, before any middleware or route runs. A declared `Content-Length` over the limit is refused without reading the body, and a body sent without one is read only as far as the limit. An upload over the limit still reaches its route, which answers in its own wire format.
+
+The Express adapter stops at the limit the same way (see "Request body limits" in its guide). Its `413` carries the message `request entity too large`, where Hono's names the limit in bytes.
+
 ---
 
 ## Middleware Integration
@@ -360,9 +368,11 @@ const app = server.getFrameworkInstance();
 
 app.get("/api/custom-stream", async (c) => {
   return c.streamText(async (stream) => {
-    for await (const chunk of neurolink.generateStream({
-      prompt: "Tell me a joke",
-    })) {
+    const result = await neurolink.stream({
+      input: { text: "Tell me a joke" },
+    });
+
+    for await (const chunk of result.stream) {
       await stream.write(chunk.content);
     }
   });
@@ -571,11 +581,11 @@ describe("API Server", () => {
 
 ## Related Documentation
 
-- **[Server Adapters Overview](/guides/server-adapters)** - Getting started with server adapters
-- **[Configuration Reference](/reference/server-configuration)** - Full configuration options
-- **[Express Adapter](/guides/server-adapters/express)** - Compare with Express adapter
-- **[Security Best Practices](/guides/server-adapters/security)** - Authentication patterns
-- **[Streaming Guide](/guides/server-adapters/streaming)** - Real-time streaming with SSE and NDJSON
+- **[Server Adapters Overview](./index.md)** - Getting started with server adapters
+- **[Configuration Reference](../../reference/server-configuration.md)** - Full configuration options
+- **[Express Adapter](./express.md)** - Compare with Express adapter
+- **[Security Best Practices](./security.md)** - Authentication patterns
+- **[Streaming Guide](./streaming.md)** - Real-time streaming with SSE and NDJSON
 
 ---
 

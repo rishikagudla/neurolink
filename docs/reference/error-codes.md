@@ -65,19 +65,18 @@ Errors related to tool registration, discovery, and execution.
 
 ```typescript
 // Check available tools before calling
-const tools = await neurolink.listTools();
+const tools = await neurolink.getAllAvailableTools();
 console.log(
   "Available tools:",
   tools.map((t) => t.name),
 );
 
 // Verify tool registration
-await neurolink.addTool({
-  name: "myTool",
+neurolink.registerTool("myTool", {
   description: "My custom tool",
-  parameters: {
+  parameters: z.object({
     /* schema */
-  },
+  }),
   execute: async (params) => {
     /* implementation */
   },
@@ -123,8 +122,11 @@ const neurolink = new NeuroLink({
   fallbackProviders: ["anthropic", "google-ai"],
 });
 
-// Or manually switch providers
-await neurolink.setProvider("anthropic");
+// Or name the provider on the call itself
+await neurolink.generate({
+  input: { text: "Hello" },
+  provider: "anthropic",
+});
 ```
 
 **PROVIDER_AUTH_FAILED**
@@ -335,6 +337,140 @@ const result = await neurolink.generate({
 });
 ```
 
+## PPT Validation Errors
+
+Errors specific to PPT (PowerPoint) generation validation.
+
+| Code                   | Description                       | Severity | Retriable | Category   |
+| ---------------------- | --------------------------------- | -------- | --------- | ---------- |
+| `INVALID_PPT_PAGES`    | Invalid page count (must be 5-50) | MEDIUM   | No        | VALIDATION |
+| `INVALID_PPT_THEME`    | Invalid theme specified           | MEDIUM   | No        | VALIDATION |
+| `INVALID_PPT_AUDIENCE` | Invalid audience type             | MEDIUM   | No        | VALIDATION |
+| `INVALID_PPT_TONE`     | Invalid tone specified            | MEDIUM   | No        | VALIDATION |
+| `INVALID_PPT_ASPECT`   | Invalid aspect ratio              | MEDIUM   | No        | VALIDATION |
+| `INVALID_PPT_FORMAT`   | Invalid output format             | MEDIUM   | No        | VALIDATION |
+| `INVALID_PPT_MODE`     | Output mode not set to ppt        | MEDIUM   | No        | VALIDATION |
+| `EMPTY_PPT_PROMPT`     | Prompt cannot be empty            | MEDIUM   | No        | VALIDATION |
+| `PPT_PROMPT_TOO_SHORT` | Prompt must be at least 10 chars  | MEDIUM   | No        | VALIDATION |
+| `PPT_PROMPT_TOO_LONG`  | Prompt exceeds 1000 characters    | MEDIUM   | No        | VALIDATION |
+
+### Resolution Guide
+
+**INVALID_PPT_PAGES**
+
+```typescript
+// Valid page count: 5-50 slides
+const result = await neurolink.generate({
+  input: { text: "Company presentation" },
+  output: {
+    mode: "ppt",
+    ppt: { pages: 10 }, // Must be between 5 and 50
+  },
+});
+```
+
+**INVALID_PPT_THEME**
+
+```typescript
+// Valid themes: 'modern', 'corporate', 'creative', 'minimal', 'dark'
+const result = await neurolink.generate({
+  input: { text: "Product launch" },
+  output: {
+    mode: "ppt",
+    ppt: {
+      pages: 12,
+      theme: "corporate", // Valid theme name
+    },
+  },
+});
+```
+
+**INVALID_PPT_AUDIENCE**
+
+```typescript
+// Valid audiences: 'business', 'students', 'technical', 'general'
+const result = await neurolink.generate({
+  input: { text: "Technical architecture overview" },
+  output: {
+    mode: "ppt",
+    ppt: {
+      pages: 15,
+      audience: "technical", // Valid audience type
+    },
+  },
+});
+```
+
+## PPT Generation Runtime Errors
+
+Runtime errors during PPT generation (as opposed to validation errors).
+
+| Code                          | Description                      | Severity | Retriable | Category   |
+| ----------------------------- | -------------------------------- | -------- | --------- | ---------- |
+| `PPT_PLANNING_FAILED`         | AI content planning failed       | HIGH     | Yes       | EXECUTION  |
+| `PPT_INVALID_AI_RESPONSE`     | AI returned malformed slide data | HIGH     | Yes       | EXECUTION  |
+| `PPT_IMAGE_GENERATION_FAILED` | AI image generation failed       | MEDIUM   | Yes       | EXECUTION  |
+| `PPT_ASSEMBLY_FAILED`         | PPTX file assembly failed        | HIGH     | No        | EXECUTION  |
+| `PPT_FILE_WRITE_FAILED`       | Could not write file to disk     | HIGH     | No        | RESOURCE   |
+| `PPT_TIMEOUT`                 | Generation exceeded timeout      | HIGH     | Yes       | TIMEOUT    |
+| `PPT_INVALID_INPUT`           | Invalid input during runtime     | HIGH     | No        | VALIDATION |
+
+### Resolution Guide
+
+**PPT_PLANNING_FAILED**
+
+```typescript
+// Use a more specific prompt or try a different model
+const result = await neurolink.generate({
+  input: {
+    text: `Quarterly Sales Report: 
+      - Revenue growth 23% YoY
+      - 450 new customers
+      - Top 3 products by region
+      - 2026 targets and roadmap`,
+  },
+  provider: "anthropic",
+  model: "claude-3.5-sonnet", // Try advanced model
+  output: {
+    mode: "ppt",
+    ppt: { pages: 15, theme: "corporate" },
+  },
+});
+```
+
+**PPT_IMAGE_GENERATION_FAILED**
+
+```typescript
+// Disable AI image generation if it fails
+const result = await neurolink.generate({
+  input: { text: "Technical architecture" },
+  output: {
+    mode: "ppt",
+    ppt: {
+      pages: 10,
+      generateAIImages: false, // Disable AI images
+    },
+  },
+});
+```
+
+**PPT_TIMEOUT**
+
+```typescript
+// Reduce slides or disable images for faster generation
+const result = await neurolink.generate({
+  input: { text: "Quick summary presentation" },
+  output: {
+    mode: "ppt",
+    ppt: {
+      pages: 5, // Fewer slides
+      generateAIImages: false, // No AI images
+    },
+  },
+  timeout: 300, // 5 minute timeout
+});
+```
+
 ## SDK Error Handling Example
 
 Complete example demonstrating proper error handling in the SDK:
@@ -508,9 +644,50 @@ Some providers have additional error codes:
 | `ENDPOINT_NOT_FOUND`  | SageMaker endpoint not found    | 404         | No        |
 | `UNKNOWN_ERROR`       | Unclassified error              | 500         | No        |
 
+### Voice Errors (STT / TTS / Realtime)
+
+STT and Realtime error codes are surfaced via the `STTError` and
+`RealtimeError` classes, which extend the shared `VoiceError` base. TTS
+error codes are exposed via the `TTS_ERROR_CODES` enum and surfaced via
+the `TTSError` class, which extends `NeuroLinkError` directly rather than
+`VoiceError` (see [TTS / Realtime Errors](#tts--realtime-errors) below).
+
+#### STT Error Codes
+
+| Code                          | Description                                                                              | Retriable |
+| ----------------------------- | ---------------------------------------------------------------------------------------- | --------- |
+| `STT_AUDIO_EMPTY`             | Empty audio buffer submitted for transcription                                           | No        |
+| `STT_AUDIO_TOO_LONG`          | Audio buffer exceeds `maxAudioBytes` (default 25MB)                                      | No        |
+| `STT_INVALID_AUDIO_FORMAT`    | Provider doesn't decode the requested audio format. Common trigger: `azure-stt` + `mp3`. | No        |
+| `STT_LANGUAGE_NOT_SUPPORTED`  | Requested language not supported by the provider                                         | No        |
+| `STT_TRANSCRIPTION_FAILED`    | Transcription failed at the provider                                                     | Sometimes |
+| `STT_PROVIDER_NOT_CONFIGURED` | Required env vars / credentials not set                                                  | No        |
+| `STT_PROVIDER_NOT_SUPPORTED`  | No handler registered for the requested provider id                                      | No        |
+| `STT_STREAM_ERROR`            | Streaming transcription failed mid-stream                                                | Yes       |
+| `STT_STREAMING_NOT_SUPPORTED` | Provider doesn't support streaming transcription                                         | No        |
+
+#### TTS / Realtime Errors
+
+`TTSError` and `RealtimeError` carry provider-specific messages (e.g.
+synthesis failure, WebSocket disconnect, function-call failure). Inspect
+`error.cause` for the underlying provider error.
+
+#### Common Triggers
+
+- **`STT_INVALID_AUDIO_FORMAT`** is thrown by `STTProcessor.transcribe()`
+  when `options.format` doesn't appear in the provider's
+  `getSupportedFormats()` list. The CLI infers the format from the
+  `--input-audio` file extension; the SDK requires you to pass it explicitly.
+  Fix: either convert the audio to a supported format, or use a different
+  STT provider. See `docs/getting-started/providers/azure-speech.md` for the
+  Azure-MP3 case.
+- **`STT_AUDIO_TOO_LONG`** is thrown when the buffer exceeds the per-call
+  `maxAudioBytes` limit. Default is 25 MB (matches Whisper's documented
+  ceiling). Override via `stt.maxAudioBytes`.
+
 ## Related Documentation
 
-- [Troubleshooting Guide](/docs/reference/troubleshooting.md) - Common issues and solutions
-- [Configuration Reference](../deployment/configuration.md) - Environment variables and settings
-- [FAQ](/docs/reference/faq.md) - Frequently asked questions
-- [Provider Feature Compatibility](/docs/reference/provider-feature-compatibility.md) - Provider capabilities matrix
+- [Troubleshooting Guide](./troubleshooting.md) - Common issues and solutions
+- [Configuration Reference](./configuration.md) - Environment variables and settings
+- [FAQ](./faq.md) - Frequently asked questions
+- [Provider Feature Compatibility](./provider-feature-compatibility.md) - Provider capabilities matrix

@@ -117,7 +117,6 @@ import {
   RETRY_ATTEMPTS,
   RETRY_DELAYS,
   PROVIDER_RETRY,
-  BACKOFF_CONFIG,
   RetryUtils,
 } from "./retry.js";
 import {
@@ -287,19 +286,6 @@ export function getPerformanceConfig(
   return PERFORMANCE_PROFILES[loadKey] ?? PERFORMANCE_PROFILES.NORMAL_LOAD;
 }
 
-// ===== TYPE EXPORTS =====
-
-/**
- * Type definitions for configuration objects
- */
-export type TimeoutCategory = keyof typeof TOOL_TIMEOUTS;
-export type RetryStrategy = keyof typeof BACKOFF_CONFIG;
-export type PerformanceProfile = keyof typeof PERFORMANCE_PROFILES;
-export type ProviderConfig =
-  (typeof PROVIDER_OPERATION_CONFIGS)[keyof typeof PROVIDER_OPERATION_CONFIGS];
-export type McpConfig =
-  (typeof MCP_OPERATION_CONFIGS)[keyof typeof MCP_OPERATION_CONFIGS];
-
 // ===== VERSION AND METADATA =====
 
 /**
@@ -309,6 +295,37 @@ export const CONSTANTS_METADATA = {
   VERSION: "1.0.0",
   LAST_UPDATED: "2025-01-27",
   TOTAL_CONSTANTS: 300,
-  CATEGORIES: ["timeouts", "retry", "performance", "tokens"],
+  CATEGORIES: ["timeouts", "retry", "performance", "tokens", "enums"],
   COMPATIBILITY: "backward_compatible",
 } as const;
+
+// ===== ENUMS =====
+export {
+  // Provider and Model Enums
+  AIProviderName,
+  OpenRouterModels,
+  BedrockModels,
+  OpenAIModels,
+  AzureOpenAIModels,
+  VertexModels,
+  GoogleAIModels,
+  AnthropicModels,
+  MistralModels,
+  OllamaModels,
+  LiteLLMModels,
+  HuggingFaceModels,
+  SageMakerModels,
+  APIVersions,
+  // Error Enums
+  ErrorCategory,
+  ErrorSeverity,
+  // Claude Subscription Enums
+  AnthropicBetaFeature,
+  // OAuth Constants
+  TOKEN_EXPIRY_BUFFER_MS,
+} from "./enums.js";
+
+// ===== ERROR CODES =====
+export { VIDEO_ERROR_CODES } from "./videoErrors.js";
+
+// Re-export subscription types from canonical location for convenience

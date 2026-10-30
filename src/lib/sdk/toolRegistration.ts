@@ -5,14 +5,15 @@
 
 import { z } from "zod";
 import { logger } from "../utils/logger.js";
-import type { MCPServerInfo, MCPServerCategory } from "../types/mcpTypes.js";
 import type {
-  ToolArgs,
-  SimpleTool as CoreSimpleTool,
-  ZodUnknownSchema,
+  JsonValue,
+  MCPServerCategory,
+  MCPServerInfo,
   SDKToolContext,
-} from "../types/tools.js";
-import type { JsonValue } from "../types/common.js";
+  SdkSimpleTool,
+  ToolArgs,
+  ZodUnknownSchema,
+} from "../types/index.js";
 import { createMCPServerInfo } from "../utils/mcpDefaults.js";
 import {
   validateToolName,
@@ -98,51 +99,11 @@ const VALIDATION_CONFIG = {
 } as const;
 
 /**
- * Context provided to tools during execution
- * Type alias for backward compatibility
- */
-export type ToolContext = SDKToolContext;
-
-/**
- * Simple tool interface for SDK users
- * Extends the core SimpleTool with specific types
- */
-export interface SimpleTool<TArgs = ToolArgs, TResult = JsonValue>
-  extends Omit<CoreSimpleTool<TArgs, TResult>, "execute"> {
-  /**
-   * Tool description that helps AI understand when to use it
-   */
-  description: string;
-
-  /**
-   * Parameters schema using Zod (optional)
-   */
-  parameters?: ZodUnknownSchema;
-
-  /**
-   * Tool execution function
-   */
-  execute: (params: TArgs, context?: ToolContext) => Promise<TResult>;
-
-  /**
-   * Optional metadata
-   */
-  metadata?: {
-    category?: string;
-    version?: string;
-    author?: string;
-    tags?: string[];
-    documentation?: string;
-    [key: string]: JsonValue | undefined;
-  };
-}
-
-/**
  * Creates a MCPServerInfo from a set of tools
  */
 export function createMCPServerFromTools(
   serverId: string,
-  tools: Record<string, SimpleTool>,
+  tools: Record<string, SdkSimpleTool>,
   metadata?: {
     title?: string;
     description?: string;
@@ -202,7 +163,7 @@ function convertSchemaToJsonSchema(schema: unknown): object {
 /**
  * Helper to create a tool with type safety
  */
-export function createTool(config: SimpleTool): SimpleTool {
+export function createTool(config: SdkSimpleTool): SdkSimpleTool {
   return config;
 }
 
@@ -211,9 +172,9 @@ export function createTool(config: SimpleTool): SimpleTool {
  */
 export function createValidatedTool(
   name: string,
-  config: SimpleTool,
+  config: SdkSimpleTool,
   options: { strict?: boolean; suggestions?: boolean } = {},
-): SimpleTool {
+): SdkSimpleTool {
   const { strict = true, suggestions = true } = options;
 
   try {
@@ -243,7 +204,7 @@ export function createValidatedTool(
 /**
  * Provide helpful suggestions for tool improvement
  */
-function provideToolSuggestions(name: string, tool: SimpleTool): void {
+function provideToolSuggestions(name: string, tool: SdkSimpleTool): void {
   const suggestions: string[] = [];
 
   // Check for common improvements
@@ -284,15 +245,30 @@ function provideToolSuggestions(name: string, tool: SimpleTool): void {
  * Helper to create a tool with typed parameters
  */
 export function createTypedTool<TParams extends ZodUnknownSchema>(
-  config: Omit<SimpleTool, "execute"> & {
+  config: Omit<SdkSimpleTool, "execute"> & {
     parameters: TParams;
     execute: (
       params: z.infer<TParams>,
-      context?: ToolContext,
+      context?: SDKToolContext,
     ) => Promise<JsonValue> | JsonValue;
   },
-): SimpleTool {
-  return config as SimpleTool;
+): SdkSimpleTool {
+  // Wrap the typed execute to match SdkSimpleTool's signature.
+  // The Zod schema validates params at runtime, so the cast within the wrapper is safe.
+  const wrappedExecute = async (
+    params: ToolArgs,
+    context?: SDKToolContext,
+  ): Promise<JsonValue> => {
+    const result = await config.execute(params as z.infer<TParams>, context);
+    return result;
+  };
+
+  return {
+    description: config.description,
+    parameters: config.parameters,
+    execute: wrappedExecute,
+    ...(config.metadata && { metadata: config.metadata }),
+  };
 }
 
 /**
@@ -352,7 +328,7 @@ function validateToolDescriptionLegacy(
 /**
  * Validate tool configuration with detailed error messages
  */
-export function validateTool(name: string, tool: SimpleTool): void {
+export function validateTool(name: string, tool: SdkSimpleTool): void {
   // Enhanced tool name validation using centralized utilities
   validateToolNameLegacy(name);
 
@@ -396,8 +372,12 @@ export function validateTool(name: string, tool: SimpleTool): void {
       );
     }
 
-    // Check for common schema validation methods (Zod uses 'parse', others might use 'validate')
-    const params = tool.parameters as unknown as Record<string, unknown>;
+    // Check for common schema validation methods (Zod uses 'parse', others might use 'validate').
+    // Despite the declared Zod type, callers may pass custom schema objects at
+    // runtime — this function's whole purpose is to validate that; probe as
+    // `unknown` and narrow to a generic record for feature detection.
+    const paramsCandidate: unknown = tool.parameters;
+    const params = paramsCandidate as Record<string, unknown>;
     const hasValidationMethod =
       typeof params.parse === "function" ||
       typeof params.validate === "function" ||
@@ -476,7 +456,7 @@ export function validateTool(name: string, tool: SimpleTool): void {
 /**
  * Utility to validate multiple tools at once
  */
-export function validateTools(tools: Record<string, SimpleTool>): {
+export function validateTools(tools: Record<string, SdkSimpleTool>): {
   valid: string[];
   invalid: Array<{ name: string; error: string }>;
 } {

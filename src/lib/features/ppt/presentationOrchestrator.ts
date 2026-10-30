@@ -12,24 +12,26 @@
  * @module presentation/presentationOrchestrator
  */
 
-// Import pptxgenjs using dynamic import for ESM compatibility
-import PptxGenJSModule from "pptxgenjs";
-const PptxGenJS = PptxGenJSModule as unknown as {
-  new (): import("./types.js").PptxPresentation;
-};
+import { loadPptxGenJS } from "./slideGenerator.js";
 import * as fs from "fs/promises";
 import type {
   PPTGenerationResult,
   PresentationGenerationOptions,
   OrchestrationState,
   SlideGeneratorConfig,
-} from "./types.js";
-import { PPTError, PPT_ERROR_CODES } from "./types.js";
+} from "../../types/index.js";
+import { PPTError, PPT_ERROR_CODES } from "./pptError.js";
 import { generateContentPlan, postProcessPlan } from "./contentPlanner.js";
 import { SlideGenerator } from "./slideGenerator.js";
 import { PPT_GENERATION_TIMEOUT_MS } from "./constants.js";
 import { logger } from "../../utils/logger.js";
 import { withTimeout, ErrorFactory } from "../../utils/errorHandling.js";
+import {
+  SpanSerializer,
+  SpanType,
+  SpanStatus,
+  getMetricsAggregator,
+} from "../../observability/index.js";
 import {
   generateOutputPath,
   ensureOutputDirectory,
@@ -68,6 +70,19 @@ import {
 export async function generatePresentation(
   options: PresentationGenerationOptions,
 ): Promise<PPTGenerationResult> {
+  const span = SpanSerializer.createSpan(
+    SpanType.PPT_GENERATION,
+    "ppt.orchestrate",
+    {
+      "ppt.operation": "orchestrate",
+      "ppt.slideCount": options.context.pages,
+      "ppt.theme":
+        typeof options.context.theme === "string"
+          ? options.context.theme
+          : "custom",
+    },
+  );
+
   const state: OrchestrationState = {
     startTime: Date.now(),
     contentPlan: null,
@@ -112,6 +127,13 @@ export async function generatePresentation(
 
     // Post-process: ensure title and thank-you slides
     state.contentPlan = postProcessPlan(planResult);
+
+    // Update span attributes with post-processed plan values (AI may have changed slide count/theme)
+    span.attributes["ppt.slideCount"] = state.contentPlan.totalSlides;
+    span.attributes["ppt.theme"] =
+      typeof state.contentPlan.theme === "string"
+        ? state.contentPlan.theme
+        : "custom";
 
     logger.info("[PresentationOrchestrator] Content plan ready", {
       title: state.contentPlan.title,
@@ -171,6 +193,7 @@ export async function generatePresentation(
 
     // Create presentation instance
     // Use pptxgenjs directly - the SlideGenerator.renderSlide handles type conversion internally
+    const PptxGenJS = await loadPptxGenJS();
     const pptxInstance = new PptxGenJS();
 
     // Set presentation metadata using pptxgenjs API directly
@@ -250,6 +273,10 @@ export async function generatePresentation(
     // =========================================================================
     // STEP 5: Return Result
     // =========================================================================
+    const endedSpan = SpanSerializer.endSpan(span, SpanStatus.OK);
+    getMetricsAggregator().recordSpan(endedSpan);
+    neurolink?.recordMetricsSpan(endedSpan);
+
     // Use values from content plan (AI may have chosen them if "AI will decide" was passed)
     const finalTheme = state.contentPlan?.theme || context.theme;
     const finalAudience = state.contentPlan?.audience || context.audience;
@@ -272,6 +299,12 @@ export async function generatePresentation(
       },
     };
   } catch (error) {
+    const endedSpan = SpanSerializer.endSpan(span, SpanStatus.ERROR);
+    endedSpan.statusMessage =
+      error instanceof Error ? error.message : String(error);
+    getMetricsAggregator().recordSpan(endedSpan);
+    neurolink?.recordMetricsSpan(endedSpan);
+
     // Re-throw PPTError as-is
     if (error instanceof PPTError) {
       logger.error("[PresentationOrchestrator] Generation failed", {

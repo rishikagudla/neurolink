@@ -1,0 +1,51 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / createConditionalScorer
+
+# Function: createConditionalScorer()
+
+> **createConditionalScorer**(`id`, `name`, `condition`, `scorer`, `options?`): [`BaseScorer`](../classes/BaseScorer.md)
+
+Create a conditional scorer that only runs if a condition is met
+
+## Parameters
+
+### id
+
+`string`
+
+### name
+
+`string`
+
+### condition
+
+(`input`) => `boolean`
+
+### scorer
+
+[`BaseScorer`](../classes/BaseScorer.md)
+
+### options?
+
+#### defaultScore?
+
+`number`
+
+#### defaultReasoning?
+
+`string`
+
+#### description?
+
+`string`
+
+#### config?
+
+[`ScorerConfig`](../type-aliases/ScorerConfig.md)
+
+## Returns
+
+[`BaseScorer`](../classes/BaseScorer.md)

@@ -1,0 +1,13 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / OpenAICompatConfigInput
+
+# Type Alias: OpenAICompatConfigInput
+
+> **OpenAICompatConfigInput** = `Pick`\<[`OpenAICompatCatalogEntry`](OpenAICompatCatalogEntry.md), `"providerName"` \| `"apiKeyEnvVar"` \| `"baseURLEnvVar"` \| `"defaultBaseURL"` \| `"computedBaseURL"` \| `"configOptions"`\>
+
+The subset of OpenAICompatCatalogEntry that resolveOpenAICompatConfig()
+needs — lets call sites pass a minimal object without the full catalog
+entry (e.g. in tests, or a future non-catalog caller).

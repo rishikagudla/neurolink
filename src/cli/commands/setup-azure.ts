@@ -20,28 +20,17 @@ import {
   displayEnvUpdateSummary,
 } from "../utils/envManager.js";
 import { getTopModelChoices } from "../../lib/utils/modelChoices.js";
-import { AIProviderName } from "../../lib/types/index.js";
+import {
+  AIProviderName,
+  type ProviderSetupArgv,
+  type ProviderSetupConfig,
+  type ProviderSetupOptions,
+} from "../../lib/types/index.js";
+import { maskCredential } from "../utils/maskCredential.js";
 
-interface AzureSetupOptions {
-  checkOnly?: boolean;
-  interactive?: boolean;
-}
-
-interface AzureSetupArgv {
-  check?: boolean;
-  nonInteractive?: boolean;
-}
-
-interface AzureConfig {
-  apiKey?: string;
-  endpoint?: string;
-  model?: string;
-  isReconfiguring?: boolean;
-}
-
-export async function handleAzureSetup(argv: AzureSetupArgv): Promise<void> {
+export async function handleAzureSetup(argv: ProviderSetupArgv): Promise<void> {
   try {
-    const options: AzureSetupOptions = {
+    const options: ProviderSetupOptions = {
       checkOnly: argv.check || false,
       interactive: !argv.nonInteractive,
     };
@@ -76,7 +65,7 @@ export async function handleAzureSetup(argv: AzureSetupArgv): Promise<void> {
       return;
     }
 
-    const config: AzureConfig = {};
+    const config: ProviderSetupConfig = {};
 
     // Step 2: Handle existing configuration
     if (hasApiKey && hasEndpoint) {
@@ -367,6 +356,23 @@ function validateApiKey(input: string): boolean | string {
   return true;
 }
 
+const AZURE_OPENAI_HOST_SUFFIX = ".openai.azure.com";
+
+/**
+ * True only when the parsed hostname is a subdomain of openai.azure.com.
+ * A substring test also accepts `openai.azure.com.evil.example` and
+ * `evilopenai.azure.com`, so the leading dot of the suffix is what pins the
+ * label boundary. The URL class has already lower-cased the host; a single
+ * trailing dot (an absolute DNS name) is the same host and is ignored.
+ */
+function isAzureOpenAIHostname(hostname: string): boolean {
+  const host = hostname.endsWith(".") ? hostname.slice(0, -1) : hostname;
+  return (
+    host.length > AZURE_OPENAI_HOST_SUFFIX.length &&
+    host.endsWith(AZURE_OPENAI_HOST_SUFFIX)
+  );
+}
+
 /**
  * Validate Azure OpenAI endpoint URL
  */
@@ -379,7 +385,7 @@ function validateEndpoint(input: string): boolean | string {
 
   try {
     const url = new URL(trimmed);
-    if (!url.hostname.includes("openai.azure.com")) {
+    if (!isAzureOpenAIHostname(url.hostname)) {
       return "Endpoint should be an Azure OpenAI URL (*.openai.azure.com)";
     }
     return true;
@@ -394,7 +400,7 @@ function validateEndpoint(input: string): boolean | string {
 async function promptForModel(): Promise<string> {
   const { modelChoice } = await inquirer.prompt([
     {
-      type: "list",
+      type: "select",
       name: "modelChoice",
       message: "Select an Azure OpenAI model:",
       choices: getTopModelChoices(AIProviderName.AZURE, 5),
@@ -429,7 +435,9 @@ async function promptForModel(): Promise<string> {
 /**
  * Update .env file with Azure OpenAI configuration using shared utilities
  */
-async function updateEnvFileWithConfig(config: AzureConfig): Promise<void> {
+async function updateEnvFileWithConfig(
+  config: ProviderSetupConfig,
+): Promise<void> {
   const spinner = ora("💾 Updating .env file...").start();
 
   try {
@@ -462,21 +470,6 @@ async function updateEnvFileWithConfig(config: AzureConfig): Promise<void> {
     );
     throw error;
   }
-}
-
-/**
- * Mask API key for display
- */
-function maskCredential(credential: string): string {
-  if (!credential || credential.length < 8) {
-    return "****";
-  }
-
-  const start = credential.slice(0, 4);
-  const end = credential.slice(-4);
-  const middle = "*".repeat(Math.max(4, credential.length - 8));
-
-  return `${start}${middle}${end}`;
 }
 
 /**

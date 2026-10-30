@@ -1,0 +1,1307 @@
+#!/usr/bin/env tsx
+import "./helpers/credentialFreeEnv.js";
+
+/**
+ * Continuous Test Suite — Amazon Bedrock native-loop characterization
+ * (Plan 08, Task 4).
+ *
+ * Pins the observable behaviour of Bedrock's two hand-rolled turn loops —
+ * `conversationLoop` (generate) and `streamingConversationLoop` (stream) —
+ * so the migration onto `runAgenticLoop` can be shown not to change it.
+ *
+ * Everything here drives the shipped surface: `new NeuroLink()` from
+ * `../dist/index.js`, no imports out of `src/`, no stubbing. The provider's
+ * real AWS SDK client is pointed at a local server with the documented
+ * `AWS_ENDPOINT_URL_BEDROCK_RUNTIME` variable, so requests are really signed
+ * with SigV4 and really routed, and the assertions are about the calls that
+ * actually go out on the wire.
+ *
+ * The stand-in speaks cleartext HTTP/2 because `@aws-sdk/client-bedrock-runtime`
+ * defaults to `NodeHttp2Handler` for its event-stream operations and refuses
+ * an HTTP/1.1 server with "Protocol error" before sending anything. Streaming
+ * responses are encoded in the real `vnd.amazon.eventstream` binary framing
+ * (see `encodeEventFrame`), so the SDK's own decoder is exercised too.
+ *
+ * The last section reads `inferenceConfig.maxTokens` off those requests to pin
+ * what a request carries for a geography-prefixed model id: the streaming path
+ * applies the model's output ceiling, generate() sends the caller's own value.
+ *
+ * Run: npx tsx test/continuous-test-suite-bedrock-loop-characterization.ts
+ *      pnpm run test:bedrock-loop-characterization
+ */
+
+import { createServer, type Http2Server } from "node:http2";
+import { crc32 } from "node:zlib";
+import { z } from "zod";
+import { assert, defineSuite } from "./helpers/harness.js";
+import { assertDistFresh } from "./helpers/distFreshness.js";
+
+assertDistFresh();
+
+const { test, section, runSuite } = defineSuite(
+  "Bedrock loop characterization",
+  { offline: true },
+);
+
+const { NeuroLink } = await import("../dist/index.js");
+
+// Already carries a geography prefix, so it is a concrete routable id under
+// any inference-profile resolution the provider may grow.
+const MODEL = "us.anthropic.claude-haiku-4-5-20251001-v1:0";
+
+type EventFrame = { type: string; payload: Record<string, unknown> };
+
+/**
+ * Encode one `:message-type: event` frame of the AWS event-stream framing:
+ * an 8-byte prelude and its CRC, the headers, the payload, and a CRC over
+ * everything before it. Verified byte-for-byte against
+ * `@smithy/eventstream-codec` for every frame type used below, which is why
+ * this can stay a local helper instead of promoting two transitive `@smithy`
+ * packages to explicit devDependencies.
+ */
+function encodeEventFrame(frame: EventFrame): Buffer {
+  const body = Buffer.from(JSON.stringify(frame.payload), "utf8");
+  const header = (name: string, value: string): Buffer => {
+    const n = Buffer.from(name, "utf8");
+    const v = Buffer.from(value, "utf8");
+    const len = Buffer.alloc(2);
+    len.writeUInt16BE(v.length);
+    return Buffer.concat([
+      Buffer.from([n.length]),
+      n,
+      Buffer.from([7]),
+      len,
+      v,
+    ]);
+  };
+  const headers = Buffer.concat([
+    header(":message-type", "event"),
+    header(":event-type", frame.type),
+    header(":content-type", "application/json"),
+  ]);
+  const totalLength = 12 + headers.length + body.length + 4;
+  const prelude = Buffer.alloc(8);
+  prelude.writeUInt32BE(totalLength, 0);
+  prelude.writeUInt32BE(headers.length, 4);
+  const preludeCrc = Buffer.alloc(4);
+  preludeCrc.writeUInt32BE(crc32(prelude));
+  const head = Buffer.concat([prelude, preludeCrc, headers, body]);
+  const messageCrc = Buffer.alloc(4);
+  messageCrc.writeUInt32BE(crc32(head));
+  return Buffer.concat([head, messageCrc]);
+}
+
+function textFrames(text: string): EventFrame[] {
+  return [
+    { type: "messageStart", payload: { role: "assistant" } },
+    {
+      type: "contentBlockDelta",
+      payload: { contentBlockIndex: 0, delta: { text } },
+    },
+    { type: "contentBlockStop", payload: { contentBlockIndex: 0 } },
+    { type: "messageStop", payload: { stopReason: "end_turn" } },
+    {
+      type: "metadata",
+      payload: { usage: { inputTokens: 10, outputTokens: 4, totalTokens: 14 } },
+    },
+  ];
+}
+
+function toolUseFrames(
+  name: string,
+  input: Record<string, unknown>,
+  toolUseId: string,
+): EventFrame[] {
+  return [
+    { type: "messageStart", payload: { role: "assistant" } },
+    {
+      type: "contentBlockStart",
+      payload: {
+        contentBlockIndex: 0,
+        start: { toolUse: { name, toolUseId } },
+      },
+    },
+    {
+      type: "contentBlockDelta",
+      payload: {
+        contentBlockIndex: 0,
+        delta: { toolUse: { input: JSON.stringify(input) } },
+      },
+    },
+    { type: "contentBlockStop", payload: { contentBlockIndex: 0 } },
+    { type: "messageStop", payload: { stopReason: "tool_use" } },
+    {
+      type: "metadata",
+      payload: { usage: { inputTokens: 12, outputTokens: 6, totalTokens: 18 } },
+    },
+  ];
+}
+
+/** Non-streaming Converse reply carrying a plain text turn. */
+function converseText(text: string): string {
+  return JSON.stringify({
+    output: { message: { role: "assistant", content: [{ text }] } },
+    stopReason: "end_turn",
+    usage: { inputTokens: 10, outputTokens: 4, totalTokens: 14 },
+  });
+}
+
+/** Non-streaming Converse reply asking for one tool call. */
+function converseToolUse(
+  name: string,
+  input: Record<string, unknown>,
+  toolUseId: string,
+  text?: string,
+): string {
+  return JSON.stringify({
+    output: {
+      message: {
+        role: "assistant",
+        content: [
+          ...(text ? [{ text }] : []),
+          { toolUse: { name, toolUseId, input } },
+        ],
+      },
+    },
+    stopReason: "tool_use",
+    usage: { inputTokens: 12, outputTokens: 6, totalTokens: 18 },
+  });
+}
+
+type StandInCall = {
+  streaming: boolean;
+  modelId: string;
+  /** Parsed request body, so assertions can look at what was actually sent. */
+  body: Record<string, unknown>;
+};
+
+type StandIn = {
+  /** One entry per request that reached the server, in order. */
+  calls: StandInCall[];
+  port: number;
+  close: () => Promise<void>;
+};
+
+/** Names of the tools declared to the model on a given request. */
+function declaredToolNames(call: StandInCall | undefined): string[] {
+  const toolConfig = call?.body?.toolConfig as
+    | { tools?: Array<{ toolSpec?: { name?: string } }> }
+    | undefined;
+  return (toolConfig?.tools ?? [])
+    .map((t) => t.toolSpec?.name)
+    .filter((n): n is string => typeof n === "string");
+}
+
+/** Tool-result blocks carried back to the model on a given request. */
+function toolResults(
+  call: StandInCall | undefined,
+): Array<{ status?: string; content?: Array<{ text?: string }> }> {
+  const messages = (call?.body?.messages ?? []) as Array<{
+    content?: Array<{
+      toolResult?: { status?: string; content?: Array<{ text?: string }> };
+    }>;
+  }>;
+  return messages
+    .flatMap((m) => m.content ?? [])
+    .map((c) => c.toolResult)
+    .filter((r): r is NonNullable<typeof r> => !!r);
+}
+
+/**
+ * `reply` is called once per request with the zero-based request index and
+ * decides that request's response: event frames for a streaming call, a JSON
+ * string for a non-streaming one.
+ */
+async function startStandIn(
+  reply: (callIndex: number) => EventFrame[] | string,
+): Promise<StandIn> {
+  const calls: StandIn["calls"] = [];
+  const server: Http2Server = createServer();
+  server.on("stream", (stream, headers) => {
+    const path = String(headers[":path"] ?? "");
+    const match = /\/model\/([^/]+)\/(converse-stream|converse)/.exec(path);
+    const streaming = match?.[2] === "converse-stream";
+    const parts: Buffer[] = [];
+    stream.on("data", (c: Buffer) => parts.push(c));
+    stream.on("end", () => {
+      const parseBody = (): Record<string, unknown> => {
+        try {
+          return JSON.parse(Buffer.concat(parts).toString("utf8") || "{}");
+        } catch {
+          return {};
+        }
+      };
+      const body = parseBody();
+      const responseSpec = reply(calls.length);
+      calls.push({
+        streaming,
+        modelId: match ? decodeURIComponent(match[1]) : "",
+        body,
+      });
+      const response = responseSpec;
+      // A sentinel the reply function can return to make the stand-in answer
+      // with a retryable status instead of a body.
+      if (response === "RETRYABLE_503") {
+        stream.respond({ ":status": 503, "content-type": "application/json" });
+        stream.end(JSON.stringify({ message: "service unavailable" }));
+        return;
+      }
+      if (typeof response === "string") {
+        stream.respond({ ":status": 200, "content-type": "application/json" });
+        stream.end(response);
+        return;
+      }
+      stream.respond({
+        ":status": 200,
+        "content-type": "application/vnd.amazon.eventstream",
+      });
+      for (const frame of response) {
+        stream.write(encodeEventFrame(frame));
+      }
+      stream.end();
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  return {
+    calls,
+    port: typeof address === "object" && address ? address.port : 0,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.close(() => resolve());
+      }),
+  };
+}
+
+/** Point the AWS SDK at the stand-in with credentials that can sign. */
+function withEnv(port: number): () => void {
+  const saved: Record<string, string | undefined> = {};
+  const set = (k: string, v: string) => {
+    saved[k] = process.env[k];
+    process.env[k] = v;
+  };
+  set("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", `http://127.0.0.1:${port}`);
+  set("AWS_ACCESS_KEY_ID", "test-fake-aws-key-id");
+  set("AWS_SECRET_ACCESS_KEY", "test-fake-aws-secret");
+  set("AWS_REGION", "us-east-1");
+  saved.AWS_SESSION_TOKEN = process.env.AWS_SESSION_TOKEN;
+  delete process.env.AWS_SESSION_TOKEN;
+  return () => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) {
+        delete process.env[k];
+      } else {
+        process.env[k] = v;
+      }
+    }
+  };
+}
+
+/**
+ * A built-in tool, so it resolves through the provider's own registry.
+ * The loop-mechanics cases below use this rather than a caller-supplied tool
+ * because caller-supplied tools do not currently execute on Bedrock at all —
+ * pinned separately in the "caller-supplied tools" section.
+ */
+const BUILT_IN_TOOL = "getCurrentTime";
+
+/** A caller-supplied tool, the kind an SDK consumer passes to generate/stream. */
+function customTool(counter: { calls: number }) {
+  return {
+    lookup: {
+      description: "look a value up",
+      inputSchema: z.object({}).passthrough(),
+      execute: async () => {
+        counter.calls++;
+        return { found: true };
+      },
+    },
+  };
+}
+
+section("streaming loop");
+
+await test("a text-only turn streams its text and stops after one call", async () => {
+  const server = await startStandIn(() => textFrames("hello from bedrock"));
+  const restore = withEnv(server.port);
+  try {
+    const nl = new NeuroLink();
+    const result = await nl.stream({
+      input: { text: "hi" },
+      provider: "bedrock",
+      model: MODEL,
+      maxTokens: 32,
+    });
+    let text = "";
+    for await (const chunk of result.stream) {
+      text += "content" in chunk ? chunk.content : "";
+    }
+    assert(
+      text.includes("hello from bedrock"),
+      "the streamed text was not surfaced to the consumer",
+    );
+    assert(
+      server.calls.length === 1,
+      `a text-only turn should take exactly one call, took ${server.calls.length}`,
+    );
+  } finally {
+    restore();
+    await server.close();
+  }
+});
+
+await test("a text-only stream emits generation:end exactly once", async () => {
+  const server = await startStandIn(() => textFrames("one stream event"));
+  const restore = withEnv(server.port);
+  const nl = new NeuroLink();
+  const events: unknown[] = [];
+  nl.getEventEmitter().on("generation:end", (event: unknown) =>
+    events.push(event),
+  );
+  try {
+    const result = await nl.stream({
+      input: { text: "hi" },
+      provider: "bedrock",
+      model: MODEL,
+      maxTokens: 32,
+    });
+    for await (const chunk of result.stream) {
+      void chunk;
+    }
+    assert(
+      server.calls.length === 1,
+      "precondition: the Bedrock streaming request did not reach the stand-in exactly once",
+    );
+    assert(
+      events.length === 1,
+      `one Bedrock stream must emit generation:end exactly once, emitted ${events.length}`,
+    );
+  } finally {
+    await nl.dispose();
+    restore();
+    await server.close();
+  }
+});
+
+await test("a tool_use turn runs the tool and finishes on the following turn", async () => {
+  const server = await startStandIn((i) =>
+    i === 0 ? toolUseFrames(BUILT_IN_TOOL, {}, "tool_1") : textFrames("done"),
+  );
+  const restore = withEnv(server.port);
+  try {
+    const nl = new NeuroLink();
+    const result = await nl.stream({
+      input: { text: "what time is it" },
+      provider: "bedrock",
+      model: MODEL,
+      maxTokens: 32,
+      maxSteps: 3,
+      disableTools: false,
+    });
+    let text = "";
+    for await (const chunk of result.stream) {
+      text += "content" in chunk ? chunk.content : "";
+    }
+    assert(
+      server.calls.length === 2,
+      `a tool round trip should take exactly two calls, took ${server.calls.length}`,
+    );
+    const results = toolResults(server.calls[1]);
+    assert(
+      results.length === 1,
+      `the follow-up call should carry exactly one tool result, carried ${results.length}`,
+    );
+    assert(
+      results[0]?.status === "success",
+      "the tool result sent back to the model was not a success",
+    );
+    assert(text.includes("done"), "the final turn's text was not surfaced");
+  } finally {
+    restore();
+    await server.close();
+  }
+});
+
+await test("the streaming cap is exactly maxSteps, and reaching it returns", async () => {
+  // Both halves of this were defects before the migration, and both were
+  // pinned here as such.
+  //
+  // The count was off by one: the old loop made its first Converse call
+  // inline, before `while (iteration < maxIterations)` was entered with
+  // `iteration` still 0, so maxSteps=3 bought 4 billed calls. The engine
+  // counts every step against one bound.
+  //
+  // Reaching the bound then threw, so the caller lost every tool result and
+  // every token already streamed. It now ends the turn and reports
+  // finishReason "tool-calls", which is what every other family does. Ask for
+  // the capped turn itself with the documented cap-only fallback policy.
+  const server = await startStandIn((i) =>
+    toolUseFrames(BUILT_IN_TOOL, {}, `tool_${i}`),
+  );
+  const restore = withEnv(server.port);
+  try {
+    const nl = new NeuroLink();
+    const result = await nl.stream({
+      input: { text: "keep going" },
+      provider: "bedrock",
+      model: MODEL,
+      maxTokens: 32,
+      maxSteps: 3,
+      fallbackOnMaxSteps: false,
+      disableTools: false,
+    });
+    for await (const chunk of result.stream) {
+      void chunk;
+    }
+    assert(
+      server.calls.length === 3,
+      `maxSteps=3 should buy exactly 3 calls, but the turn made ${server.calls.length}`,
+    );
+    assert(
+      result.metadata?.finishReason === "tool-calls",
+      "a turn cut off at the step cap should report finishReason tool-calls",
+    );
+    assert(
+      result.metadata?.stopReason === "step-cap",
+      "the actual engine cap was not carried to public stream metadata",
+    );
+  } finally {
+    restore();
+    await server.close();
+  }
+});
+
+section("generate loop");
+
+await test("a text-only generate turn returns its text after one call", async () => {
+  const server = await startStandIn(() => converseText("generated answer"));
+  const restore = withEnv(server.port);
+  try {
+    const nl = new NeuroLink();
+    const result = await nl.generate({
+      input: { text: "hi" },
+      provider: "bedrock",
+      model: MODEL,
+      maxTokens: 32,
+    });
+    assert(
+      typeof result?.content === "string" &&
+        result.content.includes("generated answer"),
+      "generate did not return the model's text",
+    );
+    assert(
+      server.calls.length === 1,
+      `a text-only generate should take exactly one call, took ${server.calls.length}`,
+    );
+    assert(
+      server.calls.every((c) => !c.streaming),
+      "the generate path should use the non-streaming Converse operation",
+    );
+  } finally {
+    restore();
+    await server.close();
+  }
+});
+
+await test("a text-only generate emits generation:end exactly once", async () => {
+  const server = await startStandIn(() => converseText("one generate event"));
+  const restore = withEnv(server.port);
+  const nl = new NeuroLink();
+  const events: unknown[] = [];
+  nl.getEventEmitter().on("generation:end", (event: unknown) =>
+    events.push(event),
+  );
+  try {
+    const result = await nl.generate({
+      input: { text: "hi" },
+      provider: "bedrock",
+      model: MODEL,
+      maxTokens: 32,
+    });
+    assert(
+      server.calls.length === 1 && result?.content === "one generate event",
+      "precondition: the successful Bedrock generate path did not complete exactly once",
+    );
+    assert(
+      events.length === 1,
+      `one Bedrock generate must emit generation:end exactly once, emitted ${events.length}`,
+    );
+  } finally {
+    await nl.dispose();
+    restore();
+    await server.close();
+  }
+});
+
+// #1741 / #1762: the success-path test above only pins the RESULT branch of
+// `conversationLoop`'s dedup marking (client.ts sets `_generationEndEmitted`
+// on the returned `generateResult`). The CATCH branch marks the thrown ERROR
+// instead — there was no result object to carry it — and had no coverage:
+// a persistently failing generate call still emitted its own manual
+// "generation:end" (for Pipeline B / Langfuse) from inside the catch block,
+// and then, without the marker, `NeuroLink.generate()`'s outer catch
+// (`emitGenerateErrorEvent`) would emit a SECOND one for the same failure.
+await test("a failed Bedrock generate emits generation:end exactly once", async () => {
+  // Every request gets a retryable 503, so the AWS SDK's own retry policy
+  // exhausts and `conversationLoop` rejects — exercising the catch branch.
+  //
+  // `disableTools: true` is deliberate, not incidental. Without it this
+  // scenario is confounded by an entirely separate, correct behaviour:
+  // `NeuroLink.generate()` first tries the MCP-tool-enabled path
+  // (`performMCPGenerationRetries`, which itself retries a transient
+  // failure) and, on that path's exhaustion, falls back to
+  // `directProviderGeneration` for one more attempt — three real calls
+  // into `AmazonBedrockProvider.generate()` for one `nl.generate()` call,
+  // confirmed by instrumenting `conversationLoop`'s catch and inspecting
+  // the call stack of each invocation. Each of those attempts legitimately
+  // emits its own `generation:end` (three real attempts against the
+  // provider, three real Pipeline B observations) — that is not the
+  // #1741/#1762 double-emit bug, and asserting "exactly one" across all
+  // three would fail for a reason unrelated to the fix under test.
+  // `disableTools: true` skips the MCP path entirely (see
+  // `attemptMCPGeneration`'s guard), so `directProviderGeneration` runs
+  // its single, non-retried attempt and this test isolates exactly the
+  // invariant the fix provides: one generate ATTEMPT, one
+  // `generation:end`, whether it succeeds (see the test above) or fails.
+  const server = await startStandIn(() => "RETRYABLE_503");
+  const restore = withEnv(server.port);
+  const nl = new NeuroLink();
+  const events: unknown[] = [];
+  nl.getEventEmitter().on("generation:end", (event: unknown) =>
+    events.push(event),
+  );
+  try {
+    let threw = false;
+    try {
+      await nl.generate({
+        input: { text: "hi" },
+        provider: "bedrock",
+        model: MODEL,
+        maxTokens: 32,
+        disableTools: true,
+      });
+    } catch {
+      threw = true;
+    }
+    assert(
+      threw,
+      "precondition: a persistently failing Bedrock generate call did not reject",
+    );
+    assert(
+      events.length === 1,
+      `one failed Bedrock generate must emit generation:end exactly once, emitted ${events.length}`,
+    );
+  } finally {
+    await nl.dispose();
+    restore();
+    await server.close();
+  }
+});
+
+await test("a generate tool_use turn runs the tool and finishes on the following turn", async () => {
+  const server = await startStandIn((i) =>
+    i === 0
+      ? converseToolUse(BUILT_IN_TOOL, {}, "tool_1")
+      : converseText("generated done"),
+  );
+  const restore = withEnv(server.port);
+  try {
+    const nl = new NeuroLink();
+    const result = await nl.generate({
+      input: { text: "what time is it" },
+      provider: "bedrock",
+      model: MODEL,
+      maxTokens: 32,
+      maxSteps: 3,
+      disableTools: false,
+    });
+    assert(
+      server.calls.length === 2,
+      `a generate tool round trip should take exactly two calls, took ${server.calls.length}`,
+    );
+    const results = toolResults(server.calls[1]);
+    assert(
+      results.length === 1,
+      `the follow-up call should carry exactly one tool result, carried ${results.length}`,
+    );
+    assert(
+      typeof result?.content === "string" &&
+        result.content.includes("generated done"),
+      "the final turn's text was not returned",
+    );
+  } finally {
+    restore();
+    await server.close();
+  }
+});
+
+await test("the generate cap honours maxSteps and keeps the model's text", async () => {
+  // The generate loop used to ignore `maxSteps` entirely, counting to a
+  // literal 10 and then throwing. The throw propagated into NeuroLink's own
+  // provider-level retry, which ran the whole turn twice more, so a runaway
+  // tool loop cost thirty billed model calls where the caller asked for
+  // three.
+  //
+  // The text assertion is the second half, and it is why the count is 3 and
+  // not 9. A turn that runs out of steps mid-tool-call has no "final" step,
+  // so the engine returned an empty string and discarded everything the
+  // model had said — and empty content reads as a failed generation to the
+  // retry layer, which then ran the turn three times over.
+  const server = await startStandIn(() =>
+    converseToolUse(BUILT_IN_TOOL, {}, "tool_x", "still working"),
+  );
+  const restore = withEnv(server.port);
+  try {
+    const nl = new NeuroLink();
+    const result = await nl.generate({
+      input: { text: "keep going" },
+      provider: "bedrock",
+      model: MODEL,
+      maxTokens: 32,
+      maxSteps: 3,
+      disableTools: false,
+    });
+    assert(
+      server.calls.length === 3,
+      `maxSteps=3 should buy exactly 3 calls, but the turn made ${server.calls.length}`,
+    );
+    assert(
+      typeof result?.content === "string" &&
+        result.content.includes("still working"),
+      "a turn stopped at the step cap should still return what the model said",
+    );
+  } finally {
+    restore();
+    await server.close();
+  }
+});
+
+await test("assistant text emitted before a tool call survives into the next step", async () => {
+  // Bedrock does not necessarily announce a text block with
+  // `contentBlockStart` — the first event for it can be a delta. Keying
+  // blocks by arrival order therefore dropped any text that preceded a
+  // toolUse block from the assistant turn replayed on the following step:
+  // the consumer saw the text, but the model stopped seeing its own
+  // reasoning. Blocks are keyed by `contentBlockIndex` instead.
+  const server = await startStandIn((i) =>
+    i === 0
+      ? [
+          { type: "messageStart", payload: { role: "assistant" } },
+          {
+            type: "contentBlockDelta",
+            payload: { contentBlockIndex: 0, delta: { text: "let me check" } },
+          },
+          {
+            type: "contentBlockStop",
+            payload: { contentBlockIndex: 0 },
+          },
+          {
+            type: "contentBlockStart",
+            payload: {
+              contentBlockIndex: 1,
+              start: { toolUse: { name: BUILT_IN_TOOL, toolUseId: "tool_1" } },
+            },
+          },
+          {
+            type: "contentBlockDelta",
+            payload: {
+              contentBlockIndex: 1,
+              delta: { toolUse: { input: "{}" } },
+            },
+          },
+          {
+            type: "contentBlockStop",
+            payload: { contentBlockIndex: 1 },
+          },
+          { type: "messageStop", payload: { stopReason: "tool_use" } },
+          {
+            type: "metadata",
+            payload: {
+              usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+            },
+          },
+        ]
+      : textFrames("done"),
+  );
+  const restore = withEnv(server.port);
+  try {
+    const nl = new NeuroLink();
+    const result = await nl.stream({
+      input: { text: "what time is it" },
+      provider: "bedrock",
+      model: MODEL,
+      maxTokens: 32,
+      maxSteps: 3,
+      disableTools: false,
+    });
+    let streamed = "";
+    for await (const chunk of result.stream) {
+      streamed += "content" in chunk ? chunk.content : "";
+    }
+    assert(
+      streamed.includes("let me check"),
+      "the pre-tool-call text never reached the consumer",
+    );
+    const replayed = JSON.stringify(server.calls[1]?.body ?? {});
+    assert(
+      replayed.includes("let me check"),
+      "the pre-tool-call text was dropped from the conversation sent back to the model",
+    );
+  } finally {
+    restore();
+    await server.close();
+  }
+});
+
+await test("disableTools declares no tools on either path", async () => {
+  // The generate path reaches its loop without BaseProvider's tool
+  // preparation, so `options.tools` is undefined there and the getAllTools()
+  // fallback would hand the model the whole registry even though the caller
+  // asked for none.
+  const generateServer = await startStandIn(() => converseText("no tools"));
+  let restore = withEnv(generateServer.port);
+  try {
+    const nl = new NeuroLink();
+    await nl.generate({
+      input: { text: "hi" },
+      provider: "bedrock",
+      model: MODEL,
+      maxTokens: 32,
+      disableTools: true,
+    });
+    assert(
+      declaredToolNames(generateServer.calls[0]).length === 0,
+      "the generate path declared tools despite disableTools",
+    );
+  } finally {
+    restore();
+    await generateServer.close();
+  }
+
+  const streamServer = await startStandIn(() => textFrames("no tools"));
+  restore = withEnv(streamServer.port);
+  try {
+    const nl = new NeuroLink();
+    const result = await nl.stream({
+      input: { text: "hi" },
+      provider: "bedrock",
+      model: MODEL,
+      maxTokens: 32,
+      disableTools: true,
+    });
+    for await (const chunk of result.stream) {
+      void chunk;
+    }
+    assert(
+      declaredToolNames(streamServer.calls[0]).length === 0,
+      "the streaming path declared tools despite disableTools",
+    );
+  } finally {
+    restore();
+    await streamServer.close();
+  }
+});
+
+await test("analytics resolves for a caller that never drains the stream", async () => {
+  // `result.analytics` used to be resolved only inside the stream iterator's
+  // finally block, so a caller that awaited it without iterating waited
+  // forever — the generator body never runs.
+  const server = await startStandIn(() => textFrames("ignored"));
+  const restore = withEnv(server.port);
+  try {
+    const nl = new NeuroLink();
+    const result = await nl.stream({
+      input: { text: "hi" },
+      provider: "bedrock",
+      model: MODEL,
+      maxTokens: 32,
+    });
+    // The timer is cleared rather than left pending: an uncleared timeout
+    // keeps the event loop alive and holds the whole suite open for its full
+    // duration after the assertion has already passed.
+    let timer: NodeJS.Timeout | undefined;
+    const analytics = await Promise.race([
+      Promise.resolve(result.analytics),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve("TIMED_OUT"), 15_000);
+      }),
+    ]).finally(() => {
+      if (timer) {
+        clearTimeout(timer);
+      }
+    });
+    assert(
+      analytics !== "TIMED_OUT",
+      "analytics never settled for a caller that did not drain the stream",
+    );
+  } finally {
+    restore();
+    await server.close();
+  }
+});
+
+await test("generate and stream agree on the finish reason for the same turn", async () => {
+  // Both paths ran a turn to the step cap, and before this they disagreed:
+  // generate surfaced Bedrock's raw "tool_use" while stream surfaced the
+  // mapped "tool-calls". Callers that branch on finishReason would have had
+  // to special-case which method they called.
+  const generateServer = await startStandIn(() =>
+    converseToolUse(BUILT_IN_TOOL, {}, "tool_x", "still working"),
+  );
+  let restore = withEnv(generateServer.port);
+  let generateFinish: string | undefined;
+  let generateRaw: string | undefined;
+  try {
+    const nl = new NeuroLink();
+    const result = await nl.generate({
+      input: { text: "keep going" },
+      provider: "bedrock",
+      model: MODEL,
+      maxTokens: 32,
+      maxSteps: 2,
+      disableTools: false,
+    });
+    generateFinish = result?.finishReason;
+    generateRaw = result?.rawFinishReason;
+  } finally {
+    restore();
+    await generateServer.close();
+  }
+
+  const streamServer = await startStandIn((i) =>
+    toolUseFrames(BUILT_IN_TOOL, {}, `tool_${i}`),
+  );
+  restore = withEnv(streamServer.port);
+  let streamFinish: string | undefined;
+  try {
+    const nl = new NeuroLink();
+    const result = await nl.stream({
+      input: { text: "keep going" },
+      provider: "bedrock",
+      model: MODEL,
+      maxTokens: 32,
+      maxSteps: 2,
+      fallbackOnMaxSteps: false,
+      disableTools: false,
+    });
+    for await (const chunk of result.stream) {
+      void chunk;
+    }
+    assert(
+      result.metadata?.stopReason === "step-cap",
+      "the streamed capped turn did not expose its actual stop reason",
+    );
+    streamFinish = result.metadata?.finishReason;
+  } finally {
+    restore();
+    await streamServer.close();
+  }
+
+  assert(
+    generateFinish === "tool-calls",
+    "generate did not report the mapped finish reason for a capped turn",
+  );
+  assert(
+    generateFinish === streamFinish,
+    "generate and stream reported different finish reasons for the same turn shape",
+  );
+  assert(
+    generateRaw === "tool_use",
+    "the raw provider finish reason was dropped instead of kept alongside",
+  );
+});
+
+section("caller-supplied tools");
+
+// Before the migration, neither of these worked. Bedrock resolved tool
+// execution through `getAllTools()` — the provider's own registry — rather
+// than the tools the caller passed for this turn, so an SDK consumer's own
+// tool could never run: the streaming path declared it to the model and then
+// failed every call to it with "Tool not found", and the generate path never
+// declared it at all.
+
+await test("a caller's own tool is declared to the model on the streaming path", async () => {
+  const server = await startStandIn(() => textFrames("hi"));
+  const restore = withEnv(server.port);
+  const counter = { calls: 0 };
+  try {
+    const nl = new NeuroLink();
+    const result = await nl.stream({
+      input: { text: "hi" },
+      provider: "bedrock",
+      model: MODEL,
+      maxTokens: 32,
+      disableTools: false,
+      tools: customTool(counter),
+    });
+    for await (const chunk of result.stream) {
+      void chunk;
+    }
+    assert(
+      declaredToolNames(server.calls[0]).includes("lookup"),
+      "the streaming path did not declare the caller's tool to the model",
+    );
+  } finally {
+    restore();
+    await server.close();
+  }
+});
+
+await test("a caller's own tool executes, on both paths", async () => {
+  const streamServer = await startStandIn((i) =>
+    i === 0 ? toolUseFrames("lookup", {}, "tool_1") : textFrames("after"),
+  );
+  let restore = withEnv(streamServer.port);
+  const streamCounter = { calls: 0 };
+  try {
+    const nl = new NeuroLink();
+    const result = await nl.stream({
+      input: { text: "look something up" },
+      provider: "bedrock",
+      model: MODEL,
+      maxTokens: 32,
+      maxSteps: 3,
+      disableTools: false,
+      tools: customTool(streamCounter),
+    });
+    for await (const chunk of result.stream) {
+      void chunk;
+    }
+    assert(
+      streamCounter.calls === 1,
+      "the caller's tool did not execute on the streaming path",
+    );
+    const results = toolResults(streamServer.calls[1]);
+    assert(
+      results[0]?.status === "success",
+      "the streaming path sent back a failed tool result",
+    );
+  } finally {
+    restore();
+    await streamServer.close();
+  }
+
+  const generateServer = await startStandIn((i) =>
+    i === 0
+      ? converseToolUse("lookup", {}, "tool_1")
+      : converseText("generated after"),
+  );
+  restore = withEnv(generateServer.port);
+  const generateCounter = { calls: 0 };
+  try {
+    const nl = new NeuroLink();
+    await nl.generate({
+      input: { text: "look something up" },
+      provider: "bedrock",
+      model: MODEL,
+      maxTokens: 32,
+      maxSteps: 3,
+      disableTools: false,
+      tools: customTool(generateCounter),
+    });
+    assert(
+      declaredToolNames(generateServer.calls[0]).includes("lookup"),
+      "the generate path did not declare the caller's tool to the model",
+    );
+    assert(
+      generateCounter.calls === 1,
+      "the caller's tool did not execute on the generate path",
+    );
+  } finally {
+    restore();
+    await generateServer.close();
+  }
+});
+
+section("max tokens for geography-prefixed ids");
+
+/** [model id, the caller's maxTokens (none when undefined)]. */
+type MaxTokensInput = readonly [string, number | undefined];
+
+/** The model id and `inferenceConfig.maxTokens` of a request that went out. */
+type SentRequest = {
+  modelId: string | undefined;
+  maxTokens: number | undefined;
+};
+
+/**
+ * Sends each input through `generate` or `stream` against one stand-in and
+ * returns, in order, what the request that went out carried. The cases below
+ * compare it with expectations by index only: a message built from what the
+ * server saw could read as a provider error and be reported as a skip.
+ */
+async function sendThrough(
+  path: "generate" | "stream",
+  inputs: readonly MaxTokensInput[],
+): Promise<SentRequest[]> {
+  const server = await startStandIn(() =>
+    path === "generate" ? converseText("ok") : textFrames("ok"),
+  );
+  const restore = withEnv(server.port);
+  const sent: SentRequest[] = [];
+  try {
+    const nl = new NeuroLink();
+    for (const [model, requested] of inputs) {
+      const first = server.calls.length;
+      const maxTokens = requested === undefined ? {} : { maxTokens: requested };
+      if (path === "generate") {
+        await nl.generate({
+          input: { text: "hi" },
+          provider: "bedrock",
+          model,
+          disableTools: true,
+          ...maxTokens,
+        });
+      } else {
+        const result = await nl.stream({
+          input: { text: "hi" },
+          provider: "bedrock",
+          model,
+          disableTools: true,
+          ...maxTokens,
+        });
+        for await (const chunk of result.stream) {
+          void chunk;
+        }
+      }
+      const call = server.calls[first];
+      sent.push({
+        modelId: call?.modelId,
+        maxTokens: (
+          call?.body.inferenceConfig as { maxTokens?: number } | undefined
+        )?.maxTokens,
+      });
+    }
+  } finally {
+    restore();
+    await server.close();
+  }
+  return sent;
+}
+
+// The streaming path runs the caller's maxTokens, or its absence, through the
+// output ceilings in PROVIDER_MAX_TOKENS.bedrock: Nova Premier 25K, Nova Pro and
+// Lite 5K, Llama 4 Maverick 8,192. Every other Bedrock id takes the 64K provider
+// default. The bare ids are the reference; the same models under a geography
+// must send the same value. Ids and geographies are combined for coverage, and
+// the table-level suite sweeps every geography over every id.
+const STREAM_CEILING_CASES: ReadonlyArray<
+  readonly [string, number | undefined, number]
+> = [
+  ["amazon.nova-pro-v1:0", undefined, 5_000],
+  ["amazon.nova-lite-v1:0", undefined, 5_000],
+  ["amazon.nova-premier-v1:0", undefined, 25_000],
+  ["meta.llama4-maverick-17b-instruct-v1:0", undefined, 8_192],
+  ["us.amazon.nova-pro-v1:0", undefined, 5_000],
+  ["eu.amazon.nova-lite-v1:0", undefined, 5_000],
+  ["apac.amazon.nova-premier-v1:0", undefined, 25_000],
+  ["global.meta.llama4-maverick-17b-instruct-v1:0", undefined, 8_192],
+  // A caller's value above the ceiling is cut to it, as for the bare id; one
+  // under it goes out as given.
+  ["amazon.nova-pro-v1:0", 100_000, 5_000],
+  ["jp.amazon.nova-pro-v1:0", 100_000, 5_000],
+  ["us.amazon.nova-pro-v1:0", 4_000, 4_000],
+  [
+    "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.amazon.nova-pro-v1:0",
+    undefined,
+    5_000,
+  ],
+  [
+    "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-pro-v1:0",
+    100_000,
+    5_000,
+  ],
+];
+
+await test("stream sends a geography-prefixed Bedrock id the max tokens of its bare id", async () => {
+  const sent = await sendThrough(
+    "stream",
+    STREAM_CEILING_CASES.map(
+      ([model, requested]): MaxTokensInput => [model, requested],
+    ),
+  );
+  const wrong: number[] = [];
+  STREAM_CEILING_CASES.forEach(([model, , expected], index) => {
+    if (sent[index].modelId !== model || sent[index].maxTokens !== expected) {
+      wrong.push(index);
+    }
+  });
+  assert(
+    wrong.length === 0,
+    `stream sent the wrong max tokens for case(s) at index ${wrong.join(", ")}`,
+  );
+});
+
+await test("stream keeps the Bedrock default max tokens for ids that are not a geography plus a known vendor and model (controls)", async () => {
+  // Controls: none of these ids may be rewritten, and every one goes out with
+  // the same value with or without the geography lookup. The Opus 4.5 row is
+  // 64K, which is also the default. An application profile's ARN never reveals
+  // its underlying model, even if its resource ID resembles a model name.
+  const controls: ReadonlyArray<readonly [string, number | undefined, number]> =
+    [
+      ["us.anthropic.claude-opus-4-5-20251101-v1:0", undefined, 64_000],
+      ["us.anthropic.claude-not-a-listed-model-v1:0", undefined, 64_000],
+      ["us.anthropic.claude-not-a-listed-model-v1:0", 100_000, 64_000],
+      ["xx.amazon.nova-pro-v1:0", undefined, 64_000],
+      ["us.us.amazon.nova-pro-v1:0", undefined, 64_000],
+      [
+        "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/us.amazon.nova-pro-v1:0",
+        undefined,
+        64_000,
+      ],
+    ];
+  const sent = await sendThrough(
+    "stream",
+    controls.map(([model, requested]): MaxTokensInput => [model, requested]),
+  );
+  const wrong: number[] = [];
+  controls.forEach(([model, , expected], index) => {
+    if (sent[index].modelId !== model || sent[index].maxTokens !== expected) {
+      wrong.push(index);
+    }
+  });
+  assert(
+    wrong.length === 0,
+    `stream sent the wrong max tokens for control(s) at index ${wrong.join(", ")}`,
+  );
+});
+
+await test("generate sends a geography-prefixed Bedrock id the same max tokens as its bare id (control)", async () => {
+  // Bedrock's generate() reaches its loop with the caller's options as given:
+  // the options normalization that applies the output ceiling, and supplies one
+  // when the caller sent none, runs on the streaming path only. So this holds
+  // with or without the geography lookup, and it guards the day generate starts
+  // applying the ceiling to bare ids.
+  const pairs = [
+    ["amazon.nova-pro-v1:0", "us.amazon.nova-pro-v1:0"],
+    ["amazon.nova-lite-v1:0", "eu.amazon.nova-lite-v1:0"],
+    ["amazon.nova-premier-v1:0", "apac.amazon.nova-premier-v1:0"],
+    [
+      "amazon.nova-pro-v1:0",
+      "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.amazon.nova-pro-v1:0",
+    ],
+    [
+      "meta.llama4-maverick-17b-instruct-v1:0",
+      "global.meta.llama4-maverick-17b-instruct-v1:0",
+    ],
+  ] as const;
+  const callerValues = [undefined, 100_000, 4_000];
+  // Each bare id is followed by its prefixed id, with the same caller value.
+  const inputs = pairs.flatMap(([bare, prefixed]) =>
+    callerValues.flatMap((value): MaxTokensInput[] => [
+      [bare, value],
+      [prefixed, value],
+    ]),
+  );
+  const sent = await sendThrough("generate", inputs);
+  const wrong: number[] = [];
+  inputs.forEach(([model], index) => {
+    if (sent[index].modelId !== model) {
+      wrong.push(index);
+    }
+  });
+  for (let index = 0; index < inputs.length; index += 2) {
+    if (sent[index].maxTokens !== sent[index + 1].maxTokens) {
+      wrong.push(index + 1);
+    }
+  }
+  assert(
+    wrong.length === 0,
+    `generate sent a prefixed id another max tokens than its bare id, or another model, for input(s) at index ${wrong.join(", ")}`,
+  );
+});
+
+await test("default no-output fallback remains enabled for a capped tool-only Bedrock turn", async () => {
+  const primary = MODEL;
+  const fallback = "amazon.nova-pro-v1:0";
+  const server = await startStandIn((index) =>
+    index < 3
+      ? toolUseFrames(BUILT_IN_TOOL, {}, `default_cap_${index}`)
+      : textFrames("FALLBACK_OK"),
+  );
+  const restore = withEnv(server.port);
+  const nl = new NeuroLink();
+  try {
+    const result = await nl.stream({
+      input: { text: "keep going" },
+      provider: "bedrock",
+      model: primary,
+      maxTokens: 32,
+      maxSteps: 3,
+      disableTools: false,
+      fallbackProvider: "bedrock",
+      fallbackModel: fallback,
+    });
+    let text = "";
+    for await (const chunk of result.stream) {
+      text += "content" in chunk ? (chunk.content ?? "") : "";
+    }
+    assert(text === "FALLBACK_OK", "default no-output fallback was suppressed");
+    assert(
+      server.calls.length === 4,
+      "expected three native steps and one owned fallback request",
+    );
+    assert(
+      server.calls
+        .slice(0, 3)
+        .every((call) => call.streaming && call.modelId === primary),
+      "the native capped turn never reached the owned endpoint under its original model",
+    );
+    assert(
+      server.calls[3].streaming && server.calls[3].modelId === fallback,
+      "default fallback did not reach the caller's configured model",
+    );
+  } finally {
+    restore();
+    await nl.shutdown();
+    await server.close();
+  }
+});
+
+await test("cap-only fallback exemption still retries an ordinary empty Bedrock turn", async () => {
+  const primary = MODEL;
+  const fallback = "amazon.nova-lite-v1:0";
+  const server = await startStandIn((index) =>
+    textFrames(index === 0 ? "" : "EMPTY_FALLBACK_OK"),
+  );
+  const restore = withEnv(server.port);
+  const nl = new NeuroLink();
+  try {
+    const result = await nl.stream({
+      input: { text: "An empty completed turn is not a step cap." },
+      provider: "bedrock",
+      model: primary,
+      maxTokens: 32,
+      maxSteps: 3,
+      disableTools: true,
+      fallbackOnMaxSteps: false,
+      fallbackProvider: "bedrock",
+      fallbackModel: fallback,
+    });
+    let text = "";
+    for await (const chunk of result.stream) {
+      text += "content" in chunk ? (chunk.content ?? "") : "";
+    }
+    assert(
+      text === "EMPTY_FALLBACK_OK",
+      "cap-only policy suppressed an ordinary no-output fallback",
+    );
+    assert(
+      server.calls.length === 2,
+      "expected one ordinary empty turn and one fallback request",
+    );
+    assert(
+      server.calls[0].streaming &&
+        server.calls[0].modelId === primary &&
+        server.calls[1].streaming &&
+        server.calls[1].modelId === fallback,
+      "the original empty turn or configured fallback never reached the owned endpoint",
+    );
+  } finally {
+    restore();
+    await nl.shutdown();
+    await server.close();
+  }
+});
+
+await runSuite();

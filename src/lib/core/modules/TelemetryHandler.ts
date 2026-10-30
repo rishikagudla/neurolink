@@ -1,7 +1,7 @@
 /**
  * Telemetry Handler Module
  *
- * Handles analytics, evaluation, performance metrics, and telemetry configuration.
+ * Handles analytics, evaluation and performance metrics.
  * Extracted from BaseProvider to follow Single Responsibility Principle.
  *
  * Responsibilities:
@@ -9,28 +9,34 @@
  * - Evaluation generation
  * - Performance metrics recording
  * - Cost calculation
- * - Telemetry configuration
  *
  * @module core/modules/TelemetryHandler
  */
 
-import type {
-  AIProviderName,
-  EnhancedGenerateResult,
-  TextGenerationOptions,
-  AnalyticsData,
-} from "../../types/index.js";
-import type { Context } from "../../types/common.js";
-import type { EvaluationData } from "../../types/index.js";
-import type { StreamOptions } from "../../types/streamTypes.js";
-import { logger } from "../../utils/logger.js";
 import { nanoid } from "nanoid";
-import { modelConfig } from "../modelConfiguration.js";
-import {
-  recordProviderPerformanceFromMetrics,
-  getPerformanceOptimizedProvider,
-} from "../evaluationProviders.js";
 import type { NeuroLink } from "../../neurolink.js";
+import type {
+  StreamOptions,
+  AIProviderName,
+  AnalyticsData,
+  EnhancedGenerateResult,
+  EvaluationData,
+  MemoryToolCallRecord,
+  MemoryToolResultRecord,
+  RawUsageObject,
+  TextGenerationOptions,
+  TokenUsage,
+  TTSMetadata,
+} from "../../types/index.js";
+import { extractTokenUsage } from "../../utils/tokenUtils.js";
+import { logger } from "../../utils/logger.js";
+import { recordProviderPerformanceFromMetrics } from "../evaluationProviders.js";
+import {
+  recordAIRequest,
+  recordCustomHistogram,
+  recordCustomMetric,
+} from "../../telemetry/aiMetrics.js";
+import { calculateCost, hasPricing } from "../../utils/pricing.js";
 
 /**
  * TelemetryHandler class - Handles analytics and telemetry for AI providers
@@ -99,29 +105,37 @@ export class TelemetryHandler {
    * Record performance metrics for a generation
    */
   async recordPerformanceMetrics(
-    usage:
-      | { promptTokens: number; completionTokens: number; totalTokens: number }
-      | undefined,
+    usage: RawUsageObject | undefined,
     responseTime: number,
   ): Promise<void> {
     try {
-      const actualCost = await this.calculateActualCost(
-        usage || { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
-      );
+      // Normalize first: rebases cache-inclusive ai@6 input onto the uncached
+      // remainder and surfaces cache tiers so the cost is priced per tier
+      // instead of billing cache reads at the full input rate.
+      const tokenUsage = extractTokenUsage(usage);
+      const totalTokens = tokenUsage.total;
+      const actualCost = await this.calculateActualCost(tokenUsage);
 
       recordProviderPerformanceFromMetrics(this.providerName, {
         responseTime,
-        tokensGenerated: usage?.totalTokens || 0,
+        tokensGenerated: totalTokens,
         cost: actualCost,
         success: true,
       });
 
-      const optimizedProvider = getPerformanceOptimizedProvider("speed");
-      logger.debug(`🚀 Performance recorded for ${this.providerName}:`, {
+      recordAIRequest(
+        this.providerName,
+        this.modelName,
+        totalTokens,
+        responseTime,
+        actualCost !== undefined && actualCost > 0 ? actualCost : undefined,
+      );
+
+      logger.debug(`Performance recorded for ${this.providerName}`, {
         responseTime: `${responseTime}ms`,
-        tokens: usage?.totalTokens || 0,
-        estimatedCost: `$${actualCost.toFixed(6)}`,
-        recommendedSpeedProvider: optimizedProvider?.provider || "none",
+        tokens: totalTokens,
+        estimatedCost:
+          actualCost === undefined ? "unknown" : `$${actualCost.toFixed(6)}`,
       });
     } catch (perfError) {
       logger.warn("⚠️ Performance recording failed:", perfError);
@@ -129,99 +143,49 @@ export class TelemetryHandler {
   }
 
   /**
-   * Calculate actual cost based on token usage and provider configuration
+   * Record a TTS synthesis failure without affecting the generation result.
    */
-  async calculateActualCost(usage: {
-    promptTokens?: number;
-    completionTokens?: number;
-    totalTokens?: number;
-  }): Promise<number> {
-    try {
-      const costInfo = modelConfig.getCostInfo(
-        this.providerName,
-        this.modelName,
-      );
-      if (!costInfo) {
-        return 0; // No cost info available
-      }
-
-      const promptTokens = usage?.promptTokens || 0;
-      const completionTokens = usage?.completionTokens || 0;
-
-      // Calculate cost per 1K tokens
-      const inputCost = (promptTokens / 1000) * costInfo.input;
-      const outputCost = (completionTokens / 1000) * costInfo.output;
-
-      return inputCost + outputCost;
-    } catch (error) {
-      logger.debug(`Cost calculation failed for ${this.providerName}:`, error);
-      return 0; // Fallback to 0 on any error
-    }
+  recordTTSFailure(
+    ttsProvider: string,
+    error: NonNullable<TTSMetadata["error"]>,
+    latency: number,
+  ): void {
+    const labels = {
+      provider: ttsProvider,
+      error_code: error.code,
+      ...(error.retriable !== undefined
+        ? { retriable: error.retriable.toString() }
+        : {}),
+    };
+    recordCustomMetric("tts_failures", 1, labels);
+    recordCustomHistogram("tts_failure_latency_ms", latency, labels);
   }
 
   /**
-   * Create telemetry configuration for Vercel AI SDK experimental_telemetry
-   * This enables automatic OpenTelemetry tracing when telemetry is enabled
+   * Estimate cost only from known per-model rates. Unknown pricing remains
+   * absent from cost metrics instead of using another model's default rate.
    */
-  getTelemetryConfig(
-    options: StreamOptions | TextGenerationOptions,
-    operationType: "stream" | "generate" = "stream",
-  ):
-    | {
-        isEnabled: boolean;
-        functionId?: string;
-        metadata?: Record<string, string | number | boolean>;
-        recordInputs?: boolean;
-        recordOutputs?: boolean;
+  async calculateActualCost(usage: TokenUsage): Promise<number | undefined> {
+    try {
+      // Try the per-model pricing table first (includes correct rates for
+      // Claude on Vertex, cache token rates, etc.)
+      if (hasPricing(this.providerName, this.modelName)) {
+        return calculateCost(this.providerName, this.modelName, usage);
       }
-    | undefined {
-    // Check if telemetry is enabled via NeuroLink observability config
-    if (!this.neurolink?.isTelemetryEnabled()) {
+
+      return undefined;
+    } catch (error) {
+      logger.debug(`Cost calculation failed for ${this.providerName}:`, error);
       return undefined;
     }
-
-    const context = options.context as Context;
-    const traceName = context?.traceName;
-    const userId = context?.userId;
-    const functionId = traceName ? traceName : userId ? userId : "guest";
-
-    const metadata: Record<string, string | number | boolean> = {
-      ...(context?.metadata || {}),
-      provider: this.providerName,
-      model: this.modelName,
-      toolsEnabled: !options.disableTools,
-      neurolink: true,
-      operationType,
-      originalProvider: this.providerName,
-    };
-
-    // Add sessionId if available
-    if ("sessionId" in options && options.sessionId) {
-      const sessionId = options.sessionId;
-      if (
-        typeof sessionId === "string" ||
-        typeof sessionId === "number" ||
-        typeof sessionId === "boolean"
-      ) {
-        metadata.sessionId = sessionId;
-      }
-    }
-
-    return {
-      isEnabled: true,
-      functionId,
-      metadata,
-      recordInputs: true,
-      recordOutputs: true,
-    };
   }
 
   /**
    * Handle tool execution storage if available
    */
   async handleToolExecutionStorage(
-    toolCalls: unknown[],
-    toolResults: unknown[],
+    toolCalls: MemoryToolCallRecord[],
+    toolResults: MemoryToolResultRecord[],
     options: TextGenerationOptions | StreamOptions,
     currentTime: Date,
   ): Promise<void> {
@@ -241,28 +205,22 @@ export class TelemetryHandler {
 
     const sessionId =
       (options.context?.sessionId as string) ||
-      (options as unknown as { sessionId?: string }).sessionId ||
+      (("sessionId" in options ? options.sessionId : undefined) as
+        | string
+        | undefined) ||
       `session-${nanoid()}`;
     const userId =
       (options.context?.userId as string) ||
-      (options as unknown as { userId?: string }).userId;
+      (("userId" in options ? options.userId : undefined) as
+        | string
+        | undefined);
 
     try {
       await this.neurolink.storeToolExecutions(
         sessionId,
         userId,
-        toolCalls as Array<{
-          toolCallId?: string;
-          toolName?: string;
-          args?: Record<string, unknown>;
-          [key: string]: unknown;
-        }>,
-        toolResults as Array<{
-          toolCallId?: string;
-          toolName?: string;
-          result?: unknown;
-          [key: string]: unknown;
-        }>,
+        toolCalls,
+        toolResults,
         currentTime,
       );
     } catch (error) {

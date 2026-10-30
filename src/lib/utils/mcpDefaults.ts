@@ -8,7 +8,7 @@ import type {
   MCPExecutableTool,
   MCPServerCategory,
   MCPServerConnectionStatus,
-} from "../types/mcpTypes.js";
+} from "../types/index.js";
 
 /**
  * Smart category detection based on context
@@ -136,8 +136,11 @@ export function createMCPServerInfo(options: {
 export function createCustomToolServerInfo(
   toolName: string,
   tool: MCPExecutableTool,
+  timeoutMs?: number,
+  maxRetries?: number,
+  totalTimeoutMs?: number,
 ): MCPServerInfo {
-  return createMCPServerInfo({
+  const serverInfo = createMCPServerInfo({
     id: `custom-tool-${toolName}`,
     name: toolName,
     tool: {
@@ -148,6 +151,20 @@ export function createCustomToolServerInfo(
     },
     isCustomTool: true,
   });
+
+  if (serverInfo.metadata) {
+    if (timeoutMs !== undefined) {
+      serverInfo.metadata.toolTimeoutMs = timeoutMs;
+    }
+    if (maxRetries !== undefined) {
+      serverInfo.metadata.toolMaxRetries = maxRetries;
+    }
+    if (totalTimeoutMs !== undefined) {
+      serverInfo.metadata.toolTotalTimeoutMs = totalTimeoutMs;
+    }
+  }
+
+  return serverInfo;
 }
 
 /**

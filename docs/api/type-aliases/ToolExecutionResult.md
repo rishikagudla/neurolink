@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v8.32.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -7,8 +7,6 @@
 # Type Alias: ToolExecutionResult\<T\>
 
 > **ToolExecutionResult**\<`T`\> = `object`
-
-Defined in: [types/tools.ts:140](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L140)
 
 Tool execution result
 Moved from src/lib/mcp/contracts/mcpContract.ts
@@ -25,23 +23,17 @@ Moved from src/lib/mcp/contracts/mcpContract.ts
 
 > **result**: `T`
 
-Defined in: [types/tools.ts:141](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L141)
-
 ---
 
 ### context?
 
-> `optional` **context**: [`ExecutionContext`](ExecutionContext.md)
-
-Defined in: [types/tools.ts:142](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L142)
+> `optional` **context?**: [`ExecutionContext`](ExecutionContext.md)
 
 ---
 
 ### performance?
 
-> `optional` **performance**: `object`
-
-Defined in: [types/tools.ts:143](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L143)
+> `optional` **performance?**: `object`
 
 #### duration
 
@@ -49,32 +41,26 @@ Defined in: [types/tools.ts:143](https://github.com/juspay/neurolink/blob/1be795
 
 #### tokensUsed?
 
-> `optional` **tokensUsed**: `number`
+> `optional` **tokensUsed?**: `number`
 
 #### cost?
 
-> `optional` **cost**: `number`
+> `optional` **cost?**: `number`
 
 ---
 
 ### validation?
 
-> `optional` **validation**: `ValidationResult`
-
-Defined in: [types/tools.ts:148](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L148)
+> `optional` **validation?**: [`ValidationResult`](ValidationResult.md)
 
 ---
 
 ### cached?
 
-> `optional` **cached**: `boolean`
-
-Defined in: [types/tools.ts:149](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L149)
+> `optional` **cached?**: `boolean`
 
 ---
 
 ### fallback?
 
-> `optional` **fallback**: `boolean`
-
-Defined in: [types/tools.ts:150](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L150)
+> `optional` **fallback?**: `boolean`

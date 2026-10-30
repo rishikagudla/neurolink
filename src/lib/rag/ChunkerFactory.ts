@@ -13,7 +13,7 @@ import type {
   ChunkerConfig,
   ChunkerMetadata,
   ChunkingStrategy,
-} from "./types.js";
+} from "../types/index.js";
 
 /**
  * Default chunker metadata entries
@@ -59,7 +59,7 @@ const DEFAULT_CHUNKER_METADATA: Record<ChunkingStrategy, ChunkerMetadata> = {
   },
   markdown: {
     description: "Splits markdown content by headers and structural elements",
-    defaultConfig: { maxSize: 1000, overlap: 0 },
+    defaultConfig: { maxSize: 1000, overlap: 50 },
     supportedOptions: ["maxSize", "headerLevels", "splitCodeBlocks"],
     useCases: ["Documentation processing", "README files"],
     aliases: ["md", "markdown-header"],
@@ -153,9 +153,8 @@ export class ChunkerFactory extends BaseFactory<Chunker, ChunkerConfig> {
     this.registerChunker(
       "character",
       async (config?: ChunkerConfig) => {
-        const { CharacterChunker } = await import(
-          "./chunkers/CharacterChunker.js"
-        );
+        const { CharacterChunker } =
+          await import("./chunkers/CharacterChunker.js");
         return new CharacterChunker(config);
       },
       DEFAULT_CHUNKER_METADATA.character,
@@ -165,9 +164,8 @@ export class ChunkerFactory extends BaseFactory<Chunker, ChunkerConfig> {
     this.registerChunker(
       "recursive",
       async (config?: ChunkerConfig) => {
-        const { RecursiveChunker } = await import(
-          "./chunkers/RecursiveChunker.js"
-        );
+        const { RecursiveChunker } =
+          await import("./chunkers/RecursiveChunker.js");
         return new RecursiveChunker(config);
       },
       DEFAULT_CHUNKER_METADATA.recursive,
@@ -177,9 +175,8 @@ export class ChunkerFactory extends BaseFactory<Chunker, ChunkerConfig> {
     this.registerChunker(
       "sentence",
       async (config?: ChunkerConfig) => {
-        const { SentenceChunker } = await import(
-          "./chunkers/SentenceChunker.js"
-        );
+        const { SentenceChunker } =
+          await import("./chunkers/SentenceChunker.js");
         return new SentenceChunker(config);
       },
       DEFAULT_CHUNKER_METADATA.sentence,
@@ -199,9 +196,8 @@ export class ChunkerFactory extends BaseFactory<Chunker, ChunkerConfig> {
     this.registerChunker(
       "markdown",
       async (config?: ChunkerConfig) => {
-        const { MarkdownChunker } = await import(
-          "./chunkers/MarkdownChunker.js"
-        );
+        const { MarkdownChunker } =
+          await import("./chunkers/MarkdownChunker.js");
         return new MarkdownChunker(config);
       },
       DEFAULT_CHUNKER_METADATA.markdown,
@@ -241,11 +237,10 @@ export class ChunkerFactory extends BaseFactory<Chunker, ChunkerConfig> {
     this.registerChunker(
       "semantic",
       async (config?: ChunkerConfig) => {
-        // TODO: Implement dedicated SemanticChunker with LLM support
-        // For now, fall back to RecursiveChunker with semantic defaults
-        const { RecursiveChunker } = await import(
-          "./chunkers/RecursiveChunker.js"
-        );
+        // Intentional fallback, not a gap: no dedicated SemanticChunker
+        // exists yet, so this uses RecursiveChunker with semantic defaults.
+        const { RecursiveChunker } =
+          await import("./chunkers/RecursiveChunker.js");
         return new RecursiveChunker(config);
       },
       DEFAULT_CHUNKER_METADATA.semantic,
@@ -255,9 +250,8 @@ export class ChunkerFactory extends BaseFactory<Chunker, ChunkerConfig> {
     this.registerChunker(
       "semantic-markdown",
       async (config?: ChunkerConfig) => {
-        const { SemanticMarkdownChunker } = await import(
-          "./chunkers/SemanticMarkdownChunker.js"
-        );
+        const { SemanticMarkdownChunker } =
+          await import("./chunkers/SemanticMarkdownChunker.js");
         return new SemanticMarkdownChunker(config);
       },
       DEFAULT_CHUNKER_METADATA["semantic-markdown"],
@@ -332,9 +326,22 @@ export class ChunkerFactory extends BaseFactory<Chunker, ChunkerConfig> {
   }
 
   /**
-   * Get metadata for a chunker
+   * Get metadata for a chunker.
+   *
+   * Awaits registration first. `metadataMap` and the alias map are populated by
+   * `registerAll()`, which only runs via the async `ensureInitialized()` — and
+   * the only place that awaited it was `create()`. So on a fresh process this
+   * returned `undefined` for every strategy until something happened to build a
+   * chunker first, and returned real metadata after. Order-dependent, silent,
+   * and `undefined` rather than a throw.
+   *
+   * `createChunker()` and `getAvailableStrategies()` were already async for
+   * exactly this reason; these readers were the ones that had not caught up.
    */
-  getChunkerMetadata(strategyOrAlias: string): ChunkerMetadata | undefined {
+  async getChunkerMetadata(
+    strategyOrAlias: string,
+  ): Promise<ChunkerMetadata | undefined> {
+    await this.ensureInitialized();
     const resolvedName = this.resolveName(strategyOrAlias);
     return this.metadataMap.get(resolvedName);
   }
@@ -342,8 +349,10 @@ export class ChunkerFactory extends BaseFactory<Chunker, ChunkerConfig> {
   /**
    * Get default configuration for a chunker
    */
-  getDefaultConfig(strategyOrAlias: string): ChunkerConfig | undefined {
-    const metadata = this.getChunkerMetadata(strategyOrAlias);
+  async getDefaultConfig(
+    strategyOrAlias: string,
+  ): Promise<ChunkerConfig | undefined> {
+    const metadata = await this.getChunkerMetadata(strategyOrAlias);
     return metadata?.defaultConfig;
   }
 
@@ -358,14 +367,16 @@ export class ChunkerFactory extends BaseFactory<Chunker, ChunkerConfig> {
   /**
    * Get all aliases mapped to their strategies
    */
-  getStrategyAliases(): Map<string, string> {
+  async getStrategyAliases(): Promise<Map<string, string>> {
+    await this.ensureInitialized();
     return this.getAliases();
   }
 
   /**
    * Check if a strategy exists
    */
-  hasStrategy(strategyOrAlias: string): boolean {
+  async hasStrategy(strategyOrAlias: string): Promise<boolean> {
+    await this.ensureInitialized();
     const resolved = this.resolveName(strategyOrAlias);
     return this.has(resolved);
   }
@@ -373,7 +384,8 @@ export class ChunkerFactory extends BaseFactory<Chunker, ChunkerConfig> {
   /**
    * Get chunkers suitable for a use case
    */
-  getChunkersForUseCase(useCase: string): ChunkingStrategy[] {
+  async getChunkersForUseCase(useCase: string): Promise<ChunkingStrategy[]> {
+    await this.ensureInitialized();
     const matches: ChunkingStrategy[] = [];
     const useCaseLower = useCase.toLowerCase();
 
@@ -393,7 +405,8 @@ export class ChunkerFactory extends BaseFactory<Chunker, ChunkerConfig> {
   /**
    * Get all chunker metadata
    */
-  getAllMetadata(): Map<string, ChunkerMetadata> {
+  async getAllMetadata(): Promise<Map<string, ChunkerMetadata>> {
+    await this.ensureInitialized();
     return new Map(this.metadataMap);
   }
 
@@ -433,7 +446,7 @@ export async function getAvailableStrategies(): Promise<ChunkingStrategy[]> {
  */
 export function getChunkerMetadata(
   strategyOrAlias: string,
-): ChunkerMetadata | undefined {
+): Promise<ChunkerMetadata | undefined> {
   return chunkerFactory.getChunkerMetadata(strategyOrAlias);
 }
 
@@ -442,6 +455,6 @@ export function getChunkerMetadata(
  */
 export function getDefaultConfig(
   strategyOrAlias: string,
-): ChunkerConfig | undefined {
+): Promise<ChunkerConfig | undefined> {
   return chunkerFactory.getDefaultConfig(strategyOrAlias);
 }

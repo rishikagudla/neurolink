@@ -8,45 +8,14 @@
  * @module processors/errors
  */
 
-import type { FileProcessingError } from "../base/types.js";
+import { isAbortError } from "../../utils/errorHandling.js";
+import type {
+  FileProcessingError,
+  FileProcessingSummary,
+  ProcessorErrorMessageTemplate,
+} from "../../types/index.js";
 
-import {
-  ERROR_MESSAGES,
-  type ErrorMessageTemplate,
-  FileErrorCode,
-} from "./FileErrorCode.js";
-
-export type { FileProcessingError };
-
-/**
- * Summary of file processing operations.
- */
-export interface FileProcessingSummary {
-  /** Total number of files attempted */
-  totalFiles: number;
-  /** Successfully processed files */
-  processedFiles: Array<{
-    filename: string;
-    size?: number;
-    type?: string;
-  }>;
-  /** Files that failed to process */
-  failedFiles: Array<{
-    filename: string;
-    error: FileProcessingError;
-  }>;
-  /** Files that were skipped */
-  skippedFiles: Array<{
-    filename: string;
-    reason: string;
-    suggestedAlternative?: string;
-  }>;
-  /** Non-fatal warnings */
-  warnings: Array<{
-    filename: string;
-    message: string;
-  }>;
-}
+import { ERROR_MESSAGES, FileErrorCode } from "./FileErrorCode.js";
 
 /**
  * Create a structured file processing error with user-friendly messaging.
@@ -70,7 +39,7 @@ export function createFileError(
   details?: Record<string, unknown>,
   originalError?: Error,
 ): FileProcessingError {
-  const template: ErrorMessageTemplate = ERROR_MESSAGES[code];
+  const template: ProcessorErrorMessageTemplate = ERROR_MESSAGES[code];
 
   const result: FileProcessingError = {
     code,
@@ -115,7 +84,7 @@ export function createCustomFileError(
   customUserMessage: string,
   details?: Record<string, unknown>,
 ): FileProcessingError {
-  const template: ErrorMessageTemplate = ERROR_MESSAGES[code];
+  const template: ProcessorErrorMessageTemplate = ERROR_MESSAGES[code];
 
   return {
     code,
@@ -207,8 +176,13 @@ export function isRetryableError(error: unknown): boolean {
   }
 
   if (error instanceof Error) {
+    // User-initiated aborts are NOT retryable
+    if (isAbortError(error)) {
+      return false;
+    }
+
     // Network/timeout errors are retryable
-    const retryableNames = ["AbortError", "TimeoutError", "FetchError"];
+    const retryableNames = ["TimeoutError", "FetchError"];
     if (retryableNames.includes(error.name)) {
       return true;
     }
@@ -329,12 +303,14 @@ export function mapErrorToCode(error: unknown): FileErrorCode {
     const message = error.message.toLowerCase();
     const name = error.name;
 
+    // User-initiated aborts are not timeouts — map to NETWORK_ERROR
+    // (no dedicated ABORTED code exists in FileErrorCode)
+    if (isAbortError(error)) {
+      return FileErrorCode.NETWORK_ERROR;
+    }
+
     // Timeout errors
-    if (
-      name === "AbortError" ||
-      name === "TimeoutError" ||
-      message.includes("timeout")
-    ) {
+    if (name === "TimeoutError" || message.includes("timeout")) {
       return FileErrorCode.DOWNLOAD_TIMEOUT;
     }
 

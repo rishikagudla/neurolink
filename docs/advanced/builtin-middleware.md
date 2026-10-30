@@ -1,6 +1,6 @@
 # Built-in Middleware Reference
 
-NeuroLink includes three production-ready middleware components for common enterprise use cases: **Analytics**, **Guardrails**, and **Auto-Evaluation**. These middleware are battle-tested and ready to use in production applications.
+NeuroLink includes three built-in middleware components for common use cases: **Analytics**, **Guardrails**, and **Auto-Evaluation**. They ship ready to wire into your generate/stream calls.
 
 ## Quick Start
 
@@ -21,6 +21,19 @@ const factory = new MiddlewareFactory({
   enabledMiddleware: ["analytics", "guardrails", "autoEvaluation"],
 });
 ```
+
+### Defaults for every call
+
+Instead of repeating `middleware` on each `generate()` or `stream()` call, set it once. From lowest to highest precedence:
+
+| Layer       | How                                                  |
+| ----------- | ---------------------------------------------------- |
+| Environment | `NEUROLINK_MIDDLEWARE_PRESET=default\|all\|security` |
+| Global      | `configureGlobalMiddleware({ preset: "all" })`       |
+| Instance    | `new NeuroLink({ middleware: { preset: "all" } })`   |
+| Per call    | `generate({ middleware: { preset: "all" } })`        |
+
+`middlewareConfig` merges per middleware id; lists and other keys set by a higher layer replace the lower layer's value. With no default set, calls are unchanged. See [Guardrails: Defaults and precedence](../features/guardrails.md#defaults-and-precedence) for the full rules.
 
 ---
 
@@ -101,13 +114,12 @@ Analytics data is automatically added to the response metadata:
 ```typescript
 import { NeuroLink } from "@juspay/neurolink";
 
-const neurolink = new NeuroLink({
-  provider: "openai",
-  model: "gpt-4",
-});
+const neurolink = new NeuroLink();
 
 const result = await neurolink.generate({
-  prompt: "Explain quantum computing",
+  input: { text: "Explain quantum computing" },
+  provider: "openai",
+  model: "gpt-4",
 });
 
 // Access analytics from response metadata
@@ -137,7 +149,7 @@ For streaming responses, analytics are available in the `rawResponse`:
 
 ```typescript
 const result = await neurolink.stream({
-  prompt: "Write a story",
+  input: { text: "Write a story" },
 });
 
 // Analytics available in rawResponse
@@ -162,7 +174,7 @@ console.log(streamAnalytics);
 **1. Cost Tracking:**
 
 ```typescript
-const result = await neurolink.generate({ prompt: "..." });
+const result = await neurolink.generate({ input: { text: "..." } });
 const analytics = result.experimental_providerMetadata?.neurolink?.analytics;
 
 // Calculate cost (example: $0.03 per 1K input tokens, $0.06 per 1K output tokens)
@@ -191,7 +203,7 @@ if (analytics.responseTime > 3000) {
 const requests = [];
 
 for (const prompt of prompts) {
-  const result = await neurolink.generate({ prompt });
+  const result = await neurolink.generate({ input: { text: prompt } });
   const analytics = result.experimental_providerMetadata?.neurolink?.analytics;
   requests.push(analytics);
 }
@@ -214,7 +226,7 @@ import { StatsD } from "node-dogstatsd";
 
 const dogstatsd = new StatsD();
 
-const result = await neurolink.generate({ prompt: "..." });
+const result = await neurolink.generate({ input: { text: "..." } });
 const analytics = result.experimental_providerMetadata?.neurolink?.analytics;
 
 dogstatsd.histogram("neurolink.response_time", analytics.responseTime);
@@ -238,7 +250,7 @@ const tokenCounter = new Counter({
   help: "Total tokens consumed",
 });
 
-const result = await neurolink.generate({ prompt: "..." });
+const result = await neurolink.generate({ input: { text: "..." } });
 const analytics = result.experimental_providerMetadata?.neurolink?.analytics;
 
 responseTimeHistogram.observe(analytics.responseTime);
@@ -283,7 +295,15 @@ const factory = new MiddlewareFactory({
 **Advanced Configuration with Model-Based Filtering:**
 
 ```typescript
-import { openai } from "@ai-sdk/openai";
+import { AIProviderFactory } from "@juspay/neurolink";
+
+// `filterModel` takes a model handle. NeuroLink no longer depends on the Vercel
+// AI SDK, so build the handle from NeuroLink's own factory rather than from
+// `@ai-sdk/openai`.
+const filterProvider = await AIProviderFactory.createProvider(
+  "openai",
+  "gpt-4o-mini",
+);
 
 const factory = new MiddlewareFactory({
   middlewareConfig: {
@@ -296,7 +316,7 @@ const factory = new MiddlewareFactory({
         // AI model-based filtering
         modelFilter: {
           enabled: true,
-          filterModel: openai("gpt-3.5-turbo"), // Use a fast model for filtering
+          filterModel: await filterProvider.getModel(), // A fast model for filtering
         },
       },
     },
@@ -391,12 +411,17 @@ Text: "[content to evaluate]"
 **Configuration:**
 
 ```typescript
-import { openai } from "@ai-sdk/openai";
+import { AIProviderFactory } from "@juspay/neurolink";
+
+const filterProvider = await AIProviderFactory.createProvider(
+  "openai",
+  "gpt-4o-mini",
+);
 
 config: {
   modelFilter: {
     enabled: true,
-    filterModel: openai("gpt-3.5-turbo") // Fast, cost-effective model
+    filterModel: await filterProvider.getModel() // Fast, cost-effective model
   }
 }
 ```
@@ -455,11 +480,11 @@ Guardrails work seamlessly with streaming responses:
 
 ```typescript
 const result = await neurolink.stream({
-  prompt: "Generate a story",
+  input: { text: "Generate a story" },
 });
 
 // Each chunk is filtered in real-time
-for await (const chunk of result.textStream) {
+for await (const chunk of result.stream) {
   console.log(chunk); // Filtered content
 }
 ```
@@ -659,7 +684,7 @@ config: {
 }
 
 // Request waits until evaluation completes
-const result = await neurolink.generate({ prompt: "..." });
+const result = await neurolink.generate({ input: { text: "..." } });
 
 // Evaluation result is available
 console.log(result.evaluationResult);
@@ -683,7 +708,7 @@ config: {
 }
 
 // Response returned immediately
-const result = await neurolink.generate({ prompt: "..." });
+const result = await neurolink.generate({ input: { text: "..." } });
 // Evaluation runs in background
 ```
 
@@ -743,10 +768,10 @@ config: {
   blocking: true; // Ignored for streams
 }
 
-const result = await neurolink.stream({ prompt: "..." });
+const result = await neurolink.stream({ input: { text: "..." } });
 
 // Stream returns immediately
-for await (const chunk of result.textStream) {
+for await (const chunk of result.stream) {
   console.log(chunk);
 }
 
@@ -879,7 +904,6 @@ Priority 90:  Auto-Evaluation (quality checks)
 
 ```typescript
 import { MiddlewareFactory } from "@juspay/neurolink";
-import { openai } from "@ai-sdk/openai";
 
 const factory = new MiddlewareFactory({
   preset: "all", // Enables analytics + guardrails

@@ -4,7 +4,7 @@
  * Compliant with OpenAPI 3.1 / JSON Schema 2020-12
  */
 
-import type { JsonObject } from "../../types/common.js";
+import type { JsonObject } from "../../types/index.js";
 
 // ============================================
 // Common Schemas
@@ -124,12 +124,14 @@ export const AgentInputSchema: JsonObject = {
         images: {
           type: "array",
           items: { type: "string" },
-          description: "Array of image URLs or base64 data",
+          description:
+            "Array of images, each a data: URI, an https URL the server downloads (public hosts only, no redirects) or a path under a directory the server allows (allowedInputRoots; with none set every local path is refused with 403). Bare base64 is not accepted, and http:// or any other scheme is refused with 400. A request is limited in attachment count and total bytes (413).",
         },
         files: {
           type: "array",
           items: { type: "string" },
-          description: "Array of file paths or URLs",
+          description:
+            "Array of files, each a data: URI, an https URL the server downloads (public hosts only, no redirects) or a path under a directory the server allows (allowedInputRoots; with none set every local path is refused with 403). http:// or any other scheme is refused with 400. A request is limited in attachment count and total bytes (413), images and files together.",
         },
       },
     },

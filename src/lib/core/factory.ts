@@ -1,16 +1,27 @@
 // ✅ CIRCULAR DEPENDENCY FIX: Remove barrel export import
 // Providers are now managed via ProviderFactory instead of direct imports
+import { SpanKind, SpanStatusCode } from "@opentelemetry/api";
+import type { NeuroLink } from "../neurolink.js";
+import { tracers } from "../telemetry/tracers.js";
 import { ProviderFactory } from "../factories/providerFactory.js";
+import {
+  PROVIDER_ALIAS_INDEX,
+  PROVIDER_DESCRIPTORS_BY_NAME,
+} from "../factories/providerDescriptors.js";
 import { ProviderRegistry } from "../factories/providerRegistry.js";
 import { getBestProvider } from "../utils/providerUtils.js";
 import { logger } from "../utils/logger.js";
 import { dynamicModelProvider } from "./dynamicModels.js";
-import type { AIProvider, SupportedModelName } from "../types/index.js";
+import { withTimeout, ErrorFactory } from "../utils/errorHandling.js";
+import type {
+  AIProvider,
+  SupportedModelName,
+  NeurolinkCredentials,
+  ProviderPairResult,
+} from "../types/index.js";
 import { AIProviderName } from "../constants/enums.js";
-import type { UnknownRecord } from "../types/common.js";
-import type { ProviderPairResult } from "../types/typeAliases.js";
-
 const componentIdentifier = "aiProviderFactory";
+const factoryTracer = tracers.factory;
 
 /**
  * Factory for creating AI provider instances with centralized configuration
@@ -40,16 +51,11 @@ export class AIProviderFactory {
     const INIT_TIMEOUT = 10000; // 10 seconds total timeout for initialization
 
     try {
-      // Race the initialization against a timeout
-      await Promise.race([
+      await withTimeout(
         dynamicModelProvider.initialize(),
-        new Promise((_, reject) =>
-          setTimeout(
-            () => reject(new Error("Dynamic provider initialization timeout")),
-            INIT_TIMEOUT,
-          ),
-        ),
-      ]);
+        INIT_TIMEOUT,
+        ErrorFactory.toolTimeout("dynamic-provider-init", INIT_TIMEOUT),
+      );
 
       logger.debug(
         `[${functionTag}] Dynamic model provider initialized successfully`,
@@ -69,6 +75,257 @@ export class AIProviderFactory {
       // This ensures the factory continues to work even if dynamic models fail
     }
   }
+
+  /**
+   * A provider whose descriptor declares `inferenceKinds` of exactly `["decide"]`
+   * names its own model (its registered default reads its own variable), so a
+   * chat provider's model variable has no claim on it, nor does the chat model
+   * registry. Exactly `["decide"]`: a provider that also serves text keeps its
+   * chat-model fallbacks.
+   */
+  private static isDecisionOnly(providerName: string): boolean {
+    const canonical = PROVIDER_ALIAS_INDEX.get(providerName.toLowerCase());
+    const kinds =
+      canonical === undefined
+        ? undefined
+        : PROVIDER_DESCRIPTORS_BY_NAME.get(canonical)?.inferenceKinds;
+    return kinds?.length === 1 && kinds[0] === "decide";
+  }
+
+  private static resolveModelFromEnvironment(
+    providerName: string,
+    modelName: string | null | undefined,
+    functionTag: string,
+  ): string | null | undefined {
+    if (modelName && modelName !== "default") {
+      logger.debug(
+        `[${functionTag}] Skipping environment variable check - explicit model provided: ${modelName}`,
+      );
+      return modelName;
+    }
+
+    // The group below is chosen by `includes`, so "openai-decisions" would be
+    // handed OPENAI_MODEL, the chat provider's variable, ahead of its own.
+    if (this.isDecisionOnly(providerName)) {
+      logger.debug(
+        `[${functionTag}] Skipping chat-model environment variables - ${providerName} serves decisions only and reads its own model setting`,
+      );
+      return modelName;
+    }
+
+    logger.debug(
+      `[${functionTag}] Checking environment variables for provider: ${providerName}`,
+    );
+
+    const normalizedProvider = providerName.toLowerCase();
+    const envConfigs = [
+      {
+        match: ["bedrock"],
+        label: "Bedrock",
+        vars: ["BEDROCK_MODEL", "BEDROCK_MODEL_ID"],
+      },
+      {
+        match: ["vertex"],
+        label: "Vertex",
+        vars: ["VERTEX_MODEL"],
+      },
+      {
+        match: ["azure"],
+        label: "Azure",
+        vars: [
+          "AZURE_OPENAI_MODEL",
+          "AZURE_OPENAI_DEPLOYMENT",
+          "AZURE_OPENAI_DEPLOYMENT_ID",
+        ],
+      },
+      {
+        match: ["openai", "gpt", "chatgpt", "openai-compat"],
+        label: "OpenAI",
+        vars: ["OPENAI_MODEL"],
+      },
+      {
+        match: ["anthropic", "claude", "anthropic-claude"],
+        label: "Anthropic",
+        vars: ["ANTHROPIC_MODEL"],
+      },
+      {
+        match: ["google", "gemini"],
+        label: "Google AI",
+        vars: ["GOOGLE_AI_MODEL"],
+      },
+      {
+        match: ["mistral"],
+        label: "Mistral",
+        vars: ["MISTRAL_MODEL"],
+      },
+      {
+        match: ["ollama"],
+        label: "Ollama",
+        vars: ["OLLAMA_MODEL"],
+      },
+      {
+        match: ["litellm"],
+        label: "LiteLLM",
+        vars: ["LITELLM_MODEL"],
+      },
+    ] as const;
+
+    const envConfig = envConfigs.find((config) =>
+      config.match.some((match) => normalizedProvider.includes(match)),
+    );
+    if (!envConfig) {
+      logger.debug(
+        `[${functionTag}] Provider ${providerName} - no environment variable check implemented`,
+      );
+      return modelName;
+    }
+
+    const matchedVar = envConfig.vars.find((name) => process.env[name]);
+    const envModel = matchedVar ? process.env[matchedVar] : undefined;
+    if (envModel) {
+      logger.debug(
+        `[${functionTag}] Environment variable found for ${envConfig.label}`,
+        {
+          envVariable: matchedVar,
+          resolvedModel: envModel,
+        },
+      );
+      return envModel;
+    }
+
+    logger.debug(
+      `[${functionTag}] No ${envConfig.label} environment variables found (${envConfig.vars.join(", ")})`,
+    );
+    return modelName;
+  }
+
+  private static async resolveDynamicModelName(
+    providerName: string,
+    modelName: string | null | undefined,
+    resolvedModelName: string | null | undefined,
+    functionTag: string,
+  ): Promise<string | null | undefined> {
+    if (
+      (resolvedModelName && resolvedModelName !== "default") ||
+      (modelName && modelName !== "default")
+    ) {
+      logger.debug(`[${functionTag}] Skipping dynamic model resolution`, {
+        resolvedModelName: resolvedModelName || "none",
+        reason:
+          "Model already resolved from environment variables or explicit parameter",
+      });
+      return resolvedModelName;
+    }
+
+    // The registry lists chat providers, and a decision-only provider reads its
+    // own model setting, so loading it for one can only cost: it is awaited (up
+    // to the 10 s init timeout), tries a local port, then GitHub, then a file,
+    // and is tried again by the next call when every source fails.
+    if (this.isDecisionOnly(providerName)) {
+      logger.debug(`[${functionTag}] Skipping dynamic model resolution`, {
+        resolvedModelName: resolvedModelName || "none",
+        reason: `${providerName} serves decisions only and reads its own model setting`,
+      });
+      return resolvedModelName;
+    }
+
+    logger.debug(`[${functionTag}] Attempting dynamic model resolution`, {
+      currentResolvedModel: resolvedModelName || "none",
+      reason: "No environment variable found and no explicit model provided",
+    });
+
+    try {
+      const normalizedProvider = this.normalizeProviderName(providerName);
+
+      if (dynamicModelProvider.needsRefresh()) {
+        logger.debug(
+          `[${functionTag}] Dynamic model provider needs refresh - initializing`,
+        );
+        await this.initializeDynamicProviderWithTimeout();
+      }
+
+      const dynamicModel = dynamicModelProvider.resolveModel(
+        normalizedProvider,
+        modelName || undefined,
+      );
+      if (!dynamicModel) {
+        logger.debug(
+          `[${functionTag}] Dynamic model resolution returned null`,
+          {
+            provider: normalizedProvider,
+            requestedModel: modelName || "default",
+          },
+        );
+        return resolvedModelName;
+      }
+
+      logger.debug(`[${functionTag}] Resolved dynamic model`, {
+        provider: normalizedProvider,
+        requestedModel: modelName || "default",
+        resolvedModel: dynamicModel.id,
+        displayName: dynamicModel.displayName,
+        pricing: dynamicModel.pricing.input,
+      });
+      return dynamicModel.id;
+    } catch (resolveError) {
+      logger.debug(
+        `[${functionTag}] Dynamic model resolution failed, using static fallback`,
+        {
+          error:
+            resolveError instanceof Error
+              ? resolveError.message
+              : String(resolveError),
+        },
+      );
+      return resolvedModelName;
+    }
+  }
+
+  private static async createResolvedProvider(
+    providerName: string,
+    resolvedModelName: string | null | undefined,
+    sdk: NeuroLink | undefined,
+    region: string | undefined,
+    functionTag: string,
+    credentials?: NeurolinkCredentials,
+  ): Promise<{
+    normalizedName: string;
+    finalModelName: string | undefined;
+    provider: AIProvider;
+  }> {
+    await withTimeout(
+      ProviderRegistry.registerAllProviders(),
+      30_000,
+      ErrorFactory.toolTimeout("provider-registration", 30_000),
+    );
+
+    const normalizedName = this.normalizeProviderName(providerName);
+    const finalModelName =
+      resolvedModelName === "default" || resolvedModelName === null
+        ? undefined
+        : resolvedModelName;
+
+    logger.debug(`[${functionTag}] Final provider configuration`, {
+      originalProviderName: providerName,
+      normalizedProviderName: normalizedName,
+      resolvedModelName: resolvedModelName || "not resolved",
+      finalModelName: finalModelName || "using provider default",
+    });
+
+    const provider = await withTimeout(
+      ProviderFactory.createProvider(
+        normalizedName,
+        finalModelName,
+        sdk,
+        region,
+        credentials,
+      ),
+      30_000,
+      ErrorFactory.toolTimeout(`provider-creation:${normalizedName}`, 30_000),
+    );
+
+    return { normalizedName, finalModelName, provider };
+  }
   /**
    * Create a provider instance for the specified provider type
    * @param providerName - Name of the provider ('vertex', 'bedrock', 'openai')
@@ -82,259 +339,120 @@ export class AIProviderFactory {
     providerName: string,
     modelName?: string | null,
     enableMCP: boolean = true,
-    sdk?: UnknownRecord,
+    sdk?: NeuroLink,
     region?: string,
+    credentials?: NeurolinkCredentials,
   ): Promise<AIProvider> {
     const functionTag = "AIProviderFactory.createProvider";
 
     // Providers are registered via ProviderFactory.initialize() on first use
 
-    logger.debug(`[${functionTag}] Provider creation started`, {
-      providerName,
-      modelName: modelName || "default",
-      enableMCP,
-      environmentVariables: {
-        BEDROCK_MODEL: process.env.BEDROCK_MODEL || "not set",
-        BEDROCK_MODEL_ID: process.env.BEDROCK_MODEL_ID || "not set",
-        VERTEX_MODEL: process.env.VERTEX_MODEL || "not set",
-        OPENAI_MODEL: process.env.OPENAI_MODEL || "not set",
-      },
-    });
-
-    try {
-      // DYNAMIC MODEL PROVIDER STATUS (2025): Enhanced with timeout handling
-      //
-      // ✅ FIXED: Hanging issues resolved with comprehensive timeout implementation
-      // - Added robust timeout handling (3s localhost, 5s GitHub, 1s local file)
-      // - Implemented health checks for localhost endpoints
-      // - Added graceful degradation when all sources fail
-      // - Enhanced error handling and logging for debugging
-      //
-      // The dynamic model provider now provides reliable functionality without hanging
-
-      let resolvedModelName = modelName;
-
-      // PRIORITY 1: Check environment variables BEFORE dynamic resolution
-      if (!modelName || modelName === "default") {
-        logger.debug(
-          `[${functionTag}] Checking environment variables for provider: ${providerName}`,
-        );
-
-        // Check for provider-specific environment variables first
-        if (providerName.toLowerCase().includes("bedrock")) {
-          const envModel =
-            process.env.BEDROCK_MODEL || process.env.BEDROCK_MODEL_ID;
-          if (envModel) {
-            resolvedModelName = envModel;
-            logger.debug(
-              `[${functionTag}] Environment variable found for Bedrock`,
-              {
-                envVariable: process.env.BEDROCK_MODEL
-                  ? "BEDROCK_MODEL"
-                  : "BEDROCK_MODEL_ID",
-                resolvedModel: envModel,
-              },
-            );
-          } else {
-            logger.debug(
-              `[${functionTag}] No Bedrock environment variables found (BEDROCK_MODEL, BEDROCK_MODEL_ID)`,
-            );
-          }
-        } else if (providerName.toLowerCase().includes("vertex")) {
-          const envModel = process.env.VERTEX_MODEL;
-          if (envModel) {
-            resolvedModelName = envModel;
-            logger.debug(
-              `[${functionTag}] Environment variable found for Vertex`,
-              {
-                envVariable: "VERTEX_MODEL",
-                resolvedModel: envModel,
-              },
-            );
-          } else {
-            logger.debug(
-              `[${functionTag}] No Vertex environment variables found (VERTEX_MODEL)`,
-            );
-          }
-        } else if (providerName.toLowerCase().includes("azure")) {
-          const envModel =
-            process.env.AZURE_OPENAI_MODEL ||
-            process.env.AZURE_OPENAI_DEPLOYMENT ||
-            process.env.AZURE_OPENAI_DEPLOYMENT_ID;
-          if (envModel) {
-            resolvedModelName = envModel;
-            logger.debug(
-              `[${functionTag}] Environment variable found for Azure`,
-              {
-                envVariable: process.env.AZURE_OPENAI_MODEL
-                  ? "AZURE_OPENAI_MODEL"
-                  : process.env.AZURE_OPENAI_DEPLOYMENT
-                    ? "AZURE_OPENAI_DEPLOYMENT"
-                    : "AZURE_OPENAI_DEPLOYMENT_ID",
-                resolvedModel: envModel,
-              },
-            );
-          } else {
-            logger.debug(
-              `[${functionTag}] No Azure environment variables found (AZURE_OPENAI_MODEL, AZURE_OPENAI_DEPLOYMENT, AZURE_OPENAI_DEPLOYMENT_ID)`,
-            );
-          }
-        } else {
-          logger.debug(
-            `[${functionTag}] Provider ${providerName} - no environment variable check implemented`,
-          );
-        }
-      } else {
-        logger.debug(
-          `[${functionTag}] Skipping environment variable check - explicit model provided: ${modelName}`,
-        );
-      }
-
-      // PRIORITY 2: Enable dynamic model resolution only if no env var found
-      if (
-        (!resolvedModelName || resolvedModelName === "default") &&
-        (!modelName || modelName === "default")
-      ) {
-        logger.debug(`[${functionTag}] Attempting dynamic model resolution`, {
-          currentResolvedModel: resolvedModelName || "none",
-          reason:
-            "No environment variable found and no explicit model provided",
-        });
-
-        try {
-          const normalizedProvider = this.normalizeProviderName(providerName);
-
-          // Initialize with timeout protection - won't hang anymore
-          if (dynamicModelProvider.needsRefresh()) {
-            logger.debug(
-              `[${functionTag}] Dynamic model provider needs refresh - initializing`,
-            );
-            await this.initializeDynamicProviderWithTimeout();
-          }
-
-          const dynamicModel = dynamicModelProvider.resolveModel(
-            normalizedProvider,
-            modelName || undefined,
-          );
-
-          if (dynamicModel) {
-            resolvedModelName = dynamicModel.id;
-            logger.debug(`[${functionTag}] Resolved dynamic model`, {
-              provider: normalizedProvider,
-              requestedModel: modelName || "default",
-              resolvedModel: resolvedModelName,
-              displayName: dynamicModel.displayName,
-              pricing: dynamicModel.pricing.input,
-            });
-          } else {
-            logger.debug(
-              `[${functionTag}] Dynamic model resolution returned null`,
-              {
-                provider: normalizedProvider,
-                requestedModel: modelName || "default",
-              },
-            );
-          }
-        } catch (resolveError) {
-          logger.debug(
-            `[${functionTag}] Dynamic model resolution failed, using static fallback`,
-            {
-              error:
-                resolveError instanceof Error
-                  ? resolveError.message
-                  : String(resolveError),
-            },
-          );
-          // Continue with static model name - no functionality loss
-        }
-      } else {
-        logger.debug(`[${functionTag}] Skipping dynamic model resolution`, {
-          resolvedModelName: resolvedModelName || "none",
-          reason:
-            "Model already resolved from environment variables or explicit parameter",
-        });
-      }
-
-      // CRITICAL FIX: Initialize providers before using them
-      await ProviderRegistry.registerAllProviders();
-
-      // PURE FACTORY PATTERN: No switch statements - use ProviderFactory exclusively
-      const normalizedName = this.normalizeProviderName(providerName);
-      const finalModelName =
-        resolvedModelName === "default" || resolvedModelName === null
-          ? undefined
-          : resolvedModelName;
-
-      logger.debug(`[${functionTag}] Final provider configuration`, {
-        originalProviderName: providerName,
-        normalizedProviderName: normalizedName,
-        originalModelName: modelName || "not provided",
-        resolvedModelName: resolvedModelName || "not resolved",
-        finalModelName: finalModelName || "using provider default",
-      });
-
-      // Create provider with enhanced SDK and region support
-      const provider = await ProviderFactory.createProvider(
-        normalizedName,
-        finalModelName,
-        sdk,
-        region,
-      );
-
-      // Summary logging in format expected by debugging tools
-      logger.debug(
-        `[AIProviderFactory] Provider creation completed { providerName: '${normalizedName}', modelName: '${finalModelName}' }`,
-      );
-      logger.debug(`[AIProviderFactory] Resolved model: ${finalModelName}`);
-
-      logger.debug(
-        componentIdentifier,
-        "Pure factory pattern provider created",
-        {
-          providerName: normalizedName,
-          modelName: finalModelName,
-          factoryUsed: true,
+    return factoryTracer.startActiveSpan(
+      "factory.createProvider",
+      {
+        kind: SpanKind.INTERNAL,
+        attributes: {
+          "provider.name": providerName,
+          "model.name": modelName || "default",
+          "mcp.enabled": enableMCP,
         },
-      );
+      },
+      async (span) => {
+        logger.debug(`[${functionTag}] Provider creation started`, {
+          providerName,
+          modelName: modelName || "default",
+          enableMCP,
+          environmentVariables: {
+            BEDROCK_MODEL: process.env.BEDROCK_MODEL || "not set",
+            BEDROCK_MODEL_ID: process.env.BEDROCK_MODEL_ID || "not set",
+            VERTEX_MODEL: process.env.VERTEX_MODEL || "not set",
+            OPENAI_MODEL: process.env.OPENAI_MODEL || "not set",
+          },
+        });
 
-      // Wrap with MCP if enabled
-      if (enableMCP) {
         try {
-          logger.debug(
-            `[${functionTag}] MCP wrapping disabled - functionCalling removed`,
+          // DYNAMIC MODEL PROVIDER STATUS (2025): Enhanced with timeout handling
+          //
+          // ✅ FIXED: Hanging issues resolved with comprehensive timeout implementation
+          // - Added robust timeout handling (3s localhost, 5s GitHub, 1s local file)
+          // - Implemented health checks for localhost endpoints
+          // - Added graceful degradation when all sources fail
+          // - Enhanced error handling and logging for debugging
+          //
+          // The dynamic model provider now provides reliable functionality without hanging
+
+          let resolvedModelName = this.resolveModelFromEnvironment(
+            providerName,
+            modelName,
+            functionTag,
           );
-          // MCP wrapping simplified - removed functionCalling dependency
-        } catch (mcpError) {
-          logger.warn(
-            `[${functionTag}] Failed to wrap with MCP, using base provider`,
+          resolvedModelName = await this.resolveDynamicModelName(
+            providerName,
+            modelName,
+            resolvedModelName,
+            functionTag,
+          );
+          const { normalizedName, finalModelName, provider } =
+            await this.createResolvedProvider(
+              providerName,
+              resolvedModelName,
+              sdk,
+              region,
+              functionTag,
+              credentials,
+            );
+
+          // Summary logging in format expected by debugging tools
+          logger.debug(
+            `[AIProviderFactory] Provider creation completed { providerName: '${normalizedName}', modelName: '${finalModelName}' }`,
+          );
+          logger.debug(`[AIProviderFactory] Resolved model: ${finalModelName}`);
+
+          logger.debug(
+            componentIdentifier,
+            "Pure factory pattern provider created",
             {
-              error:
-                mcpError instanceof Error ? mcpError.message : String(mcpError),
+              providerName: normalizedName,
+              modelName: finalModelName,
+              factoryUsed: true,
             },
           );
+
+          span.setAttribute("provider.resolved_name", normalizedName);
+          if (finalModelName) {
+            span.setAttribute("model.resolved_name", finalModelName);
+          }
+
+          logger.debug(`[${functionTag}] Provider creation succeeded`, {
+            providerName,
+            modelName: finalModelName || "default",
+            providerType: provider.constructor.name,
+            mcpEnabled: enableMCP,
+          });
+
+          span.setStatus({ code: SpanStatusCode.OK });
+          return provider;
+        } catch (error) {
+          const errorMessage =
+            error instanceof Error ? error.message : String(error);
+
+          span.setStatus({ code: SpanStatusCode.ERROR, message: errorMessage });
+          span.recordException(
+            error instanceof Error ? error : new Error(String(error)),
+          );
+
+          logger.debug(`[${functionTag}] Provider creation failed`, {
+            providerName,
+            modelName: modelName || "default",
+            error: errorMessage,
+          });
+
+          throw error;
+        } finally {
+          span.end();
         }
-      }
-
-      logger.debug(`[${functionTag}] Provider creation succeeded`, {
-        providerName,
-        modelName: finalModelName || "default",
-        providerType: provider.constructor.name,
-        mcpEnabled: enableMCP,
-      });
-
-      return provider;
-    } catch (error) {
-      const errorMessage =
-        error instanceof Error ? error.message : String(error);
-
-      logger.debug(`[${functionTag}] Provider creation failed`, {
-        providerName,
-        modelName: modelName || "default",
-        error: errorMessage,
-      });
-
-      throw error;
-    }
+      },
+    );
   }
 
   /**
@@ -389,7 +507,7 @@ export class AIProviderFactory {
     requestedProvider?: string,
     modelName?: string | null,
     enableMCP: boolean = true,
-    sdk?: UnknownRecord,
+    sdk?: NeuroLink,
   ): Promise<AIProvider> {
     const functionTag = "AIProviderFactory.createBestProvider";
 

@@ -9,7 +9,12 @@ import type Router from "@koa/router";
 import type { Socket } from "net";
 import type { NeuroLink } from "../../neurolink.js";
 import { logger } from "../../utils/logger.js";
-import { AlreadyRunningError, ServerStopError, wrapError } from "../errors.js";
+import {
+  AlreadyRunningError,
+  ServerAdapterError,
+  ServerStopError,
+  wrapError,
+} from "../errors.js";
 import { BaseServerAdapter } from "../abstract/baseServerAdapter.js";
 import type {
   MiddlewareDefinition,
@@ -17,29 +22,20 @@ import type {
   ServerAdapterConfig,
   ServerAdapterEvents,
   ServerContext,
-} from "../types.js";
+  KoaRateLimitEntry,
+} from "../../types/index.js";
+import { resolveClientAddress } from "../utils/clientAddress.js";
+import { shapeRouteError } from "../utils/clientError.js";
+import { pathMatchesAny } from "../utils/pathMatch.js";
 import { isErrorResponse } from "../utils/validation.js";
-
-/**
- * Koa context type
- */
-type KoaContext = Koa.ParameterizedContext<
-  Koa.DefaultState,
-  Koa.DefaultContext
->;
-
-/**
- * Koa next function type
- */
-type KoaNext = Koa.Next;
-
-/**
- * Rate limit store entry
- */
-type RateLimitEntry = {
-  count: number;
-  resetAt: number;
-};
+import {
+  isRawBodyContentType,
+  isWebResponse,
+  parseByteLimit,
+  RawBodyTooLargeError,
+  readRawBody,
+  readWebResponse,
+} from "../utils/rawBody.js";
 
 /**
  * Koa-specific server adapter
@@ -50,9 +46,15 @@ export class KoaServerAdapter extends BaseServerAdapter {
   private router!: Router;
   private server?: import("http").Server;
   private frameworkInitialized = false;
-  private rateLimitStore = new Map<string, RateLimitEntry>();
+  private rateLimitStore = new Map<string, KoaRateLimitEntry>();
   private rateLimitCleanupInterval?: ReturnType<typeof setInterval>;
   private sockets: Set<Socket> = new Set();
+  // The rate limiter counts nothing it cannot attribute, and says so once.
+  private warnedNoClientAddress = false;
+  // Middleware from registerMiddleware(). It runs through one dispatcher that
+  // is mounted ahead of the router: app.use() after the router is mounted
+  // would only ever see requests no route matched.
+  private registeredMiddleware: Koa.Middleware[] = [];
 
   constructor(neurolink: NeuroLink, config: ServerAdapterConfig = {}) {
     super(neurolink, config);
@@ -76,8 +78,12 @@ export class KoaServerAdapter extends BaseServerAdapter {
     }
 
     // Dynamic imports to avoid loading if not used
-    const KoaModule = await import("koa");
-    const RouterModule = await import("@koa/router");
+    const KoaModule = await this.importFrameworkDependency<{
+      default: typeof import("koa");
+    }>("koa", "Koa");
+    const RouterModule = await this.importFrameworkDependency<
+      typeof import("@koa/router")
+    >("@koa/router", "Koa");
 
     const Koa = KoaModule.default;
     const Router = RouterModule.default;
@@ -86,7 +92,7 @@ export class KoaServerAdapter extends BaseServerAdapter {
     this.router = new Router();
 
     // Request ID middleware (first)
-    this.app.use(async (ctx: KoaContext, next: KoaNext) => {
+    this.app.use(async (ctx: Koa.ParameterizedContext, next: Koa.Next) => {
       ctx.state.requestId =
         (ctx.get("x-request-id") as string) || this.generateRequestId();
       ctx.set("X-Request-ID", ctx.state.requestId);
@@ -94,32 +100,35 @@ export class KoaServerAdapter extends BaseServerAdapter {
     });
 
     // Error handling middleware (should be early to catch all errors)
-    this.app.use(async (ctx: KoaContext, next: KoaNext) => {
+    this.app.use(async (ctx: Koa.ParameterizedContext, next: Koa.Next) => {
       try {
         await next();
       } catch (error) {
         const err = error as Error & { status?: number; statusCode?: number };
         const requestId = ctx.state.requestId;
 
-        logger.error("[KoaAdapter] Request error", {
-          requestId,
-          error: err.message,
-          stack: err.stack,
-        });
+        this.logRequestError("KoaAdapter", requestId, err);
 
-        this.emit("error", {
+        this.emitRequestError({
           requestId,
           error: err,
           timestamp: new Date(),
-        } satisfies ServerAdapterEvents["error"]);
+        });
 
-        const statusCode = err.status || err.statusCode || 500;
+        const adapterError =
+          error instanceof ServerAdapterError ? error : undefined;
+        const statusCode =
+          adapterError?.getHttpStatus() || err.status || err.statusCode || 500;
+        // A 4xx carries a message this server or Koa composed; any 5xx's
+        // text stays in the log.
+        const serverSide = statusCode >= 500;
         ctx.status = statusCode;
         ctx.body = {
           error: {
-            code: statusCode === 500 ? "INTERNAL_ERROR" : `HTTP_${statusCode}`,
-            message:
-              statusCode === 500 ? "An internal error occurred" : err.message,
+            code:
+              adapterError?.code ??
+              (serverSide ? "INTERNAL_ERROR" : `HTTP_${statusCode}`),
+            message: serverSide ? "An internal error occurred" : err.message,
           },
           metadata: {
             requestId,
@@ -131,15 +140,20 @@ export class KoaServerAdapter extends BaseServerAdapter {
 
     // CORS middleware
     if (this.config.cors.enabled) {
-      const corsModule = await import("@koa/cors");
+      const corsModule = await this.importFrameworkDependency<{
+        default: typeof import("@koa/cors");
+      }>("@koa/cors", "Koa");
       const cors = corsModule.default;
       this.app.use(
         cors({
           origin: (ctx) => {
-            const origin = ctx.request.headers.origin || "*";
+            // The wildcard is sent as the literal "*": reflecting the
+            // request's Origin instead would grant any page a credentialed
+            // allowance the wildcard itself cannot carry.
             if (this.config.cors.origins.includes("*")) {
-              return origin;
+              return "*";
             }
+            const origin = ctx.request.headers.origin ?? "";
             return this.config.cors.origins.includes(origin) ? origin : "";
           },
           allowMethods: this.config.cors.methods?.join(","),
@@ -152,7 +166,9 @@ export class KoaServerAdapter extends BaseServerAdapter {
 
     // Body parsing middleware
     if (this.config.bodyParser.enabled) {
-      const bodyParserModule = await import("koa-bodyparser");
+      const bodyParserModule = await this.importFrameworkDependency<{
+        default: typeof import("koa-bodyparser");
+      }>("koa-bodyparser", "Koa");
       const bodyParser = bodyParserModule.default;
       this.app.use(
         bodyParser({
@@ -160,6 +176,25 @@ export class KoaServerAdapter extends BaseServerAdapter {
           enableTypes: ["json", "form", "text"],
         }),
       );
+      // Uploads (multipart, octet-stream, audio/*) reach the route as bytes.
+      const rawLimit = parseByteLimit(this.config.bodyParser.rawMaxSize);
+      this.app.use(async (ctx, next) => {
+        if (isRawBodyContentType(ctx.get("content-type"))) {
+          try {
+            ctx.request.body = await readRawBody(ctx.req, rawLimit);
+          } catch (error) {
+            if (error instanceof RawBodyTooLargeError) {
+              ctx.status = 413;
+              ctx.body = {
+                error: { code: "PAYLOAD_TOO_LARGE", message: error.message },
+              };
+              return;
+            }
+            throw error;
+          }
+        }
+        await next();
+      });
     }
 
     // Rate limiting middleware
@@ -175,7 +210,7 @@ export class KoaServerAdapter extends BaseServerAdapter {
 
     // Logging middleware
     if (this.config.logging.enabled) {
-      this.app.use(async (ctx: KoaContext, next: KoaNext) => {
+      this.app.use(async (ctx: Koa.ParameterizedContext, next: Koa.Next) => {
         const startTime = Date.now();
         logger.info(`[KoaAdapter] ${ctx.method} ${ctx.path}`, {
           requestId: ctx.state.requestId,
@@ -190,6 +225,10 @@ export class KoaServerAdapter extends BaseServerAdapter {
       });
     }
 
+    this.app.use((ctx: Koa.ParameterizedContext, next: Koa.Next) =>
+      this.runRegisteredMiddleware(ctx, next),
+    );
+
     // Mount router
     this.app.use(this.router.routes());
     this.app.use(this.router.allowedMethods());
@@ -201,22 +240,48 @@ export class KoaServerAdapter extends BaseServerAdapter {
    * Create rate limiter middleware for Koa
    */
   private createRateLimiter(): Koa.Middleware {
-    return async (ctx: KoaContext, next: KoaNext): Promise<void> => {
+    return async (
+      ctx: Koa.ParameterizedContext,
+      next: Koa.Next,
+    ): Promise<void> => {
       // Skip rate limiting for excluded paths
-      if (this.config.rateLimit.skipPaths) {
-        for (const skipPath of this.config.rateLimit.skipPaths) {
-          if (ctx.path.startsWith(skipPath)) {
-            await next();
-            return;
-          }
-        }
+      if (pathMatchesAny(ctx.path, this.config.rateLimit.skipPaths)) {
+        await next();
+        return;
       }
 
-      const key =
-        ctx.get("x-forwarded-for") ||
-        ctx.get("x-real-ip") ||
-        ctx.ip ||
-        "unknown";
+      // The TCP peer, or behind a declared proxy the client it reports. A
+      // header alone used to be the key, so a rotating X-Forwarded-For escaped
+      // the limit; a request with no attributable address is let through
+      // rather than pooled with every other such request.
+      const key = this.config.rateLimit.keyGenerator
+        ? this.config.rateLimit.keyGenerator(
+            this.createContext({
+              requestId: ctx.state.requestId,
+              method: ctx.method,
+              path: ctx.path,
+              headers: ctx.headers as Record<string, string>,
+              query: ctx.query as Record<string, string>,
+              params: {},
+              remoteAddress: ctx.req.socket?.remoteAddress,
+            }),
+          )
+        : resolveClientAddress({
+            remoteAddress: ctx.req.socket?.remoteAddress,
+            forwardedFor: ctx.get("x-forwarded-for") || undefined,
+            trustProxy: this.config.rateLimit.trustProxy,
+            trustedProxies: this.config.rateLimit.trustedProxies,
+          });
+      if (key === undefined) {
+        if (!this.warnedNoClientAddress) {
+          this.warnedNoClientAddress = true;
+          logger.alwaysStderr(
+            "[KoaAdapter] A request arrived with no peer address, so the rate limiter cannot count it; configure rateLimit.keyGenerator to limit by another key.",
+          );
+        }
+        await next();
+        return;
+      }
       const now = Date.now();
       const windowMs = this.config.rateLimit.windowMs;
       const maxRequests = this.config.rateLimit.maxRequests;
@@ -274,8 +339,17 @@ export class KoaServerAdapter extends BaseServerAdapter {
    * Override initialize to ensure async framework setup
    */
   public async initialize(): Promise<void> {
-    // Initialize Koa asynchronously first
-    await this.initializeFrameworkAsync();
+    // Initialize Koa asynchronously first. This runs before
+    // super.initialize()'s try/catch even starts, so a failure here (e.g. the
+    // "koa" package is not installed) must be caught here too — otherwise it
+    // propagates with lifecycleState left at "uninitialized" instead of
+    // "error".
+    try {
+      await this.initializeFrameworkAsync();
+    } catch (error) {
+      this.lifecycleState = "error";
+      throw error;
+    }
 
     // Then call base class initialize
     await super.initialize();
@@ -293,7 +367,7 @@ export class KoaServerAdapter extends BaseServerAdapter {
       | "patch"
       | "options";
 
-    this.router[method](route.path, async (ctx: KoaContext) => {
+    this.router[method](route.path, async (ctx: Koa.ParameterizedContext) => {
       const requestId = ctx.state.requestId;
       const startTime = Date.now();
 
@@ -306,12 +380,27 @@ export class KoaServerAdapter extends BaseServerAdapter {
         query: ctx.query as Record<string, string>,
         params: ctx.params as Record<string, string>,
         body: ctx.request.body,
+        remoteAddress: ctx.req.socket?.remoteAddress,
       });
 
       // Copy response headers from middleware (stored in ctx.state by middleware)
       if (ctx.state.responseHeaders) {
         serverCtx.responseHeaders = { ...ctx.state.responseHeaders };
       }
+      this.restoreCarriedContext(serverCtx, ctx.state.carriedContext);
+
+      // The handler learns of a client that went away, and a request over
+      // `config.timeout` is answered 504 and its work aborted. Koa applied no
+      // request timeout at all.
+      const abort = this.attachRequestAbort(serverCtx, {
+        onClientClose: (listener) =>
+          ctx.req.on("close", () => {
+            if (!ctx.res.writableFinished) {
+              listener();
+            }
+          }),
+        applyTimeout: !route.streaming?.enabled,
+      });
 
       // Emit request event
       this.emit("request", {
@@ -321,23 +410,77 @@ export class KoaServerAdapter extends BaseServerAdapter {
         timestamp: new Date(),
       } satisfies ServerAdapterEvents["request"]);
 
-      // Handle streaming if configured
-      if (route.streaming?.enabled) {
-        return this.handleStreamingResponse(ctx, serverCtx, route);
-      }
+      try {
+        // Handle streaming if configured
+        if (route.streaming?.enabled) {
+          return await this.handleStreamingResponse(ctx, serverCtx, route);
+        }
 
-      // Execute handler
-      const result = await route.handler(serverCtx);
-      const duration = Date.now() - startTime;
+        // Execute handler
+        const result = abort.deadline
+          ? await Promise.race([route.handler(serverCtx), abort.deadline])
+          : await route.handler(serverCtx);
+        const duration = Date.now() - startTime;
 
-      // Check if result is an error response
-      if (isErrorResponse(result)) {
-        const statusCode = result.httpStatus ?? 500;
+        // A route that answers in its own wire format returns a web Response.
+        if (isWebResponse(result)) {
+          const raw = await readWebResponse(result);
+          this.emit("response", {
+            requestId,
+            statusCode: raw.status,
+            duration,
+            timestamp: new Date(),
+          } satisfies ServerAdapterEvents["response"]);
+          for (const [key, value] of Object.entries({
+            ...serverCtx.responseHeaders,
+            ...raw.headers,
+          })) {
+            ctx.set(key, value);
+          }
+          ctx.status = raw.status;
+          ctx.body = raw.body;
+          return;
+        }
 
-        // Emit response event with error status
+        // Check if result is an error response
+        if (isErrorResponse(result)) {
+          const statusCode = result.httpStatus ?? 500;
+
+          // Emit response event with error status
+          this.emit("response", {
+            requestId,
+            statusCode,
+            duration,
+            timestamp: new Date(),
+          } satisfies ServerAdapterEvents["response"]);
+
+          // Apply response headers from middleware and handler
+          if (serverCtx.responseHeaders) {
+            for (const [key, value] of Object.entries(
+              serverCtx.responseHeaders,
+            )) {
+              ctx.set(key, value);
+            }
+          }
+
+          // Return error response with proper status code
+          ctx.status = statusCode;
+          ctx.body = {
+            error: result.error,
+            metadata: {
+              ...result.metadata,
+              requestId,
+              timestamp: new Date().toISOString(),
+              duration,
+            },
+          };
+          return;
+        }
+
+        // Emit response event
         this.emit("response", {
           requestId,
-          statusCode,
+          statusCode: 200,
           duration,
           timestamp: new Date(),
         } satisfies ServerAdapterEvents["response"]);
@@ -351,44 +494,42 @@ export class KoaServerAdapter extends BaseServerAdapter {
           }
         }
 
-        // Return error response with proper status code
-        ctx.status = statusCode;
+        // Return formatted response
         ctx.body = {
-          error: result.error,
+          data: result,
           metadata: {
-            ...result.metadata,
             requestId,
             timestamp: new Date().toISOString(),
             duration,
           },
         };
-        return;
-      }
-
-      // Emit response event
-      this.emit("response", {
-        requestId,
-        statusCode: 200,
-        duration,
-        timestamp: new Date(),
-      } satisfies ServerAdapterEvents["response"]);
-
-      // Apply response headers from middleware and handler
-      if (serverCtx.responseHeaders) {
-        for (const [key, value] of Object.entries(serverCtx.responseHeaders)) {
-          ctx.set(key, value);
-        }
-      }
-
-      // Return formatted response
-      ctx.body = {
-        data: result,
-        metadata: {
+      } catch (error) {
+        // The exception's text stays in the log under this request id; the
+        // client gets a fixed message for its category.
+        const shaped = shapeRouteError("KoaAdapter", requestId, error);
+        this.emitRequestError({
           requestId,
-          timestamp: new Date().toISOString(),
-          duration,
-        },
-      };
+          error: error instanceof Error ? error : new Error(String(error)),
+          timestamp: new Date(),
+        });
+        this.emit("response", {
+          requestId,
+          statusCode: shaped.status,
+          duration: Date.now() - startTime,
+          timestamp: new Date(),
+        } satisfies ServerAdapterEvents["response"]);
+        if (ctx.res.headersSent) {
+          ctx.res.end();
+          return;
+        }
+        ctx.status = shaped.status;
+        ctx.body = {
+          error: { code: shaped.code, message: shaped.message },
+          metadata: { requestId, timestamp: new Date().toISOString() },
+        };
+      } finally {
+        abort.release();
+      }
     });
   }
 
@@ -396,7 +537,7 @@ export class KoaServerAdapter extends BaseServerAdapter {
    * Handle streaming response using Server-Sent Events
    */
   private async handleStreamingResponse(
-    ctx: KoaContext,
+    ctx: Koa.ParameterizedContext,
     serverCtx: ServerContext,
     route: RouteDefinition,
   ): Promise<void> {
@@ -435,10 +576,14 @@ export class KoaServerAdapter extends BaseServerAdapter {
       stream.write(`data: \n\n`);
       stream.end();
     } catch (error) {
+      const shaped = shapeRouteError("KoaAdapter", serverCtx.requestId, error);
       stream.write(`event: error\n`);
       stream.write(
         `data: ${JSON.stringify({
-          error: error instanceof Error ? error.message : "Stream error",
+          error: shaped.message,
+          code: shaped.code,
+          status: shaped.status,
+          requestId: serverCtx.requestId,
         })}\n\n`,
       );
       stream.end();
@@ -451,52 +596,76 @@ export class KoaServerAdapter extends BaseServerAdapter {
   protected registerFrameworkMiddleware(
     middleware: MiddlewareDefinition,
   ): void {
-    this.app.use(async (ctx: KoaContext, next: KoaNext) => {
-      // Skip excluded paths
-      if (middleware.excludePaths?.some((p) => ctx.path.startsWith(p))) {
-        return next();
-      }
+    this.registeredMiddleware.push(
+      async (ctx: Koa.ParameterizedContext, next: Koa.Next) => {
+        // Skip excluded paths
+        if (pathMatchesAny(ctx.path, middleware.excludePaths)) {
+          return next();
+        }
 
-      // Check if path matches
-      const paths = middleware.paths || ["/"];
-      const matches = paths.some((p) => ctx.path.startsWith(p) || p === "*");
-      if (!matches) {
-        return next();
-      }
+        // Check if path matches
+        if (!pathMatchesAny(ctx.path, middleware.paths || ["/"])) {
+          return next();
+        }
 
-      // Initialize response headers storage in ctx.state if not present
-      if (!ctx.state.responseHeaders) {
-        ctx.state.responseHeaders = {};
-      }
+        // Initialize response headers storage in ctx.state if not present
+        if (!ctx.state.responseHeaders) {
+          ctx.state.responseHeaders = {};
+        }
 
-      // Create context with existing response headers from previous middleware
-      const serverCtx = this.createContext({
-        requestId: ctx.state.requestId,
-        method: ctx.method,
-        path: ctx.path,
-        headers: ctx.headers as Record<string, string>,
-        query: ctx.query as Record<string, string>,
-        params: ctx.params as Record<string, string>,
-        body: ctx.request.body,
-      });
+        // Create context with existing response headers from previous middleware
+        const serverCtx = this.createContext({
+          requestId: ctx.state.requestId,
+          method: ctx.method,
+          path: ctx.path,
+          headers: ctx.headers as Record<string, string>,
+          query: ctx.query as Record<string, string>,
+          params: ctx.params as Record<string, string>,
+          body: ctx.request.body,
+          remoteAddress: ctx.req.socket?.remoteAddress,
+        });
 
-      // Copy existing response headers to context
-      serverCtx.responseHeaders = { ...ctx.state.responseHeaders };
+        // Copy existing response headers to context
+        serverCtx.responseHeaders = { ...ctx.state.responseHeaders };
+        this.restoreCarriedContext(serverCtx, ctx.state.carriedContext);
 
-      // Execute middleware
-      await middleware.handler(serverCtx, async () => {
-        // After middleware execution, merge response headers back to ctx.state
+        // Execute middleware
+        await middleware.handler(serverCtx, async () => {
+          // What this middleware set (ctx.user included) is for the next
+          // middleware and the route handler, which build their own contexts.
+          ctx.state.carriedContext = this.captureCarriedContext(serverCtx);
+          // After middleware execution, merge response headers back to ctx.state
+          if (serverCtx.responseHeaders) {
+            Object.assign(ctx.state.responseHeaders, serverCtx.responseHeaders);
+          }
+          return next();
+        });
+
+        // Also merge headers after handler returns (for middleware that set headers after next())
         if (serverCtx.responseHeaders) {
           Object.assign(ctx.state.responseHeaders, serverCtx.responseHeaders);
         }
-        return next();
-      });
+      },
+    );
+  }
 
-      // Also merge headers after handler returns (for middleware that set headers after next())
-      if (serverCtx.responseHeaders) {
-        Object.assign(ctx.state.responseHeaders, serverCtx.responseHeaders);
+  /**
+   * Run registered middleware in registration order, then continue to the
+   * router. Reads the list per request, so later registrations apply too.
+   */
+  private runRegisteredMiddleware(
+    ctx: Koa.ParameterizedContext,
+    next: Koa.Next,
+  ): Promise<void> {
+    const dispatch = async (index: number): Promise<void> => {
+      const middleware = this.registeredMiddleware[index];
+      if (!middleware) {
+        await next();
+        return;
       }
-    });
+      await middleware(ctx, () => dispatch(index + 1));
+    };
+    return dispatch(0);
   }
 
   /**
@@ -519,6 +688,7 @@ export class KoaServerAdapter extends BaseServerAdapter {
           this.isRunning = true;
           this.startTime = new Date();
           this.lifecycleState = "running";
+          this.warnIfSensitiveRoutesUnauthenticated();
 
           // Track connections for graceful shutdown
           this.server?.on("connection", (socket: Socket) => {
@@ -646,5 +816,9 @@ export class KoaServerAdapter extends BaseServerAdapter {
    */
   public getFrameworkInstance(): unknown {
     return this.app;
+  }
+
+  public override getNativeServer(): unknown {
+    return this.server;
   }
 }

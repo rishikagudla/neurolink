@@ -2,8 +2,10 @@
  * @file Implements the RetryManager class for handling evaluation retries.
  */
 
-import type { EvaluationResult } from "../types/evaluationTypes.js";
-import type { TextGenerationOptions } from "../types/generateTypes.js";
+import type {
+  EvaluationResult,
+  TextGenerationOptions,
+} from "../types/index.js";
 
 /**
  * Manages the retry logic for the auto-evaluation middleware. It decides if a
@@ -76,7 +78,7 @@ export class RetryManager {
     feedback: string,
     attemptNumber: number,
   ): string {
-    let instruction = "";
+    let instruction: string;
     switch (attemptNumber) {
       case 2: // First retry
         instruction = `The previous response was not satisfactory. Please improve it based on the following feedback: "${feedback}".`;

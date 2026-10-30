@@ -13,44 +13,28 @@
 import { readFile } from "node:fs/promises";
 import { ErrorCategory, ErrorSeverity } from "../../constants/enums.js";
 import { TIMEOUTS } from "../../constants/timeouts.js";
+import { VIDEO_ERROR_CODES } from "../../constants/videoErrors.js";
 import type {
+  VertexOperationResult,
   VideoGenerationResult,
   VideoOutputOptions,
-} from "../../types/multimodal.js";
-import { NeuroLinkError, withTimeout } from "../../utils/errorHandling.js";
+} from "../../types/index.js";
+import {
+  isAbortError,
+  NeuroLinkError,
+  withTimeout,
+} from "../../utils/errorHandling.js";
 import { logger } from "../../utils/logger.js";
 
 // ============================================================================
-// VIDEO ERROR CODES
+// VIDEO ERROR CODES (Re-exported for backward compatibility)
 // ============================================================================
 
 /**
- * Video generation runtime error codes
- *
- * These are for runtime/execution errors during video generation.
- * Pure option/shape validation (missing image option, invalid config values, etc.)
- * is handled by parameterValidation.ts using ERROR_CODES from errorHandling.ts.
- *
- * Error categorization:
- * - INVALID_INPUT → ErrorCategory.execution (runtime I/O failures)
- * - parameterValidation errors → ErrorCategory.validation (schema/option issues)
- *
- * Following TTS pattern (TTS_ERROR_CODES + TTSError in ttsProcessor.ts)
+ * Video error codes - re-exported from constants module for backward compatibility.
+ * @see {@link VIDEO_ERROR_CODES} in constants/videoErrors.ts for definitions
  */
-export const VIDEO_ERROR_CODES = {
-  /** Video generation API call failed */
-  GENERATION_FAILED: "VIDEO_GENERATION_FAILED",
-  /** Provider (Vertex AI) not properly configured */
-  PROVIDER_NOT_CONFIGURED: "VIDEO_PROVIDER_NOT_CONFIGURED",
-  /** Polling for video completion timed out */
-  POLL_TIMEOUT: "VIDEO_POLL_TIMEOUT",
-  /**
-   * Runtime I/O error during input processing.
-   * Used for: failed URL fetch, failed file read, corrupt/unreadable buffer.
-   * NOT for: missing options or invalid config shapes (use parameterValidation).
-   */
-  INVALID_INPUT: "VIDEO_INVALID_INPUT",
-} as const;
+export { VIDEO_ERROR_CODES };
 
 /**
  * Video generation error class
@@ -92,6 +76,9 @@ const POLL_INTERVAL_MS = 5000;
 /** Full model name for Veo 3.1 (IMPORTANT: not just "veo-3.1") */
 const VEO_MODEL = "veo-3.1-generate-001";
 
+/** Full model name for Veo 3.1 Fast (used for transitions) */
+const VEO_FAST_MODEL = "veo-3.1-fast-generate-001";
+
 /** Default location for Vertex AI */
 const DEFAULT_LOCATION = "us-central1";
 
@@ -112,8 +99,15 @@ const DEFAULT_LOCATION = "us-central1";
  * ```
  */
 export function isVertexVideoConfigured(): boolean {
+  // Same credential detection as googleVertex.ts hasGoogleCredentials().
+  // GoogleAuth (used by getAccessToken) also supports ADC from
+  // `gcloud auth application-default login` automatically, so we only
+  // gate on the explicit env vars here — if none are set, we still
+  // allow the call through and let GoogleAuth resolve ADC at runtime.
+  // This avoids duplicating GoogleAuth's discovery logic.
   return !!(
     process.env.GOOGLE_APPLICATION_CREDENTIALS ||
+    process.env.GOOGLE_APPLICATION_CREDENTIALS_NEUROLINK ||
     process.env.GOOGLE_SERVICE_ACCOUNT_KEY ||
     (process.env.GOOGLE_AUTH_CLIENT_EMAIL &&
       process.env.GOOGLE_AUTH_PRIVATE_KEY)
@@ -130,9 +124,16 @@ async function getVertexConfig(): Promise<{
   project: string;
   location: string;
 }> {
+  // Veo 3.1 is only published in us-central1 (and the synthetic
+  // `global` endpoint). When the operator's environment defaults to
+  // a region where Veo 3.1 isn't available (e.g. us-east5 set for
+  // Gemini chat traffic), the regional endpoint returns a 404
+  // "Publisher Model … was not found". Allow `GOOGLE_VEO_LOCATION` as
+  // a Veo-specific override and fall through to us-central1 instead
+  // of inheriting the default Vertex region.
   const location =
-    process.env.GOOGLE_VERTEX_LOCATION ||
-    process.env.GOOGLE_CLOUD_LOCATION ||
+    process.env.GOOGLE_VEO_LOCATION ||
+    process.env.GOOGLE_VERTEX_VIDEO_LOCATION ||
     DEFAULT_LOCATION;
 
   // Try environment variables first
@@ -195,7 +196,9 @@ async function getAccessToken(): Promise<string> {
     // google-auth-library is a transitive dependency from @google-cloud/vertexai
     // Using dynamic import with type assertion for runtime resolution
     const googleAuthLib = (await import(
-      "google-auth-library" as unknown as string
+      // Widening the literal to `string` skips compile-time module resolution
+      // (the package is an untyped transitive dependency).
+      "google-auth-library" as string
     )) as {
       GoogleAuth: new (options: {
         keyFilename?: string;
@@ -310,7 +313,7 @@ function detectMimeType(image: Buffer): string {
  */
 function calculateDimensions(
   resolution: "720p" | "1080p",
-  aspectRatio: "9:16" | "16:9",
+  aspectRatio: "9:16" | "16:9" | "1:1" | string,
 ): { width: number; height: number } {
   if (resolution === "1080p") {
     return aspectRatio === "9:16"
@@ -365,23 +368,10 @@ export async function generateVideoWithVertex(
   options: VideoOutputOptions = {},
   region?: string,
 ): Promise<VideoGenerationResult> {
-  // Validate configuration
-  if (!isVertexVideoConfigured()) {
-    throw new VideoError({
-      code: VIDEO_ERROR_CODES.PROVIDER_NOT_CONFIGURED,
-      message:
-        "Vertex AI credentials not configured. Set GOOGLE_APPLICATION_CREDENTIALS environment variable",
-      category: ErrorCategory.CONFIGURATION,
-      severity: ErrorSeverity.HIGH,
-      retriable: false,
-      context: {
-        provider: "vertex",
-        feature: "video-generation",
-        suggestion:
-          "Set GOOGLE_APPLICATION_CREDENTIALS to the path of your service account JSON file",
-      },
-    });
-  }
+  // Credential validation is deferred to getAccessToken() which uses
+  // GoogleAuth — it handles env vars, service accounts, AND ADC from
+  // `gcloud auth application-default login` automatically.
+  // Same pattern as googleVertex.ts — no synchronous pre-check needed.
 
   const config = await getVertexConfig();
   const project = config.project;
@@ -394,6 +384,7 @@ export async function generateVideoWithVertex(
   const durationSeconds = options.length || 6; // 4, 6, or 8
   const aspectRatio = options.aspectRatio || "16:9";
   const generateAudio = options.audio ?? true;
+  const abortSignal = options.abortSignal;
 
   logger.debug("Starting Vertex video generation", {
     project,
@@ -416,7 +407,13 @@ export async function generateVideoWithVertex(
     const accessToken = await getAccessToken();
 
     // Construct API request - predictLongRunning endpoint
-    const endpoint = `https://${location}-aiplatform.googleapis.com/v1/projects/${project}/locations/${location}/publishers/google/models/${VEO_MODEL}:predictLongRunning`;
+    // Global endpoint uses aiplatform.googleapis.com (no region prefix),
+    // same pattern as googleVertex.ts createVertexSettings
+    const apiHost =
+      location === "global"
+        ? "aiplatform.googleapis.com"
+        : `${location}-aiplatform.googleapis.com`;
+    const endpoint = `https://${apiHost}/v1/projects/${project}/locations/${location}/publishers/google/models/${VEO_MODEL}:predictLongRunning`;
 
     // Request body structure (verified working from video.js reference)
     const requestBody = {
@@ -441,9 +438,13 @@ export async function generateVideoWithVertex(
 
     logger.debug("Sending video generation request", { endpoint });
 
-    // Create abort controller for request timeout
+    // Create abort controller for request timeout, chained onto the
+    // caller's cancellation signal so either source stops the request.
     const controller = new AbortController();
     const requestTimeout = setTimeout(() => controller.abort(), 30000); // 30s request timeout
+    const requestSignal = abortSignal
+      ? AbortSignal.any([abortSignal, controller.signal])
+      : controller.signal;
 
     // Start long-running operation
     let response: Response;
@@ -455,11 +456,21 @@ export async function generateVideoWithVertex(
           "Content-Type": "application/json; charset=utf-8",
         },
         body: JSON.stringify(requestBody),
-        signal: controller.signal,
+        signal: requestSignal,
       });
     } catch (error) {
       clearTimeout(requestTimeout);
-      if (error instanceof Error && error.name === "AbortError") {
+      if (isAbortError(error)) {
+        if (abortSignal?.aborted) {
+          throw new VideoError({
+            code: VIDEO_ERROR_CODES.GENERATION_FAILED,
+            message: "Vertex video generation aborted by caller",
+            category: ErrorCategory.EXECUTION,
+            severity: ErrorSeverity.MEDIUM,
+            retriable: false,
+            context: { provider: "vertex", endpoint },
+          });
+        }
         throw new VideoError({
           code: VIDEO_ERROR_CODES.GENERATION_FAILED,
           message: "Video generation request timed out after 30 seconds",
@@ -515,6 +526,7 @@ export async function generateVideoWithVertex(
       project,
       location,
       Math.max(1000, remainingTime), // Ensure at least 1 second timeout
+      abortSignal,
     );
 
     const processingTime = Date.now() - startTime;
@@ -567,18 +579,6 @@ export async function generateVideoWithVertex(
 /**
  * Vertex AI operation result type for type safety
  */
-type VertexOperationResult = {
-  done?: boolean;
-  response?: {
-    videos?: Array<{
-      bytesBase64Encoded?: string;
-      gcsUri?: string;
-    }>;
-  };
-  error?: {
-    message?: string;
-  };
-};
 
 /**
  * Extract video buffer from completed operation result
@@ -665,9 +665,13 @@ async function makePollRequest(
   operationName: string,
   accessToken: string,
   timeoutMs: number = 30000,
+  abortSignal?: AbortSignal,
 ): Promise<VertexOperationResult> {
   const controller = new AbortController();
   const requestTimeout = setTimeout(() => controller.abort(), timeoutMs);
+  const requestSignal = abortSignal
+    ? AbortSignal.any([abortSignal, controller.signal])
+    : controller.signal;
 
   let response: Response;
   try {
@@ -678,11 +682,21 @@ async function makePollRequest(
         "Content-Type": "application/json; charset=utf-8",
       },
       body: JSON.stringify({ operationName }), // Pass operation name in body
-      signal: controller.signal,
+      signal: requestSignal,
     });
   } catch (error) {
     clearTimeout(requestTimeout);
-    if (error instanceof Error && error.name === "AbortError") {
+    if (isAbortError(error)) {
+      if (abortSignal?.aborted) {
+        throw new VideoError({
+          code: VIDEO_ERROR_CODES.GENERATION_FAILED,
+          message: "Vertex poll for operation aborted by caller",
+          category: ErrorCategory.EXECUTION,
+          severity: ErrorSeverity.MEDIUM,
+          retriable: false,
+          context: { provider: "vertex", operationName },
+        });
+      }
       throw new VideoError({
         code: VIDEO_ERROR_CODES.GENERATION_FAILED,
         message: `Poll request timed out after ${timeoutMs}ms`,
@@ -741,47 +755,376 @@ async function pollVideoOperation(
   project: string,
   location: string,
   timeoutMs: number,
+  abortSignal?: AbortSignal,
 ): Promise<Buffer> {
+  return pollOperation({
+    modelOrEndpoint: VEO_MODEL,
+    operationName,
+    accessToken,
+    project,
+    location,
+    timeoutMs,
+    abortSignal,
+  });
+}
+
+// ============================================================================
+// TRANSITION GENERATION (Director Mode)
+// ============================================================================
+
+/**
+ * Generate a transition clip using Veo 3.1 Fast's first-and-last-frame interpolation.
+ *
+ * This calls the Veo API with both `image` (first frame) and `lastFrame` (last frame),
+ * producing a video that smoothly interpolates between the two frames.
+ *
+ * @param firstFrame - JPEG buffer of the first frame (last frame of clip N)
+ * @param lastFrame - JPEG buffer of the last frame (first frame of clip N+1)
+ * @param prompt - Transition prompt describing desired visual flow
+ * @param options - Video output options (resolution, aspect ratio, audio)
+ * @param durationSeconds - Duration of the transition clip (4, 6, or 8)
+ * @param region - Vertex AI region override
+ * @returns Video buffer of the transition clip
+ *
+ * @throws {VideoError} When API returns an error or polling times out
+ */
+export async function generateTransitionWithVertex(
+  firstFrame: Buffer,
+  lastFrame: Buffer,
+  prompt: string,
+  options: {
+    abortSignal?: AbortSignal;
+    aspectRatio?: "9:16" | "16:9" | "1:1" | string;
+    resolution?: "720p" | "1080p";
+    audio?: boolean;
+  } = {},
+  durationSeconds: 4 | 6 | 8 = 4,
+  region?: string,
+): Promise<Buffer> {
+  const config = await getVertexConfig();
+  const project = config.project;
+  const location = region || config.location;
   const startTime = Date.now();
 
-  // Use fetchPredictOperation endpoint - this is MODEL-SPECIFIC
-  const pollEndpoint = `https://${location}-aiplatform.googleapis.com/v1/projects/${project}/locations/${location}/publishers/google/models/${VEO_MODEL}:fetchPredictOperation`;
+  const aspectRatio = options.aspectRatio || "16:9";
+  const resolution = options.resolution || "720p";
+  const generateAudio = options.audio ?? true;
+  const abortSignal = options.abortSignal;
+
+  logger.debug("Starting transition clip generation", {
+    model: VEO_FAST_MODEL,
+    durationSeconds,
+    firstFrameSize: firstFrame.length,
+    lastFrameSize: lastFrame.length,
+    promptLength: prompt.length,
+  });
+
+  try {
+    const firstFrameBase64 = firstFrame.toString("base64");
+    const lastFrameBase64 = lastFrame.toString("base64");
+    const firstMime = detectMimeType(firstFrame);
+    const lastMime = detectMimeType(lastFrame);
+    const accessToken = await getAccessToken();
+
+    // Use Veo 3.1 Fast for transitions (faster with minimal quality difference)
+    const endpoint = `https://${location}-aiplatform.googleapis.com/v1/projects/${project}/locations/${location}/publishers/google/models/${VEO_FAST_MODEL}:predictLongRunning`;
+
+    const requestBody = {
+      instances: [
+        {
+          prompt: prompt,
+          image: {
+            bytesBase64Encoded: firstFrameBase64,
+            mimeType: firstMime,
+          },
+          lastFrame: {
+            bytesBase64Encoded: lastFrameBase64,
+            mimeType: lastMime,
+          },
+        },
+      ],
+      parameters: {
+        sampleCount: 1,
+        durationSeconds: durationSeconds,
+        aspectRatio: aspectRatio,
+        resolution: resolution,
+        generateAudio: generateAudio,
+      },
+    };
+
+    const controller = new AbortController();
+    const requestTimeout = setTimeout(() => controller.abort(), 30000);
+    const requestSignal = abortSignal
+      ? AbortSignal.any([abortSignal, controller.signal])
+      : controller.signal;
+
+    let response: Response;
+    try {
+      response = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json; charset=utf-8",
+        },
+        body: JSON.stringify(requestBody),
+        signal: requestSignal,
+      });
+    } catch (error) {
+      clearTimeout(requestTimeout);
+      if (isAbortError(error)) {
+        if (abortSignal?.aborted) {
+          throw new VideoError({
+            code: VIDEO_ERROR_CODES.DIRECTOR_TRANSITION_FAILED,
+            message: "Vertex transition generation aborted by caller",
+            category: ErrorCategory.EXECUTION,
+            severity: ErrorSeverity.MEDIUM,
+            retriable: false,
+          });
+        }
+        throw new VideoError({
+          code: VIDEO_ERROR_CODES.DIRECTOR_TRANSITION_FAILED,
+          message: "Transition generation request timed out after 30 seconds",
+          category: ErrorCategory.EXECUTION,
+          severity: ErrorSeverity.MEDIUM,
+          retriable: true,
+        });
+      }
+      throw error;
+    }
+    clearTimeout(requestTimeout);
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new VideoError({
+        code: VIDEO_ERROR_CODES.DIRECTOR_TRANSITION_FAILED,
+        message: `Transition API error: ${response.status} - ${errorText}`,
+        category: ErrorCategory.EXECUTION,
+        severity: ErrorSeverity.MEDIUM,
+        retriable: response.status >= 500,
+        context: { status: response.status, error: errorText },
+      });
+    }
+
+    const operation = await response.json();
+    const operationName = operation.name;
+
+    if (!operationName) {
+      throw new VideoError({
+        code: VIDEO_ERROR_CODES.DIRECTOR_TRANSITION_FAILED,
+        message: "Transition API did not return an operation name",
+        category: ErrorCategory.EXECUTION,
+        severity: ErrorSeverity.MEDIUM,
+        retriable: false,
+      });
+    }
+
+    // Poll with Veo Fast model endpoint
+    const remainingTime =
+      VIDEO_GENERATION_TIMEOUT_MS - (Date.now() - startTime);
+    const videoBuffer = await pollTransitionOperation(
+      operationName,
+      accessToken,
+      project,
+      location,
+      Math.max(1000, remainingTime),
+      abortSignal,
+    );
+
+    logger.debug("Transition clip generated", {
+      processingTime: Date.now() - startTime,
+      videoSize: videoBuffer.length,
+    });
+
+    return videoBuffer;
+  } catch (error) {
+    if (error instanceof VideoError) {
+      throw error;
+    }
+
+    throw new VideoError({
+      code: VIDEO_ERROR_CODES.DIRECTOR_TRANSITION_FAILED,
+      message: `Transition generation failed: ${error instanceof Error ? error.message : String(error)}`,
+      category: ErrorCategory.EXECUTION,
+      severity: ErrorSeverity.MEDIUM,
+      retriable: true,
+      originalError: error instanceof Error ? error : undefined,
+    });
+  }
+}
+
+/**
+ * Common polling helper that handles both video and transition operations.
+ * Accepts a model name to construct the appropriate endpoint.
+ */
+async function pollOperation(args: {
+  modelOrEndpoint: string;
+  operationName: string;
+  accessToken: string;
+  project: string;
+  location: string;
+  timeoutMs: number;
+  abortSignal?: AbortSignal;
+}): Promise<Buffer> {
+  const {
+    modelOrEndpoint,
+    operationName,
+    accessToken,
+    project,
+    location,
+    timeoutMs,
+    abortSignal,
+  } = args;
+  const startTime = Date.now();
+
+  const makeAbortedError = (): VideoError =>
+    new VideoError({
+      code: VIDEO_ERROR_CODES.GENERATION_FAILED,
+      message: "Vertex poll for operation aborted by caller",
+      category: ErrorCategory.EXECUTION,
+      severity: ErrorSeverity.MEDIUM,
+      retriable: false,
+      context: { provider: "vertex", operationName },
+    });
+
+  // Global endpoint uses aiplatform.googleapis.com (no region prefix),
+  // same pattern as the predictLongRunning endpoint at line 374
+  const pollHost =
+    location === "global"
+      ? "aiplatform.googleapis.com"
+      : `${location}-aiplatform.googleapis.com`;
+  const pollEndpoint = `https://${pollHost}/v1/projects/${project}/locations/${location}/publishers/google/models/${modelOrEndpoint}:fetchPredictOperation`;
 
   while (Date.now() - startTime < timeoutMs) {
+    if (abortSignal?.aborted) {
+      throw makeAbortedError();
+    }
+
     const result = await makePollRequest(
       pollEndpoint,
       operationName,
       accessToken,
+      undefined,
+      abortSignal,
     );
 
     if (result.done) {
       return extractVideoFromResult(result, operationName);
     }
 
-    const elapsed = Date.now() - startTime;
-    logger.debug("Polling video operation...", {
+    logger.debug("Polling operation...", {
       operationName,
-      elapsed,
-      remainingMs: timeoutMs - elapsed,
+      elapsed: Date.now() - startTime,
     });
 
-    // Wait before next poll
-    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+    // Abortable sleep — a caller abort mid-interval must not wait out the
+    // full poll interval before being observed.
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = (): void => {
+        clearTimeout(timer);
+        reject(makeAbortedError());
+      };
+      const timer = setTimeout(() => {
+        abortSignal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, POLL_INTERVAL_MS);
+      abortSignal?.addEventListener("abort", onAbort, { once: true });
+    });
   }
 
-  // Timeout reached
   throw new VideoError({
     code: VIDEO_ERROR_CODES.POLL_TIMEOUT,
-    message: `Video generation timed out after ${Math.round(timeoutMs / 1000)}s while polling for completion`,
+    message: `Operation timed out after ${Math.round(timeoutMs / 1000)}s`,
     category: ErrorCategory.TIMEOUT,
-    severity: ErrorSeverity.HIGH,
+    severity: ErrorSeverity.MEDIUM,
     retriable: true,
-    context: {
-      operationName,
-      timeoutMs,
-      provider: "vertex",
-      suggestion:
-        "Try again - video generation can take 1-3 minutes. Consider using a shorter duration or lower resolution.",
-    },
+    context: { operationName, timeoutMs },
   });
+}
+
+/**
+ * Poll Vertex AI operation for transition clip completion.
+ * Uses the Veo Fast model fetchPredictOperation endpoint.
+ */
+async function pollTransitionOperation(
+  operationName: string,
+  accessToken: string,
+  project: string,
+  location: string,
+  timeoutMs: number,
+  abortSignal?: AbortSignal,
+): Promise<Buffer> {
+  return pollOperation({
+    modelOrEndpoint: VEO_FAST_MODEL,
+    operationName,
+    accessToken,
+    project,
+    location,
+    timeoutMs,
+    abortSignal,
+  });
+}
+
+// ============================================================================
+// VIDEO HANDLER CLASS WRAPPER (registered with VideoProcessor)
+// ============================================================================
+
+import type {
+  VideoHandler,
+  VideoTransitionOptions,
+} from "../../types/index.js";
+
+/**
+ * Class wrapper around the standalone Vertex Veo functions, conforming to
+ * the `VideoHandler` contract so it can register with `VideoProcessor`.
+ *
+ * The free functions (`generateVideoWithVertex`, `generateTransitionWithVertex`,
+ * `isVertexVideoConfigured`) are kept exported for backward compatibility —
+ * external callers (Director's `directorPipeline.ts`, test scripts) reference
+ * them directly.
+ */
+export class VertexVideoHandler implements VideoHandler {
+  public readonly maxDurationSeconds = 8;
+  public readonly supportedAspectRatios: readonly ("9:16" | "16:9")[] = [
+    "9:16",
+    "16:9",
+  ];
+  public readonly supportedResolutions: readonly ("720p" | "1080p")[] = [
+    "720p",
+    "1080p",
+  ];
+
+  isConfigured(): boolean {
+    return isVertexVideoConfigured();
+  }
+
+  generate(
+    image: Buffer,
+    prompt: string,
+    options: VideoOutputOptions,
+    region?: string,
+  ): Promise<VideoGenerationResult> {
+    return generateVideoWithVertex(image, prompt, options, region);
+  }
+
+  generateTransition(
+    firstFrame: Buffer,
+    lastFrame: Buffer,
+    prompt: string,
+    options?: VideoTransitionOptions,
+    region?: string,
+  ): Promise<Buffer> {
+    return generateTransitionWithVertex(
+      firstFrame,
+      lastFrame,
+      prompt,
+      {
+        abortSignal: options?.abortSignal,
+        aspectRatio: options?.aspectRatio,
+        resolution: options?.resolution,
+        audio: options?.audio,
+      },
+      options?.durationSeconds ?? 4,
+      region,
+    );
+  }
 }

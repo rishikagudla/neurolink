@@ -17,13 +17,14 @@ import type {
   ConfirmationTimeoutEvent,
   HITLStatistics,
   HITLAuditLog,
-} from "../types/hitlTypes.js";
+} from "../types/index.js";
 import { HITLTimeoutError, HITLConfigurationError } from "./hitlErrors.js";
 import { logger } from "../utils/logger.js";
 
 // Default configuration constants
 const DEFAULT_TIMEOUT = 30000; // 30 seconds
-const DEFAULT_ALLOW_MODIFICATION = false;
+// Shared with NeuroLink's HITL init logs so they report the policy applied here
+export const DEFAULT_ALLOW_MODIFICATION = false;
 
 /**
  * HITLManager - Central orchestrator for Human-in-the-Loop safety mechanisms
@@ -65,10 +66,14 @@ export class HITLManager extends EventEmitter {
       timeout: config.timeout ?? DEFAULT_TIMEOUT, // Default: 30 seconds
       confirmationMethod: config.confirmationMethod ?? "event", // Default: "event"
       allowArgumentModification:
-        config.allowArgumentModification ?? DEFAULT_ALLOW_MODIFICATION, // Default: true
+        config.allowArgumentModification ?? DEFAULT_ALLOW_MODIFICATION, // Default: false
       autoApproveOnTimeout: config.autoApproveOnTimeout ?? false, // Default: false (safe)
+      autoApproveExclusions: Array.isArray(config.autoApproveExclusions)
+        ? [...config.autoApproveExclusions]
+        : (config.autoApproveExclusions ?? []),
       auditLogging: config.auditLogging ?? false, // Default: false
       customRules: config.customRules ?? [], // Default: empty array
+      confirmBuiltinTools: config.confirmBuiltinTools ?? true, // Default: true (built-in write/bash tools prompt)
     };
 
     if (!configWithDefaults.enabled) {
@@ -78,6 +83,16 @@ export class HITLManager extends EventEmitter {
     if (!Array.isArray(configWithDefaults.dangerousActions)) {
       throw new HITLConfigurationError(
         "dangerousActions must be an array of strings",
+      );
+    }
+    if (
+      !Array.isArray(configWithDefaults.autoApproveExclusions) ||
+      configWithDefaults.autoApproveExclusions.some(
+        (name) => typeof name !== "string" || name.length === 0,
+      )
+    ) {
+      throw new HITLConfigurationError(
+        "autoApproveExclusions must be an array of non-empty tool names",
       );
     }
 
@@ -311,7 +326,9 @@ export class HITLManager extends EventEmitter {
     const responseTime = Date.now() - request.timestamp;
 
     // Check if auto-approve on timeout is enabled
-    const shouldAutoApprove = this.config.autoApproveOnTimeout === true;
+    const shouldAutoApprove =
+      this.config.autoApproveOnTimeout === true &&
+      !this.config.autoApproveExclusions?.includes(request.toolName);
 
     // Log audit trail if enabled
     if (this.config.auditLogging) {
@@ -524,7 +541,12 @@ export class HITLManager extends EventEmitter {
    * Get current configuration
    */
   getConfig(): HITLConfig {
-    return { ...this.config };
+    return {
+      ...this.config,
+      autoApproveExclusions: Array.isArray(this.config.autoApproveExclusions)
+        ? [...this.config.autoApproveExclusions]
+        : this.config.autoApproveExclusions,
+    };
   }
 
   /**
@@ -576,5 +598,22 @@ export class HITLManager extends EventEmitter {
    */
   getPendingCount(): number {
     return this.pendingConfirmations.size;
+  }
+
+  /**
+   * Whether a specific confirmation is still awaiting a response on this manager.
+   *
+   * A pending entry holds the `resolve`/`reject` of the suspended tool call, so it
+   * exists only in the memory of the manager that issued it. A manager constructed
+   * after the confirmation was issued — a session rebuilt from persisted state, for
+   * example — has an empty set, and `processUserResponse` for such an id logs a
+   * warning and returns without resolving anything.
+   *
+   * Callers that report an outcome back to a user should check this before treating
+   * a delivered `hitl:confirmation-response` as acted upon: the event being received
+   * says a listener existed, not that anything was waiting for it.
+   */
+  hasPendingConfirmation(confirmationId: string): boolean {
+    return this.pendingConfirmations.has(confirmationId);
   }
 }

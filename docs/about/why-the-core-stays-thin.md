@@ -1,0 +1,122 @@
+# Why the NeuroLink Core Stays Thin
+
+**Breadth without bloat**: what's actually in the package, and why unused capability costs you nothing at runtime
+
+---
+
+NeuroLink's pitch is breadth: one install covers 17 capability domains — providers, MCP, evals,
+RAG, observability, voice, media, workflows, and more. Breadth claims like that earn a reasonable
+reflex: "so it's another bloated framework that drags in everything whether I need it or not."
+That reflex is fair, and it's the one framework abandonments over the last two years keep citing.
+So instead of asking you to take breadth-without-bloat on faith, here's what's actually in the
+package and why the surface doesn't have to cost you disk space, install time, or attack surface
+you didn't ask for.
+
+## Providers load on demand, not on import
+
+NeuroLink ships named provider integrations plus a generic OpenAI-compatible adapter. None
+of them run at import time. `src/lib/factories/providerRegistry.ts` resolves a provider name to a
+dynamic `import()` of that provider's module only when you actually request it — Anthropic's
+client only loads if you call `createBestAIProvider("anthropic")` or equivalent; Ollama, LiteLLM,
+Hugging Face, Bedrock, Vertex, and the rest are each behind their own `await import("../providers/<name>.js")`
+line, one per provider, all in that same file. Ask for OpenAI and only the OpenAI
+provider module executes — the rest never get evaluated.
+
+## Heavy media/document deps are optional and lazy
+
+The 35 packages that do real work in image, video, audio, and document processing —
+`sharp`, `ffmpeg-static`/`fluent-ffmpeg`, `pdf-parse`, `mammoth`, `exceljs`,
+`pptxgenjs`, the LiveKit voice-agent plugins, `bullmq`, `fastify`/`koa`/`express` server adapters —
+are declared in `optionalDependencies`, not `dependencies`, in `package.json`. Being optional means
+a package manager can skip them entirely if install fails or if you opt out; being _lazy_ on top of
+that means the code that needs them doesn't touch them until the feature runs. `sharp` is a good
+example: NeuroLink's video processor only calls `(await import("sharp")).default` inside the
+frame-resize path (`src/lib/processors/media/VideoProcessor.ts`), not anywhere near startup. If you
+never touch video, `sharp`'s native bindings never load into your process.
+
+## Schema conversion loads on first use, not on import
+
+Converting between Zod schemas and JSON Schema — for a Zod 3 tool's parameters, or a plain
+JSON Schema `parameters`/`inputSchema` object — needs `zod-to-json-schema` or
+`json-schema-to-zod` respectively (`src/lib/utils/schemaConversion.ts`). Neither is a top-level
+import: both load via `require()`, through `createRequire(import.meta.url)`, the first time a
+conversion actually runs, so importing the SDK — or converting only Zod 4 schemas, which use
+Zod's own built-in `z.toJSONSchema()` and never touch either package — never pulls them in. A
+`require()` made this way is not one a bundler follows, so nothing on the SDK's import graph
+pulls either package in ahead of use.
+
+The flip side is that a bundler cannot resolve this load for you. It does not see the
+`require()`, so bundling the SDK does not make these two packages available to it, and listing
+them as `external` changes nothing about it. They have to be resolvable at run time from where
+the bundle runs, so ship `zod-to-json-schema` and `json-schema-to-zod` in the `node_modules`
+next to it. When they are not, the `require()` fails. That failure degrades rather than
+crashes — a schema or tool that needed the missing package gets an empty object schema instead,
+logged once per package at error level — but the model then sees no parameters for it, so treat
+the error log as actionable, not just informational. The one bundle we ship ourselves, the
+browser artifact (`dist/browser/neurolink.min.js`), is handled in its build:
+`scripts/build-browser.mjs` bundles both packages in and serves them through its `module` stub.
+
+## The package exposes real subpath entry points, not one giant bundle
+
+`package.json`'s `exports` map lists separate entry points — `./voice`, `./music`, `./avatar`,
+`./image-gen`, `./workflow`, `./rag`, `./files`, `./processors/*`, `./adapters/*`, `./livekit` —
+alongside the default `.` entry. That's what lets a bundler tree-shake: importing
+`@juspay/neurolink/rag` doesn't pull the voice stack into your bundle graph. The package also
+declares `"type": "module"` and a `sideEffects` array scoped to `**/*.css` plus the compiled
+voice/music/avatar entry files — everything else is marked side-effect-free, which is the signal
+bundlers use to safely drop unused exports instead of keeping code "just in case."
+
+## One interface, swappable implementations
+
+Every provider — whether it's a first-party AI SDK wrapper or a bare HTTP client for something
+like llama.cpp — implements the same `AIProvider` contract defined against `BaseProvider`
+(`src/lib/core/baseProvider.ts`). Generation, streaming, tool calls, and lifecycle hooks are all
+expressed once, at the interface level, so adding provider #25 is additive (a new file + a new
+`import()` branch in the registry), not a change to the surface every existing provider has to pay
+for.
+
+## Where we're heavy today, honestly
+
+Lazy `import()` stops code from _running_ until it's needed, but it doesn't stop `npm install`
+from _downloading_ everything in `dependencies` (as opposed to `optionalDependencies`).
+`@aws-sdk/client-bedrock`, `@aws-sdk/client-bedrock-runtime`, `@aws-sdk/client-sagemaker-runtime`,
+`@aws-sdk/credential-provider-node`, `@google-cloud/vertexai`, `@google-cloud/text-to-speech`, and
+`@huggingface/inference` now live in `optionalDependencies` — matching the treatment
+media/document deps already get.
+
+Optional doesn't mean skipped by default: a plain `npm install` still downloads all seven, same as
+it always has for `sharp` or `pdf-parse`. What optional buys you is the ability to opt out —
+`npm install --omit=optional`, or an npm client falling back gracefully when one of them fails to
+build on an unsupported platform, drops them without breaking anything else. We verified that
+directly: a clean `--omit=optional` install still runs `import('@juspay/neurolink')`,
+`neurolink --version`, and the CLI entry point directly (`node dist/cli/index.js --version`)
+correctly, and asking for a provider whose SDK got skipped — Bedrock or SageMaker, say — fails
+with a plain, actionable error at the moment you request that provider, not a crash at import
+time.
+
+That safety only holds because all seven are genuinely lazy — nothing reachable from
+`import '@juspay/neurolink'` (or from the CLI's startup path) touches them at load time. Three of
+them weren't, until the audits that found it: `@google-cloud/vertexai` was a top-of-file import in
+the built-in `websearchGrounding` agent tool (`src/lib/agent/directTools.ts`);
+`@google-cloud/text-to-speech` was a top-of-file import in the TTS auto-registration that runs on
+`voice` module load (`src/lib/adapters/tts/googleTTSHandler.ts`); and
+`@aws-sdk/client-sagemaker-runtime`'s client was constructed synchronously in
+`SageMakerRuntimeClient`'s constructor (`src/lib/providers/sagemaker/client.ts`), reachable
+statically from the CLI entry point via `cli/index.ts -> parser.ts -> commandFactory.ts ->
+sagemakerCommandFactory.ts -> sagemaker/client.ts` — so `neurolink --version` touched it whether
+or not you ever ran a SageMaker command. All three now load via a dynamic `import()` at the point
+of use instead, and the SageMaker client's own construction moved into a lazy `getClient()`
+accessor so the SDK isn't touched until the first actual `invokeEndpoint` call.
+
+That last fix is also what makes `@aws-sdk/credential-provider-node`'s move pay off in practice:
+it used to install unconditionally anyway, as a transitive dependency of the still-eager
+`client-sagemaker-runtime`. With SageMaker's runtime SDK now genuinely optional too, an
+`--omit=optional` install measurably drops both — `node_modules` goes from roughly 1.2 GB with the
+optional cloud SDKs installed to roughly 230 MB without them.
+
+## Bottom line
+
+Thin doesn't mean small; it means the code you don't use doesn't run, and increasingly doesn't
+even load. Provider selection, heavy media/document processing, and now all of the named
+cloud-provider SDKs — including SageMaker's runtime client, the last holdout — prove that in the
+source, not just in the pitch.

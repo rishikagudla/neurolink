@@ -8,9 +8,10 @@ import chalk from "chalk";
 import type {
   RedisConversationObject,
   ConversationSummary,
-} from "../../lib/types/conversation.js";
-import type { RedisStorageConfig } from "../../lib/types/conversation.js";
-import type { ConversationChoice } from "../../lib/types/cli.js";
+  RedisStorageConfig,
+  ConversationChoice,
+  MenuChoice,
+} from "../../lib/types/index.js";
 import {
   createRedisClient,
   scanKeys,
@@ -27,11 +28,9 @@ import {
   getContentIcon,
 } from "../../lib/utils/loopUtils.js";
 
-type MenuChoice = ConversationChoice | inquirer.Separator;
-type RedisClient = Awaited<ReturnType<typeof createRedisClient>>;
-
 export class ConversationSelector {
-  private redisClient: RedisClient | null = null;
+  private redisClient: Awaited<ReturnType<typeof createRedisClient>> | null =
+    null;
   private redisConfig: Required<RedisStorageConfig>;
   private conversationCache: ConversationSummary[] | null = null;
   private cacheTimestamp: number = 0;
@@ -223,7 +222,10 @@ export class ConversationSelector {
         value: "NEW_CONVERSATION",
         short: "New Conversation",
       },
-      new inquirer.Separator(),
+      // Cast is intentional: inquirer's Separator (type: string) narrows to the
+      // MenuChoice separator variant (type: "separator"); inquirer accepts it
+      // at runtime.
+      new inquirer.Separator() as MenuChoice,
     ];
 
     for (const conversation of conversations.slice(
@@ -242,7 +244,7 @@ export class ConversationSelector {
   ): Promise<string | "NEW_CONVERSATION"> {
     const answer = await inquirer.prompt([
       {
-        type: "list",
+        type: "select",
         name: "selectedConversation",
         message: "Select a conversation to continue:",
         choices,

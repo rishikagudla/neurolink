@@ -1,13 +1,8 @@
 import { logger } from "../../utils/logger.js";
-
-export type RegistryEntry<TItem, TMetadata = unknown> = {
-  factory: () => Promise<TItem>;
-  metadata: TMetadata;
-  instance?: TItem;
-};
+import type { InfraRegistryEntry } from "../../types/index.js";
 
 export abstract class BaseRegistry<TItem, TMetadata = unknown> {
-  protected items = new Map<string, RegistryEntry<TItem, TMetadata>>();
+  protected items = new Map<string, InfraRegistryEntry<TItem, TMetadata>>();
   protected initialized = false;
   protected initPromise: Promise<void> | null = null;
 
@@ -28,9 +23,14 @@ export abstract class BaseRegistry<TItem, TMetadata = unknown> {
   register(
     id: string,
     factory: () => Promise<TItem>,
-    metadata: TMetadata,
+    aliases: string[] = [],
+    options?: { metadata: TMetadata },
   ): void {
+    const metadata = options?.metadata ?? ({} as TMetadata);
     this.items.set(id, { factory, metadata });
+    for (const alias of aliases) {
+      this.items.set(alias.toLowerCase(), { factory, metadata });
+    }
     logger.debug(`Registered ${id} in registry`);
   }
 

@@ -1,10 +1,11 @@
-import { generateText } from "ai";
-import type { LanguageModelV1Middleware } from "ai";
 import type {
   NeuroLinkMiddleware,
   NeuroLinkMiddlewareMetadata,
-} from "../../types/middlewareTypes.js";
-import type { GuardrailsMiddlewareConfig } from "../../types/guardrails.js";
+  GuardrailsMiddlewareConfig,
+  LanguageModelV3StreamPart,
+  BadWordsConfig,
+  LanguageModelV3Content,
+} from "../../types/index.js";
 import {
   createBlockedResponse,
   createBlockedStream,
@@ -12,12 +13,88 @@ import {
   handlePrecallGuardrails,
 } from "../utils/guardrailsUtils.js";
 import { logger } from "../../utils/logger.js";
+import { generateOnceNative } from "../../utils/nativeSingleShot.js";
+import type { LanguageModelMiddleware } from "../../types/index.js";
+
+/**
+ * Filter each contiguous run of text parts as one string.
+ *
+ * A prohibited term that straddles two adjacent text parts is invisible to a
+ * per-part filter, and the parts are concatenated downstream (`lifecycle.ts`
+ * joins adjacent text), so the term reached the caller whole. Anthropic's
+ * native path emits one text part per content block, so adjacent parts are a
+ * real shape, not a theoretical one. Non-text parts keep their position; a run
+ * is rebuilt as a single text part only when the filter changed it.
+ */
+const filterTextRuns = (
+  content: ReadonlyArray<LanguageModelV3Content>,
+  badWords: BadWordsConfig | undefined,
+  context: string,
+): LanguageModelV3Content[] => {
+  const out: LanguageModelV3Content[] = [];
+  let run: Array<Extract<LanguageModelV3Content, { type: "text" }>> = [];
+  const flushRun = (): void => {
+    if (run.length === 0) {
+      return;
+    }
+    const merged = run.map((part) => part.text).join("");
+    const filtered = applyContentFiltering(merged, badWords, context);
+    if (filtered.hasChanges) {
+      out.push({ ...run[0], text: filtered.filteredText });
+    } else {
+      out.push(...run);
+    }
+    run = [];
+  };
+  for (const part of content) {
+    if (part.type === "text") {
+      run.push(part);
+    } else {
+      flushRun();
+      out.push(part);
+    }
+  }
+  flushRun();
+  return out;
+};
 
 /**
  * Create Guardrails AI middleware for content filtering and policy enforcement
  * @param config Configuration for the guardrails middleware
  * @returns NeuroLink middleware instance
  */
+/**
+ * Turn whatever a caller put in `filterModel` into a model handle.
+ *
+ * A handle is used as-is. A string is resolved through NeuroLink's own
+ * provider factory, accepting either "provider:model" or a bare model id.
+ * Imported lazily so the middleware module does not pull the provider factory
+ * into every bundle that merely registers guardrails.
+ */
+async function resolveFilterModel(filterModel: unknown): Promise<unknown> {
+  if (typeof filterModel !== "string") {
+    return filterModel;
+  }
+  const [maybeProvider, ...rest] = filterModel.split(":");
+  const hasProvider = rest.length > 0;
+  const { ProviderFactory } =
+    await import("../../factories/providerFactory.js");
+  const provider = await ProviderFactory.createProvider(
+    hasProvider ? maybeProvider : undefined,
+    hasProvider ? rest.join(":") : filterModel,
+  );
+  // `getModel()` is BaseProvider's sanctioned public handle but is not on the
+  // narrower `AIProvider` type, so narrow at the boundary rather than assert
+  // through it (Critical Rule 14).
+  const handle = provider as { getModel?: () => unknown };
+  if (typeof handle.getModel !== "function") {
+    throw new Error(
+      `guardrails: provider for "${filterModel}" exposes no model handle`,
+    );
+  }
+  return handle.getModel();
+}
+
 export function createGuardrailsMiddleware(
   config: GuardrailsMiddlewareConfig = {},
 ): NeuroLinkMiddleware {
@@ -33,7 +110,8 @@ export function createGuardrailsMiddleware(
   // WeakMap to store blocking state from transformParams to wrap methods
   const blockingState = new WeakMap<object, boolean>();
 
-  const middleware: LanguageModelV1Middleware = {
+  const middleware: LanguageModelMiddleware = {
+    specificationVersion: "v3" as const,
     transformParams: async ({ params }) => {
       if (config.precallEvaluation?.enabled) {
         const { shouldBlock, transformedParams } =
@@ -54,29 +132,44 @@ export function createGuardrailsMiddleware(
 
       let result = await doGenerate();
 
-      const filterResult = applyContentFiltering(
-        result.text || "",
-        config.badWords,
-        "generate",
-      );
-      if (filterResult.hasChanges) {
-        result = { ...result, text: filterResult.filteredText };
-      }
+      result = {
+        ...result,
+        content: filterTextRuns(result.content, config.badWords, "generate"),
+      };
 
       if (config.modelFilter?.enabled && config.modelFilter.filterModel) {
         logger.debug(`[GuardrailsMiddleware] Invoking model-based filter.`);
         try {
-          const filterPrompt = `Is the following text safe? Respond with only "safe" or "unsafe".\n\nText: "${result.text}"`;
-          const { text: filterResponse } = await generateText({
-            model: config.modelFilter.filterModel,
-            prompt: filterPrompt,
-          });
+          const text = result.content
+            .filter((part) => part.type === "text")
+            .map((part) => part.text)
+            .join("");
+          const filterPrompt = `Is the following text safe? Respond with only "safe" or "unsafe".\n\nText: "${text}"`;
+          // `ModelFilterConfig.filterModel` is typed `LanguageModel`, which
+          // admits a bare model id, and the documented examples used one.
+          // `generateOnceNative` needs a handle exposing doGenerate, so a
+          // string threw, the catch below logged it, and the turn returned
+          // unfiltered — a security control that silently did nothing.
+          const filterModel = await resolveFilterModel(
+            config.modelFilter.filterModel,
+          );
+          const { text: filterResponse } = await generateOnceNative(
+            filterModel,
+            { prompt: filterPrompt },
+          );
 
           if (filterResponse.toLowerCase().trim() === "unsafe") {
             logger.warn(
               `[GuardrailsMiddleware] Model-based filter flagged content as unsafe.`,
             );
-            result = { ...result, text: "<REDACTED BY AI GUARDRAIL>" };
+            result = {
+              ...result,
+              content: result.content.map((part) =>
+                part.type === "text"
+                  ? { ...part, text: "<REDACTED BY AI GUARDRAIL>" }
+                  : part,
+              ),
+            };
           }
         } catch (error) {
           logger.error(`[GuardrailsMiddleware] Model-based filter failed.`, {
@@ -103,29 +196,52 @@ export function createGuardrailsMiddleware(
       const { stream, ...rest } = await doStream();
       let hasYieldedChunks = false;
 
-      const transformStream = new TransformStream({
+      // With bad-word filtering on, a text run is buffered and filtered as one
+      // string: a term split across deltas is invisible per delta and every
+      // consumer reassembles it. The run is released when a non-text part
+      // arrives or the stream ends, so the guardrail trades incremental
+      // delivery of that run for not being bypassable by chunking. With
+      // filtering off, deltas pass through untouched and unbuffered.
+      const bufferTextRuns = config.badWords?.enabled === true;
+      let pendingText:
+        | Extract<LanguageModelV3StreamPart, { type: "text-delta" }>
+        | undefined;
+      const releaseText = (
+        controller: TransformStreamDefaultController<LanguageModelV3StreamPart>,
+      ): void => {
+        if (!pendingText) {
+          return;
+        }
+        const filtered = applyContentFiltering(
+          pendingText.delta,
+          config.badWords,
+          "stream",
+        );
+        controller.enqueue(
+          filtered.hasChanges
+            ? { ...pendingText, delta: filtered.filteredText }
+            : pendingText,
+        );
+        pendingText = undefined;
+      };
+
+      const transformStream = new TransformStream<
+        LanguageModelV3StreamPart,
+        LanguageModelV3StreamPart
+      >({
         transform(chunk, controller) {
           hasYieldedChunks = true;
-          let filteredChunk = chunk;
-          if (
-            typeof filteredChunk === "object" &&
-            "textDelta" in filteredChunk
-          ) {
-            const filterResult = applyContentFiltering(
-              filteredChunk.textDelta,
-              config.badWords,
-              "stream",
-            );
-            if (filterResult.hasChanges) {
-              filteredChunk = {
-                ...filteredChunk,
-                textDelta: filterResult.filteredText,
-              };
-            }
+          if (chunk.type === "text-delta" && bufferTextRuns) {
+            pendingText = pendingText
+              ? { ...pendingText, delta: pendingText.delta + chunk.delta }
+              : chunk;
+            return;
           }
-          controller.enqueue(filteredChunk);
+          releaseText(controller);
+          controller.enqueue(chunk);
         },
-        flush() {
+        flush(controller) {
+          releaseText(controller);
           if (!hasYieldedChunks) {
             logger.warn(
               `[GuardrailsMiddleware] Stream ended without yielding any chunks`,

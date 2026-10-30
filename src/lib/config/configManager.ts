@@ -9,13 +9,13 @@ import { createHash } from "crypto";
 import { logger } from "../utils/logger.js";
 import type {
   NeuroLinkConfig,
-  ProviderConfig,
+  ProviderRuntimeConfig,
   BackupInfo,
   BackupMetadata,
   ConfigValidationResult,
   ConfigUpdateOptions,
-} from "../types/configTypes.js";
-import { DEFAULT_CONFIG } from "../types/configTypes.js";
+} from "../types/index.js";
+import { DEFAULT_CONFIG } from "../types/index.js";
 
 const { readFile, writeFile, readdir, mkdir, unlink, access } = fs;
 
@@ -96,6 +96,7 @@ export class NeuroLinkConfigManager {
       }
       throw new Error(
         `Config update failed, restored from backup: ${(error as Error).message}`,
+        { cause: error },
       );
     }
   }
@@ -206,6 +207,7 @@ export default ${JSON.stringify(currentConfig, null, 2)};`;
     } catch (error) {
       throw new Error(
         `Failed to restore from backup ${backupFilename}: ${(error as Error).message}`,
+        { cause: error },
       );
     }
   }
@@ -247,7 +249,7 @@ export default ${JSON.stringify(currentConfig, null, 2)};`;
    */
   async updateProviderStatus(
     providerId: string,
-    status: Partial<ProviderConfig>,
+    status: Partial<ProviderRuntimeConfig>,
   ): Promise<void> {
     const config = await this.loadConfig();
     if (!config.providers) {

@@ -1,15 +1,42 @@
 # Changelog
 
-All notable changes to NeuroLink are documented in this changelog.
+**The current release notes live on GitHub Releases:
+[github.com/juspay/neurolink/releases](https://github.com/juspay/neurolink/releases)** — generated
+automatically by semantic-release on every publish, so they are always current. An RSS/Atom feed
+is available at [releases.atom](https://github.com/juspay/neurolink/releases.atom).
 
-For the complete and most up-to-date changelog, please visit:
-**[CHANGELOG.md](https://github.com/juspay/neurolink/blob/release/CHANGELOG.md)** in the GitHub repository.
+> `CHANGELOG.md` in the repository is **not** a reliable source of the current version.
+> `@semantic-release/git` was deliberately removed so that nothing pushes back to the `release`
+> branch (branch protection rejects pushes that carry no check runs), which means the committed
+> `CHANGELOG.md` stops at the last version that was committed by hand. It still ships inside the
+> published npm package, where it is generated at publish time and is correct.
 
 ---
 
-## Latest Releases
+## Release highlights
 
-### v8.26.1 (Current Release - December 31, 2025)
+The entries below are hand-written highlights for selected past releases. They are an archive,
+not a complete or current list — use GitHub Releases above for that.
+
+### v9.14.0 (February 28, 2026)
+
+**Features:**
+
+- **(providers):** Add Claude Subscription Support with OAuth 2.0 PKCE authentication for Claude Pro/Max subscriptions
+
+**What's New:**
+
+- **OAuth 2.0 with PKCE authentication** for Claude Pro, Max, and Team subscription users, enabling API access without separate API keys
+- **Automatic token refresh** before every `generate()` and `stream()` call, ensuring uninterrupted sessions
+- **Model tier access enforcement** with six subscription tiers: `free`, `pro`, `max`, `max_5`, `max_20`, and `api`, restricting model access based on the user's plan
+- **New `auth` CLI command** with four subcommands: `login` (browser-based OAuth flow), `status` (display current authentication state), `refresh` (manually refresh tokens), and `logout` (revoke and clear credentials)
+- **Secure token storage** at `~/.neurolink/anthropic-credentials.json` with filesystem-level permissions
+- **Beta feature support** for `claude-code`, `interleaved-thinking`, and `fine-grained-tool-streaming` via Anthropic beta headers
+- **99 integration tests** covering authentication flows, token lifecycle, tier enforcement, and CLI command behavior
+
+---
+
+### v8.26.1 (December 31, 2025)
 
 **Bug Fixes:**
 
@@ -111,16 +138,16 @@ Migrating between major versions? Check out our comprehensive upgrade guides:
 
 ### Major Version Upgrades
 
-- **v7 to v8 Migration Guide** (Coming Soon)
-  - Breaking changes overview
-  - API migration patterns
-  - New features and improvements
-  - Step-by-step upgrade instructions
+- **v8 to v9 Migration Guide**
 
-- **v6 to v7 Migration Guide** (Coming Soon)
-  - Factory pattern introduction
-  - Provider registration changes
-  - MCP integration updates
+  > This guide is planned for a future release.
+
+- **v7 to v8 Migration Guide**
+
+  > This guide is planned for a future release.
+
+- **v6 to v7 Migration Guide**
+  > This guide is planned for a future release.
 
 ### Migrating from Other SDKs
 
@@ -140,8 +167,9 @@ Already using another AI SDK? We have migration guides:
 
 ## Release Highlights by Feature Area
 
-### Providers (v8.20.0 - v8.26.1)
+### Providers (v8.20.0 - v9.14.0)
 
+- **v9.14.0**: Claude Subscription Support with OAuth 2.0 PKCE authentication
 - **v8.26.1**: Gemini 3 stability improvements
 - **v8.24.0**: OpenRouter provider (300+ models)
 - **v8.20.0**: Enhanced provider error handling
@@ -225,9 +253,9 @@ For a complete history of all releases including detailed commit information, se
 - **[Installation Guide](getting-started/installation.md)** - Install the latest version
 - **[Quick Start](getting-started/quick-start.md)** - Get up and running quickly
 - **[Migration Guides](guides/migration-guide.md)** - Upgrade from older versions
-- **Breaking Changes** (Coming Soon) - Detailed breaking changes documentation
+- **Breaking Changes** - Detailed breaking changes documentation is planned for a future release
 
 ---
 
-**Last Updated:** January 1, 2026
-**Current Version:** v8.26.1
+**Last Updated:** February 28, 2026
+**Current Version:** v9.14.0

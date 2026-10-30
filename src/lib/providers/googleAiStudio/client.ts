@@ -1,0 +1,3329 @@
+import type { Span } from "@opentelemetry/api";
+import {
+  type AIProviderName,
+  ErrorCategory,
+  ErrorSeverity,
+  GoogleAIModels,
+} from "../../constants/enums.js";
+import { BaseProvider } from "../../core/baseProvider.js";
+import {
+  IMAGE_GENERATION_MODELS,
+  TOOL_STORAGE_TIMEOUT_MS,
+} from "../../core/constants.js";
+import {
+  mergeMediaFileAliases,
+  normalizeVisionImageFormats,
+  processUnifiedFilesArray,
+} from "../../utils/messageBuilder.js";
+import type { NeuroLink } from "../../neurolink.js";
+import {
+  ATTR,
+  tracers,
+  withClientSpan,
+  withClientStreamSpan,
+  withSpan,
+} from "../../telemetry/index.js";
+import type {
+  AnalyticsData,
+  EmbedInput,
+  UnknownRecord,
+  ZodUnknownSchema,
+  EnhancedGenerateResult,
+  TextGenerationOptions,
+  GenAIClient,
+  GenAILiveSession,
+  GoogleGenAIClass,
+  GoogleLiveAudioQueueItem,
+  LiveServerMessage,
+  AudioChunk,
+  NativeToolDeclarationsResult,
+  NativeToolsConfig,
+  StreamOptions,
+  StreamResult,
+} from "../../types/index.js";
+
+import {
+  AuthenticationError,
+  InvalidModelError,
+  NetworkError,
+  ProviderError,
+  RateLimitError,
+} from "../../types/index.js";
+import { ERROR_CODES, NeuroLinkError } from "../../utils/errorHandling.js";
+import { logger } from "../../utils/logger.js";
+import { drainDetachedPump } from "../../utils/drainDetachedPump.js";
+import {
+  attachStreamCancel,
+  cancelStream,
+  releaseIterator,
+} from "../../utils/streamCancellation.js";
+import { observeGeneration } from "../../telemetry/observation.js";
+import { withGeneration } from "../../telemetry/withSpan.js";
+import { createGeminiLoopAdapter } from "../../core/geminiLoopAdapter.js";
+import { isDirectTTSRequest } from "../../core/resolveRequestKind.js";
+import { runAgenticLoop } from "../../core/loopEngine.js";
+import {
+  DEFAULT_TOOL_MAX_RETRIES,
+  resolveToolTimeoutMs,
+} from "../../core/constants.js";
+import { isToolsSchemaExclusionInForce } from "../../core/modules/structuredOutputPolicy.js";
+import {
+  GEMINI_ELISION_NOTE,
+  planGeminiLoopReclaim,
+  previewGeminiToolResponseText,
+} from "../../context/geminiLoopGuard.js";
+import {
+  getAvailableInputTokens,
+  getContextWindowSize,
+} from "../../constants/contextWindows.js";
+import {
+  composeAbortSignals,
+  createTimeoutController,
+  TimeoutError,
+} from "../../utils/timeout.js";
+import { withTimeout } from "../../utils/async/index.js";
+import { estimateTokens } from "../../utils/tokenEstimation.js";
+import { transformToolExecutions } from "../../utils/transformationUtils.js";
+import { resolveToolExecutionRecords } from "../../core/toolExecutionRecorder.js";
+import {
+  buildDedupedEngineTools,
+  buildGeminiResponseSchema,
+  buildLoopExitMessage,
+  buildNativeConfig,
+  buildWrapupNudgeText,
+  computeMaxSteps,
+  createContextGuard,
+  createTurnClock,
+  buildUserPartsWithMultimodal,
+  extractThoughtSignature,
+  geminiContentsToV3Prompt,
+  handleMaxStepsTermination,
+  mapGeminiFinishReason,
+  prependConversationMessages,
+  resolveTurnStopReason,
+  v3PromptToGeminiContents,
+} from "../googleNativeGemini3/index.js";
+import { createStreamChannel } from "../../core/streamChannel.js";
+import { toNativeToolDeclarations } from "../../core/nativeToolFormat.js";
+import { googleSdkProxyHttpOptions } from "../../proxy/proxyFetch.js";
+import type {
+  LanguageModel,
+  LanguageModelV3,
+  LanguageModelV3CallOptions,
+  LanguageModelV3GenerateResult,
+  LanguageModelV3StreamPart,
+  ModelMessage,
+  Schema,
+} from "../../types/index.js";
+
+// ── Model middleware stream/generate bridges ──
+//
+// Caller model middleware (transformParams / wrapGenerate / wrapStream) is
+// defined in terms of a `LanguageModelV3`'s `doGenerate`/`doStream`, not this
+// provider's hand-rolled native loop. These two functions are the boundary
+// between the two: `chunksToV3Stream` turns the loop's push-based channel
+// into the `ReadableStream<LanguageModelV3StreamPart>` a `doStream` must
+// return, and `v3StreamToChunks` turns the (possibly middleware-replaced)
+// V3 stream that comes back out of `applyMiddlewareToModel` into the plain
+// `{content}` chunks `StreamResult.stream` has always carried. Mirrors the
+// identically-named pair in `openaiChatCompletionsBase.ts`; not shared with
+// it because each native provider's PR is independent (see
+// docs/plans/2026-09-07-middleware-on-native-providers.md).
+
+/** Pulls one native chunk at a time and forwards a wrapped stream's cancel. */
+function chunksToV3Stream(
+  source: AsyncIterable<{ content: string }>,
+  completion: Promise<LanguageModelV3StreamPart>,
+  cancel: () => void,
+): ReadableStream<LanguageModelV3StreamPart> {
+  const iterator = source[Symbol.asyncIterator]();
+  return new ReadableStream<LanguageModelV3StreamPart>({
+    async pull(controller) {
+      try {
+        const next = await iterator.next();
+        if (next.done) {
+          controller.enqueue(await completion);
+          controller.close();
+        } else {
+          controller.enqueue({
+            type: "text-delta",
+            delta: next.value.content,
+          });
+        }
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    async cancel() {
+      // `config.abortSignal` is the only cancellation channel @google/genai
+      // reads (see the `sendStep` comment below), and this is what wires a
+      // caller breaking out of a wrapped stream through to it.
+      cancel();
+      await iterator.return?.();
+    },
+  });
+}
+
+async function* v3StreamToChunks(
+  stream: ReadableStream<LanguageModelV3StreamPart>,
+  onFinish: (
+    part: Extract<LanguageModelV3StreamPart, { type: "finish" }>,
+  ) => void,
+  // Called from `finally` — natural close, thrown error, AND a consumer's
+  // early `.return()` (a `break`/cancel mid-iteration) — but only when a
+  // "finish" part was never read. Lets the caller run its finish-gated
+  // cleanup (resource release, settling a pending analytics promise) even
+  // when this generator is abandoned before ever reaching one, which
+  // otherwise leaves that cleanup permanently unrun.
+  onAbandoned?: () => void,
+): AsyncIterable<{ content: string }> {
+  const reader = stream.getReader();
+  let done = false;
+  let finishSeen = false;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) {
+        done = true;
+        return;
+      }
+      const part = next.value;
+      if (part.type === "text-delta") {
+        yield { content: part.delta };
+      } else if (part.type === "finish") {
+        finishSeen = true;
+        onFinish(part);
+      } else if (part.type === "error") {
+        throw part.error;
+      }
+    }
+  } finally {
+    try {
+      if (!done) {
+        await reader.cancel();
+      }
+    } finally {
+      reader.releaseLock();
+      if (!finishSeen) {
+        onAbandoned?.();
+      }
+    }
+  }
+}
+
+/**
+ * Seed the V3 prompt caller model middleware sees with the turn's current
+ * system instruction. Gemini has no wire-visible system role — the
+ * instruction rides separately on `config.systemInstruction` — so
+ * `geminiContentsToV3Prompt(contents)` alone can never emit a system
+ * message, and `transformParams` never sees the caller's real system
+ * prompt to inspect, edit or remove. Prepending it here as a leading
+ * `{role: "system"}` V3 message makes it visible; `v3PromptToGeminiContents`
+ * reads it straight back out as `systemText` on the way back in.
+ */
+function buildMiddlewareVisiblePrompt(
+  config: Record<string, unknown>,
+  contents: Array<{ role: string; parts: unknown[] }>,
+): ModelMessage[] {
+  const systemInstruction = config.systemInstruction;
+  const leadingSystemMessage: ModelMessage[] =
+    typeof systemInstruction === "string" && systemInstruction.length > 0
+      ? [{ role: "system", content: systemInstruction }]
+      : [];
+  return [...leadingSystemMessage, ...geminiContentsToV3Prompt(contents)];
+}
+
+// Google AI Live API types now imported from ../types/providerSpecific.js
+
+// Import proper types for multimodal message handling
+
+// Create Google GenAI client
+async function createGoogleGenAIClient(
+  apiKey: string,
+  baseURL?: string,
+): Promise<GenAIClient> {
+  const mod: unknown = await import("@google/genai");
+  const ctor = (mod as Record<string, unknown>).GoogleGenAI as unknown;
+  if (!ctor) {
+    throw new NeuroLinkError({
+      code: ERROR_CODES.INVALID_CONFIGURATION,
+      message: "@google/genai does not export GoogleGenAI",
+      category: ErrorCategory.CONFIGURATION,
+      severity: ErrorSeverity.CRITICAL,
+      retriable: false,
+      context: { module: "@google/genai", expectedExport: "GoogleGenAI" },
+    });
+  }
+  const Ctor = ctor as GoogleGenAIClass;
+  // httpOptions carries the endpoint override and, when a proxy is configured,
+  // the proxy-aware fetch the SDK sends its requests through.
+  //
+  // baseUrl is only included when resolved — verified against
+  // @google/genai's ApiClient (dist/node/index.cjs) that it falls back to
+  // its own default whenever httpOptions.baseUrl is undefined, so omitting
+  // the key and passing `baseUrl: undefined` behave identically; the key is
+  // still omitted outright for a cleaner outbound config object.
+  return new Ctor({
+    apiKey,
+    httpOptions: {
+      ...(baseURL ? { baseUrl: baseURL } : {}),
+      ...googleSdkProxyHttpOptions(),
+    },
+  });
+}
+
+/**
+ * Google AI Studio provider implementation using BaseProvider
+ * Migrated from original GoogleAIStudio class to new factory pattern
+ *
+ * @important Structured Output Limitation
+ * Google Gemini models cannot combine function calling (tools) with structured
+ * output (JSON schema). When using schemas with output.format: "json", you MUST
+ * set disableTools: true.
+ *
+ * Error without disableTools:
+ * "Function calling with a response mime type: 'application/json' is unsupported"
+ *
+ * This is a Google API limitation documented at:
+ * https://ai.google.dev/gemini-api/docs/function-calling
+ *
+ * @example
+ * ```typescript
+ * // ✅ Correct usage with schemas
+ * const provider = new GoogleAIStudioProvider("gemini-2.5-flash");
+ * const result = await provider.generate({
+ *   input: { text: "Analyze data" },
+ *   schema: MySchema,
+ *   output: { format: "json" },
+ *   disableTools: true  // Required
+ * });
+ * ```
+ *
+ * @note Gemini 3 Pro Preview (November 2025) will support combining tools + schemas
+ * @note "Too many states for serving" errors can occur with complex schemas + tools.
+ *       Solution: Simplify schema or use disableTools: true
+ */
+
+/**
+ * Reclaim context from an AI Studio loop history IN PLACE.
+ *
+ * This loop had NO in-turn guard at all — it appended a model turn plus a tool
+ * turn every step with nothing bounding growth, so a long agentic run walked
+ * into a provider "context length exceeded" and lost every completed step.
+ * Shares its reclaim policy with the other provider loops via loopGuardCore.
+ *
+ * Returns true when something was reclaimed.
+ */
+function reclaimAiStudioContext(
+  contents: Array<{ role: string; parts: unknown[] }>,
+  modelName: string,
+  observedPromptTokens?: number,
+): boolean {
+  const plan = planGeminiLoopReclaim({
+    contents,
+    availableInputTokens: getAvailableInputTokens("googleAiStudio", modelName),
+    provider: "googleAiStudio",
+    ...(observedPromptTokens ? { observedPromptTokens } : {}),
+  });
+  if (!plan) {
+    return false;
+  }
+  const dropSet = new Set(plan.drop);
+  const truncateSet = new Set(plan.truncate);
+  const rebuilt: Array<{ role: string; parts: unknown[] }> = [];
+  for (let i = 0; i < contents.length; i++) {
+    if (dropSet.has(i)) {
+      continue;
+    }
+    const content = contents[i];
+    if (truncateSet.has(i) && Array.isArray(content.parts)) {
+      rebuilt.push({
+        ...content,
+        parts: content.parts.map((part) => {
+          const record = part as {
+            functionResponse?: { name?: string; response?: unknown };
+          };
+          if (!record.functionResponse) {
+            return part;
+          }
+          const text = JSON.stringify(record.functionResponse.response) ?? "";
+          if (text.length <= 2048) {
+            return part;
+          }
+          return {
+            functionResponse: {
+              name: record.functionResponse.name,
+              response: { result: previewGeminiToolResponseText(text) },
+            },
+          };
+        }),
+      });
+      continue;
+    }
+    rebuilt.push(content);
+  }
+  if (dropSet.size > 0) {
+    let noteIndex = rebuilt.findIndex(
+      (c) =>
+        Array.isArray(c.parts) &&
+        c.parts.some(
+          (part) =>
+            !!(part as { functionCall?: unknown }).functionCall ||
+            !!(part as { functionResponse?: unknown }).functionResponse,
+        ),
+    );
+    if (noteIndex < 0) {
+      noteIndex = Math.min(1, rebuilt.length);
+    }
+    rebuilt.splice(noteIndex, 0, {
+      role: "user",
+      parts: [{ text: GEMINI_ELISION_NOTE }],
+    });
+  }
+  contents.length = 0;
+  contents.push(...rebuilt);
+  return true;
+}
+
+export class GoogleAIStudioProvider extends BaseProvider {
+  private credentials?: { apiKey?: string; baseURL?: string };
+
+  constructor(
+    modelName?: string,
+    sdk?: unknown,
+    credentials?: { apiKey?: string; baseURL?: string },
+  ) {
+    super(
+      modelName,
+      "google-ai" as AIProviderName,
+      sdk as NeuroLink | undefined,
+    );
+    this.credentials = credentials;
+    logger.debug("GoogleAIStudioProvider initialized", {
+      model: this.modelName,
+      provider: this.providerName,
+      sdkProvided: !!sdk,
+    });
+  }
+  // ===================
+  // ABSTRACT METHOD IMPLEMENTATIONS
+  // ===================
+
+  public getProviderName(): AIProviderName {
+    return "google-ai" as AIProviderName;
+  }
+
+  public getDefaultModel(): string {
+    return process.env.GOOGLE_AI_MODEL || GoogleAIModels.GEMINI_2_5_FLASH;
+  }
+
+  /**
+   * AI SDK model instance — no longer used.
+   * All models are routed through native @google/genai SDK directly.
+   */
+  public getAISDKModel(): LanguageModel {
+    throw new NeuroLinkError({
+      code: ERROR_CODES.INVALID_CONFIGURATION,
+      message:
+        "GoogleAIStudioProvider no longer uses @ai-sdk/google. All models use native @google/genai SDK.",
+      category: ErrorCategory.CONFIGURATION,
+      severity: ErrorSeverity.CRITICAL,
+      retriable: false,
+      context: { provider: this.providerName, model: this.modelName },
+    });
+  }
+
+  protected formatProviderError(error: unknown): Error {
+    if (error instanceof TimeoutError) {
+      return new NetworkError(error.message, this.providerName);
+    }
+
+    const errorRecord = error as UnknownRecord;
+    const message =
+      typeof errorRecord?.message === "string"
+        ? errorRecord.message
+        : "Unknown error";
+    const statusCode =
+      typeof errorRecord?.status === "number"
+        ? errorRecord.status
+        : typeof errorRecord?.statusCode === "number"
+          ? errorRecord.statusCode
+          : undefined;
+
+    // Authentication errors
+    if (
+      message.includes("API_KEY_INVALID") ||
+      message.includes("Invalid API key") ||
+      statusCode === 401
+    ) {
+      return new AuthenticationError(
+        "Invalid Google AI API key. Please check your GOOGLE_AI_API_KEY environment variable.",
+        this.providerName,
+      );
+    }
+
+    // Rate limit errors
+    if (
+      message.includes("RATE_LIMIT_EXCEEDED") ||
+      message.includes("rate limit") ||
+      message.includes("429") ||
+      statusCode === 429
+    ) {
+      return new RateLimitError(
+        "Google AI rate limit exceeded. Please try again later.",
+        this.providerName,
+      );
+    }
+
+    // Model not found errors — gate on a 404 status when available; fall
+    // back to literal phrase matching only when we have no status code at
+    // all. Avoids misclassifying permission/validation errors that happen
+    // to mention model resource paths (e.g. "...models/foo permission...").
+    if (
+      statusCode === 404 ||
+      (statusCode === undefined &&
+        (message.includes("model not found") ||
+          message.includes("Model not found")))
+    ) {
+      return new InvalidModelError(
+        `Model '${this.modelName}' not found. Please check the model name and ensure it is available.`,
+        this.providerName,
+      );
+    }
+
+    // Network connectivity errors
+    if (
+      message.includes("ECONNRESET") ||
+      message.includes("ENOTFOUND") ||
+      message.includes("ETIMEDOUT") ||
+      message.includes("ECONNREFUSED") ||
+      message.includes("network") ||
+      message.includes("connection")
+    ) {
+      return new NetworkError(
+        `Connection error: ${message}`,
+        this.providerName,
+      );
+    }
+
+    // Server errors (5xx)
+    if (
+      message.includes("500") ||
+      message.includes("502") ||
+      message.includes("503") ||
+      message.includes("504") ||
+      message.includes("server error") ||
+      message.includes("Internal Server Error") ||
+      (statusCode && statusCode >= 500 && statusCode < 600)
+    ) {
+      return new ProviderError(
+        `Google AI server error: ${message}. Please try again later.`,
+        this.providerName,
+      );
+    }
+
+    return new ProviderError(`Google AI error: ${message}`, this.providerName);
+  }
+
+  /**
+   * Overrides the BaseProvider's image generation method to implement it for Google AI.
+   * This method calls the Google AI API to generate an image from a prompt.
+   * @param options The generation options containing the prompt.
+   * @returns A promise that resolves to the generation result, including the image data.
+   */
+  protected async executeImageGeneration(
+    options: TextGenerationOptions,
+  ): Promise<EnhancedGenerateResult> {
+    return withGeneration(
+      {
+        provider: this.providerName,
+        model: options.model || this.modelName,
+        input: { prompt: options.prompt || options.input?.text || "" },
+      },
+      (span) => this.generateImage(options, span),
+    );
+  }
+
+  private async generateImage(
+    options: TextGenerationOptions,
+    span: Span,
+  ): Promise<EnhancedGenerateResult> {
+    // Image-to-image generation takes reference images through the same
+    // `input.images` array, and generate() routes here BEFORE reaching its own
+    // normalization call — so a reference photo in HEIC/BMP/AVIF would arrive
+    // at the API untranscoded. Normalizing at the top of this method covers
+    // every route in, rather than relying on each caller to remember.
+    // Idempotent, so a request that was already normalized pays nothing.
+    await normalizeVisionImageFormats(options.input);
+
+    const prompt = options.prompt || options.input?.text || "";
+    const imageModelName = options.model || this.modelName;
+    const startTime = Date.now();
+    const apiKey = this.getApiKey();
+
+    logger.info("🎨 Starting Google AI Studio image generation", {
+      model: imageModelName,
+      prompt: prompt.substring(0, 100),
+      provider: this.providerName,
+    });
+
+    // Use the @google/genai client for image generation
+    let client: GenAIClient;
+    try {
+      client = await createGoogleGenAIClient(apiKey, this.getBaseURL());
+    } catch {
+      throw new AuthenticationError(
+        "Missing '@google/genai'. Install with: npm install @google/genai",
+        this.providerName,
+      );
+    }
+
+    try {
+      // Build content array with multimodal support
+      const imageParts = await Promise.all(
+        (options.input?.images || []).map(async (image) => {
+          // Handle ImageWithAltText objects
+          if (typeof image === "object" && "url" in image) {
+            const imageUrl = image.url as string;
+            if (imageUrl.startsWith("http")) {
+              const response = await fetch(imageUrl);
+              if (!response.ok) {
+                throw new Error(
+                  `Failed to fetch image from ${imageUrl}: ${response.status} ${response.statusText}`,
+                );
+              }
+              const arrayBuffer = await response.arrayBuffer();
+              const buffer = Buffer.from(arrayBuffer);
+              const mimeType = this.detectImageType(buffer);
+              logger.debug(
+                `Downloaded and detected image MIME type: ${mimeType}`,
+              );
+              return {
+                inlineData: {
+                  mimeType,
+                  data: buffer.toString("base64"),
+                },
+              };
+            }
+            // Base64 URL in ImageWithAltText
+            const buffer = Buffer.from(imageUrl as string, "base64");
+            const mimeType = this.detectImageType(buffer);
+            return {
+              inlineData: {
+                mimeType,
+                data: buffer.toString("base64"),
+              },
+            };
+          }
+          // Handle string URLs
+          if (typeof image === "string" && image.startsWith("http")) {
+            const response = await fetch(image);
+            if (!response.ok) {
+              throw new Error(
+                `Failed to fetch image from ${image}: ${response.status} ${response.statusText}`,
+              );
+            }
+            const arrayBuffer = await response.arrayBuffer();
+            const buffer = Buffer.from(arrayBuffer);
+            const mimeType = this.detectImageType(buffer);
+            logger.debug(
+              `Downloaded and detected image MIME type: ${mimeType}`,
+            );
+            return {
+              inlineData: {
+                mimeType,
+                data: buffer.toString("base64"),
+              },
+            };
+          }
+          // Handle Buffer or base64 string
+          const buffer = Buffer.isBuffer(image)
+            ? image
+            : typeof image === "string"
+              ? Buffer.from(image, "base64")
+              : Buffer.from(""); // Fallback for unexpected types
+          const mimeType = this.detectImageType(buffer);
+          logger.debug(`Detected image MIME type: ${mimeType}`);
+          return {
+            inlineData: {
+              mimeType,
+              data: buffer.toString("base64"),
+            },
+          };
+        }),
+      );
+
+      const contents = [
+        {
+          role: "user",
+          parts: [{ text: prompt }, ...imageParts],
+        },
+      ];
+
+      // Configure for image generation
+      const generateConfig = {
+        responseModalities: ["IMAGE", "TEXT"] as ("TEXT" | "IMAGE" | "AUDIO")[], // This is the key setting for image generation
+      };
+
+      logger.debug("Starting image generation request", {
+        model: imageModelName,
+        contentParts: contents[0].parts.length,
+        responseModalities: generateConfig.responseModalities,
+      });
+
+      // Try streaming approach first
+      let imageData: string | null = null;
+      let textContent = "";
+
+      try {
+        // Await the Promise to get the AsyncIterable
+        const stream = await client.models.generateContentStream({
+          model: imageModelName,
+          contents: contents,
+          config: generateConfig,
+        });
+
+        // Process the stream
+        for await (const chunk of stream) {
+          logger.debug("Received chunk", {
+            hasCandidate: !!chunk.candidates?.[0],
+            hasContent: !!chunk.candidates?.[0]?.content,
+            hasParts: !!chunk.candidates?.[0]?.content?.parts,
+          });
+
+          const candidate = chunk.candidates?.[0];
+          if (candidate?.content?.parts) {
+            for (const part of candidate.content.parts) {
+              // Check for image data
+              if ("inlineData" in part && part.inlineData?.data) {
+                const foundImageData = part.inlineData.data;
+                imageData = foundImageData;
+                // Keep the DECLARED value separate from the display default.
+                // ImageGenService trusts a string `mimeType` on imageOutput and
+                // skips sniffing, so forwarding a hardcoded "image/png" for a
+                // vendor that declared nothing would defeat the byte detection
+                // — WebP bytes would ship labelled PNG, with a .png extension.
+                const declaredMimeType = part.inlineData.mimeType;
+                const mimeType = declaredMimeType || "image/png";
+
+                logger.info("Image generation successful", {
+                  model: imageModelName,
+                  mimeType,
+                  dataLength: foundImageData.length,
+                  responseTime: Date.now() - startTime,
+                });
+
+                const result: EnhancedGenerateResult = {
+                  content: `Generated image using ${imageModelName} (${mimeType})`,
+                  imageOutput: {
+                    // The vendor declares the format on the inline part; that
+                    // beats sniffing it back out of the bytes. When it declares
+                    // nothing, omit the field entirely so the service sniffs
+                    // rather than trusting a default we invented.
+                    base64: foundImageData,
+                    ...(declaredMimeType ? { mimeType: declaredMimeType } : {}),
+                  },
+                  provider: this.providerName,
+                  model: imageModelName,
+                  usage: {
+                    input: this.estimateTokenCount(prompt),
+                    output: 0,
+                    total: this.estimateTokenCount(prompt),
+                  },
+                };
+
+                observeGeneration(span, {
+                  responseModel: imageModelName,
+                  output: result.content,
+                  usage: result.usage,
+                  finishReason: "stop",
+                });
+                return await this.enhanceResult(result, options, startTime);
+              }
+
+              // Check for text content
+              if ("text" in part && part.text) {
+                textContent += part.text;
+                logger.debug("Received text content", {
+                  text: part.text.substring(0, 100),
+                });
+              }
+            }
+          }
+        }
+      } catch (streamError) {
+        logger.debug("Streaming failed, trying non-streaming approach", {
+          error:
+            streamError instanceof Error
+              ? streamError.message
+              : String(streamError),
+        });
+      }
+
+      // If no image was found, try non-streaming approach
+      if (!imageData) {
+        logger.debug("Trying non-streaming approach");
+
+        const response = await client.models.generateContent({
+          model: imageModelName,
+          contents: contents,
+          config: generateConfig,
+        });
+
+        const candidate = response.candidates?.[0];
+        if (candidate?.content?.parts) {
+          for (const part of candidate.content.parts) {
+            if ("inlineData" in part && part.inlineData?.data) {
+              const foundImageData = part.inlineData.data;
+              imageData = foundImageData;
+              // See the streaming site above: only a mime type the vendor
+              // actually declared may be forwarded, or the sniffer is bypassed.
+              const declaredMimeType = part.inlineData.mimeType;
+              const mimeType = declaredMimeType || "image/png";
+
+              logger.info("Image generation successful (non-streaming)", {
+                model: imageModelName,
+                mimeType,
+                dataLength: foundImageData.length,
+                responseTime: Date.now() - startTime,
+              });
+
+              const result: EnhancedGenerateResult = {
+                content: `Generated image using ${imageModelName} (${mimeType})`,
+                imageOutput: {
+                  // As above: forward only a declared value, never a default.
+                  base64: foundImageData,
+                  ...(declaredMimeType ? { mimeType: declaredMimeType } : {}),
+                },
+                provider: this.providerName,
+                model: imageModelName,
+                usage: {
+                  input: this.estimateTokenCount(prompt),
+                  output: 0,
+                  total: this.estimateTokenCount(prompt),
+                },
+              };
+
+              observeGeneration(span, {
+                responseModel: imageModelName,
+                output: result.content,
+                usage: result.usage,
+                finishReason: "stop",
+              });
+              return await this.enhanceResult(result, options, startTime);
+            }
+
+            if ("text" in part && part.text) {
+              textContent += part.text;
+            }
+          }
+        }
+      }
+
+      // If we reach here, no image was generated
+      logger.warn("No image data found in response", {
+        model: imageModelName,
+        prompt: prompt.substring(0, 100),
+        hasTextContent: !!textContent,
+        textContent: textContent.substring(0, 200),
+      });
+
+      throw new ProviderError(
+        textContent ||
+          `Image generation completed but no image data was returned. This may indicate an issue with the model "${imageModelName}" or the prompt: "${prompt}". Please try again or use a different model.`,
+        this.providerName,
+      );
+    } catch (error) {
+      logger.error("Image generation failed", {
+        error: error instanceof Error ? error.message : String(error),
+        model: imageModelName,
+        prompt: prompt.substring(0, 100),
+      });
+
+      throw this.handleProviderError(error);
+    }
+  }
+
+  /**
+   * Detect image MIME type from buffer
+   */
+  private detectImageType(buffer: Buffer): string {
+    // Check PNG signature
+    if (
+      buffer.length >= 8 &&
+      buffer[0] === 0x89 &&
+      buffer[1] === 0x50 &&
+      buffer[2] === 0x4e &&
+      buffer[3] === 0x47
+    ) {
+      return "image/png";
+    }
+
+    // Check JPEG signature
+    if (
+      buffer.length >= 3 &&
+      buffer[0] === 0xff &&
+      buffer[1] === 0xd8 &&
+      buffer[2] === 0xff
+    ) {
+      return "image/jpeg";
+    }
+
+    // Check WebP signature
+    if (
+      buffer.length >= 12 &&
+      buffer[0] === 0x52 &&
+      buffer[1] === 0x49 &&
+      buffer[2] === 0x46 &&
+      buffer[3] === 0x46 &&
+      buffer[8] === 0x57 &&
+      buffer[9] === 0x45 &&
+      buffer[10] === 0x42 &&
+      buffer[11] === 0x50
+    ) {
+      return "image/webp";
+    }
+
+    // Check GIF signature
+    if (
+      buffer.length >= 6 &&
+      buffer[0] === 0x47 &&
+      buffer[1] === 0x49 &&
+      buffer[2] === 0x46
+    ) {
+      return "image/gif";
+    }
+
+    // Default to PNG if unknown
+    return "image/png";
+  }
+
+  /**
+   * Estimate token count from text using centralized estimation with provider multipliers
+   */
+  private estimateTokenCount(text: string): number {
+    return estimateTokens(text, "google-ai");
+  }
+
+  // executeGenerate removed - BaseProvider handles all generation with tools
+  /**
+   * Run the file preprocessing this provider's native paths depend on.
+   *
+   * AI Studio overrides both `generate()` and `executeStream()` and routes
+   * straight to the native SDK, so neither reaches
+   * `buildMultimodalMessagesArray` — the place that turns `input.files` into
+   * text, images, PDFs and `nativeAudioFiles`. `BaseProvider.stream()` does
+   * build messages, but onto a throwaway clone whose result is discarded, so
+   * the real `options.input` came through untouched.
+   *
+   * The consequence was asymmetric and easy to miss: `generate()` did this
+   * inline and worked, while `stream()` silently dropped every attached file —
+   * not just audio, but the metadata summary too. Vertex hit the identical bug
+   * (#1258) and solved it with exactly this shape, called from both entry
+   * points.
+   */
+  private async preprocessNativeFileInput(
+    options: TextGenerationOptions | StreamOptions,
+  ): Promise<void> {
+    // The user-facing aliases (`input.audioFiles`, `input.videoFiles`) are
+    // folded into `input.files` here, exactly as the Vertex client does. Only
+    // `files` is processed below, so without this a caller who used the
+    // documented `audioFiles` field had it silently ignored on both of this
+    // provider's paths.
+    if (options.input) {
+      mergeMediaFileAliases(options.input);
+    }
+    if (options.input?.files && options.input.files.length > 0) {
+      try {
+        // Mutates options.input.text / .images / .pdfFiles / .nativeAudioFiles
+        // in place.
+        await processUnifiedFilesArray(
+          options as Parameters<typeof processUnifiedFilesArray>[0],
+          100 * 1024 * 1024,
+          this.providerName,
+        );
+      } catch (fileError) {
+        logger.warn(
+          `[GoogleAIStudio] processUnifiedFilesArray threw, continuing without file content: ${fileError instanceof Error ? fileError.message : String(fileError)}`,
+        );
+      }
+    }
+
+    // Runs even without input.files: a caller can populate input.images
+    // directly, and this native path never reaches the shared multimodal
+    // builder that would otherwise normalize the formats.
+    await normalizeVisionImageFormats(options.input);
+  }
+
+  protected async executeStream(
+    options: StreamOptions,
+    analysisSchema?: ZodUnknownSchema | Schema<unknown>,
+  ): Promise<StreamResult> {
+    const modelName = options.model || this.modelName;
+
+    // Phase 1: if audio input present, bridge to Gemini Live (Studio) using @google/genai
+    //
+    // Deliberately excluded from caller model middleware: Gemini Live is a
+    // persistent bidirectional session (audio in, audio/text out), not a
+    // single request/response turn, and has no `LanguageModelV3CallOptions`/
+    // `doStream` shape to run `transformParams`/`wrapStream` against. See
+    // docs/plans/2026-09-07-middleware-on-native-providers.md.
+    if (options.input?.audio) {
+      return await this.executeAudioStreamViaGeminiLive(options);
+    }
+
+    // #1258, for this provider: stream() must run the same file preprocessing
+    // generate() does, or attached files are dropped on this path alone.
+    await this.preprocessNativeFileInput(options);
+
+    // Structured output (analysisSchema, JSON format, or schema) is incompatible with tools on Gemini.
+    const wantsStructuredOutput = Boolean(
+      analysisSchema || options.output?.format === "json" || options.schema,
+    );
+
+    // Tool filter (a0269210): trust options.tools — caller (BaseProvider.stream)
+    // already merged MCP/built-in tools with user tools and applied any
+    // enabledToolNames filter. Re-attaching getAllTools() here would clobber
+    // that filter and re-introduce filtered-out tools.
+    const shouldUseTools =
+      !options.disableTools && this.supportsTools() && !wantsStructuredOutput;
+    const optionTools = options.tools || {};
+
+    // Merge into options for native SDK path
+    let mergedOptions = {
+      ...options,
+      tools: optionTools,
+    };
+
+    // Tools + JSON conflict (Gemini), via the shared predicate.
+    const wantsJsonOutput = options.output?.format === "json" || options.schema;
+    const exclusionInForce = isToolsSchemaExclusionInForce(
+      this.providerName,
+      modelName,
+      !mergedOptions.disableTools,
+      Object.keys(mergedOptions.tools ?? {}).length,
+    );
+    if (wantsJsonOutput && exclusionInForce) {
+      logger.warn(
+        "[GoogleAIStudio] Gemini does not support tools and JSON schema output simultaneously. Disabling tools for this request.",
+      );
+      mergedOptions = { ...mergedOptions, disableTools: true, tools: {} };
+    }
+
+    const hasActiveTools =
+      shouldUseTools &&
+      !mergedOptions.disableTools &&
+      mergedOptions.tools &&
+      Object.keys(mergedOptions.tools).length > 0;
+
+    if (hasActiveTools) {
+      logger.info(
+        "[GoogleAIStudio] Routing to native @google/genai SDK for tool calling",
+        {
+          model: modelName,
+          totalToolCount: Object.keys(mergedOptions.tools ?? {}).length,
+        },
+      );
+    }
+
+    // Route ALL models through native @google/genai SDK (no more @ai-sdk/google dependency)
+    return this.executeNativeGemini3Stream(mergedOptions);
+  }
+
+  /**
+   * Execute stream using native @google/genai SDK
+   * Uses @google/genai directly for all Gemini models (2.0, 2.5, 3.x)
+   */
+  private async executeNativeGemini3Stream(
+    options: StreamOptions,
+  ): Promise<StreamResult> {
+    const modelName = options.model || this.modelName;
+
+    return withClientStreamSpan(
+      {
+        name: "provider.stream",
+        tracer: tracers.provider,
+        detached: true,
+        rootWhenOrphaned: true,
+        attributes: {
+          [ATTR.NL_MODEL]: modelName,
+          [ATTR.NL_PROVIDER]: this.providerName,
+        },
+      },
+      async (span) => {
+        const startTime = Date.now();
+        const timeout = this.getTimeout(options);
+        const timeoutController = createTimeoutController(
+          timeout,
+          this.providerName,
+          "stream",
+        );
+
+        try {
+          const apiKey = this.getApiKey();
+          const client = await createGoogleGenAIClient(
+            apiKey,
+            this.getBaseURL(),
+          );
+
+          logger.debug(
+            "[GoogleAIStudio] Using native @google/genai for Gemini 3",
+            {
+              model: modelName,
+              hasTools:
+                !!options.tools && Object.keys(options.tools).length > 0,
+            },
+          );
+
+          // Build contents from input. Prepend prior conversation turns so
+          // multi-turn callers (memory, loop REPL, agent flows) actually
+          // carry context — the previous build started fresh from the
+          // current user input only, which silently dropped history.
+          //
+          // `buildUserPartsWithMultimodal` is the shared helper that also
+          // attaches `input.images` and `input.pdfFiles` as `inlineData`
+          // parts. The previous AI Studio path pushed only `{ text }` and
+          // silently dropped both, which is why the model legitimately
+          // reported "no image attached" on multimodal calls.
+          const currentContents: Array<{
+            role: string;
+            parts: unknown[];
+          }> = [];
+          prependConversationMessages(
+            currentContents,
+            options.conversationMessages,
+          );
+          const userParts = await buildUserPartsWithMultimodal(
+            options.input,
+            options.input.text,
+            "[GoogleAIStudio:stream]",
+            modelName,
+          );
+          currentContents.push({
+            role: "user",
+            parts: userParts,
+          });
+
+          // Convert tools
+          let toolsConfig: NativeToolsConfig | undefined;
+          let declarationsResult: NativeToolDeclarationsResult | undefined;
+
+          if (
+            options.tools &&
+            Object.keys(options.tools).length > 0 &&
+            !options.disableTools
+          ) {
+            const result = toNativeToolDeclarations(
+              options.tools,
+              "functionDeclarations",
+            );
+            declarationsResult = result;
+            toolsConfig = result.toolsConfig;
+
+            logger.debug("[GoogleAIStudio] Converted tools for native SDK", {
+              toolCount: toolsConfig[0].functionDeclarations.length,
+              toolNames: toolsConfig[0].functionDeclarations.map((t) => t.name),
+            });
+          }
+
+          // Native JSON / schema enforcement: when no tools are being sent
+          // (the AI Studio orchestrator above already force-disables tools
+          // whenever JSON/schema output is requested), enforce the response
+          // shape natively via responseMimeType / responseSchema. Without
+          // this, JSON output was best-effort prompting only.
+          const wantsNativeJson =
+            !toolsConfig &&
+            (options.output?.format === "json" || !!options.schema);
+          const nativeResponseSchema =
+            wantsNativeJson && options.schema
+              ? buildGeminiResponseSchema(options.schema as ZodUnknownSchema)
+              : undefined;
+
+          const config = buildNativeConfig(
+            {
+              ...options,
+              // Effective model (falls back to the instance default) so the
+              // registry sampling-support check sees the model actually used.
+              model: modelName,
+              wantsJsonOutput: wantsNativeJson,
+              responseSchema: nativeResponseSchema,
+            },
+            toolsConfig,
+          );
+          const maxSteps = computeMaxSteps(options.maxSteps);
+
+          // Abort fan-in. The caller's signal, the pre-existing per-request
+          // timeout controller and the turn clock's watchdogs all trip one
+          // internal controller, and everything downstream (SDK request,
+          // engine, guarded tool executors) rides its signal — so a deadline
+          // reaches a tool mid-execution, not only the next step boundary.
+          const upstreamSignal = composeAbortSignals(
+            options.abortSignal,
+            timeoutController?.controller.signal,
+          );
+          const internalAbort = new AbortController();
+          const onUpstreamAbort = () => internalAbort.abort();
+          upstreamSignal?.addEventListener("abort", onUpstreamAbort);
+          if (upstreamSignal?.aborted) {
+            internalAbort.abort();
+          }
+          const toolExecTimeoutMs = resolveToolTimeoutMs(options.toolTimeoutMs);
+          // No `defaultTurnTimeoutMs`: this path already carries a whole-turn
+          // bound in `timeoutController`, and arming a second timer for the
+          // same instant would make which one fired a race. The clock owns an
+          // explicit `turnTimeoutMs` and the stall watchdog; the controller
+          // keeps the default deadline it always had, and `timedOut` below
+          // reads both so either one is reported as a time-limit exit.
+          const turnClock = createTurnClock({
+            ...(options.turnTimeoutMs !== undefined
+              ? { turnTimeoutMs: options.turnTimeoutMs }
+              : {}),
+            ...(options.stallTimeoutMs !== undefined
+              ? { stallTimeoutMs: options.stallTimeoutMs }
+              : {}),
+            ...(options.wrapupTimeLeadMs !== undefined
+              ? { wrapupTimeLeadMs: options.wrapupTimeLeadMs }
+              : {}),
+            onDeadline: (kind) => {
+              logger.warn(
+                kind === "timeout"
+                  ? `[GoogleAIStudio] Native Gemini turn exceeded its ${options.turnTimeoutMs}ms time budget — aborting`
+                  : `[GoogleAIStudio] Native Gemini turn made no progress for ${options.stallTimeoutMs}ms — aborting`,
+              );
+              internalAbort.abort();
+            },
+          });
+          const composedSignal: AbortSignal = internalAbort.signal;
+          /**
+           * True when a wall-clock bound ended the turn. Both the turn clock's
+           * explicit deadline and the pre-existing per-request controller are
+           * time limits, so an exit caused by either must not be reported as a
+           * bare caller abort.
+           */
+          const hitTimeLimit = (): boolean =>
+            turnClock.timedOut ||
+            timeoutController?.controller.signal.aborted === true;
+
+          // Create a push-based text channel so the caller receives tokens as
+          // they arrive from the network rather than after full buffering.
+          const channel = createStreamChannel<{ content: string }>();
+
+          // Shared mutable state updated by the background agentic loop.
+          const allToolCalls: Array<{
+            toolName: string;
+            args: Record<string, unknown>;
+          }> = [];
+          // Mirror the Vertex Gemini stream path: track tool executions so
+          // the storage hook can persist real outputs and StreamResult can
+          // surface toolsUsed/toolExecutions for tool-bearing turns.
+          const toolExecutions: Array<{
+            name: string;
+            input: Record<string, unknown>;
+            output: unknown;
+          }> = [];
+
+          // analyticsResolvers lets the background loop settle the analytics
+          // promise once token counts are known (after the loop completes).
+          let analyticsResolve!: (value: AnalyticsData) => void;
+          let analyticsReject!: (reason: unknown) => void;
+          const analyticsPromise = new Promise<AnalyticsData>((res, rej) => {
+            analyticsResolve = res;
+            analyticsReject = rej;
+          });
+
+          // Shared metadata object mutated by the background loop so the
+          // returned object reflects the final values after stream completion.
+          // Typed against StreamResult so the turn-exit fields the loop fills
+          // in at close (stopReason / rawFinishReason / stepsUsed) are the
+          // declared ones rather than late additions to an inferred shape.
+          const metadata: NonNullable<StreamResult["metadata"]> = {
+            streamId: `native-${Date.now()}`,
+            startTime,
+            responseTime: 0,
+            totalToolExecutions: 0,
+          };
+
+          // The agentic loop is a named function (not an immediately-invoked
+          // one) so it can be started from inside `streamBaseModel.doStream`
+          // below, after caller model middleware has had a chance to rewrite
+          // the prompt/sampling params via `transformParams`. `runLoop`'s own
+          // two parameters shadow the outer `currentContents` / `config`, so
+          // every reference to those names in the body below picks up
+          // whatever `doStream` decided to run with, without renaming
+          // anything past this point.
+          const runLoop = async (
+            currentContents: Array<{ role: string; parts: unknown[] }>,
+            config: Record<string, unknown>,
+          ) => {
+            let lastStepText = "";
+            let totalInputTokens = 0;
+            let totalOutputTokens = 0;
+            let totalCacheReadTokens = 0;
+            let totalReasoningTokens = 0;
+            let step = 0;
+            // Model calls the engine actually made, reported from the
+            // per-step request hook. `step` above counts only steps that
+            // produced tool calls, so it misses the final text-only step and
+            // would under-report `stepsUsed`, which is a public field.
+            let stepsTaken = 0;
+            let wasAborted = false;
+            let lastFinishReason: string | undefined;
+            // Cheap trigger for the in-turn reclaim, mirroring the Vertex twin.
+            // Planning serializes the WHOLE accumulated history to estimate it,
+            // so running it unconditionally charges that once per step for the
+            // life of the turn; the guard tracks real prompt counts plus
+            // measured growth instead, and it supplies the observed count that
+            // calibrates the planner's char estimate.
+            const contextGuard = createContextGuard(
+              getContextWindowSize("googleAiStudio", modelName),
+            );
+
+            try {
+              // Agentic loop for tool calling
+              // The turn itself now runs on the shared engine: the step cap,
+              // tool dispatch, the failure breaker and usage accumulation are
+              // engine-owned. Everything below is the provider half — building
+              // one request, and the per-step side effects the old loop
+              // performed inline.
+              const baseAdapter = createGeminiLoopAdapter({
+                providerLabel: "GoogleAIStudio",
+                provider: this.providerName,
+                maxSteps,
+                // Same threshold the hand-rolled dispatcher used, which is
+                // what makes an always-failing tool dispatch exactly twice.
+                toolFailureBreaker: { maxRetries: DEFAULT_TOOL_MAX_RETRIES },
+                liveTools: options.tools ?? {},
+                // A tool hydrated mid-turn gets the same bound, abort race
+                // and stall ping as one declared up front.
+                toolGuards: {
+                  toolTimeoutMs: toolExecTimeoutMs,
+                  abortSignal: composedSignal,
+                  onProgress: () => turnClock.noteProgress(),
+                },
+                ...(declarationsResult
+                  ? { declarations: declarationsResult }
+                  : {}),
+                buildRequest: (contents) => ({
+                  model: modelName,
+                  contents,
+                  config,
+                }),
+                // `config.abortSignal` is the ONLY cancellation channel
+                // @google/genai reads (ApiClient forwards
+                // `params.config.abortSignal` to fetch). This loop previously
+                // passed a top-level `httpOptions.signal`, which is not a key
+                // the SDK looks at, so nothing could cancel an in-flight
+                // request — a caller abort or a blown deadline only took
+                // effect at the next step boundary, and never at all against a
+                // provider that had gone quiet mid-stream.
+                sendStep: async (request, signal) => {
+                  turnClock.noteProgress();
+                  const built = request as {
+                    model: string;
+                    contents: unknown;
+                    config?: Record<string, unknown>;
+                  };
+                  return client.models.generateContentStream({
+                    ...built,
+                    config: { ...(built.config ?? {}), abortSignal: signal },
+                  } as Parameters<
+                    typeof client.models.generateContentStream
+                  >[0]);
+                },
+                noteUsage: (inputTokens, outputTokens) => {
+                  contextGuard.noteUsage(inputTokens, outputTokens);
+                },
+                // Pure: the engine assigns what this returns. The old loop
+                // reclaimed in place because it owned `currentContents`.
+                planReclaim: (contents, stepIndex) => {
+                  if (stepIndex !== 0 && !contextGuard.shouldStop()) {
+                    return undefined;
+                  }
+                  const working = [...contents];
+                  if (
+                    !reclaimAiStudioContext(
+                      working,
+                      modelName,
+                      contextGuard.projectedNextPromptTokens,
+                    )
+                  ) {
+                    return undefined;
+                  }
+                  contextGuard.resetAfterReclaim();
+                  return { conversation: working };
+                },
+              });
+
+              // Wrapped because these fire once PER STEP in the loop this
+              // replaces, and buildToolResultMessages is the only hook that
+              // runs per step with exactly that step's results. Reading them
+              // off the turn's final result would batch every step into one
+              // late write and lose the per-step thought signature.
+              const adapter: typeof baseAdapter = {
+                ...baseAdapter,
+                // Counted HERE, not in buildToolResultMessages: this runs once
+                // per model call, including the final text-only step that asks
+                // for no tools. Counting in the tool-result hook reports one
+                // step fewer for every turn that ends normally.
+                buildStepRequest: (contents, engineStep) => {
+                  stepsTaken = engineStep + 1;
+                  turnClock.noteProgress();
+                  return baseAdapter.buildStepRequest(contents, engineStep);
+                },
+                buildToolResultMessages: (
+                  contents,
+                  stepResult,
+                  toolResults,
+                  engineStep,
+                ) => {
+                  // The engine's own step, not a count of times this hook ran.
+                  // The two agree only while nothing skips the hook mid-turn:
+                  // a malformed-call retry `continue`s before it and still
+                  // consumes a step, so a self-incrementing counter drifts by
+                  // exactly the number of retries and mislabels every row
+                  // after the first. Values are unchanged for this provider
+                  // today — it enables no such retry — and stay correct if it
+                  // ever does.
+                  step = engineStep + 1;
+                  for (const call of stepResult.toolCalls) {
+                    span.addEvent("gen_ai.tool_call", {
+                      "tool.name": call.name,
+                      "tool.step": step,
+                    });
+                  }
+                  lastStepText = stepResult.text || lastStepText;
+                  for (const call of stepResult.toolCalls) {
+                    allToolCalls.push({
+                      toolName: call.name,
+                      args: call.args,
+                    });
+                  }
+                  for (const result of toolResults) {
+                    toolExecutions.push({
+                      name: result.name,
+                      input: result.args,
+                      output: result.output,
+                    });
+                  }
+                  if (toolResults.length > 0) {
+                    const stepThoughtSig = extractThoughtSignature(
+                      stepResult.raw.rawResponseParts,
+                    );
+                    withTimeout(
+                      this.handleToolExecutionStorage(
+                        stepResult.toolCalls.map((call, i) => ({
+                          toolName: call.name,
+                          args: call.args,
+                          ...(i === 0 && stepThoughtSig
+                            ? { thoughtSignature: stepThoughtSig }
+                            : {}),
+                          stepIndex: step,
+                        })),
+                        toolResults.map((result) => ({
+                          toolName: result.name,
+                          output: result.output,
+                          stepIndex: step,
+                        })),
+                        options,
+                        new Date(),
+                      ),
+                      TOOL_STORAGE_TIMEOUT_MS,
+                      "tool storage write timed out",
+                    ).catch((error: unknown) => {
+                      logger.warn(
+                        "[GoogleAIStudio] Failed to store native tool executions",
+                        {
+                          error:
+                            error instanceof Error
+                              ? error.message
+                              : String(error),
+                        },
+                      );
+                    });
+                  }
+                  const next = baseAdapter.buildToolResultMessages(
+                    contents,
+                    stepResult,
+                    toolResults,
+                    engineStep,
+                  );
+                  // Time-budget wrap-up nudge (twin of the Vertex Gemini
+                  // loops'): with the turn deadline approaching, tell the
+                  // model to consolidate. Rides as a trailing text part on the
+                  // tool-response user turn. Only fires against an EXPLICIT
+                  // turnTimeoutMs — createTurnClock refuses to nudge against a
+                  // defensive default, so no caller gains injected prompt text
+                  // without asking for a time budget.
+                  if (turnClock.shouldNudgeWrapup()) {
+                    const last = next[next.length - 1] as
+                      | { parts?: unknown[] }
+                      | undefined;
+                    if (last && Array.isArray(last.parts)) {
+                      last.parts.push({ text: buildWrapupNudgeText(false) });
+                    }
+                  }
+                  // Project this step's growth: the appended tool results ride
+                  // the next prompt, which the provider has not reported on yet.
+                  try {
+                    const appended = next[next.length - 1];
+                    contextGuard.noteAppendedChars(
+                      JSON.stringify(appended?.parts ?? []).length,
+                    );
+                  } catch {
+                    /* estimation is best-effort — never break the loop */
+                  }
+                  return next;
+                },
+              };
+
+              // Through the turn's DedupExecuteMap, NOT the raw executors:
+              // `.get()` returns the dedup wrapper that answers an identical
+              // repeated {name, args} from the per-turn cache (BZ-3327).
+              const engineTools = buildDedupedEngineTools(
+                declarationsResult,
+                options.tools,
+                {
+                  toolTimeoutMs: toolExecTimeoutMs,
+                  abortSignal: composedSignal,
+                  onProgress: () => turnClock.noteProgress(),
+                },
+              );
+
+              const { stream: engineStream, resultPromise } = runAgenticLoop(
+                adapter,
+                currentContents,
+                {
+                  tools: engineTools,
+                  abortSignal: composedSignal,
+                  // The engine bounds every tool call itself. Passing the same
+                  // value the guards above use keeps the engine's backstop from
+                  // being tighter than what the caller asked for.
+                  toolTimeoutMs: toolExecTimeoutMs,
+                },
+              );
+
+              const pump = (async () => {
+                for await (const chunk of engineStream) {
+                  // Every chunk is progress, which is what keeps a productive
+                  // but slow turn away from the stall watchdog.
+                  turnClock.noteProgress();
+                  channel.push(chunk);
+                }
+              })();
+
+              let engineResult;
+              let turnFailure: unknown;
+              try {
+                engineResult = await resultPromise;
+              } catch (error) {
+                turnFailure = error;
+              }
+              // Drained unconditionally and tolerantly: when the turn ends by
+              // abort the channel rejects too, and re-awaiting a settled
+              // rejection would rethrow the very error the branch below has
+              // already decided to absorb.
+              await drainDetachedPump(pump, "GoogleAIStudio");
+              if (turnFailure !== undefined) {
+                // A turn ended by its own time budget or by the caller is not
+                // a provider failure. Rethrowing one would surface a deadline
+                // as a network error and, worse, send the caller down an
+                // unbounded fallback path right after a blown budget. A
+                // provider timeout keeps throwing exactly as before, because
+                // classifying it is what produces the timeout error callers
+                // already handle.
+                if (turnClock.expired || options.abortSignal?.aborted) {
+                  wasAborted = true;
+                } else {
+                  logger.error(
+                    "[GoogleAIStudio] Native SDK error",
+                    turnFailure,
+                  );
+                  throw this.handleProviderError(turnFailure);
+                }
+              }
+
+              if (engineResult) {
+                totalInputTokens += engineResult.usage.inputTokens;
+                totalOutputTokens += engineResult.usage.outputTokens;
+                totalCacheReadTokens += engineResult.usage.cacheReadTokens ?? 0;
+                totalReasoningTokens += engineResult.usage.reasoningTokens ?? 0;
+                lastFinishReason =
+                  engineResult.rawStopReason ?? lastFinishReason;
+                if (engineResult.aborted) {
+                  wasAborted = true;
+                }
+              }
+              if (composedSignal.aborted) {
+                wasAborted = true;
+              }
+
+              // The turn produced a final answer when the model stopped
+              // calling tools of its own accord, rather than being cut off at
+              // the cap.
+              const completedWithFinalAnswer =
+                engineResult !== undefined &&
+                (engineResult.toolCalls.length === 0 ||
+                  engineResult.finishReason !== "tool-calls");
+
+              // Handle max-steps termination: if the model was still calling
+              // tools when we hit the limit, push a synthetic final message.
+              // An aborted turn is NOT a step-cap turn — a killed 3-step turn
+              // claiming it "reached the 200-step limit" is the exact
+              // mislabeling this loop is being fixed for.
+              const hitStepLimitWithoutFinalAnswer =
+                !wasAborted && step >= maxSteps && !completedWithFinalAnswer;
+              if (hitStepLimitWithoutFinalAnswer) {
+                const fallback = handleMaxStepsTermination(
+                  "[GoogleAIStudio]",
+                  step,
+                  maxSteps,
+                  "", // finalText is empty — model didn't stop on its own
+                  lastStepText,
+                );
+                if (fallback) {
+                  channel.push({ content: fallback });
+                }
+              } else if (wasAborted && !completedWithFinalAnswer) {
+                // Exactly one honest terminal chunk, matching the actual exit
+                // cause, and only when the consumer has not already been given
+                // the model's own prose.
+                logger.warn(
+                  `[GoogleAIStudio] Tool call loop ended mid-turn ` +
+                    `(${hitTimeLimit() ? "turn time limit" : turnClock.stalled ? "stall watchdog" : "caller abort"}); ` +
+                    `returning an honest terminal message.`,
+                );
+                channel.push({
+                  content: buildLoopExitMessage({
+                    timedOut: hitTimeLimit(),
+                    stalled: turnClock.stalled,
+                    elapsedMs: turnClock.elapsedMs(),
+                    wasAborted,
+                    ...(options.stallTimeoutMs !== undefined
+                      ? { stallTimeoutMs: options.stallTimeoutMs }
+                      : {}),
+                    maxSteps,
+                    toolCallCount: allToolCalls.length,
+                  }),
+                });
+              }
+
+              const responseTime = Date.now() - startTime;
+
+              // Turn-exit discriminator, independent of the provider-shaped
+              // finishReason — consumers branch on this instead of sniffing
+              // strings. It reports only conditions this loop can actually
+              // observe: it never claims a context-cap, because the reclaim
+              // planner here has no stop-the-turn branch to report.
+              const stopReason = resolveTurnStopReason({
+                timedOut: hitTimeLimit(),
+                stalled: turnClock.stalled,
+                wasAborted,
+                cappedWithoutAnswer: hitStepLimitWithoutFinalAnswer,
+                finishReason: mapGeminiFinishReason(lastFinishReason),
+              });
+              if (stopReason !== "completed") {
+                this.emitTurnEvent({
+                  phase: stopReason,
+                  step: stepsTaken,
+                  maxSteps,
+                  toolCallCount: allToolCalls.length,
+                  elapsedMs: turnClock.elapsedMs(),
+                });
+              }
+
+              // Update shared metadata so the returned object reflects final values.
+              metadata.responseTime = responseTime;
+              metadata.totalToolExecutions = allToolCalls.length;
+              metadata.stopReason = stopReason;
+              metadata.stepsUsed = stepsTaken;
+              if (lastFinishReason !== undefined) {
+                metadata.rawFinishReason = lastFinishReason;
+              }
+
+              // Gemini promptTokenCount is OVERLAPPING: it already includes
+              // cachedContentTokenCount. Subtract once here so calculateCost
+              // bills the cached portion at the cheaper cacheRead rate without
+              // double-counting. Total billable tokens are conserved.
+              const adjustedInputTokens = Math.max(
+                0,
+                totalInputTokens - totalCacheReadTokens,
+              );
+              analyticsResolve({
+                provider: this.providerName,
+                model: modelName,
+                tokenUsage: {
+                  input: adjustedInputTokens,
+                  // Thinking tokens are billed at the output rate but Gemini
+                  // does NOT include them in candidatesTokenCount, so they
+                  // are folded into `output` — what calculateCost bills at
+                  // the output rate — with `reasoning` as the subset.
+                  output: totalOutputTokens + totalReasoningTokens,
+                  total:
+                    adjustedInputTokens +
+                    totalCacheReadTokens +
+                    totalOutputTokens +
+                    totalReasoningTokens,
+                  ...(totalCacheReadTokens > 0
+                    ? { cacheReadTokens: totalCacheReadTokens }
+                    : {}),
+                  ...(totalReasoningTokens > 0
+                    ? { reasoning: totalReasoningTokens }
+                    : {}),
+                },
+                requestDuration: responseTime,
+                timestamp: new Date().toISOString(),
+                // Turn-lifecycle telemetry. The generate path gets these for
+                // free because createAnalytics reads them off the result;
+                // this path settles its own analytics, so they are set here.
+                stepsUsed: stepsTaken,
+                toolCallCount: allToolCalls.length,
+                stopReason,
+                elapsedMs: turnClock.elapsedMs(),
+                ...(lastFinishReason !== undefined
+                  ? { rawFinishReason: lastFinishReason }
+                  : {}),
+              });
+
+              channel.close();
+            } catch (err) {
+              channel.error(err);
+              analyticsReject(err);
+            } finally {
+              turnClock.dispose();
+              upstreamSignal?.removeEventListener("abort", onUpstreamAbort);
+              timeoutController?.cleanup();
+            }
+          };
+
+          // Not started yet — `streamBaseModel.doStream` starts it (assigning
+          // this) once middleware has run `transformParams` and either calls
+          // through or short-circuits. `v3StreamToChunks`'s finish handler
+          // below reads this to tell the two cases apart.
+          let loopPromise: Promise<unknown> | undefined;
+
+          // Seeded from `config` (buildNativeConfig's own output), not raw
+          // `options` — `config` already applied the registry sampling-param
+          // strip for models that reject temperature/topP. Seeding from
+          // `options` instead would hand middleware (and, if untouched by
+          // it, the effectiveConfig merge below) the caller's raw value and
+          // silently reintroduce a param buildNativeConfig deliberately
+          // dropped.
+          const v3Params: LanguageModelV3CallOptions = {
+            prompt: buildMiddlewareVisiblePrompt(config, currentContents),
+            ...(typeof config.maxOutputTokens === "number"
+              ? { maxOutputTokens: config.maxOutputTokens }
+              : {}),
+            ...(typeof config.temperature === "number"
+              ? { temperature: config.temperature }
+              : {}),
+            ...(typeof config.topP === "number" ? { topP: config.topP } : {}),
+            abortSignal: composedSignal,
+          };
+
+          // The `LanguageModelV3` handle caller model middleware wraps.
+          // `doGenerate` is never called on this path — NeuroLink drives
+          // Google AI Studio streaming through `doStream` only — so it
+          // throws descriptively rather than faking a result, mirroring
+          // `buildDelegatingModel().doStream` in openaiChatCompletionsBase.ts.
+          const streamBaseModel: LanguageModelV3 = {
+            specificationVersion: "v3",
+            provider: this.providerName,
+            modelId: modelName,
+            supportedUrls: {},
+            doGenerate: () => {
+              throw new Error(
+                "GoogleAIStudio: doGenerate is not implemented on the native stream model — NeuroLink streams through executeStream/doStream for this provider.",
+              );
+            },
+            doStream: async (params: LanguageModelV3CallOptions) => {
+              // Honour whatever `transformParams` did to the prompt / sampling
+              // params on the way back in, falling back to the values this
+              // turn was built with when middleware left them untouched.
+              const { contents: transformedContents, systemText } =
+                v3PromptToGeminiContents(params.prompt);
+              const effectiveConfig: Record<string, unknown> = {
+                ...config,
+                ...(typeof params.temperature === "number"
+                  ? { temperature: params.temperature }
+                  : {}),
+                ...(typeof params.maxOutputTokens === "number"
+                  ? { maxOutputTokens: params.maxOutputTokens }
+                  : {}),
+                ...(typeof params.topP === "number"
+                  ? { topP: params.topP }
+                  : {}),
+              };
+              // Unconditional, not `...(systemText ? {...} : {})`: the
+              // leading system message `buildMiddlewareVisiblePrompt` seeds
+              // above means an ABSENT `systemText` is itself middleware's
+              // answer — it stripped the caller's system prompt — not
+              // "nothing to override". A conditional spread here would fall
+              // through to `config`'s own `systemInstruction` and silently
+              // undo that removal.
+              if (systemText) {
+                effectiveConfig.systemInstruction = systemText;
+              } else {
+                delete effectiveConfig.systemInstruction;
+              }
+              loopPromise = runLoop(transformedContents, effectiveConfig);
+              // Suppress unhandled-rejection warnings — errors are forwarded
+              // to the channel / analyticsPromise and surface when the
+              // caller iterates the stream or reads `.analytics`.
+              loopPromise.catch(() => undefined);
+              const completion: Promise<LanguageModelV3StreamPart> =
+                analyticsPromise.then((analytics) => ({
+                  type: "finish" as const,
+                  finishReason: {
+                    unified: mapGeminiFinishReason(metadata.rawFinishReason),
+                  },
+                  usage: {
+                    inputTokens: { total: analytics.tokenUsage.input },
+                    outputTokens: { total: analytics.tokenUsage.output },
+                  },
+                }));
+              void completion.catch(() => undefined);
+              return {
+                stream: chunksToV3Stream(channel.iterable, completion, () =>
+                  internalAbort.abort(),
+                ),
+              };
+            },
+          };
+
+          let stream: ReadableStream<LanguageModelV3StreamPart>;
+          try {
+            const wrappedStreamModel = await this.applyMiddlewareToModel(
+              streamBaseModel,
+              options,
+            );
+            if (typeof wrappedStreamModel === "string") {
+              throw new Error(
+                "GoogleAIStudio: native stream middleware resolved to a bare model id string, expected a LanguageModelV3 handle.",
+              );
+            }
+            ({ stream } = await wrappedStreamModel.doStream(v3Params));
+          } catch (error) {
+            internalAbort.abort();
+            channel.close();
+            turnClock.dispose();
+            upstreamSignal?.removeEventListener("abort", onUpstreamAbort);
+            timeoutController?.cleanup();
+            throw this.handleProviderError(error);
+          }
+
+          // Settles the short-circuit case's analytics + releases its
+          // per-turn resources (timeout timer, abort listener, turn clock).
+          // Called from `v3StreamToChunks` either when a synthetic "finish"
+          // part arrives (`part` set) or, when the stream is abandoned
+          // before one ever does — a consumer breaking out of iteration
+          // early, or a short-circuit stream that never emits "finish" at
+          // all — with no `part` at all. Guarded by `!loopPromise` (a real
+          // `runLoop` turn owns its own cleanup in its own `finally`, above)
+          // and by `shortCircuitSettled` so a "finish" that arrives
+          // concurrently with abandonment can't run this twice.
+          let shortCircuitSettled = false;
+          const settleShortCircuit = (
+            part?: Extract<LanguageModelV3StreamPart, { type: "finish" }>,
+          ): void => {
+            if (loopPromise || shortCircuitSettled) {
+              return;
+            }
+            shortCircuitSettled = true;
+            const responseTime = Date.now() - startTime;
+            const stopReason = resolveTurnStopReason({
+              timedOut: false,
+              stalled: false,
+              // No "finish" part ever arrived — the turn's outcome is
+              // unknown, so this is the closest honest fit among the
+              // existing GenerateStopReason values (never "completed").
+              wasAborted: !part,
+              cappedWithoutAnswer: false,
+              ...(part ? { finishReason: part.finishReason.unified } : {}),
+            });
+            metadata.responseTime = responseTime;
+            metadata.stopReason = stopReason;
+            metadata.stepsUsed = 0;
+            analyticsResolve({
+              provider: this.providerName,
+              model: modelName,
+              tokenUsage: {
+                input: part?.usage.inputTokens.total ?? 0,
+                output: part?.usage.outputTokens.total ?? 0,
+                total:
+                  (part?.usage.inputTokens.total ?? 0) +
+                  (part?.usage.outputTokens.total ?? 0),
+              },
+              requestDuration: responseTime,
+              timestamp: new Date().toISOString(),
+              stepsUsed: 0,
+              toolCallCount: 0,
+              stopReason,
+              elapsedMs: responseTime,
+            });
+            turnClock.dispose();
+            upstreamSignal?.removeEventListener("abort", onUpstreamAbort);
+            timeoutController?.cleanup();
+          };
+
+          const chunkSource = v3StreamToChunks(
+            stream,
+            (part) => settleShortCircuit(part),
+            () => settleShortCircuit(),
+          );
+
+          const result: StreamResult = {
+            stream: chunkSource,
+            provider: this.providerName,
+            model: modelName,
+            toolCalls: allToolCalls,
+            analytics: analyticsPromise,
+            metadata,
+          };
+          // Surface tools-used + executions via getters so they resolve at
+          // access time, after the background loop has populated the live
+          // arrays. Same lazy pattern used for `structuredOutput` elsewhere.
+          Object.defineProperty(result, "toolsUsed", {
+            enumerable: true,
+            configurable: true,
+            get: () => allToolCalls.map((tc) => tc.toolName),
+          });
+          Object.defineProperty(result, "toolExecutions", {
+            enumerable: true,
+            configurable: true,
+            get: () => transformToolExecutions(toolExecutions),
+          });
+          return result;
+        } finally {
+          // Timeout controller cleanup is managed inside the background loop
+        }
+      },
+      (r) => r.stream,
+      (r, wrapped) => ({ ...r, stream: wrapped }),
+    );
+  }
+
+  /**
+   * Execute generate using native @google/genai SDK for Gemini 3 models
+   * This bypasses @ai-sdk/google to properly handle thought_signature
+   */
+  private async executeNativeGemini3Generate(
+    options: TextGenerationOptions,
+  ): Promise<EnhancedGenerateResult> {
+    const modelName = options.model || this.modelName;
+
+    return withClientSpan(
+      {
+        name: "provider.generate",
+        tracer: tracers.provider,
+        detached: true,
+        rootWhenOrphaned: true,
+        attributes: {
+          [ATTR.NL_MODEL]: modelName,
+          [ATTR.NL_PROVIDER]: this.providerName,
+        },
+      },
+      async (span) => {
+        const startTime = Date.now();
+        const timeout = this.getTimeout(options);
+        const timeoutController = createTimeoutController(
+          timeout,
+          this.providerName,
+          "generate",
+        );
+        // Declared out here so the finally below can release the watchdog
+        // timers and the caller-signal listener on every exit, including the
+        // throws inside the try that never reach the clock's own scope.
+        let releaseTurnResources: () => void = () => {};
+
+        try {
+          const apiKey = this.getApiKey();
+          const client = await createGoogleGenAIClient(
+            apiKey,
+            this.getBaseURL(),
+          );
+
+          logger.debug(
+            "[GoogleAIStudio] Using native @google/genai for Gemini 3 generate",
+            {
+              model: modelName,
+              hasTools:
+                !!options.tools && Object.keys(options.tools).length > 0,
+            },
+          );
+
+          // Build contents from input
+          // Prefer input.text over prompt — processCSVFilesForNativeSDK enriches
+          // input.text with inlined CSV data, so using prompt first would discard it.
+          const promptText = options.input?.text || options.prompt || "";
+          // Prepend prior conversation turns so multi-turn generate calls
+          // see history; otherwise the native generate path silently drops
+          // every turn before the current prompt.
+          //
+          // `buildUserPartsWithMultimodal` also attaches inline image / PDF
+          // parts. Without it the request body was text-only and the model
+          // legitimately reported "no image / PDF attached".
+          const currentContents: Array<{
+            role: string;
+            parts: unknown[];
+          }> = [];
+          prependConversationMessages(
+            currentContents,
+            options.conversationMessages,
+          );
+          const userParts = await buildUserPartsWithMultimodal(
+            options.input,
+            promptText,
+            "[GoogleAIStudio:generate]",
+            modelName,
+          );
+          currentContents.push({
+            role: "user",
+            parts: userParts,
+          });
+
+          // Convert tools (a0269210: trust options.tools — already merged + filtered upstream)
+          let toolsConfig: NativeToolsConfig | undefined;
+          let declarationsResult: NativeToolDeclarationsResult | undefined;
+
+          const shouldUseTools = !options.disableTools;
+          // Structured output (JSON format or schema) is incompatible with
+          // tools on Gemini — routed through the shared predicate so this
+          // decision matches stream()'s orchestrator (previously this path
+          // had no proactive check and silently dropped the schema instead).
+          const wantsNativeJsonRequested = Boolean(
+            options.output?.format === "json" || options.schema,
+          );
+          const exclusionInForce = isToolsSchemaExclusionInForce(
+            this.providerName,
+            modelName,
+            shouldUseTools,
+            Object.keys(options.tools || {}).length,
+          );
+          if (wantsNativeJsonRequested && exclusionInForce) {
+            logger.warn(
+              "[GoogleAIStudio] Gemini does not support tools and JSON schema output simultaneously. Disabling tools for this request (generate()).",
+            );
+          }
+          // Both conjuncts, matching the warning directly above and the
+          // stream path's gate. `isToolsSchemaExclusionInForce` answers "does
+          // the tools/schema exclusion APPLY to this provider and model", and
+          // is true for any Gemini request that has tools at all — it is not
+          // "the exclusion is triggered". Testing `!exclusionInForce` alone
+          // therefore made this branch reachable only when there were NO
+          // tools, so every caller-supplied tool was dropped on the generate
+          // path whether or not structured output was ever requested.
+          if (
+            shouldUseTools &&
+            !(wantsNativeJsonRequested && exclusionInForce)
+          ) {
+            const tools = options.tools || {};
+
+            if (Object.keys(tools).length > 0) {
+              const result = toNativeToolDeclarations(
+                tools,
+                "functionDeclarations",
+              );
+              declarationsResult = result;
+              toolsConfig = result.toolsConfig;
+
+              logger.debug(
+                "[GoogleAIStudio] Converted tools for native SDK generate",
+                {
+                  toolCount: toolsConfig[0].functionDeclarations.length,
+                  toolNames: toolsConfig[0].functionDeclarations.map(
+                    (t) => t.name,
+                  ),
+                },
+              );
+            }
+          }
+
+          // Native JSON / schema enforcement (generate path). Mirrors the
+          // stream block above; only set when no tools are being sent
+          // because Gemini cannot combine function calling with JSON mime.
+          const wantsNativeJson = !toolsConfig && wantsNativeJsonRequested;
+          const nativeResponseSchema =
+            wantsNativeJson && options.schema
+              ? buildGeminiResponseSchema(options.schema as ZodUnknownSchema)
+              : undefined;
+
+          const config = buildNativeConfig(
+            {
+              ...options,
+              // Effective model (falls back to the instance default) so the
+              // registry sampling-support check sees the model actually used.
+              model: modelName,
+              wantsJsonOutput: wantsNativeJson,
+              responseSchema: nativeResponseSchema,
+            },
+            toolsConfig,
+          );
+
+          // Abort fan-in — see the streaming twin for why the turn clock
+          // drives an internal controller rather than composing a third
+          // signal at each call site.
+          const upstreamSignal = composeAbortSignals(
+            options.abortSignal,
+            timeoutController?.controller.signal,
+          );
+          const internalAbort = new AbortController();
+          const onUpstreamAbort = () => internalAbort.abort();
+          upstreamSignal?.addEventListener("abort", onUpstreamAbort);
+          if (upstreamSignal?.aborted) {
+            internalAbort.abort();
+          }
+          const toolExecTimeoutMs = resolveToolTimeoutMs(options.toolTimeoutMs);
+          // No `defaultTurnTimeoutMs`: the pre-existing whole-turn bound on
+          // this path is `timeoutController`, and `hitTimeLimit()` reads it,
+          // so no new default deadline is introduced by arming the clock.
+          const turnClock = createTurnClock({
+            ...(options.turnTimeoutMs !== undefined
+              ? { turnTimeoutMs: options.turnTimeoutMs }
+              : {}),
+            ...(options.stallTimeoutMs !== undefined
+              ? { stallTimeoutMs: options.stallTimeoutMs }
+              : {}),
+            ...(options.wrapupTimeLeadMs !== undefined
+              ? { wrapupTimeLeadMs: options.wrapupTimeLeadMs }
+              : {}),
+            onDeadline: (kind) => {
+              logger.warn(
+                kind === "timeout"
+                  ? `[GoogleAIStudio] Native Gemini generate turn exceeded its ${options.turnTimeoutMs}ms time budget — aborting`
+                  : `[GoogleAIStudio] Native Gemini generate turn made no progress for ${options.stallTimeoutMs}ms — aborting`,
+              );
+              internalAbort.abort();
+            },
+          });
+          const composedSignal: AbortSignal = internalAbort.signal;
+          releaseTurnResources = () => {
+            turnClock.dispose();
+            upstreamSignal?.removeEventListener("abort", onUpstreamAbort);
+          };
+          const hitTimeLimit = (): boolean =>
+            turnClock.timedOut ||
+            timeoutController?.controller.signal.aborted === true;
+          const maxSteps = computeMaxSteps(options.maxSteps);
+
+          // Named function (not inlined): `generateBaseModel.doGenerate`
+          // below starts it once caller model middleware has run
+          // `transformParams` on the prompt / sampling params. Its two
+          // parameters shadow the outer `currentContents` / `config`, so
+          // every reference to those names in the body below picks up
+          // whatever `doGenerate` decided to run with, without renaming
+          // anything past this point.
+          const runGenerateLoop = async (
+            currentContents: Array<{ role: string; parts: unknown[] }>,
+            config: Record<string, unknown>,
+          ): Promise<EnhancedGenerateResult> => {
+            let finalText = "";
+            let lastStepText = "";
+            let totalInputTokens = 0;
+            let totalOutputTokens = 0;
+            let totalCacheReadTokens = 0;
+            let totalReasoningTokens = 0;
+            const allToolCalls: Array<{
+              toolName: string;
+              args: Record<string, unknown>;
+            }> = [];
+            const toolExecutions: Array<{
+              name: string;
+              input: Record<string, unknown>;
+              output: unknown;
+            }> = [];
+            let step = 0;
+            // Model calls made — see the streaming twin for why this is not
+            // `step`.
+            let stepsTaken = 0;
+            let wasAborted = false;
+            let lastFinishReason: string | undefined;
+            // Cheap reclaim trigger — see the stream twin.
+            const contextGuard = createContextGuard(
+              getContextWindowSize("googleAiStudio", modelName),
+            );
+
+            // Agentic loop for tool calling
+            // Same shared engine as the streaming twin. This path has no
+            // consumer channel — generate() returns one result rather than
+            // streaming — so the engine's stream is drained and discarded, and
+            // the turn's text comes from the result.
+            const baseAdapter = createGeminiLoopAdapter({
+              providerLabel: "GoogleAIStudio",
+              provider: this.providerName,
+              maxSteps,
+              toolFailureBreaker: { maxRetries: DEFAULT_TOOL_MAX_RETRIES },
+              liveTools: options.tools ?? {},
+              toolGuards: {
+                toolTimeoutMs: toolExecTimeoutMs,
+                abortSignal: composedSignal,
+                onProgress: () => turnClock.noteProgress(),
+              },
+              ...(declarationsResult
+                ? { declarations: declarationsResult }
+                : {}),
+              buildRequest: (contents) => ({
+                model: modelName,
+                contents,
+                config,
+              }),
+              // See the streaming twin: `config.abortSignal` is the only
+              // cancellation channel the SDK reads.
+              sendStep: async (request, signal) => {
+                turnClock.noteProgress();
+                const built = request as {
+                  model: string;
+                  contents: unknown;
+                  config?: Record<string, unknown>;
+                };
+                return client.models.generateContentStream({
+                  ...built,
+                  config: { ...(built.config ?? {}), abortSignal: signal },
+                } as Parameters<typeof client.models.generateContentStream>[0]);
+              },
+              noteUsage: (inputTokens, outputTokens) => {
+                contextGuard.noteUsage(inputTokens, outputTokens);
+              },
+              planReclaim: (contents, stepIndex) => {
+                if (stepIndex !== 0 && !contextGuard.shouldStop()) {
+                  return undefined;
+                }
+                const working = [...contents];
+                if (
+                  !reclaimAiStudioContext(
+                    working,
+                    modelName,
+                    contextGuard.projectedNextPromptTokens,
+                  )
+                ) {
+                  return undefined;
+                }
+                contextGuard.resetAfterReclaim();
+                return { conversation: working };
+              },
+            });
+
+            const adapter: typeof baseAdapter = {
+              ...baseAdapter,
+              // Once per model call, including the final text-only step — see
+              // the streaming twin.
+              buildStepRequest: (contents, engineStep) => {
+                stepsTaken = engineStep + 1;
+                turnClock.noteProgress();
+                return baseAdapter.buildStepRequest(contents, engineStep);
+              },
+              buildToolResultMessages: (
+                contents,
+                stepResult,
+                toolResults,
+                engineStep,
+              ) => {
+                // Same as the streaming twin: the engine's step, not a count of
+                // hook invocations. See the comment there.
+                step = engineStep + 1;
+                for (const call of stepResult.toolCalls) {
+                  span.addEvent("gen_ai.tool_call", {
+                    "tool.name": call.name,
+                    "tool.step": step,
+                  });
+                  allToolCalls.push({ toolName: call.name, args: call.args });
+                }
+                lastStepText = stepResult.text || lastStepText;
+                for (const result of toolResults) {
+                  toolExecutions.push({
+                    name: result.name,
+                    input: result.args,
+                    output: result.output,
+                  });
+                }
+                if (toolResults.length > 0) {
+                  const stepThoughtSig = extractThoughtSignature(
+                    stepResult.raw.rawResponseParts,
+                  );
+                  withTimeout(
+                    this.handleToolExecutionStorage(
+                      stepResult.toolCalls.map((call, i) => ({
+                        toolName: call.name,
+                        args: call.args,
+                        ...(i === 0 && stepThoughtSig
+                          ? { thoughtSignature: stepThoughtSig }
+                          : {}),
+                        stepIndex: step,
+                      })),
+                      toolResults.map((result) => ({
+                        toolName: result.name,
+                        output: result.output,
+                        stepIndex: step,
+                      })),
+                      options,
+                      new Date(),
+                    ),
+                    TOOL_STORAGE_TIMEOUT_MS,
+                    "tool storage write timed out",
+                  ).catch((error: unknown) => {
+                    logger.warn(
+                      "[GoogleAIStudio] Failed to store native tool executions",
+                      {
+                        error:
+                          error instanceof Error
+                            ? error.message
+                            : String(error),
+                      },
+                    );
+                  });
+                }
+                const next = baseAdapter.buildToolResultMessages(
+                  contents,
+                  stepResult,
+                  toolResults,
+                  engineStep,
+                );
+                // Wrap-up nudge — see the streaming twin.
+                if (turnClock.shouldNudgeWrapup()) {
+                  const last = next[next.length - 1] as
+                    | { parts?: unknown[] }
+                    | undefined;
+                  if (last && Array.isArray(last.parts)) {
+                    last.parts.push({ text: buildWrapupNudgeText(false) });
+                  }
+                }
+                try {
+                  const appended = next[next.length - 1];
+                  contextGuard.noteAppendedChars(
+                    JSON.stringify(appended?.parts ?? []).length,
+                  );
+                } catch {
+                  /* estimation is best-effort — never break the loop */
+                }
+                return next;
+              },
+            };
+
+            // Same dedup routing as the streaming twin above.
+            const engineTools = buildDedupedEngineTools(
+              declarationsResult,
+              options.tools,
+              {
+                toolTimeoutMs: toolExecTimeoutMs,
+                abortSignal: composedSignal,
+                onProgress: () => turnClock.noteProgress(),
+              },
+            );
+
+            const { stream: engineStream, resultPromise } = runAgenticLoop(
+              adapter,
+              currentContents,
+              {
+                tools: engineTools,
+                abortSignal: composedSignal,
+                toolTimeoutMs: toolExecTimeoutMs,
+              },
+            );
+
+            // Drained, not consumed: nothing streams out of generate(), but an
+            // undrained channel would stall the engine mid-turn.
+            const drain = (async () => {
+              for await (const chunk of engineStream) {
+                void chunk;
+                turnClock.noteProgress();
+              }
+            })();
+
+            let engineResult;
+            let turnFailure: unknown;
+            try {
+              engineResult = await resultPromise;
+            } catch (error) {
+              turnFailure = error;
+            }
+            await drainDetachedPump(drain, "GoogleAIStudio");
+            if (turnFailure !== undefined) {
+              // Same split as the streaming twin: a blown time budget or a
+              // caller abort ends the turn honestly, a provider failure still
+              // throws.
+              if (turnClock.expired || options.abortSignal?.aborted) {
+                wasAborted = true;
+              } else {
+                logger.error(
+                  "[GoogleAIStudio] Native SDK generate error",
+                  turnFailure,
+                );
+                throw this.handleProviderError(turnFailure);
+              }
+            }
+
+            if (engineResult) {
+              totalInputTokens += engineResult.usage.inputTokens;
+              totalOutputTokens += engineResult.usage.outputTokens;
+              totalCacheReadTokens += engineResult.usage.cacheReadTokens ?? 0;
+              totalReasoningTokens += engineResult.usage.reasoningTokens ?? 0;
+              lastFinishReason = engineResult.rawStopReason ?? lastFinishReason;
+              finalText = engineResult.text;
+              if (engineResult.aborted) {
+                wasAborted = true;
+              }
+            }
+            if (composedSignal.aborted) {
+              wasAborted = true;
+            }
+
+            const hitStepLimitWithoutAnswer =
+              !wasAborted && step >= maxSteps && !finalText;
+            if (wasAborted && !finalText) {
+              // Never the step-cap text for a turn the budget killed: prefer
+              // the prose the model already produced, else an honest message
+              // naming the actual exit cause.
+              logger.warn(
+                `[GoogleAIStudio] Generate tool call loop ended mid-turn ` +
+                  `(${hitTimeLimit() ? "turn time limit" : turnClock.stalled ? "stall watchdog" : "caller abort"}); ` +
+                  `returning gathered text or an honest terminal message.`,
+              );
+              finalText =
+                lastStepText ||
+                buildLoopExitMessage({
+                  timedOut: hitTimeLimit(),
+                  stalled: turnClock.stalled,
+                  elapsedMs: turnClock.elapsedMs(),
+                  wasAborted,
+                  ...(options.stallTimeoutMs !== undefined
+                    ? { stallTimeoutMs: options.stallTimeoutMs }
+                    : {}),
+                  maxSteps,
+                  toolCallCount: allToolCalls.length,
+                });
+            } else {
+              finalText = handleMaxStepsTermination(
+                "[GoogleAIStudio]",
+                step,
+                maxSteps,
+                finalText,
+                lastStepText,
+              );
+            }
+
+            const responseTime = Date.now() - startTime;
+
+            // Turn-exit discriminator — see the streaming twin.
+            const stopReason = resolveTurnStopReason({
+              timedOut: hitTimeLimit(),
+              stalled: turnClock.stalled,
+              wasAborted,
+              cappedWithoutAnswer: hitStepLimitWithoutAnswer,
+              finishReason: mapGeminiFinishReason(lastFinishReason),
+            });
+            if (stopReason !== "completed") {
+              this.emitTurnEvent({
+                phase: stopReason,
+                step: stepsTaken,
+                maxSteps,
+                toolCallCount: allToolCalls.length,
+                elapsedMs: turnClock.elapsedMs(),
+              });
+            }
+
+            // Build EnhancedGenerateResult and route through enhanceResult so
+            // analytics / evaluation / tracing stay attached. The native AI
+            // Studio generate path bypasses BaseProvider.generate(), so
+            // skipping enhanceResult would silently drop those features.
+            // Gemini promptTokenCount is OVERLAPPING (already includes
+            // cachedContentTokenCount). Subtract once so the cached portion is
+            // billed at the cheaper cacheRead rate without double-counting.
+            const adjustedInputTokens = Math.max(
+              0,
+              totalInputTokens - totalCacheReadTokens,
+            );
+            const baseResult: EnhancedGenerateResult = {
+              content: finalText,
+              provider: this.providerName,
+              model: modelName,
+              // createAnalytics reads these off the result, so setting them
+              // here is also what puts stepsUsed / stopReason / elapsedMs /
+              // rawFinishReason on `result.analytics`.
+              stopReason,
+              stepsUsed: stepsTaken,
+              ...(lastFinishReason !== undefined
+                ? { rawFinishReason: lastFinishReason }
+                : {}),
+              usage: {
+                input: adjustedInputTokens,
+                // Thinking tokens are billed at the output rate but Gemini
+                // does NOT include them in candidatesTokenCount, so they are
+                // folded into `output` — what calculateCost bills at the
+                // output rate — with `reasoning` as the subset.
+                output: totalOutputTokens + totalReasoningTokens,
+                total:
+                  adjustedInputTokens +
+                  totalCacheReadTokens +
+                  totalOutputTokens +
+                  totalReasoningTokens,
+                ...(totalCacheReadTokens > 0
+                  ? { cacheReadTokens: totalCacheReadTokens }
+                  : {}),
+                ...(totalReasoningTokens > 0
+                  ? { reasoning: totalReasoningTokens }
+                  : {}),
+              },
+              ...(totalReasoningTokens > 0 && {
+                reasoningTokens: totalReasoningTokens,
+              }),
+              responseTime,
+              toolsUsed: allToolCalls.map((tc) => tc.toolName),
+              toolExecutions: resolveToolExecutionRecords(
+                options,
+                toolExecutions,
+              ),
+              enhancedWithTools: allToolCalls.length > 0,
+            };
+            return baseResult;
+          };
+
+          // Not run yet — `generateBaseModel.doGenerate` runs it (assigning
+          // `turnBaseResult`) once caller model middleware has had its turn
+          // and either calls through or short-circuits. Absence of
+          // `turnBaseResult` after the call below is how the short-circuit
+          // case is told apart from a real turn, mirroring the streaming
+          // twin's `!loopPromise` check.
+          let turnBaseResult: EnhancedGenerateResult | undefined;
+
+          // Seeded from `config` (buildNativeConfig's own output), not raw
+          // `options` — see the streaming twin's identical comment: `config`
+          // already applied the registry sampling-param strip for models
+          // that reject temperature/topP, and seeding from raw `options`
+          // would silently reintroduce a param buildNativeConfig dropped.
+          const v3Params: LanguageModelV3CallOptions = {
+            prompt: buildMiddlewareVisiblePrompt(config, currentContents),
+            ...(typeof config.maxOutputTokens === "number"
+              ? { maxOutputTokens: config.maxOutputTokens }
+              : {}),
+            ...(typeof config.temperature === "number"
+              ? { temperature: config.temperature }
+              : {}),
+            ...(typeof config.topP === "number" ? { topP: config.topP } : {}),
+            abortSignal: composedSignal,
+          };
+
+          // The `LanguageModelV3` handle caller model middleware wraps.
+          // `doStream` is never called on this path — NeuroLink runs Google
+          // AI Studio's synchronous turn through `doGenerate` only — so it
+          // throws descriptively rather than faking a result, mirroring
+          // `buildDelegatingModel().doStream` in openaiChatCompletionsBase.ts.
+          const generateBaseModel: LanguageModelV3 = {
+            specificationVersion: "v3",
+            provider: this.providerName,
+            modelId: modelName,
+            supportedUrls: {},
+            doStream: () => {
+              throw new Error(
+                "GoogleAIStudio: doStream is not implemented on the native generate model — NeuroLink runs this provider's turn synchronously through doGenerate.",
+              );
+            },
+            doGenerate: async (params: LanguageModelV3CallOptions) => {
+              // Honour whatever `transformParams` did to the prompt /
+              // sampling params on the way back in, falling back to the
+              // values this turn was built with when middleware left them
+              // untouched.
+              const { contents: transformedContents, systemText } =
+                v3PromptToGeminiContents(params.prompt);
+              const effectiveConfig: Record<string, unknown> = {
+                ...config,
+                ...(typeof params.temperature === "number"
+                  ? { temperature: params.temperature }
+                  : {}),
+                ...(typeof params.maxOutputTokens === "number"
+                  ? { maxOutputTokens: params.maxOutputTokens }
+                  : {}),
+                ...(typeof params.topP === "number"
+                  ? { topP: params.topP }
+                  : {}),
+              };
+              // Unconditional — see the streaming twin's identical comment:
+              // an absent `systemText` here means middleware deliberately
+              // removed the caller's system prompt (seeded in by
+              // `buildMiddlewareVisiblePrompt` above), not that there is
+              // nothing to override.
+              if (systemText) {
+                effectiveConfig.systemInstruction = systemText;
+              } else {
+                delete effectiveConfig.systemInstruction;
+              }
+              const loopResult = await runGenerateLoop(
+                transformedContents,
+                effectiveConfig,
+              );
+              turnBaseResult = loopResult;
+              return {
+                content: loopResult.content
+                  ? [{ type: "text" as const, text: loopResult.content }]
+                  : [],
+                finishReason: {
+                  unified: mapGeminiFinishReason(loopResult.rawFinishReason),
+                },
+                usage: {
+                  inputTokens: { total: loopResult.usage?.input ?? 0 },
+                  outputTokens: { total: loopResult.usage?.output ?? 0 },
+                },
+              };
+            },
+          };
+
+          let v3Result: LanguageModelV3GenerateResult;
+          try {
+            const wrappedGenerateModel = await this.applyMiddlewareToModel(
+              generateBaseModel,
+              options,
+            );
+            if (typeof wrappedGenerateModel === "string") {
+              throw new Error(
+                "GoogleAIStudio: native generate middleware resolved to a bare model id string, expected a LanguageModelV3 handle.",
+              );
+            }
+            v3Result = await wrappedGenerateModel.doGenerate(v3Params);
+          } catch (error) {
+            throw this.handleProviderError(error);
+          }
+
+          // `doGenerate`'s post-middleware result is authoritative for
+          // content/usage/finishReason — that is the whole point of
+          // `wrapGenerate` being able to replace it. Turn-lifecycle
+          // telemetry that has no V3 equivalent (stopReason, stepsUsed,
+          // tool bookkeeping) comes from `turnBaseResult` when the real
+          // turn ran, and from short-circuit defaults when it did not.
+          let finalContent = "";
+          for (const part of v3Result.content) {
+            if (part.type === "text") {
+              finalContent += part.text;
+            }
+          }
+
+          // The native turn's own usage (cacheReadTokens / reasoning / the
+          // pre-middleware total) — `v3Result.usage` only ever carries
+          // input/output, so without folding this in, a `wrapGenerate` that
+          // never touches usage at all still silently drops the cache and
+          // reasoning telemetry that reached `enhanceResult` before this
+          // middleware bridge existed. Absent (full short-circuit, no real
+          // turn) degrades to today's input/output-only shape.
+          const nativeUsage = turnBaseResult?.usage;
+          const finalInputTokens = v3Result.usage.inputTokens.total ?? 0;
+          const finalOutputTokens = v3Result.usage.outputTokens.total ?? 0;
+
+          const finalBaseResult: EnhancedGenerateResult = {
+            ...(turnBaseResult ?? {
+              provider: this.providerName,
+              model: modelName,
+              stopReason: resolveTurnStopReason({
+                timedOut: false,
+                stalled: false,
+                wasAborted: false,
+                cappedWithoutAnswer: false,
+                finishReason: v3Result.finishReason.unified,
+              }),
+              stepsUsed: 0,
+              responseTime: Date.now() - startTime,
+              toolsUsed: [],
+              toolExecutions: [],
+              enhancedWithTools: false,
+            }),
+            content: finalContent,
+            usage: {
+              ...nativeUsage,
+              input: finalInputTokens,
+              output: finalOutputTokens,
+              total:
+                finalInputTokens +
+                finalOutputTokens +
+                (nativeUsage?.cacheReadTokens ?? 0),
+            },
+          };
+          return this.enhanceResult(finalBaseResult, options, startTime);
+        } finally {
+          releaseTurnResources();
+          timeoutController?.cleanup();
+        }
+      },
+    );
+  }
+
+  /**
+   * Override generate to route Gemini 3 models with tools to native SDK
+   */
+  async generate(
+    optionsOrPrompt: TextGenerationOptions | string,
+  ): Promise<EnhancedGenerateResult | null> {
+    // Normalize options
+    const options =
+      typeof optionsOrPrompt === "string"
+        ? { prompt: optionsOrPrompt }
+        : optionsOrPrompt;
+
+    const modelName = options.model || this.modelName;
+
+    // Image-generation models reject function-calling. Route them to
+    // executeImageGeneration without merging tools. This must happen
+    // BEFORE getToolsForStream to avoid leaking registered (MCP / built-in)
+    // tools into the image API request, which trips
+    // "Function calling is not enabled for this model".
+    // startsWith (not includes) so a hypothetical text model whose ID
+    // contains an image-model string as a substring isn't silently routed
+    // to executeImageGeneration and stripped of tool support.
+    const isImageModel = IMAGE_GENERATION_MODELS.some((m) =>
+      modelName.toLowerCase().startsWith(m.toLowerCase()),
+    );
+    if (isImageModel) {
+      logger.info(
+        "[GoogleAIStudio] Routing image generation model to executeImageGeneration",
+        { model: modelName },
+      );
+      return this.executeImageGeneration(options);
+    }
+
+    // TTS direct-synthesis mode: synthesise the input text directly (no LLM
+    // call). BaseProvider.runGenerateInActiveContext does the same dispatch
+    // — replicated here because AI Studio's override bypasses that path.
+    if (isDirectTTSRequest(options.tts)) {
+      logger.info(
+        "[GoogleAIStudio] Routing TTS direct-synthesis to handleDirectTTSSynthesis",
+        { model: modelName },
+      );
+      return this.handleDirectTTSSynthesis(options, Date.now());
+    }
+
+    await this.preprocessNativeFileInput(options);
+
+    // Merge registered (built-in / MCP) tools with caller-supplied tools.
+    // AI Studio's generate() bypasses BaseProvider.generate(), so the
+    // ToolsManager-driven merge that normally injects sdk.registerTool()
+    // entries never runs here. Without this call, registered tools never
+    // reach the native function-calling path.
+    const baseTools = !options.disableTools
+      ? await this.getToolsForStream(options)
+      : {};
+    let mergedOptions = {
+      ...options,
+      tools: baseTools,
+    };
+
+    // Check for tools + JSON schema conflict, via the shared predicate (same
+    // gate executeStream() and executeNativeGemini3Generate() use) so this
+    // path also honors isGeminiProvider/isNativeAnthropicProvider instead of
+    // hand-rolling its own tools+schema condition.
+    const wantsJsonOutput = options.output?.format === "json" || options.schema;
+    const exclusionInForce = isToolsSchemaExclusionInForce(
+      this.providerName,
+      modelName,
+      !mergedOptions.disableTools,
+      Object.keys(mergedOptions.tools ?? {}).length,
+    );
+    if (wantsJsonOutput && exclusionInForce) {
+      logger.warn(
+        "[GoogleAIStudio] Gemini does not support tools and JSON schema output simultaneously. Disabling tools for this request.",
+      );
+      mergedOptions = { ...mergedOptions, disableTools: true, tools: {} };
+    }
+
+    const hasActiveTools =
+      !mergedOptions.disableTools &&
+      mergedOptions.tools &&
+      Object.keys(mergedOptions.tools).length > 0;
+
+    if (hasActiveTools) {
+      logger.info(
+        "[GoogleAIStudio] Routing generate to native @google/genai SDK for tool calling",
+        {
+          model: modelName,
+          totalToolCount: Object.keys(mergedOptions.tools ?? {}).length,
+        },
+      );
+    }
+
+    // Route ALL models through native @google/genai SDK (no more @ai-sdk/google dependency).
+    const generateStartTime = Date.now();
+    const inputPrompt =
+      (mergedOptions.input as { text?: string } | undefined)?.text ||
+      (mergedOptions as { prompt?: string }).prompt ||
+      "";
+    try {
+      // Wrap in `neurolink.executeGeneration` so the observability span
+      // chain (Test: Generate Span Chain) sees a third inner span on the
+      // native @google/genai path. This provider overrides generate() instead
+      // of using BaseProvider's shared flow, so the span is added here.
+      let result = await withSpan(
+        {
+          name: "executeGeneration",
+          tracer: tracers.provider,
+          detached: true,
+          attributes: {
+            [ATTR.NL_MODEL]: modelName,
+            path: "native.google-genai",
+          },
+        },
+        async () => this.executeNativeGemini3Generate(mergedOptions),
+      );
+      // Pipe through TTS-of-AI-response when caller asks for it. No-op when
+      // tts is disabled or useAiResponse is false.
+      result = await this.synthesizeAIResponseIfNeeded(result, options);
+      this.emitGenerationEnd(
+        modelName,
+        result,
+        generateStartTime,
+        true,
+        undefined,
+        inputPrompt,
+      );
+      return result;
+    } catch (error) {
+      this.emitGenerationEnd(
+        modelName,
+        null,
+        generateStartTime,
+        false,
+        error,
+        inputPrompt,
+      );
+      throw error;
+    }
+  }
+
+  /**
+   * Emit `generation:end` for native Google AI Studio generate calls, so
+   * analytics listeners see them.
+   */
+  private emitGenerationEnd(
+    modelName: string,
+    result: EnhancedGenerateResult | null,
+    startTime: number,
+    success: boolean,
+    error?: unknown,
+    prompt?: string,
+  ): void {
+    const emitter = this.neurolink?.getEventEmitter();
+    if (!emitter) {
+      return;
+    }
+    const usage =
+      result?.usage && typeof result.usage === "object"
+        ? result.usage
+        : { input: 0, output: 0, total: 0 };
+    // Mark on the result so the SDK-level runStandardGenerateRequest knows
+    // this provider already emitted `generation:end` itself and skips its
+    // own duplicate emission. Without this flag the public event listener
+    // (and the observability test) would see two events per generate call.
+    if (result && typeof result === "object") {
+      (result as { _generationEndEmitted?: boolean })._generationEndEmitted =
+        true;
+    }
+    if (!success && error && typeof error === "object") {
+      (error as { _generationEndEmitted?: boolean })._generationEndEmitted =
+        true;
+    }
+    emitter.emit("generation:end", {
+      provider: this.providerName,
+      responseTime: Date.now() - startTime,
+      timestamp: Date.now(),
+      prompt: prompt || "",
+      result: {
+        content: result?.content || "",
+        usage,
+        model: modelName,
+        provider: this.providerName,
+        finishReason: success ? "stop" : "error",
+      },
+      success,
+      ...(error
+        ? { error: error instanceof Error ? error.message : String(error) }
+        : {}),
+    });
+  }
+
+  // ===================
+  // HELPER METHODS
+  // ===================
+  private async executeAudioStreamViaGeminiLive(
+    options: StreamOptions,
+  ): Promise<StreamResult> {
+    const startTime = Date.now();
+    const apiKey = this.getApiKey();
+
+    // Dynamic import to avoid hard dependency unless audio streaming is used
+    let client: GenAIClient;
+    try {
+      client = await createGoogleGenAIClient(apiKey, this.getBaseURL());
+    } catch {
+      throw new AuthenticationError(
+        "Missing '@google/genai'. Install with: pnpm add @google/genai",
+        this.providerName,
+      );
+    }
+
+    const model =
+      this.modelName ||
+      process.env.GOOGLE_VOICE_AI_MODEL ||
+      "gemini-2.5-flash-preview-native-audio-dialog";
+
+    // Simple async queue for yielding audio events to the outer AsyncIterable
+    const queue: GoogleLiveAudioQueueItem[] = [];
+    let notifyNext: (() => void) | null = null;
+    let done = false;
+    let terminalQueued = false;
+    let cleanupRequested = false;
+    let liveSession: GenAILiveSession | undefined = undefined;
+    let sessionCloseIssued = false;
+    let inputIterator: AsyncIterator<Buffer> | undefined;
+    let removeAbortListener: () => void = () => undefined;
+
+    const wake = (): void => {
+      const notify = notifyNext;
+      notifyNext = null;
+      notify?.();
+    };
+
+    const cleanup = (): void => {
+      if (!cleanupRequested) {
+        cleanupRequested = true;
+        removeAbortListener();
+        cancelStream(options.input?.audio?.frames);
+        if (inputIterator) {
+          releaseIterator(inputIterator);
+          inputIterator = undefined;
+        }
+      }
+      // A close callback can run just before connect() yields its session.
+      // Keep cleanup repeatable so that newly acquired handle is still closed.
+      if (liveSession && !sessionCloseIssued) {
+        sessionCloseIssued = true;
+        try {
+          void Promise.resolve(liveSession.close?.()).catch(() => {});
+        } catch {
+          // Cleanup cannot replace the stream's original outcome.
+        }
+      }
+    };
+
+    const push = (item: GoogleLiveAudioQueueItem) => {
+      if (done || terminalQueued) {
+        return;
+      }
+      queue.push(item);
+      if (item.type !== "audio") {
+        terminalQueued = true;
+        cleanup();
+      }
+      // A consumer can already be parked before either end or error arrives.
+      wake();
+    };
+
+    const cancel = (): void => {
+      done = true;
+      queue.length = 0;
+      cleanup();
+      wake();
+    };
+
+    // @google/genai 2.x waits inside connect() for the server's setupComplete
+    // message and does not reject when the socket errors or closes first, so a
+    // refused key or model would leave this await pending forever. Fail on the
+    // first error or close that arrives before the session is up. Once it is
+    // up, the callbacks below end the stream as they always did.
+    let sessionOpen = false;
+    let failConnect: (error: Error) => void = () => undefined;
+    const connectFailed = new Promise<never>((_resolve, reject) => {
+      failConnect = reject;
+    });
+
+    const connecting = client.live.connect({
+      model,
+      callbacks: {
+        onopen: () => {
+          // no-op
+        },
+        onmessage: async (message: LiveServerMessage) => {
+          if (done || terminalQueued) {
+            return;
+          }
+          try {
+            const audio =
+              message?.serverContent?.modelTurn?.parts?.[0]?.inlineData;
+            if (audio?.data) {
+              const buf = Buffer.from(String(audio.data), "base64");
+              const chunk: AudioChunk = {
+                data: buf,
+                sampleRateHz: 24000,
+                channels: 1,
+                encoding: "PCM16LE",
+              };
+              push({ type: "audio", audio: chunk });
+            }
+            if (message?.serverContent?.interrupted) {
+              // allow consumer to handle; no special action required here
+            }
+          } catch (e) {
+            push({ type: "error", error: e });
+          }
+        },
+        onerror: (e: { message?: string }) => {
+          if (!sessionOpen) {
+            failConnect(
+              new Error("Gemini Live connection failed before setup completed"),
+            );
+          }
+          push({ type: "error", error: e });
+        },
+        onclose: (_e: { code?: number; reason?: string }) => {
+          if (!sessionOpen) {
+            failConnect(
+              new Error("Gemini Live connection closed before setup completed"),
+            );
+          }
+          push({ type: "end" });
+        },
+      },
+      config: {
+        responseModalities: ["AUDIO"] as ("TEXT" | "IMAGE" | "AUDIO")[],
+        speechConfig: {
+          voiceConfig: { prebuiltVoiceConfig: { voiceName: "Orus" } },
+        },
+      },
+    });
+    const session = await Promise.race([connecting, connectFailed]);
+    liveSession = session;
+    sessionOpen = true;
+    if (cleanupRequested) {
+      cleanup();
+    }
+
+    const signal = options.abortSignal;
+    if (signal && !cleanupRequested) {
+      const onAbort = (): void => {
+        push({
+          type: "error",
+          error:
+            signal.reason instanceof Error
+              ? signal.reason
+              : new DOMException("The operation was aborted", "AbortError"),
+        });
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+      if (signal.aborted) {
+        onAbort();
+      }
+    }
+
+    // Feed upstream audio frames concurrently
+    (async () => {
+      try {
+        if (cleanupRequested) {
+          return;
+        }
+        const spec = options.input?.audio;
+        if (!spec) {
+          logger.debug(
+            "[GeminiLive] No audio spec found on input; skipping upstream send",
+          );
+          return;
+        }
+        const framesIterator = spec.frames[Symbol.asyncIterator]();
+        inputIterator = framesIterator;
+        while (!cleanupRequested) {
+          const nextFrame = await framesIterator.next();
+          if (cleanupRequested) {
+            return;
+          }
+          if (nextFrame.done) {
+            inputIterator = undefined;
+            break;
+          }
+          const frame = nextFrame.value;
+          // Zero-length frame acts as a 'flush' control signal
+          if (!frame || (frame as Buffer).byteLength === 0) {
+            try {
+              if (session.sendInput) {
+                await session.sendInput({ event: "flush" });
+              } else if (session.sendRealtimeInput) {
+                await session.sendRealtimeInput({ event: "flush" });
+              }
+            } catch (err) {
+              logger.debug("[GeminiLive] flush control failed (non-fatal)", {
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+            continue;
+          }
+          // Convert PCM16LE buffer to base64 and wrap in genai Blob-like object
+          const base64 = (frame as Buffer).toString("base64");
+          const mimeType = `audio/pcm;rate=${spec.sampleRateHz || 16000}`;
+          await session.sendRealtimeInput?.({
+            media: { data: base64, mimeType },
+          });
+        }
+        if (cleanupRequested) {
+          return;
+        }
+        // Best-effort flush signal if supported
+        try {
+          if (session.sendInput) {
+            await session.sendInput({ event: "flush" });
+          } else if (session.sendRealtimeInput) {
+            await session.sendRealtimeInput({ event: "flush" });
+          }
+        } catch (err) {
+          logger.debug("[GeminiLive] final flush failed (non-fatal)", {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      } catch (e) {
+        push({ type: "error", error: e });
+      }
+    })().catch(() => {
+      // ignore
+    });
+
+    // AsyncIterable for stream events
+    const asyncIterable = {
+      [Symbol.asyncIterator]() {
+        return {
+          async next(): Promise<
+            IteratorResult<{ type: "audio"; audio: AudioChunk }>
+          > {
+            while (true) {
+              const item = queue.shift();
+              if (item?.type === "audio") {
+                return {
+                  value: { type: "audio", audio: item.audio },
+                  done: false,
+                };
+              }
+              if (item?.type === "end") {
+                done = true;
+                return { value: undefined, done: true };
+              }
+              if (item?.type === "error") {
+                done = true;
+                throw item.error instanceof Error
+                  ? item.error
+                  : new Error(String(item.error));
+              }
+              if (done) {
+                return { value: undefined, done: true };
+              }
+              await new Promise<void>((resolve) => {
+                notifyNext = resolve;
+              });
+            }
+          },
+          async return(): Promise<
+            IteratorResult<{ type: "audio"; audio: AudioChunk }>
+          > {
+            cancel();
+            return { value: undefined, done: true };
+          },
+        };
+      },
+    } as AsyncIterable<{ type: "audio"; audio: AudioChunk }>;
+    attachStreamCancel(asyncIterable, cancel);
+
+    return {
+      stream: asyncIterable,
+      provider: this.providerName,
+      model: model,
+      metadata: {
+        startTime,
+        streamId: `google-ai-audio-${Date.now()}`,
+      },
+    };
+  }
+
+  protected getDefaultEmbeddingModel(): string {
+    return (
+      process.env.GOOGLE_AI_EMBEDDING_MODEL ||
+      process.env.GOOGLE_EMBEDDING_MODEL ||
+      "gemini-embedding-001"
+    );
+  }
+
+  /**
+   * Generate embeddings for text using Google AI Studio embedding models
+   * @param input - The text to embed (string or EmbedInput)
+   * @param modelName - The embedding model to use (default: gemini-embedding-001)
+   * @returns Promise resolving to the embedding vector
+   */
+  async embed(
+    input: string | EmbedInput,
+    modelName?: string,
+  ): Promise<number[]> {
+    if (typeof input !== "string" && input.image) {
+      throw new ProviderError(
+        `${this.providerName} does not support image embeddings; provide text input`,
+        this.providerName,
+      );
+    }
+
+    const text = typeof input === "string" ? input : (input.text ?? "");
+    const embeddingModelName =
+      modelName || this.getDefaultEmbeddingModel() || "gemini-embedding-001";
+
+    logger.debug("Generating embedding", {
+      provider: this.providerName,
+      model: embeddingModelName,
+      textLength: text.length,
+    });
+
+    try {
+      const apiKey = this.getApiKey();
+      const client = await createGoogleGenAIClient(apiKey, this.getBaseURL());
+
+      const result = await client.models.embedContent({
+        model: embeddingModelName,
+        contents: [text],
+      });
+
+      const embedding = result.embeddings?.[0]?.values;
+      if (!embedding || embedding.length === 0) {
+        throw new ProviderError(
+          "No embedding returned from Google AI",
+          this.providerName,
+        );
+      }
+
+      logger.debug("Embedding generated successfully", {
+        provider: this.providerName,
+        model: embeddingModelName,
+        embeddingDimension: embedding.length,
+      });
+
+      return embedding;
+    } catch (error) {
+      logger.error("Embedding generation failed", {
+        error: error instanceof Error ? error.message : String(error),
+        model: embeddingModelName,
+        textLength: text.length,
+      });
+
+      throw this.handleProviderError(error);
+    }
+  }
+
+  /**
+   * Generate embeddings for multiple texts in a single batch
+   * @param texts - The texts to embed
+   * @param modelName - The embedding model to use (default: gemini-embedding-001)
+   * @returns Promise resolving to an array of embedding vectors
+   */
+  async embedMany(texts: string[], modelName?: string): Promise<number[][]> {
+    const embeddingModelName =
+      modelName || this.getDefaultEmbeddingModel() || "gemini-embedding-001";
+
+    logger.debug("Generating batch embeddings", {
+      provider: this.providerName,
+      model: embeddingModelName,
+      count: texts.length,
+    });
+
+    let rows: Array<number[] | undefined>;
+    try {
+      const apiKey = this.getApiKey();
+      const client = await createGoogleGenAIClient(apiKey, this.getBaseURL());
+
+      rows = [];
+      if (embeddingModelName.includes("gemini-embedding-2")) {
+        // @google/genai 2.x reads an array of strings for these models as ONE
+        // content with several parts, so a batch would come back as a single
+        // vector. Embed each text on its own, a few at a time, in order.
+        const concurrency = 8;
+        for (let start = 0; start < texts.length; start += concurrency) {
+          const group = texts.slice(start, start + concurrency);
+          const results = await Promise.all(
+            group.map((text) =>
+              client.models.embedContent({
+                model: embeddingModelName,
+                contents: [text],
+              }),
+            ),
+          );
+          for (const result of results) {
+            rows.push(result.embeddings?.[0]?.values);
+          }
+        }
+      } else {
+        const result = await client.models.embedContent({
+          model: embeddingModelName,
+          contents: texts,
+        });
+        rows.push(
+          ...(result.embeddings || []).map(
+            (e: { values?: number[] }) => e.values,
+          ),
+        );
+      }
+
+      // One vector per text, or fail: a silent mismatch would pair texts with
+      // the wrong vectors downstream.
+      if (rows.length !== texts.length) {
+        throw new Error(
+          `Embedding response held ${rows.length} vectors for ${texts.length} texts`,
+        );
+      }
+    } catch (error) {
+      logger.error("Batch embedding generation failed", {
+        error: error instanceof Error ? error.message : String(error),
+        model: embeddingModelName,
+        count: texts.length,
+      });
+
+      throw this.handleProviderError(error);
+    }
+
+    // Checked after the try on purpose: a thrown error is re-worded by
+    // handleProviderError from keywords in its text, so an index such as 429
+    // or 502 would turn this into a rate-limit or server error.
+    const embeddings = rows.map((values, index) => {
+      if (!values || values.length === 0) {
+        logger.error("Batch embedding returned no values", {
+          model: embeddingModelName,
+          index,
+        });
+        throw new ProviderError(
+          `Embedding for the text at index ${index} came back without values`,
+          this.providerName,
+        );
+      }
+      return values;
+    });
+
+    logger.debug("Batch embeddings generated successfully", {
+      provider: this.providerName,
+      model: embeddingModelName,
+      count: embeddings.length,
+      embeddingDimension: embeddings[0]?.length,
+    });
+
+    return embeddings;
+  }
+
+  private getApiKey(): string {
+    const apiKey =
+      this.credentials?.apiKey ||
+      process.env.GOOGLE_AI_API_KEY ||
+      process.env.GOOGLE_GENERATIVE_AI_API_KEY;
+
+    if (!apiKey) {
+      throw new AuthenticationError(
+        "GOOGLE_AI_API_KEY or GOOGLE_GENERATIVE_AI_API_KEY environment variable is not set",
+        this.providerName,
+      );
+    }
+
+    return apiKey;
+  }
+
+  // Mirrors mistral.ts's baseURL precedence (credentials override, then env,
+  // then unset — the SDK's own default applies when unset). Blank/whitespace
+  // values are treated as unset so an empty override can't accidentally
+  // clobber the default.
+  private getBaseURL(): string | undefined {
+    const baseURL =
+      this.credentials?.baseURL?.trim() ||
+      process.env.GOOGLE_AI_BASE_URL?.trim();
+    return baseURL && baseURL.length > 0 ? baseURL : undefined;
+  }
+}
+
+export default GoogleAIStudioProvider;

@@ -3,33 +3,44 @@
  * Handles in-memory conversation storage, session management, and context injection
  */
 
-import type {
-  ConversationMemoryConfig,
-  SessionMemory,
-  ConversationMemoryStats,
-  ChatMessage,
-  StoreConversationTurnOptions,
-} from "../types/conversation.js";
-import { ConversationMemoryError } from "../types/conversation.js";
+import { randomUUID } from "crypto";
 import {
   DEFAULT_MAX_SESSIONS,
   MEMORY_THRESHOLD_PERCENTAGE,
-  RECENT_MESSAGES_RATIO,
   MESSAGES_PER_TURN,
 } from "../config/conversationMemory.js";
-import { logger } from "../utils/logger.js";
-import { randomUUID } from "crypto";
 import { TokenUtils } from "../constants/tokens.js";
+import { SummarizationEngine } from "../context/summarizationEngine.js";
+import { context } from "@opentelemetry/api";
+import { tracers, withSpan } from "../telemetry/index.js";
+import type {
+  ChatMessage,
+  ConversationMemoryConfig,
+  ConversationMemoryStats,
+  SessionListItem,
+  SessionMemory,
+  StoreConversationTurnOptions,
+  IConversationMemoryManager,
+  TurnMessageIdentity,
+} from "../types/index.js";
+import { ConversationMemoryError } from "../types/index.js";
 import {
   buildContextFromPointer,
   getEffectiveTokenThreshold,
-  generateSummary,
 } from "../utils/conversationMemory.js";
+import { logger } from "../utils/logger.js";
+import {
+  assistantTurnIdentity,
+  isTurnAlreadyStored,
+  userTurnIdentity,
+} from "../utils/conversationTurnIdentity.js";
+import { extractIsErrorText } from "../utils/toolResultStatus.js";
 
-export class ConversationMemoryManager {
+export class ConversationMemoryManager implements IConversationMemoryManager {
   private sessions: Map<string, SessionMemory> = new Map();
   public config: ConversationMemoryConfig;
   private isInitialized: boolean = false;
+  private summarizationEngine: SummarizationEngine = new SummarizationEngine();
 
   /**
    * Track sessions currently being summarized to prevent race conditions
@@ -58,9 +69,29 @@ export class ConversationMemoryManager {
       throw new ConversationMemoryError(
         "Failed to initialize conversation memory",
         "CONFIG_ERROR",
-        { error: error instanceof Error ? error.message : String(error) },
+        {
+          error: error instanceof Error ? error.message : String(error),
+        },
       );
     }
+  }
+
+  /** Whether this memory manager can persist data (always true for in-memory within process) */
+  public get canPersist(): boolean {
+    return true;
+  }
+
+  /** Whether Redis client is configured (always false for in-memory) */
+  public get isRedisConfigured(): boolean {
+    return false;
+  }
+
+  /** Get health status for monitoring */
+  public getHealthStatus(): { initialized: boolean; connected: boolean } {
+    return {
+      initialized: this.isInitialized,
+      connected: false,
+    };
   }
 
   /**
@@ -70,82 +101,125 @@ export class ConversationMemoryManager {
   async storeConversationTurn(
     options: StoreConversationTurnOptions,
   ): Promise<void> {
-    await this.ensureInitialized();
+    return withSpan(
+      {
+        name: "memory.storeTurn",
+        tracer: tracers.memory,
+        attributes: {
+          "memory.type": "in-memory",
+          "session.id": options.sessionId,
+          "memory.operation": "store_turn",
+        },
+      },
+      async (span) => {
+        await this.ensureInitialized();
 
-    try {
-      // Get or create session
-      let session = this.sessions.get(options.sessionId);
-      if (!session) {
-        session = this.createNewSession(options.sessionId, options.userId);
-        this.sessions.set(options.sessionId, session);
-      }
+        try {
+          // Get or create session
+          let session = this.sessions.get(options.sessionId);
+          if (!session) {
+            session = this.createNewSession(options.sessionId, options.userId);
+            this.sessions.set(options.sessionId, session);
+          }
 
-      const tokenThreshold = options.providerDetails
-        ? getEffectiveTokenThreshold(
-            options.providerDetails.provider,
-            options.providerDetails.model,
-            this.config.tokenThreshold,
-            session.tokenThreshold,
-          )
-        : this.config.tokenThreshold || 50000;
+          if (isTurnAlreadyStored(session.messages, options.turnId)) {
+            return;
+          }
 
-      const userMsg = await this.validateAndPrepareMessage(
-        options.userMessage,
-        "user",
-        tokenThreshold,
-      );
-      const assistantMsg = await this.validateAndPrepareMessage(
-        options.aiResponse,
-        "assistant",
-        tokenThreshold,
-      );
+          const tokenThreshold = options.providerDetails
+            ? getEffectiveTokenThreshold(
+                options.providerDetails.provider,
+                options.providerDetails.model,
+                this.config.tokenThreshold,
+                session.tokenThreshold,
+              )
+            : this.config.tokenThreshold || 50000;
 
-      if (options.events && options.events.length > 0) {
-        assistantMsg.events = options.events;
-      }
+          const userMsg = await this.validateAndPrepareMessage(
+            options.userMessage,
+            "user",
+            tokenThreshold,
+            userTurnIdentity(options),
+          );
+          const assistantMsg = await this.validateAndPrepareMessage(
+            options.aiResponse,
+            "assistant",
+            tokenThreshold,
+            assistantTurnIdentity(options),
+          );
 
-      session.messages.push(userMsg, assistantMsg);
-      session.lastActivity = Date.now();
+          if (options.events && options.events.length > 0) {
+            assistantMsg.events = options.events;
+          }
 
-      const shouldSummarize =
-        options.enableSummarization !== undefined
-          ? options.enableSummarization
-          : this.config.enableSummarization;
+          session.messages.push(userMsg);
+          // Pinned skill activations ride between ask and answer, mirroring
+          // the actual order (ask → skill loaded → answer). Stored verbatim —
+          // skill instructions are never truncated.
+          if (options.skillMessages && options.skillMessages.length > 0) {
+            session.messages.push(...options.skillMessages);
+          }
+          session.messages.push(assistantMsg);
+          session.lastActivity = Date.now();
 
-      if (shouldSummarize) {
-        // Only trigger summarization if not already in progress for this session
-        if (!this.summarizationInProgress.has(options.sessionId)) {
-          setImmediate(async () => {
-            try {
-              await this.checkAndSummarize(session, tokenThreshold);
-            } catch (error) {
-              logger.error("Background summarization failed", {
-                sessionId: session.sessionId,
-                error: error instanceof Error ? error.message : String(error),
-              });
+          // Store API-reported token counts if available
+          if (options.tokenUsage) {
+            session.lastApiTokenCount = options.tokenUsage;
+          }
+
+          span.setAttribute("memory.message_count", session.messages.length);
+
+          const shouldSummarize =
+            options.enableSummarization !== undefined
+              ? options.enableSummarization
+              : this.config.enableSummarization;
+
+          if (shouldSummarize) {
+            // Only trigger summarization if not already in progress for this session
+            if (!this.summarizationInProgress.has(options.sessionId)) {
+              const summarizeWithContext = context.bind(
+                context.active(),
+                async () => {
+                  try {
+                    await this.checkAndSummarize(
+                      session,
+                      tokenThreshold,
+                      options.requestId,
+                    );
+                  } catch (error) {
+                    logger.error("Background summarization failed", {
+                      sessionId: session.sessionId,
+                      requestId: options.requestId,
+                      error:
+                        error instanceof Error ? error.message : String(error),
+                    });
+                  }
+                },
+              );
+              setImmediate(summarizeWithContext);
+            } else {
+              logger.debug(
+                "[ConversationMemoryManager] Summarization already in progress, skipping",
+                {
+                  sessionId: options.sessionId,
+                },
+              );
             }
-          });
-        } else {
-          logger.debug(
-            "[ConversationMemoryManager] Summarization already in progress, skipping",
+          }
+
+          this.enforceSessionLimit();
+        } catch (error) {
+          throw new ConversationMemoryError(
+            `Failed to store conversation turn for session ${options.sessionId}`,
+            "STORAGE_ERROR",
             {
               sessionId: options.sessionId,
+              error: error instanceof Error ? error.message : String(error),
             },
           );
         }
-      }
-
-      this.enforceSessionLimit();
-    } catch (error) {
-      throw new ConversationMemoryError(
-        `Failed to store conversation turn for session ${options.sessionId}`,
-        "STORAGE_ERROR",
-        {
-          sessionId: options.sessionId,
-          error: error instanceof Error ? error.message : String(error),
-        },
-      );
-    }
+      },
+    );
   }
 
   /**
@@ -156,8 +230,9 @@ export class ConversationMemoryManager {
     content: string,
     role: ChatMessage["role"],
     threshold: number,
+    identity?: TurnMessageIdentity,
   ): Promise<ChatMessage> {
-    const id = randomUUID();
+    const id = identity?.id ?? randomUUID();
     const tokenCount = TokenUtils.estimateTokenCount(content);
 
     const maxMessageSize = Math.floor(threshold * MEMORY_THRESHOLD_PERCENTAGE);
@@ -181,6 +256,7 @@ export class ConversationMemoryManager {
         content: truncated,
         timestamp: new Date().toISOString(),
         metadata: {
+          ...identity?.metadata,
           truncated: true,
         },
       };
@@ -191,6 +267,7 @@ export class ConversationMemoryManager {
       role,
       content,
       timestamp: new Date().toISOString(),
+      ...(identity?.metadata ? { metadata: identity.metadata } : {}),
     };
   }
 
@@ -200,6 +277,7 @@ export class ConversationMemoryManager {
   private async checkAndSummarize(
     session: SessionMemory,
     threshold: number,
+    requestId?: string,
   ): Promise<void> {
     // Acquire lock - if already in progress, skip
     if (this.summarizationInProgress.has(session.sessionId)) {
@@ -215,22 +293,13 @@ export class ConversationMemoryManager {
     this.summarizationInProgress.add(session.sessionId);
 
     try {
-      const contextMessages = buildContextFromPointer(session);
-      const tokenCount = this.estimateTokens(contextMessages);
-
-      session.lastTokenCount = tokenCount;
-      session.lastCountedAt = Date.now();
-
-      logger.debug("Token count check", {
-        sessionId: session.sessionId,
-        tokenCount,
+      await this.summarizationEngine.checkAndSummarize(
+        session,
         threshold,
-        needsSummarization: tokenCount >= threshold,
-      });
-
-      if (tokenCount >= threshold) {
-        await this.summarizeSessionTokenBased(session, threshold);
-      }
+        this.config,
+        "[ConversationMemory]",
+        requestId,
+      );
     } catch (error) {
       logger.error("Token counting or summarization failed", {
         sessionId: session.sessionId,
@@ -247,7 +316,12 @@ export class ConversationMemoryManager {
    */
   private estimateTokens(messages: ChatMessage[]): number {
     return messages.reduce((total, msg) => {
-      return total + TokenUtils.estimateTokenCount(msg.content);
+      let msgTokens = TokenUtils.estimateTokenCount(msg.content);
+      if (msg.events && Array.isArray(msg.events) && msg.events.length > 0) {
+        const eventsJson = JSON.stringify(msg.events);
+        msgTokens += TokenUtils.estimateTokenCount(eventsJson);
+      }
+      return total + msgTokens;
     }, 0);
   }
 
@@ -256,12 +330,37 @@ export class ConversationMemoryManager {
    * Returns messages from pointer onwards (or all if no pointer)
    * Now consistently async to match Redis implementation
    */
-  async buildContextMessages(sessionId: string): Promise<ChatMessage[]> {
-    const session = this.sessions.get(sessionId);
-    return session ? buildContextFromPointer(session) : [];
+  async buildContextMessages(
+    sessionId: string,
+    _userId?: string,
+    _enableSummarization?: boolean,
+    requestId?: string,
+  ): Promise<ChatMessage[]> {
+    return withSpan(
+      {
+        name: "memory.buildContext",
+        tracer: tracers.memory,
+        attributes: {
+          "memory.type": "in-memory",
+          "session.id": sessionId,
+          "memory.operation": "build_context",
+        },
+      },
+      async (span) => {
+        const session = this.sessions.get(sessionId);
+        const messages = session
+          ? buildContextFromPointer(session, requestId)
+          : [];
+        span.setAttribute("memory.message_count", messages.length);
+        return messages;
+      },
+    );
   }
 
-  public getSession(sessionId: string): SessionMemory | undefined {
+  public getSession(
+    sessionId: string,
+    _userId?: string,
+  ): SessionMemory | undefined {
     return this.sessions.get(sessionId);
   }
 
@@ -281,88 +380,6 @@ export class ConversationMemoryManager {
         summarizesTo,
       },
     };
-  }
-
-  /**
-   * Token-based summarization (pointer-based, non-destructive)
-   */
-  private async summarizeSessionTokenBased(
-    session: SessionMemory,
-    threshold: number,
-  ): Promise<void> {
-    const startIndex = session.summarizedUpToMessageId
-      ? session.messages.findIndex(
-          (m) => m.id === session.summarizedUpToMessageId,
-        ) + 1
-      : 0;
-
-    const recentMessages = session.messages.slice(startIndex);
-    if (recentMessages.length === 0) {
-      return;
-    }
-
-    const targetRecentTokens = threshold * RECENT_MESSAGES_RATIO;
-    const splitIndex = await this.findSplitIndexByTokens(
-      recentMessages,
-      targetRecentTokens,
-    );
-    const messagesToSummarize = recentMessages.slice(0, splitIndex);
-
-    if (messagesToSummarize.length === 0) {
-      return;
-    }
-
-    const summary = await generateSummary(
-      messagesToSummarize,
-      this.config,
-      "[ConversationMemory]",
-      session.summarizedMessage,
-    );
-
-    if (!summary) {
-      logger.warn(
-        `[ConversationMemory] Summary generation failed for session ${session.sessionId}`,
-      );
-      return;
-    }
-
-    const lastSummarized = messagesToSummarize[messagesToSummarize.length - 1];
-    session.summarizedUpToMessageId = lastSummarized.id;
-    session.summarizedMessage = summary; // Store summary separately
-
-    logger.info(
-      `[ConversationMemory] Summarization complete for session ${session.sessionId}`,
-      {
-        summarizedCount: messagesToSummarize.length,
-        totalMessages: session.messages.length,
-        pointer: session.summarizedUpToMessageId,
-      },
-    );
-  }
-
-  /**
-   * Find split index to keep recent messages within target token count
-   */
-  private async findSplitIndexByTokens(
-    messages: ChatMessage[],
-    targetRecentTokens: number,
-  ): Promise<number> {
-    let recentTokens = 0;
-    let splitIndex = messages.length;
-
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msgTokens = TokenUtils.estimateTokenCount(messages[i].content);
-
-      if (recentTokens + msgTokens > targetRecentTokens) {
-        splitIndex = i + 1;
-        break;
-      }
-
-      recentTokens += msgTokens;
-    }
-
-    // To ensure at least one message is summarized
-    return Math.max(1, splitIndex);
   }
 
   private async ensureInitialized(): Promise<void> {
@@ -404,8 +421,13 @@ export class ConversationMemoryManager {
     await this.ensureInitialized();
 
     const sessions = Array.from(this.sessions.values());
+    // Pinned skill messages are extra rows inside a turn — exclude them so
+    // a skill-activating turn still counts as one turn.
     const totalTurns = sessions.reduce(
-      (sum, session) => sum + session.messages.length / MESSAGES_PER_TURN,
+      (sum, session) =>
+        sum +
+        session.messages.filter((msg) => !msg.metadata?.isSkill).length /
+          MESSAGES_PER_TURN,
       0,
     );
 
@@ -415,19 +437,241 @@ export class ConversationMemoryManager {
     };
   }
 
-  public async clearSession(sessionId: string): Promise<boolean> {
-    const session = this.sessions.get(sessionId);
-    if (!session) {
-      return false;
+  /**
+   * List all sessions with metadata
+   * @param userId - Optional user ID to filter sessions
+   * @returns Array of session list items with metadata
+   */
+  public async listSessions(userId?: string): Promise<SessionListItem[]> {
+    await this.ensureInitialized();
+
+    const sessions = Array.from(this.sessions.values());
+    const now = Date.now();
+
+    return sessions
+      .filter((session) => !userId || session.userId === userId)
+      .map((session) => {
+        const lastActive = this.formatTimeAgo(now - session.lastActivity);
+        return {
+          id: session.sessionId,
+          title: session.sessionId, // In-memory doesn't store title, use sessionId
+          createdAt: new Date(session.createdAt).toISOString(),
+          updatedAt: new Date(session.lastActivity).toISOString(),
+          userId: session.userId,
+          messageCount: session.messages.length,
+          lastActive,
+        };
+      })
+      .sort(
+        (a, b) =>
+          new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
+      );
+  }
+
+  /**
+   * Format milliseconds into human-readable time ago string
+   */
+  private formatTimeAgo(ms: number): string {
+    const seconds = Math.floor(ms / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const hours = Math.floor(minutes / 60);
+    const days = Math.floor(hours / 24);
+
+    if (days > 0) {
+      return `${days} day${days > 1 ? "s" : ""} ago`;
     }
-    this.sessions.delete(sessionId);
-    logger.info("Session cleared", { sessionId });
-    return true;
+    if (hours > 0) {
+      return `${hours} hour${hours > 1 ? "s" : ""} ago`;
+    }
+    if (minutes > 0) {
+      return `${minutes} minute${minutes > 1 ? "s" : ""} ago`;
+    }
+    return "just now";
+  }
+
+  public async clearSession(sessionId: string): Promise<boolean> {
+    return withSpan(
+      {
+        name: "memory.clear",
+        tracer: tracers.memory,
+        attributes: {
+          "memory.type": "in-memory",
+          "session.id": sessionId,
+          "memory.operation": "clear_session",
+        },
+      },
+      async (span) => {
+        const session = this.sessions.get(sessionId);
+        if (!session) {
+          span.setAttribute("memory.session_found", false);
+          return false;
+        }
+        this.sessions.delete(sessionId);
+        span.setAttribute("memory.session_found", true);
+        logger.info("Session cleared", { sessionId });
+        return true;
+      },
+    );
   }
 
   public async clearAllSessions(): Promise<void> {
     const sessionIds = Array.from(this.sessions.keys());
     this.sessions.clear();
     logger.info("All sessions cleared", { clearedCount: sessionIds.length });
+  }
+
+  /**
+   * Get the raw messages array for a session.
+   * Returns the full messages list without context filtering or summarization.
+   * Returns a deep copy to prevent external mutation of internal state.
+   */
+  async getSessionMessages(
+    sessionId: string,
+    _userId?: string,
+  ): Promise<ChatMessage[]> {
+    await this.ensureInitialized();
+    const session = this.sessions.get(sessionId);
+    return session ? session.messages.map((msg) => ({ ...msg })) : [];
+  }
+
+  /**
+   * Replace the entire messages array for a session.
+   * Creates the session if it does not exist.
+   * Resets summary pointers since old pointers may reference messages that no longer exist.
+   */
+  async setSessionMessages(
+    sessionId: string,
+    messages: ChatMessage[],
+    userId?: string,
+  ): Promise<void> {
+    await this.ensureInitialized();
+    let session = this.sessions.get(sessionId);
+    if (!session) {
+      session = this.createNewSession(sessionId, userId);
+      this.sessions.set(sessionId, session);
+      this.enforceSessionLimit();
+    }
+    session.messages = [...messages];
+    session.summarizedUpToMessageId = undefined;
+    session.summarizedMessage = undefined;
+    session.lastTokenCount = undefined;
+    session.lastCountedAt = undefined;
+    session.lastActivity = Date.now();
+  }
+
+  /**
+   * Persist a step's tool calls and results as `tool_call` / `tool_result`
+   * messages, mirroring the Redis manager.
+   *
+   * Parity fix: this used to exist only on the Redis backend, so an in-memory
+   * session never turned tool activity into messages and every downstream path
+   * that reasons about tool batches (compaction, pruning, pair repair) saw a
+   * different history shape depending on `STORAGE_TYPE`.
+   *
+   * Calls are written before results — the same order the Redis flush uses —
+   * and `toolCallId` is carried on BOTH sides so `repairToolPairs` can match by
+   * id rather than adjacency (a parallel batch has no positional pairing).
+   */
+  async storeToolExecution(
+    sessionId: string,
+    userId: string | undefined,
+    toolCalls: Array<{
+      toolCallId?: string;
+      toolName?: string;
+      args?: Record<string, unknown>;
+      [key: string]: unknown;
+    }>,
+    toolResults: Array<{
+      toolCallId?: string;
+      output?: unknown;
+      result?: unknown;
+      error?: string;
+      [key: string]: unknown;
+    }>,
+    currentTime?: Date,
+  ): Promise<void> {
+    await this.ensureInitialized();
+
+    let session = this.sessions.get(sessionId);
+    if (!session) {
+      session = this.createNewSession(sessionId, userId);
+      this.sessions.set(sessionId, session);
+      this.enforceSessionLimit();
+    }
+
+    const timestamp = (currentTime ?? new Date()).toISOString();
+    const toolNameById = new Map<string, string>();
+
+    for (const toolCall of toolCalls ?? []) {
+      const toolCallId = toolCall.toolCallId ?? "";
+      const toolName = toolCall.toolName ?? "unknown";
+      if (toolCallId) {
+        toolNameById.set(toolCallId, toolName);
+      }
+      const callStepIndex = toolCall.stepIndex;
+      session.messages.push({
+        id: randomUUID(),
+        role: "tool_call",
+        content: "", // Tool calls carry their payload in `args`, not content.
+        tool: toolName,
+        ...(toolCallId ? { toolCallId } : {}),
+        args: (toolCall.args ?? {}) as Record<string, unknown>,
+        // Zero-based loop step, so replay can keep sequential steps apart.
+        ...(typeof callStepIndex === "number"
+          ? { metadata: { stepIndex: callStepIndex } }
+          : {}),
+        timestamp,
+      });
+    }
+
+    for (const toolResult of toolResults ?? []) {
+      const toolCallId = toolResult.toolCallId ?? "";
+      const toolName =
+        (toolCallId ? toolNameById.get(toolCallId) : undefined) ??
+        String(toolResult.toolName ?? "unknown");
+      const rawOutput =
+        "output" in toolResult ? toolResult.output : toolResult.result;
+      let content: string;
+      if (typeof rawOutput === "string") {
+        content = rawOutput;
+      } else {
+        try {
+          content = JSON.stringify(rawOutput ?? null) ?? "null";
+        } catch (error) {
+          content = `[Serialization failed: ${
+            error instanceof Error ? error.message : String(error)
+          }]`;
+        }
+      }
+      // A result the tool RETURNED with `isError: true` (a thrown error that
+      // neurolink.executeTool converted, a breaker refusal, an MCP failure)
+      // is a failure too; recording it as success made the next turn's
+      // replay say "→ ok" for a call that failed.
+      const error =
+        toolResult.error !== undefined && toolResult.error !== null
+          ? String(toolResult.error)
+          : extractIsErrorText(rawOutput);
+      const stepIndex = toolResult.stepIndex;
+      session.messages.push({
+        id: randomUUID(),
+        role: "tool_result",
+        content,
+        tool: toolName,
+        ...(toolCallId ? { toolCallId } : {}),
+        result: {
+          success: error === undefined,
+          ...(error !== undefined ? { error } : {}),
+        },
+        ...(typeof stepIndex === "number" ? { metadata: { stepIndex } } : {}),
+        timestamp,
+      });
+    }
+
+    session.lastActivity = Date.now();
+  }
+
+  /** Close/shutdown — no-op for in-memory manager (no external connections to release) */
+  async close(): Promise<void> {
+    // In-memory manager has nothing to close
   }
 }

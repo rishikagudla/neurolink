@@ -1,5 +1,3 @@
-#!/usr/bin/env sh
-. "$(dirname -- "$0")/_/husky.sh"
 
 # Validate commit message format
-node scripts/commit-validation.cjs
+pnpm exec tsx scripts/commit-validation.ts

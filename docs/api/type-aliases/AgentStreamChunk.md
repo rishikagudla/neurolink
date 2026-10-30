@@ -1,0 +1,155 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / AgentStreamChunk
+
+# Type Alias: AgentStreamChunk
+
+> **AgentStreamChunk** = `object`
+
+Agent stream chunk
+
+## Properties
+
+### cost?
+
+> `optional` **cost?**: `number`
+
+SDK cost estimate in USD (for complete chunks), when priced.
+
+---
+
+### type
+
+> **type**: [`AgentStreamChunkType`](AgentStreamChunkType.md)
+
+Chunk type
+
+---
+
+### agentId
+
+> **agentId**: `string`
+
+Agent ID
+
+---
+
+### timestamp
+
+> **timestamp**: `number`
+
+Timestamp
+
+---
+
+### traceId
+
+> **traceId**: `string`
+
+Trace ID
+
+---
+
+### content?
+
+> `optional` **content?**: `string`
+
+Content (for text chunks)
+
+---
+
+### isPartial?
+
+> `optional` **isPartial?**: `boolean`
+
+Whether content is partial (for text chunks)
+
+---
+
+### usage?
+
+> `optional` **usage?**: [`TokenUsage`](TokenUsage.md)
+
+Token usage (for complete chunks)
+
+---
+
+### duration?
+
+> `optional` **duration?**: `number`
+
+Duration in ms (for complete chunks)
+
+---
+
+### status?
+
+> `optional` **status?**: [`AgentResult`](AgentResult.md)\[`"status"`\]
+
+Complete-turn status; errors remain failures even after partial text.
+
+---
+
+### toolExecutions?
+
+> `optional` **toolExecutions?**: [`ToolExecutionRecord`](ToolExecutionRecord.md)[]
+
+Final, bounded per-call records in the same shape as AgentResult.
+
+---
+
+### stopReason?
+
+> `optional` **stopReason?**: [`GenerateStopReason`](GenerateStopReason.md)
+
+Terminal reason from the underlying stream.
+
+---
+
+### error?
+
+> `optional` **error?**: `string`
+
+Error message (for error chunks)
+
+---
+
+### toolName?
+
+> `optional` **toolName?**: `string`
+
+Tool name (for tool chunks)
+
+---
+
+### toolCallId?
+
+> `optional` **toolCallId?**: `string`
+
+Tool call ID (for tool chunks)
+
+---
+
+### args?
+
+> `optional` **args?**: `unknown`
+
+Tool arguments (for tool call chunks)
+
+---
+
+### result?
+
+> `optional` **result?**: `unknown`
+
+Tool result (for tool result chunks)
+
+---
+
+### success?
+
+> `optional` **success?**: `boolean`
+
+Whether tool succeeded (for tool result chunks)

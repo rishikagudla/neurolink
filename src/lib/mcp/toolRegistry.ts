@@ -8,22 +8,34 @@ import type {
   ToolResult,
   MCPServerInfo,
   MCPServerCategory,
-} from "../types/mcpTypes.js";
-import type {
   ToolImplementation,
   ToolInfo,
   ExecutionContext,
-} from "../types/tools.js";
-import type { UnknownRecord } from "../types/common.js";
+  FileToolRootPolicy,
+  UnknownRecord,
+  HITLManager,
+} from "../types/index.js";
 import { MCPRegistry } from "./registry.js";
 import { registryLogger } from "../utils/logger.js";
 import { randomUUID } from "crypto";
 import { shouldDisableBuiltinTools } from "../utils/toolUtils.js";
-import { directAgentTools } from "../agent/directTools.js";
+import {
+  createDirectAgentTools,
+  directAgentTools,
+} from "../agent/directTools.js";
+import {
+  boundFileToolRoots,
+  resolveFileToolRootPolicy,
+} from "../utils/fileToolRoots.js";
+import { convertZodToJsonSchema } from "../utils/schemaConversion.js";
 import { detectCategory, createMCPServerInfo } from "../utils/mcpDefaults.js";
 import { FlexibleToolValidator } from "./flexibleToolValidator.js";
-import type { HITLManager } from "../types/hitlTypes.js";
+import { ErrorFactory } from "../utils/errorHandling.js";
+
 import { HITLUserRejectedError, HITLTimeoutError } from "../hitl/hitlErrors.js";
+import { withSpan, tracers, ATTR } from "../telemetry/index.js";
+import { SpanStatusCode } from "@opentelemetry/api";
+import { getAuthContext } from "../auth/authContext.js";
 
 export class MCPToolRegistry extends MCPRegistry {
   private tools: Map<string, ToolInfo> = new Map();
@@ -34,6 +46,10 @@ export class MCPToolRegistry extends MCPRegistry {
   > = new Map();
   private builtInServerInfos: MCPServerInfo[] = []; // DIRECT storage for MCPServerInfo
   private hitlManager?: HITLManager; // Optional HITL manager for safety mechanisms
+  // The owning NeuroLink's file-tool roots, for callers (HTTP tool routes, CLI)
+  // that execute built-in tools on this registry without a bound policy.
+  private fileToolRootResolver: () => FileToolRootPolicy = () =>
+    resolveFileToolRootPolicy({});
 
   constructor() {
     super();
@@ -63,6 +79,31 @@ export class MCPToolRegistry extends MCPRegistry {
   }
 
   /**
+   * Resolve file-tool roots for built-in tools executed on this registry
+   * without a per-call policy. Set by the NeuroLink instance that created it.
+   */
+  setFileToolRootResolver(resolver: () => FileToolRootPolicy): void {
+    this.fileToolRootResolver = resolver;
+  }
+
+  /**
+   * The built-in tool bound to the policy that applies to this execution: one
+   * NeuroLink bound on the context, else this registry's owner's roots.
+   */
+  private directToolFor(
+    toolName: string,
+    fallback: unknown,
+    context?: ExecutionContext,
+  ): unknown {
+    const policy = boundFileToolRoots(context) ?? this.fileToolRootResolver();
+    if (policy.roots === null) {
+      return fallback;
+    }
+    const bound: Record<string, unknown> = createDirectAgentTools(policy);
+    return bound[toolName] ?? fallback;
+  }
+
+  /**
    * Register all direct tools from directAgentTools
    */
   private registerDirectTools(): void {
@@ -78,10 +119,18 @@ export class MCPToolRegistry extends MCPRegistry {
       }
 
       const toolId = `direct.${toolName}`;
+      // Register the tool's real parameter schema (converted from Zod) instead
+      // of a `{}` placeholder — token-budget accounting and tool listings read
+      // this ToolInfo, and an empty schema makes both under-count reality.
+      const inputSchema = convertZodToJsonSchema(
+        (toolDef as { inputSchema?: unknown }).inputSchema as Parameters<
+          typeof convertZodToJsonSchema
+        >[0],
+      ) as ToolInfo["inputSchema"];
       const toolInfo: ToolInfo = {
         name: toolName,
         description: toolDef.description || `Direct tool: ${toolName}`,
-        inputSchema: {},
+        inputSchema,
         serverId: "direct",
         category: detectCategory({ isBuiltIn: true, serverId: "direct" }),
       };
@@ -92,12 +141,14 @@ export class MCPToolRegistry extends MCPRegistry {
           try {
             // Direct tools from AI SDK expect their specific parameter structure
             // Each tool validates its own parameters, so we safely pass them through
-            const result = await (
-              toolDef.execute as (
-                params: unknown,
-                ctx: unknown,
-              ) => Promise<unknown>
-            )(params, {
+            const boundTool = this.directToolFor(
+              toolName,
+              toolDef,
+              context,
+            ) as {
+              execute: (params: unknown, ctx: unknown) => Promise<unknown>;
+            };
+            const result = await boundTool.execute(params, {
               toolCallId: context?.sessionId || "unknown",
               messages: [],
             });
@@ -125,7 +176,7 @@ export class MCPToolRegistry extends MCPRegistry {
           }
         },
         description: toolDef.description,
-        inputSchema: {},
+        inputSchema,
       });
 
       registryLogger.debug(`Registered direct tool: ${toolName} as ${toolId}`);
@@ -214,6 +265,15 @@ export class MCPToolRegistry extends MCPRegistry {
       // For other tools, use fully-qualified serverId.toolName to avoid collisions
       const isCustomTool = serverId.startsWith("custom-tool-");
       const toolId = isCustomTool ? tool.name : `${serverId}.${tool.name}`;
+      const toolTimeoutMs = serverInfo.metadata?.toolTimeoutMs as
+        | number
+        | undefined;
+      const toolMaxRetries = serverInfo.metadata?.toolMaxRetries as
+        | number
+        | undefined;
+      const toolTotalTimeoutMs = serverInfo.metadata?.toolTotalTimeoutMs as
+        | number
+        | undefined;
       const toolInfo = {
         name: tool.name,
         description: tool.description,
@@ -225,6 +285,11 @@ export class MCPToolRegistry extends MCPRegistry {
           serverId: serverInfo.id,
         }),
         permissions: [], // MCPServerInfo.tools doesn't have permissions
+        ...(toolTimeoutMs !== undefined && { timeoutMs: toolTimeoutMs }),
+        ...(toolMaxRetries !== undefined && { maxRetries: toolMaxRetries }),
+        ...(toolTotalTimeoutMs !== undefined && {
+          totalTimeoutMs: toolTotalTimeoutMs,
+        }),
       };
 
       // Register only with fully-qualified toolId to avoid collisions
@@ -242,6 +307,11 @@ export class MCPToolRegistry extends MCPRegistry {
         category: detectCategory({
           existingCategory: serverInfo.metadata?.category,
           serverId: serverInfo.id,
+        }),
+        ...(toolTimeoutMs !== undefined && { timeoutMs: toolTimeoutMs }),
+        ...(toolMaxRetries !== undefined && { maxRetries: toolMaxRetries }),
+        ...(toolTotalTimeoutMs !== undefined && {
+          totalTimeoutMs: toolTotalTimeoutMs,
         }),
       });
 
@@ -300,205 +370,283 @@ export class MCPToolRegistry extends MCPRegistry {
   ): Promise<T> {
     const startTime = Date.now();
 
-    try {
-      registryLogger.info(
-        `🔧 [TOOL_EXECUTION] Starting execution: ${toolName}`,
-        { args, context },
-      );
-
-      // Try to find the tool by fully-qualified name first
-      let tool = this.tools.get(toolName);
-      registryLogger.info(
-        `🔍 [TOOL_LOOKUP] Direct lookup result for '${toolName}':`,
-        !!tool,
-      );
-
-      // If not found, search for tool by name across all entries (for backward compatibility)
-      let toolId = toolName;
-      if (!tool) {
-        for (const [candidateToolId, toolInfo] of this.tools.entries()) {
-          if (toolInfo.name === toolName) {
-            tool = toolInfo;
-            toolId = candidateToolId;
-            break;
-          }
+    // Resolve serverId eagerly for span attributes
+    let preResolvedServerId: string | undefined;
+    const toolEntry = this.tools.get(toolName);
+    if (toolEntry) {
+      preResolvedServerId = toolEntry.serverId;
+    } else {
+      for (const toolInfo of this.tools.values()) {
+        if (toolInfo.name === toolName) {
+          preResolvedServerId = toolInfo.serverId;
+          break;
         }
       }
+    }
 
-      if (!tool) {
-        throw new Error(`Tool '${toolName}' not found in registry`);
-      }
+    return withSpan(
+      {
+        name: "tool.registry.execute",
+        tracer: tracers.mcp,
+        attributes: {
+          "tool.name": toolName,
+          [ATTR.MCP_SERVER_ID]: preResolvedServerId || "builtin",
+          // Registry-level wrapper around the `tool` observation of the same
+          // call: it stays an OpenTelemetry span but is not exported.
+          [ATTR.NL_INTERNAL]: true,
+        },
+      },
+      async (span) => {
+        try {
+          registryLogger.info(
+            `🔧 [TOOL_EXECUTION] Starting execution: ${toolName}`,
+            {
+              hasArgs: args !== undefined,
+              hasContext: context !== undefined,
+              sessionId: context?.sessionId,
+            },
+          );
 
-      // Create execution context if not provided
-      const execContext: ExecutionContext = {
-        sessionId: context?.sessionId || randomUUID(),
-        userId: context?.userId,
-        ...context,
-      };
+          const { tool, toolId } = this.resolveToolExecutionTarget(toolName);
+          if (!tool) {
+            throw new Error(`Tool '${toolName}' not found in registry`);
+          }
 
-      // Get the tool implementation using the resolved toolId
-      const toolImpl = this.toolImplementations.get(toolId);
-      registryLogger.debug(
-        `Looking for tool '${toolName}' (toolId: '${toolId}'), found: ${!!toolImpl}, type: ${typeof toolImpl?.execute}`,
-      );
-      registryLogger.debug(
-        `Available tools:`,
-        Array.from(this.toolImplementations.keys()),
-      );
+          // Classify tool type for observability
+          const serverId = tool.serverId || "unknown";
+          const toolType =
+            serverId === "direct"
+              ? "builtin"
+              : serverId.startsWith("custom-tool-")
+                ? "custom"
+                : "mcp";
+          span.setAttribute("tool.type", toolType);
+          span.setAttribute(ATTR.MCP_SERVER_ID, serverId);
 
-      if (!toolImpl || typeof toolImpl?.execute !== "function") {
-        throw new Error(
-          `Tool '${toolName}' implementation not found or not executable`,
-        );
-      }
+          const execContext = this.createExecutionContext(context);
 
-      // HITL Safety Check: Request confirmation if required
-      let finalArgs = args;
-      if (this.hitlManager && this.hitlManager.isEnabled()) {
-        const requiresConfirmation = this.hitlManager.requiresConfirmation(
-          toolName,
-          args,
-        );
+          // Get the tool implementation using the resolved toolId
+          const toolImpl = this.toolImplementations.get(toolId);
+          registryLogger.debug(
+            `Looking for tool '${toolName}' (toolId: '${toolId}'), found: ${!!toolImpl}, type: ${typeof toolImpl?.execute}`,
+          );
+          registryLogger.debug(
+            `Available tools:`,
+            Array.from(this.toolImplementations.keys()),
+          );
 
-        if (requiresConfirmation) {
-          registryLogger.info(`Tool '${toolName}' requires HITL confirmation`);
+          if (!toolImpl || typeof toolImpl?.execute !== "function") {
+            throw new Error(
+              `Tool '${toolName}' implementation not found or not executable`,
+            );
+          }
 
+          // Capture argument metadata (avoid logging raw values which may contain secrets)
+          let argsStr: string;
           try {
-            const confirmationResult =
-              await this.hitlManager.requestConfirmation(toolName, args, {
+            argsStr = JSON.stringify(args).slice(0, 4096);
+          } catch {
+            argsStr = "[unserializable]";
+          }
+          span.setAttribute("tool.arguments_present", args !== undefined);
+          span.setAttribute("tool.arguments_size", argsStr.length);
+
+          // HITL Safety Check: Request confirmation if required
+          let finalArgs = args;
+          const HITLState = context?.hitlState;
+          if (
+            !HITLState?.triggered &&
+            this.hitlManager &&
+            this.hitlManager.isEnabled()
+          ) {
+            const requiresConfirmation = this.hitlManager.requiresConfirmation(
+              toolName,
+              args,
+            );
+
+            if (requiresConfirmation) {
+              registryLogger.info(
+                `Tool '${toolName}' requires HITL confirmation`,
+              );
+              span.addEvent("tool.hitl_requested");
+
+              try {
+                if (HITLState) {
+                  HITLState.triggered = true;
+                }
+                const confirmationResult =
+                  await this.hitlManager.requestConfirmation(toolName, args, {
+                    serverId: tool.serverId,
+                    sessionId: execContext.sessionId,
+                    userId: execContext.userId,
+                  });
+
+                if (!confirmationResult.approved) {
+                  // User rejected the tool execution
+                  span.addEvent("tool.hitl_rejected");
+                  throw new HITLUserRejectedError(
+                    `Tool execution rejected by user: ${confirmationResult.reason || "No reason provided"}`,
+                    toolName,
+                    confirmationResult.reason,
+                  );
+                }
+
+                span.addEvent("tool.hitl_approved");
+
+                // User approved - use modified arguments if provided
+                if (confirmationResult.modifiedArguments !== undefined) {
+                  finalArgs = confirmationResult.modifiedArguments;
+                  registryLogger.info(
+                    `Tool '${toolName}' arguments modified by user`,
+                  );
+                }
+
+                registryLogger.info(
+                  `Tool '${toolName}' approved for execution (response time: ${confirmationResult.responseTime}ms)`,
+                );
+              } catch (error) {
+                if (error instanceof HITLTimeoutError) {
+                  // Timeout occurred - user didn't respond in time
+                  registryLogger.warn(
+                    `Tool '${toolName}' execution timed out waiting for user confirmation`,
+                  );
+                  throw error;
+                } else if (error instanceof HITLUserRejectedError) {
+                  // User explicitly rejected
+                  registryLogger.info(
+                    `Tool '${toolName}' execution rejected by user`,
+                  );
+                  throw error;
+                } else {
+                  // Other HITL error (configuration, system error, etc.)
+                  registryLogger.error(
+                    `HITL confirmation failed for tool '${toolName}':`,
+                    error,
+                  );
+                  throw new Error(
+                    `HITL confirmation failed: ${error instanceof Error ? error.message : String(error)}`,
+                    { cause: error },
+                  );
+                }
+              }
+            } else {
+              registryLogger.debug(
+                `Tool '${toolName}' does not require HITL confirmation`,
+              );
+            }
+          }
+
+          // Execute the actual tool (with potentially modified arguments)
+          registryLogger.debug(
+            `Executing tool '${toolName}' with args:`,
+            finalArgs,
+          );
+          const toolResult = await toolImpl.execute(finalArgs, execContext);
+
+          // Properly wrap raw results in ToolResult format
+          let result: ToolResult;
+
+          // Check if result is already a ToolResult object
+          if (
+            toolResult &&
+            typeof toolResult === "object" &&
+            "success" in toolResult &&
+            typeof (toolResult as ToolResult).success === "boolean"
+          ) {
+            // Result is already a ToolResult, enhance with metadata
+            const toolResultObj = toolResult as ToolResult;
+            result = {
+              ...toolResultObj,
+              usage: {
+                ...(toolResultObj.usage || {}),
+                executionTime: Date.now() - startTime,
+              },
+              metadata: {
+                ...(toolResultObj.metadata || {}),
+                toolName,
                 serverId: tool.serverId,
                 sessionId: execContext.sessionId,
-                userId: execContext.userId,
-              });
-
-            if (!confirmationResult.approved) {
-              // User rejected the tool execution
-              throw new HITLUserRejectedError(
-                `Tool execution rejected by user: ${confirmationResult.reason || "No reason provided"}`,
+                executionTime: Date.now() - startTime,
+              },
+            };
+          } else {
+            // Result is a raw value, wrap it in ToolResult format
+            result = {
+              success: true,
+              data: toolResult,
+              usage: {
+                executionTime: Date.now() - startTime,
+              },
+              metadata: {
                 toolName,
-                confirmationResult.reason,
-              );
-            }
-
-            // User approved - use modified arguments if provided
-            if (confirmationResult.modifiedArguments !== undefined) {
-              finalArgs = confirmationResult.modifiedArguments;
-              registryLogger.info(
-                `Tool '${toolName}' arguments modified by user`,
-              );
-            }
-
-            registryLogger.info(
-              `Tool '${toolName}' approved for execution (response time: ${confirmationResult.responseTime}ms)`,
-            );
-          } catch (error) {
-            if (error instanceof HITLTimeoutError) {
-              // Timeout occurred - user didn't respond in time
-              registryLogger.warn(
-                `Tool '${toolName}' execution timed out waiting for user confirmation`,
-              );
-              throw error;
-            } else if (error instanceof HITLUserRejectedError) {
-              // User explicitly rejected
-              registryLogger.info(
-                `Tool '${toolName}' execution rejected by user`,
-              );
-              throw error;
-            } else {
-              // Other HITL error (configuration, system error, etc.)
-              registryLogger.error(
-                `HITL confirmation failed for tool '${toolName}':`,
-                error,
-              );
-              throw new Error(
-                `HITL confirmation failed: ${error instanceof Error ? error.message : String(error)}`,
-              );
-            }
+                serverId: tool.serverId,
+                sessionId: execContext.sessionId,
+                executionTime: Date.now() - startTime,
+              },
+            };
           }
-        } else {
+
+          // Update statistics
+          const duration = Date.now() - startTime;
+          this.updateStats(toolName, duration);
+
+          // Record success on span
+          let resultStr: string;
+          try {
+            resultStr = JSON.stringify(result.data) ?? "undefined";
+          } catch {
+            resultStr = "[unserializable]";
+          }
+          span.setAttribute("tool.result_length", resultStr.length);
+          span.setAttribute("tool.success", true);
+
           registryLogger.debug(
-            `Tool '${toolName}' does not require HITL confirmation`,
+            `Tool '${toolName}' executed successfully in ${duration}ms`,
           );
+          return result as T;
+        } catch (error) {
+          registryLogger.error(`Tool execution failed: ${toolName}`, error);
+
+          // Record failure on span
+          span.setAttribute("tool.success", false);
+
+          // Rethrow precondition errors (tool not found, not executable)
+          const errMsg = error instanceof Error ? error.message : String(error);
+          if (
+            errMsg.includes("not found in registry") ||
+            errMsg.includes("not executable")
+          ) {
+            throw error;
+          }
+
+          // Explicitly set ERROR status — we're returning (not throwing) so withSpan
+          // won't automatically detect this as an error (gap T3 fix)
+          span.setStatus({
+            code: SpanStatusCode.ERROR,
+            message: errMsg,
+          });
+          if (error instanceof Error) {
+            span.recordException(error);
+          }
+
+          // Return runtime execution errors in ToolResult format
+          const errorResult = {
+            success: false,
+            data: null,
+            error: error instanceof Error ? error.message : String(error),
+            usage: {
+              executionTime: Date.now() - startTime,
+            },
+            metadata: {
+              toolName,
+              sessionId: context?.sessionId,
+            },
+          } as T;
+
+          return errorResult;
         }
-      }
-
-      // Execute the actual tool (with potentially modified arguments)
-      registryLogger.debug(
-        `Executing tool '${toolName}' with args:`,
-        finalArgs,
-      );
-      const toolResult = await toolImpl.execute(finalArgs, execContext);
-
-      // Properly wrap raw results in ToolResult format
-      let result: ToolResult;
-
-      // Check if result is already a ToolResult object
-      if (
-        toolResult &&
-        typeof toolResult === "object" &&
-        "success" in toolResult &&
-        typeof (toolResult as ToolResult).success === "boolean"
-      ) {
-        // Result is already a ToolResult, enhance with metadata
-        const toolResultObj = toolResult as ToolResult;
-        result = {
-          ...toolResultObj,
-          usage: {
-            ...(toolResultObj.usage || {}),
-            executionTime: Date.now() - startTime,
-          },
-          metadata: {
-            ...(toolResultObj.metadata || {}),
-            toolName,
-            serverId: tool.serverId,
-            sessionId: execContext.sessionId,
-            executionTime: Date.now() - startTime,
-          },
-        };
-      } else {
-        // Result is a raw value, wrap it in ToolResult format
-        result = {
-          success: true,
-          data: toolResult,
-          usage: {
-            executionTime: Date.now() - startTime,
-          },
-          metadata: {
-            toolName,
-            serverId: tool.serverId,
-            sessionId: execContext.sessionId,
-            executionTime: Date.now() - startTime,
-          },
-        };
-      }
-
-      // Update statistics
-      const duration = Date.now() - startTime;
-      this.updateStats(toolName, duration);
-
-      registryLogger.debug(
-        `Tool '${toolName}' executed successfully in ${duration}ms`,
-      );
-      return result as T;
-    } catch (error) {
-      registryLogger.error(`Tool execution failed: ${toolName}`, error);
-
-      // Return error in ToolResult format
-      const errorResult = {
-        success: false,
-        data: null,
-        error: error instanceof Error ? error.message : String(error),
-        usage: {
-          executionTime: Date.now() - startTime,
-        },
-        metadata: {
-          toolName,
-          sessionId: context?.sessionId,
-        },
-      } as T;
-
-      return errorResult;
-    }
+      },
+    );
   }
 
   /**
@@ -593,6 +741,52 @@ export class MCPToolRegistry extends MCPRegistry {
       `Listed ${result.length} unique tools (${filter ? "filtered" : "unfiltered"})`,
     );
     return result;
+  }
+
+  private resolveToolExecutionTarget(toolName: string): {
+    tool: ToolInfo | undefined;
+    toolId: string;
+  } {
+    let tool = this.tools.get(toolName);
+    registryLogger.info(
+      `🔍 [TOOL_LOOKUP] Direct lookup result for '${toolName}':`,
+      !!tool,
+    );
+
+    let toolId = toolName;
+    if (!tool) {
+      const matches = Array.from(this.tools.entries()).filter(
+        ([, toolInfo]) => toolInfo.name === toolName,
+      );
+      if (matches.length > 1) {
+        throw ErrorFactory.toolExecutionFailed(
+          toolName,
+          new Error(
+            `Ambiguous tool name '${toolName}'. Use fully-qualified name 'serverId.${toolName}'.`,
+          ),
+        );
+      }
+      if (matches.length === 1) {
+        [toolId, tool] = matches[0];
+      }
+    }
+
+    return { tool, toolId };
+  }
+
+  private createExecutionContext(context?: ExecutionContext): ExecutionContext {
+    let authUserId: string | undefined;
+    try {
+      authUserId = getAuthContext()?.user?.id;
+    } catch {
+      // Auth context not available — that's fine
+    }
+
+    return {
+      ...context,
+      sessionId: context?.sessionId ?? randomUUID(),
+      userId: context?.userId ?? authUserId,
+    };
   }
 
   /**
@@ -690,6 +884,33 @@ export class MCPToolRegistry extends MCPRegistry {
       }
     }
     return Array.from(uniqueTools.values());
+  }
+
+  /**
+   * NL-001: Get available tools, filtering out those with OPEN circuit breakers.
+   * Returns both the filtered tools and the list of unavailable tool names.
+   */
+  getAvailableTools(
+    circuitBreakers: Map<
+      string,
+      import("../utils/errorHandling.js").CircuitBreaker
+    >,
+  ): { tools: ToolInfo[]; unavailableTools: string[] } {
+    const allTools = Array.from(this.tools.values());
+    const unavailableTools: string[] = [];
+    const tools: ToolInfo[] = [];
+
+    for (const tool of allTools) {
+      const breakerKey = `${tool.serverId || "unknown"}.${tool.name}`;
+      const breaker = circuitBreakers.get(breakerKey);
+      if (breaker && breaker.getState() === "open") {
+        unavailableTools.push(tool.name);
+      } else {
+        tools.push(tool);
+      }
+    }
+
+    return { tools, unavailableTools };
   }
 
   /**
@@ -857,9 +1078,6 @@ export class MCPToolRegistry extends MCPRegistry {
     );
     return removed;
   }
-
-  // TODO: Add FlexibleToolValidator class in next task
-  // This will contain only universal safety checks (empty names, control characters, length limits)
 }
 
 // Create default instance

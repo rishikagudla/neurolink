@@ -14,8 +14,9 @@ keywords: hitl, human in the loop, tool confirmation, safety, approval workflow,
 
 **Why use it**: Prevent costly mistakes and give users control over potentially dangerous AI actions. Think of it as an "Are you sure?" dialog for AI assistant operations.
 
-!!! warning "Security Best Practice"
+:::warning[Security Best Practice]
 Only use HITL for truly risky operations. Overusing confirmation prompts degrades user experience and can lead to "confirmation fatigue" where users approve actions without reading them.
+:::
 
 **Common use cases**:
 
@@ -73,8 +74,13 @@ const neurolink = new NeuroLink({
   },
 });
 
-// (1)! Listen for confirmation requests
-neurolink.on("hitl:confirmation-request", async (event) => {
+// (1)! Reach the SDK's event emitter. NeuroLink does not extend EventEmitter,
+// so there is no neurolink.on() / neurolink.emit().
+const emitter = neurolink.getEventEmitter();
+
+// (2)! Listen for confirmation requests
+emitter.on("hitl:confirmation-request", async (event) => {
+  const receivedAt = Date.now();
   const {
     confirmationId,
     toolName,
@@ -82,7 +88,7 @@ neurolink.on("hitl:confirmation-request", async (event) => {
     timeoutMs,
   } = event.payload;
 
-  // (2)! Show your app's confirmation UI
+  // (3)! Show your app's confirmation UI
   const approved = await showConfirmationDialog({
     action: toolName,
     details: args,
@@ -90,31 +96,31 @@ neurolink.on("hitl:confirmation-request", async (event) => {
     timeoutMs,
   });
 
-  // (3)! Send response back to NeuroLink
-  neurolink.emit("hitl:confirmation-response", {
+  // (4)! Send response back to NeuroLink
+  emitter.emit("hitl:confirmation-response", {
     type: "hitl:confirmation-response",
     payload: {
-      confirmationId, // (4)! Must match the request
+      confirmationId, // Must match the request
       approved, // (5)! User decision
       reason: approved ? undefined : "User denied permission",
       metadata: {
         timestamp: new Date().toISOString(),
-        responseTime: Date.now(), // Track response speed
+        responseTime: Date.now() - receivedAt, // Milliseconds since the request arrived
       },
     },
   });
 });
 
 // (6)! Handle confirmation timeouts
-neurolink.on("hitl:timeout", (event) => {
+emitter.on("hitl:timeout", (event) => {
   console.warn(`Confirmation timed out for ${event.payload.toolName}`);
 });
 ```
 
-1. Event-based confirmation workflow - NeuroLink emits requests, your app handles them
-2. Show confirmation UI with tool details and countdown timer
-3. Respond using event emitter with confirmation ID
-4. Confirmation ID links the response to the specific request
+1. Get the event emitter - `NeuroLink` is not itself an emitter, so requests and responses both go through `getEventEmitter()`
+2. Subscribe to confirmation requests - NeuroLink emits one before running a tool that needs approval
+3. Show your confirmation UI with the tool name, arguments and remaining time
+4. Reply on the same emitter, echoing the request's `confirmationId` so the response is matched to its request
 5. Approval decision determines if tool executes
 6. Optional: Handle cases where user doesn't respond in time
 
@@ -159,21 +165,61 @@ const riskyTool = {
 - **Automatic reset**: Permission flag clears immediately after use
 - **Fail-safe**: Defaults to requiring permission when in doubt
 
+### Built-in tools
+
+HITL applies to the built-in tools (`readFile`, `writeFile`, `listDirectory`,
+`analyzeCSV`, `calculateMath`, `getCurrentTime`, `websearchGrounding` and the
+opt-in `executeBashCommand`) exactly as it applies to tools you register:
+`dangerousActions` keywords and `customRules` are matched against the tool
+name on every model-driven call. Before the 2026-10 security audit fix (finding
+C3) built-in tools bypassed HITL entirely — only tools executed through the
+tool registry were gated — so a
+prompt-injected model could write files or, with the bash tool enabled, run
+shell commands with no confirmation, while the bash tool's own description
+claimed otherwise.
+
+Two built-ins change the machine and are **confirmed on every call while HITL
+is enabled, whatever `dangerousActions` lists**: `writeFile` and
+`executeBashCommand`. To gate them by keywords only, like every other tool,
+set `confirmBuiltinTools: false`:
+
+```typescript
+const neurolink = new NeuroLink({
+  hitl: {
+    enabled: true,
+    dangerousActions: ["delete", "drop"],
+    confirmBuiltinTools: false, // writeFile / executeBashCommand follow the keywords
+  },
+});
+```
+
+A denied built-in call is reported to the model as a failed tool call
+(`Tool execution rejected by user: <reason>`); the model sees the denial and
+can continue without the side effect. A confirmation that returns
+`modifiedArguments` runs the tool with those arguments. The confirmation
+request carries `serverId: "direct"` for a built-in tool.
+
+Per-call tools passed through `generate({ tools })` are the host's own code
+and are not gated by HITL; wrap their `execute` yourself if they need it.
+
 ## API Reference
 
 ### Event Types
 
+All HITL events ride the SDK emitter returned by
+`neurolink.getEventEmitter()`; `emitter` below is that object.
+
 **Confirmation Request Event** (`hitl:confirmation-request`):
 
 ```typescript
-neurolink.on("hitl:confirmation-request", (event) => {
+emitter.on("hitl:confirmation-request", (event) => {
   event.payload: {
     confirmationId: string;      // Unique ID for this request
     toolName: string;            // Tool requiring confirmation
     arguments: unknown;          // Tool parameters for review
     actionType: string;          // Human-readable description
     timeoutMs: number;           // Milliseconds until timeout
-    allowModification: boolean;  // Can user edit arguments?
+    allowModification: boolean;  // Hint for your UI; NeuroLink applies modifiedArguments either way
     metadata: { ... }            // Session/user context
   }
 });
@@ -182,7 +228,7 @@ neurolink.on("hitl:confirmation-request", (event) => {
 **Confirmation Response** (emit from your app):
 
 ```typescript
-neurolink.emit("hitl:confirmation-response", {
+emitter.emit("hitl:confirmation-response", {
   type: "hitl:confirmation-response",
   payload: {
     confirmationId: string;      // Must match request
@@ -200,7 +246,7 @@ neurolink.emit("hitl:confirmation-response", {
 **Timeout Event** (`hitl:timeout`):
 
 ```typescript
-neurolink.on("hitl:timeout", (event) => {
+emitter.on("hitl:timeout", (event) => {
   event.payload: {
     confirmationId: string;
     toolName: string;
@@ -208,8 +254,6 @@ neurolink.on("hitl:timeout", (event) => {
   }
 });
 ```
-
-See [human-in-the-loop.md](../human-in-the-loop.md) for complete technical documentation.
 
 ## Troubleshooting
 
@@ -236,20 +280,23 @@ const tool = {
 
 ```typescript
 // Always respond to confirmation requests with matching ID
-neurolink.on("hitl:confirmation-request", async (event) => {
+const emitter = neurolink.getEventEmitter();
+
+emitter.on("hitl:confirmation-request", async (event) => {
+  const receivedAt = Date.now();
   const { confirmationId } = event.payload; // (1)!
 
   const approved = await showConfirmationDialog(event.payload);
 
   // (2)! Send response with EXACT confirmationId from request
-  neurolink.emit("hitl:confirmation-response", {
+  emitter.emit("hitl:confirmation-response", {
     type: "hitl:confirmation-response",
     payload: {
       confirmationId, // (3)! Must match request exactly
       approved,
       metadata: {
         timestamp: new Date().toISOString(),
-        responseTime: Date.now(),
+        responseTime: Date.now() - receivedAt,
       },
     },
   });
@@ -267,7 +314,9 @@ neurolink.on("hitl:confirmation-request", async (event) => {
 
 ```typescript
 // Set up event listener BEFORE making AI requests
-neurolink.on("hitl:confirmation-request", async (event) => {
+const emitter = neurolink.getEventEmitter();
+
+emitter.on("hitl:confirmation-request", async (event) => {
   // (1)! Show your confirmation UI
   await handleConfirmationPrompt(event);
 });
@@ -283,8 +332,9 @@ const result = await neurolink.generate({
 
 ## Best Practices
 
-!!! tip "Production Recommendation"
+:::tip[Production Recommendation]
 Store user confirmation preferences to avoid repeated prompts for the same action type. For example, if a user approves "delete temporary files" once, cache that preference for similar low-risk deletions in the same session.
+:::
 
 ### For Developers
 
@@ -326,5 +376,3 @@ If upgrading from versions before v7.39.0:
 3. Implement confirmation dialog in your UI
 4. Test with low-risk tools first
 5. Roll out to production gradually
-
-For comprehensive technical documentation, diagrams, and security details, see the [complete HITL guide](../human-in-the-loop.md).

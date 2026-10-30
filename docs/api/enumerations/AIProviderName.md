@@ -1,12 +1,10 @@
-[**NeuroLink API Reference v8.32.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
 [NeuroLink API Reference](../README.md) / AIProviderName
 
 # Enumeration: AIProviderName
-
-Defined in: [constants/enums.ts:8](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/constants/enums.ts#L8)
 
 Supported AI Provider Names
 
@@ -16,15 +14,11 @@ Supported AI Provider Names
 
 > **BEDROCK**: `"bedrock"`
 
-Defined in: [constants/enums.ts:9](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/constants/enums.ts#L9)
-
 ---
 
 ### OPENAI
 
 > **OPENAI**: `"openai"`
-
-Defined in: [constants/enums.ts:10](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/constants/enums.ts#L10)
 
 ---
 
@@ -32,15 +26,11 @@ Defined in: [constants/enums.ts:10](https://github.com/juspay/neurolink/blob/1be
 
 > **OPENAI_COMPATIBLE**: `"openai-compatible"`
 
-Defined in: [constants/enums.ts:11](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/constants/enums.ts#L11)
-
 ---
 
 ### OPENROUTER
 
 > **OPENROUTER**: `"openrouter"`
-
-Defined in: [constants/enums.ts:12](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/constants/enums.ts#L12)
 
 ---
 
@@ -48,15 +38,11 @@ Defined in: [constants/enums.ts:12](https://github.com/juspay/neurolink/blob/1be
 
 > **VERTEX**: `"vertex"`
 
-Defined in: [constants/enums.ts:13](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/constants/enums.ts#L13)
-
 ---
 
 ### ANTHROPIC
 
 > **ANTHROPIC**: `"anthropic"`
-
-Defined in: [constants/enums.ts:14](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/constants/enums.ts#L14)
 
 ---
 
@@ -64,23 +50,11 @@ Defined in: [constants/enums.ts:14](https://github.com/juspay/neurolink/blob/1be
 
 > **AZURE**: `"azure"`
 
-Defined in: [constants/enums.ts:15](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/constants/enums.ts#L15)
-
 ---
 
 ### GOOGLE_AI
 
 > **GOOGLE_AI**: `"google-ai"`
-
-Defined in: [constants/enums.ts:16](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/constants/enums.ts#L16)
-
----
-
-### HUGGINGFACE
-
-> **HUGGINGFACE**: `"huggingface"`
-
-Defined in: [constants/enums.ts:17](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/constants/enums.ts#L17)
 
 ---
 
@@ -88,23 +62,11 @@ Defined in: [constants/enums.ts:17](https://github.com/juspay/neurolink/blob/1be
 
 > **OLLAMA**: `"ollama"`
 
-Defined in: [constants/enums.ts:18](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/constants/enums.ts#L18)
-
----
-
-### MISTRAL
-
-> **MISTRAL**: `"mistral"`
-
-Defined in: [constants/enums.ts:19](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/constants/enums.ts#L19)
-
 ---
 
 ### LITELLM
 
 > **LITELLM**: `"litellm"`
-
-Defined in: [constants/enums.ts:20](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/constants/enums.ts#L20)
 
 ---
 
@@ -112,12 +74,647 @@ Defined in: [constants/enums.ts:20](https://github.com/juspay/neurolink/blob/1be
 
 > **SAGEMAKER**: `"sagemaker"`
 
-Defined in: [constants/enums.ts:21](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/constants/enums.ts#L21)
+---
+
+### NVIDIA_NIM
+
+> **NVIDIA_NIM**: `"nvidia-nim"`
+
+---
+
+### LM_STUDIO
+
+> **LM_STUDIO**: `"lm-studio"`
+
+---
+
+### LLAMACPP
+
+> **LLAMACPP**: `"llamacpp"`
+
+---
+
+### A2AGENT
+
+> **A2AGENT**: `"a2agent"`
+
+---
+
+### ABLITERATION
+
+> **ABLITERATION**: `"abliteration"`
+
+---
+
+### ABOVE_DEV
+
+> **ABOVE_DEV**: `"above-dev"`
+
+---
+
+### AI21
+
+> **AI21**: `"ai21"`
+
+---
+
+### AIAND
+
+> **AIAND**: `"aiand"`
+
+---
+
+### AIHUBMIX
+
+> **AIHUBMIX**: `"aihubmix"`
+
+---
+
+### AIONLABS
+
+> **AIONLABS**: `"aionlabs"`
+
+---
+
+### AMBIENT
+
+> **AMBIENT**: `"ambient"`
+
+---
+
+### API_ROUTE
+
+> **API_ROUTE**: `"api-route"`
+
+---
+
+### ARCEE
+
+> **ARCEE**: `"arcee"`
+
+---
+
+### ATLAS_CLOUD
+
+> **ATLAS_CLOUD**: `"atlas-cloud"`
+
+---
+
+### AVIAN_IO
+
+> **AVIAN_IO**: `"avian-io"`
+
+---
+
+### BAIDU_QIANFAN
+
+> **BAIDU_QIANFAN**: `"baidu-qianfan"`
+
+---
+
+### BASETEN
+
+> **BASETEN**: `"baseten"`
+
+---
+
+### BEE_HEOSSI
+
+> **BEE_HEOSSI**: `"bee-heossi"`
+
+---
+
+### BYTEPLUS_MODELARK
+
+> **BYTEPLUS_MODELARK**: `"byteplus-modelark"`
+
+---
+
+### BYTEZ
+
+> **BYTEZ**: `"bytez"`
+
+---
+
+### CEREBRAS
+
+> **CEREBRAS**: `"cerebras"`
+
+---
+
+### CHARM_HYPER
+
+> **CHARM_HYPER**: `"charm-hyper"`
+
+---
+
+### CHUTES
+
+> **CHUTES**: `"chutes"`
+
+---
+
+### CLOUDFLARE
+
+> **CLOUDFLARE**: `"cloudflare"`
+
+---
+
+### CRUSOE
+
+> **CRUSOE**: `"crusoe"`
+
+---
+
+### DASHSCOPE
+
+> **DASHSCOPE**: `"dashscope"`
+
+---
+
+### DEEPINFRA
+
+> **DEEPINFRA**: `"deepinfra"`
+
+---
+
+### DEEPSEEK
+
+> **DEEPSEEK**: `"deepseek"`
+
+---
+
+### EMPIRIOLABS
+
+> **EMPIRIOLABS**: `"empiriolabs"`
+
+---
+
+### FEATHERLESS_AI
+
+> **FEATHERLESS_AI**: `"featherless-ai"`
+
+---
+
+### FIREWORKS
+
+> **FIREWORKS**: `"fireworks"`
+
+---
+
+### FRIENDLI
+
+> **FRIENDLI**: `"friendli"`
+
+---
+
+### GMICLOUD
+
+> **GMICLOUD**: `"gmicloud"`
+
+---
+
+### GRADIENTAI
+
+> **GRADIENTAI**: `"gradientai"`
+
+---
+
+### GROQ
+
+> **GROQ**: `"groq"`
+
+---
+
+### HETZNER_INFERENCE
+
+> **HETZNER_INFERENCE**: `"hetzner-inference"`
+
+---
+
+### HUGGINGFACE
+
+> **HUGGINGFACE**: `"huggingface"`
+
+---
+
+### INCEPTION_LABS
+
+> **INCEPTION_LABS**: `"inception-labs"`
+
+---
+
+### INCEPTRON
+
+> **INCEPTRON**: `"inceptron"`
+
+---
+
+### INCO
+
+> **INCO**: `"inco"`
+
+---
+
+### INFERENCE_NET
+
+> **INFERENCE_NET**: `"inference-net"`
+
+---
+
+### IO_INTELLIGENCE
+
+> **IO_INTELLIGENCE**: `"io-intelligence"`
+
+---
+
+### KOSCOMPUTE
+
+> **KOSCOMPUTE**: `"koscompute"`
+
+---
+
+### LAYA
+
+> **LAYA**: `"laya"`
+
+---
+
+### LEMONFOX_AI
+
+> **LEMONFOX_AI**: `"lemonfox-ai"`
+
+---
+
+### LILAC
+
+> **LILAC**: `"lilac"`
+
+---
+
+### LLMTECH
+
+> **LLMTECH**: `"llmtech"`
+
+---
+
+### LONGCAT
+
+> **LONGCAT**: `"longcat"`
+
+---
+
+### MANCER
+
+> **MANCER**: `"mancer"`
+
+---
+
+### META_MODEL_API
+
+> **META_MODEL_API**: `"meta-model-api"`
+
+---
+
+### MINIMAX
+
+> **MINIMAX**: `"minimax"`
+
+---
+
+### MISTRAL
+
+> **MISTRAL**: `"mistral"`
+
+---
+
+### MOARK
+
+> **MOARK**: `"moark"`
+
+---
+
+### MODELSCOPE
+
+> **MODELSCOPE**: `"modelscope"`
+
+---
+
+### MOONSHOT_AI
+
+> **MOONSHOT_AI**: `"moonshot-ai"`
+
+---
+
+### MORPH
+
+> **MORPH**: `"morph"`
+
+---
+
+### NAVER_CLOVA_STUDIO
+
+> **NAVER_CLOVA_STUDIO**: `"naver-clova-studio"`
+
+---
+
+### NEBIUS
+
+> **NEBIUS**: `"nebius"`
+
+---
+
+### NEURALWATT
+
+> **NEURALWATT**: `"neuralwatt"`
+
+---
+
+### NOVITA
+
+> **NOVITA**: `"novita"`
+
+---
+
+### OPENAI_DECISIONS
+
+> **OPENAI_DECISIONS**: `"openai-decisions"`
+
+---
+
+### OVHCLOUD
+
+> **OVHCLOUD**: `"ovhcloud"`
+
+---
+
+### PARASAIL
+
+> **PARASAIL**: `"parasail"`
+
+---
+
+### PARETO_INFERENCE
+
+> **PARETO_INFERENCE**: `"pareto-inference"`
+
+---
+
+### PERPLEXITY
+
+> **PERPLEXITY**: `"perplexity"`
+
+---
+
+### POOLSIDE
+
+> **POOLSIDE**: `"poolside"`
+
+---
+
+### PRIME_INTELLECT
+
+> **PRIME_INTELLECT**: `"prime-intellect"`
+
+---
+
+### REKA
+
+> **REKA**: `"reka"`
+
+---
+
+### RUNINFRA
+
+> **RUNINFRA**: `"runinfra"`
+
+---
+
+### SAKANA_AI
+
+> **SAKANA_AI**: `"sakana-ai"`
+
+---
+
+### SAMBANOVA
+
+> **SAMBANOVA**: `"sambanova"`
+
+---
+
+### SARVAM
+
+> **SARVAM**: `"sarvam"`
+
+---
+
+### SCALEDOWN
+
+> **SCALEDOWN**: `"scaledown"`
+
+---
+
+### SCALEWAY
+
+> **SCALEWAY**: `"scaleway"`
+
+---
+
+### SILICONFLOW
+
+> **SILICONFLOW**: `"siliconflow"`
+
+---
+
+### STACKIT
+
+> **STACKIT**: `"stackit"`
+
+---
+
+### STEPFUN
+
+> **STEPFUN**: `"stepfun"`
+
+---
+
+### SUBCONSCIOUS
+
+> **SUBCONSCIOUS**: `"subconscious"`
+
+---
+
+### SUBQ
+
+> **SUBQ**: `"subq"`
+
+---
+
+### SYNTHETIC
+
+> **SYNTHETIC**: `"synthetic"`
+
+---
+
+### TELNYX
+
+> **TELNYX**: `"telnyx"`
+
+---
+
+### THINKING_MACHINES
+
+> **THINKING_MACHINES**: `"thinking-machines"`
+
+---
+
+### TINFOIL
+
+> **TINFOIL**: `"tinfoil"`
+
+---
+
+### TOGETHER_AI
+
+> **TOGETHER_AI**: `"together-ai"`
+
+---
+
+### UMANS_AI
+
+> **UMANS_AI**: `"umans-ai"`
+
+---
+
+### UPSTAGE
+
+> **UPSTAGE**: `"upstage"`
+
+---
+
+### VENICE_AI
+
+> **VENICE_AI**: `"venice-ai"`
+
+---
+
+### VISPARK
+
+> **VISPARK**: `"vispark"`
+
+---
+
+### VULTR_INFERENCE
+
+> **VULTR_INFERENCE**: `"vultr-inference"`
+
+---
+
+### WAFER
+
+> **WAFER**: `"wafer"`
+
+---
+
+### WANDB_INFERENCE
+
+> **WANDB_INFERENCE**: `"wandb-inference"`
+
+---
+
+### XAI
+
+> **XAI**: `"xai"`
+
+---
+
+### XIAOMI_MIMO
+
+> **XIAOMI_MIMO**: `"xiaomi-mimo"`
+
+---
+
+### XOR
+
+> **XOR**: `"xor"`
+
+---
+
+### Z_AI
+
+> **Z_AI**: `"z-ai"`
+
+---
+
+### COHERE
+
+> **COHERE**: `"cohere"`
+
+---
+
+### REPLICATE
+
+> **REPLICATE**: `"replicate"`
+
+---
+
+### VOYAGE
+
+> **VOYAGE**: `"voyage"`
+
+---
+
+### JINA
+
+> **JINA**: `"jina"`
+
+---
+
+### STABILITY
+
+> **STABILITY**: `"stability"`
+
+---
+
+### IDEOGRAM
+
+> **IDEOGRAM**: `"ideogram"`
+
+---
+
+### RECRAFT
+
+> **RECRAFT**: `"recraft"`
+
+---
+
+### TYPESAFE
+
+> **TYPESAFE**: `"typesafe"`
+
+TypeSafe (Jev) — serves the `decide` inference type only.
+
+---
+
+### PERPLEXITY_DECIDER
+
+> **PERPLEXITY_DECIDER**: `"perplexity-decider"`
+
+Perplexity Decisions API (`pplx-decider-v1-27b`) — serves the `decide`
+inference type only. Distinct from `PERPLEXITY`, the Sonar text provider.
+
+---
+
+### CLOUDFLARE_CLEF
+
+> **CLOUDFLARE_CLEF**: `"cloudflare-clef"`
+
+Cloudflare Clef (`@cf/cloudflare/clef`, `@cf/cloudflare/clef-flash`) on
+Workers AI — serves the `decide` inference type only. Distinct from
+`CLOUDFLARE`, the Workers AI text provider.
 
 ---
 
 ### AUTO
 
 > **AUTO**: `"auto"`
-
-Defined in: [constants/enums.ts:22](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/constants/enums.ts#L22)

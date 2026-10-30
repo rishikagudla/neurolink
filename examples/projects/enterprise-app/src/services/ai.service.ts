@@ -1,30 +1,33 @@
 import { NeuroLink } from "@juspay/neurolink";
-import { neurolinkConfig } from "../config/neurolink.config.js";
+import {
+  attachApprovalHandler,
+  neurolinkConfig,
+} from "../config/neurolink.config.js";
 
 /**
  * Message format for conversation context
  */
-export interface ConversationMessage {
+export type ConversationMessage = {
   role: "user" | "assistant" | "system";
   content: string;
-}
+};
 
 /**
  * Options for generate method
  */
-export interface GenerateOptions {
+export type GenerateOptions = {
   provider?: string;
   model?: string;
   maxTokens?: number;
   temperature?: number;
   messages?: ConversationMessage[];
   systemPrompt?: string;
-}
+};
 
 /**
  * Options for stream method
  */
-export interface StreamOptions {
+export type StreamOptions = {
   provider?: string;
   model?: string;
   maxTokens?: number;
@@ -32,20 +35,20 @@ export interface StreamOptions {
   messages?: ConversationMessage[];
   systemPrompt?: string;
   onChunk?: (chunk: string) => void;
-}
+};
 
 /**
  * Options for tool-enabled generation
  */
-export interface ToolGenerateOptions extends GenerateOptions {
+export type ToolGenerateOptions = GenerateOptions & {
   tools: string[];
   maxToolCalls?: number;
-}
+};
 
 /**
  * Result from generate operations
  */
-export interface GenerateResult {
+export type GenerateResult = {
   text: string;
   usage?: {
     promptTokens: number;
@@ -57,7 +60,7 @@ export interface GenerateResult {
     arguments: Record<string, any>;
   }>;
   finishReason?: string;
-}
+};
 
 /**
  * Enterprise AI Service that wraps NeuroLink SDK
@@ -79,6 +82,7 @@ export class AIService {
       model: this.defaultModel,
       ...neurolinkConfig,
     });
+    attachApprovalHandler(this.neurolink);
   }
 
   /**

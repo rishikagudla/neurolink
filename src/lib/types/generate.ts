@@ -1,0 +1,2163 @@
+import type { AIProviderName } from "../constants/enums.js";
+import type { RAGConfig } from "./rag.js";
+import type {
+  KnowledgeGroundingMetadata,
+  KnowledgeRequestScope,
+} from "./knowledge.js";
+import type { SkillsCallOptions } from "./skills.js";
+import type { AnalyticsData, TokenUsage } from "./analytics.js";
+import type { ClaudeLimitSnapshot } from "./subscription.js";
+import type { JsonValue } from "./common.js";
+import type {
+  TerminalAgentModeOption,
+  TerminalAgentModeVersion,
+} from "./agentMode.js";
+import type { NeurolinkTraceContext } from "./observability.js";
+import type { Content, ImageWithAltText } from "./content.js";
+import type {
+  ChatMessage,
+  ConversationMemoryConfig,
+  StreamEventSequence,
+  ToolReplayMode,
+} from "./conversation.js";
+import type { MemoryCallOptions } from "./memory.js";
+import type { EvaluationData } from "./evaluation.js";
+import type {
+  MiddlewareFactoryOptions,
+  OnFinishCallback,
+  OnErrorCallback,
+} from "./middleware.js";
+import type {
+  DirectorModeOptions,
+  DirectorSegment,
+  VideoGenerationResult,
+  VideoOutputOptions,
+} from "./multimodal.js";
+import type { PPTGenerationResult, PPTOutputOptions } from "./ppt.js";
+import type { TTSOptions, TTSResult, TTSSynthesisMode } from "./tts.js";
+import type { STTOptions, STTResult } from "./stt.js";
+import type { AvatarOptions, AvatarResult } from "./avatar.js";
+import type { MusicOptions, MusicResult } from "./music.js";
+import type {
+  StandardRecord,
+  ValidationSchema,
+  ZodUnknownSchema,
+} from "./aliases.js";
+import type { NeurolinkCredentials } from "./providers.js";
+import type {
+  CSVProcessorOptions,
+  VideoProcessorOptions,
+  OfficeProcessorOptions,
+  FileWithMetadata,
+  MultimodalAudioEntry,
+  MultimodalVideoEntry,
+  VisionImageOutputFormat,
+} from "./file.js";
+import type { WorkflowConfig } from "./workflow.js";
+import type { Schema, Tool, ToolChoice } from "./tools.js";
+import type { StepResult, LanguageModel } from "./providers.js";
+import type { ProcessorPipelineConfig } from "./ioProcessor.js";
+import type { AttachmentPolicy } from "./attachments.js";
+
+/**
+ * Generate function options type - Primary method for content generation
+ * Supports multimodal content while maintaining backward compatibility
+ */
+export type GenerateOptions = {
+  /**
+   * Input content for generation. Optional for media-only modes (avatar, music,
+   * video) where all configuration lives in `output`; the SDK synthesises an
+   * empty `input` automatically when this field is omitted.
+   */
+  input?: {
+    /** Prompt text. Optional for media-only modes (avatar, music) that are driven by uploaded files rather than a prompt. */
+    text?: string;
+    /**
+     * Images to include in the request.
+     * Supports simple image data (Buffer, string) or objects with alt text for accessibility.
+     *
+     * @example Simple usage
+     * ```typescript
+     * images: [imageBuffer, "https://example.com/image.jpg"]
+     * ```
+     *
+     * @example With alt text for accessibility
+     * ```typescript
+     * images: [
+     *   { data: imageBuffer, altText: "Product screenshot showing main dashboard" },
+     *   { data: "https://example.com/chart.png", altText: "Sales chart for Q3 2024" }
+     * ]
+     * ```
+     */
+    images?: Array<Buffer | string | ImageWithAltText>;
+    csvFiles?: Array<Buffer | string>; // Explicit CSV files
+    pdfFiles?: Array<Buffer | string>; // Explicit PDF files
+    audioFiles?: Array<Buffer | string>; // Explicit audio files (metadata/transcript extraction)
+    /**
+     * Audio whose bytes should be delivered to the provider, populated during
+     * detection rather than by callers.
+     *
+     * Separate from `audioFiles` above, which is the caller-facing input that
+     * yields a metadata summary. This one carries the decoded bytes forward so
+     * a provider that can actually listen receives the audio instead of a
+     * description of it; providers that cannot fall back to the summary and
+     * this is ignored.
+     */
+    nativeAudioFiles?: MultimodalAudioEntry[];
+    videoFiles?: Array<Buffer | string>; // Explicit video files
+    /**
+     * Video collected during file detection, carried through to a provider
+     * that can watch it. Populated by detection rather than by callers.
+     *
+     * Separate from `videoFiles` above, which is the caller-facing input that
+     * yields a metadata summary plus extracted keyframes. This one carries the
+     * decoded bytes forward so a provider that accepts video receives the clip
+     * itself; providers that cannot fall back to the frames and this is
+     * ignored.
+     */
+    nativeVideoFiles?: MultimodalVideoEntry[];
+    files?: Array<Buffer | string | FileWithMetadata>; // Auto-detect file types
+    content?: Content[]; // Advanced multimodal content
+
+    /**
+     * Director Mode segments. When provided, Director Mode is activated automatically.
+     * Each segment contains its own prompt and image.
+     * Must contain 2-10 segments.
+     */
+    segments?: DirectorSegment[];
+  };
+  /**
+   * Output configuration options
+   *
+   * @example Text output (default)
+   * ```typescript
+   * output: { format: "text" }
+   * ```
+   *
+   * @example Video generation with Veo 3.1
+   * ```typescript
+   * output: {
+   *   mode: "video",
+   *   video: {
+   *     resolution: "1080p",
+   *     length: 8,
+   *     aspectRatio: "16:9",
+   *     audio: true
+   *   }
+   * }
+   * ```
+   */
+  output?: {
+    /** Output format for text generation */
+    format?: "text" | "structured" | "json";
+    /**
+     * Output mode - determines the type of content generated
+     * - "text": Standard text generation (default)
+     * - "video": Video generation using models like Veo 3.1
+     * - "ppt": PowerPoint presentation generation
+     * - "avatar": Talking-head / lip-sync video (D-ID, HeyGen, Replicate-MuseTalk)
+     * - "music": Music / sound generation (Beatoven, ElevenLabs Music, Lyria, Replicate)
+     */
+    mode?: "text" | "video" | "ppt" | "avatar" | "music";
+    /**
+     * Video generation configuration (used when mode is "video")
+     * Requires an input image and text prompt
+     */
+    video?: VideoOutputOptions;
+    /**
+     * PowerPoint generation configuration (used when mode is "ppt")
+     * Generates slides based on text prompt
+     */
+    ppt?: PPTOutputOptions;
+    /**
+     * Director Mode configuration (only used when input.segments is provided)
+     * Controls transition prompts, durations, and concurrency.
+     */
+    director?: DirectorModeOptions;
+    /**
+     * Avatar generation configuration (used when mode is "avatar")
+     * Combines a portrait image with audio (or text via TTS) to produce
+     * a lip-synced talking-head video.
+     */
+    avatar?: AvatarOptions;
+    /**
+     * Music generation configuration (used when mode is "music")
+     * Generates music / sound from a text prompt.
+     */
+    music?: MusicOptions;
+  };
+
+  // CSV processing options (#379: reference the canonical shape so new fields
+  // like parseTimeoutMs/encoding/sanitizeColumnNames reach the public API).
+  csvOptions?: CSVProcessorOptions;
+
+  /**
+   * Office document processing options. Currently consumed by the XLSX path
+   * (`sheetName`, `formatStyle`); see OfficeProcessorOptions.
+   */
+  officeOptions?: OfficeProcessorOptions;
+
+  /** PDF processing options (#258). */
+  pdfOptions?: {
+    /** Password for an encrypted PDF (image-conversion fallback path). */
+    password?: string;
+    /** Max rendered-canvas pixels per page (#260 memory guard); oversized pages auto-downscale. */
+    maxCanvasPixels?: number;
+    /**
+     * Render scale for the image fallback used by providers without native PDF
+     * support (#297). Higher is sharper but costs roughly the square in memory
+     * and tokens. Range 0.1-10; defaults to PDF_LIMITS.DEFAULT_SCALE (1.5).
+     */
+    scale?: number;
+    /**
+     * Max pages converted by the image fallback (#297). Pages beyond this are
+     * not sent to the model at all. Defaults to PDF_LIMITS.DEFAULT_MAX_PAGES (20).
+     */
+    maxPages?: number;
+  };
+
+  /**
+   * Options for images that need transcoding before a vision provider can
+   * read them (HEIC, TIFF, BMP, ICO, JPEG 2000, AVIF — see
+   * `adapters/imageFormatSupport.ts`).
+   */
+  imageOptions?: {
+    /**
+     * Transcode target for an incompatible image. Defaults to `"png"` — the
+     * module's own default, unchanged unless a caller opts in here.
+     */
+    outputFormat?: VisionImageOutputFormat;
+  };
+
+  /**
+   * Video processing options — keyframe budget, encoder settings, and
+   * whether to transcribe the clip's spoken audio.
+   *
+   * The canonical shape, rather than a third structurally-identical copy of
+   * it: `StreamOptions` and `TextGenerationOptions` declare the same field,
+   * and the inline copies had already drifted apart in what they documented.
+   */
+  videoOptions?: VideoProcessorOptions;
+
+  /**
+   * Audio transcription options for attached audio files (#413/#440).
+   *
+   * An attached audio file is transcribed automatically when a backend is
+   * configured; this is only needed to override which one, or to help it.
+   * Without it the first configured backend wins, in the order OpenAI
+   * (Whisper), Google, Azure.
+   *
+   * @example Pin a backend and a language
+   * ```typescript
+   * await neurolink.generate({
+   *   input: { text: "Summarise this call", files: ["./call.mp3"] },
+   *   audioOptions: { provider: "openai", language: "en" },
+   * });
+   * ```
+   */
+  audioOptions?: {
+    /**
+     * Transcription backend: "openai" (aliases "whisper", "openai-whisper"),
+     * "google" or "azure". An unavailable or unrecognised choice is never
+     * swapped for another backend: no transcript is produced, and the
+     * selection reason is logged as a warning.
+     */
+    provider?: string;
+    /** Transcription model, e.g. "whisper-1". Backend-specific. */
+    transcriptionModel?: string;
+    /** Language hint, e.g. "en". Improves accuracy on non-English speech. */
+    language?: string;
+    /**
+     * OpenAI/Whisper-only context prompt to bias transcription (proper nouns,
+     * jargon). Ignored by Google and Azure.
+     */
+    prompt?: string;
+  };
+
+  /**
+   * Text-to-Speech (TTS) configuration
+   *
+   * Enable audio generation from the text response. The generated audio will be
+   * returned in the result's `audio` field as a TTSResult object.
+   *
+   * @example Basic TTS
+   * ```typescript
+   * const result = await neurolink.generate({
+   *   input: { text: "Tell me a story" },
+   *   provider: "google-ai",
+   *   tts: { enabled: true, voice: "en-US-Neural2-C" }
+   * });
+   * console.log(result.audio?.buffer); // Audio Buffer
+   * ```
+   *
+   * @example Advanced TTS with options
+   * ```typescript
+   * const result = await neurolink.generate({
+   *   input: { text: "Speak slowly and clearly" },
+   *   provider: "google-ai",
+   *   tts: {
+   *     enabled: true,
+   *     voice: "en-US-Neural2-D",
+   *     speed: 0.8,
+   *     pitch: 2.0,
+   *     format: "mp3",
+   *     quality: "standard"
+   *   }
+   * });
+   * ```
+   */
+  tts?: TTSOptions;
+
+  /**
+   * Speech-to-Text (STT) configuration
+   *
+   * Enable audio transcription. When enabled, the audio provided via `stt.audio`
+   * will be transcribed to text and used as the prompt.
+   *
+   * @example
+   * ```typescript
+   * const neurolink = new NeuroLink();
+   * const result = await neurolink.generate({
+   *   input: { text: "" },
+   *   provider: "openai",
+   *   stt: { enabled: true, provider: "whisper", language: "en-US", audio: audioBuffer }
+   * });
+   * // STT transcribes the audio, result.transcription contains the transcription
+   * ```
+   */
+  stt?: STTOptions & { provider?: string; audio?: Buffer | ArrayBuffer };
+
+  /**
+   * Thinking/reasoning configuration for extended thinking models
+   *
+   * Enables extended thinking capabilities for supported models.
+   *
+   * **Gemini 3 Models** (gemini-3.1-pro-preview, gemini-3-flash-preview):
+   * Use `thinkingLevel` to control reasoning depth:
+   * - `minimal` - Near-zero thinking (Flash only)
+   * - `low` - Fast reasoning for simple tasks
+   * - `medium` - Balanced reasoning/latency
+   * - `high` - Maximum reasoning depth (default for Pro)
+   *
+   * **Anthropic Claude** (claude-3-7-sonnet, etc.):
+   * Use `budgetTokens` to set token budget for thinking.
+   *
+   * @example Gemini 3 with thinking level
+   * ```typescript
+   * const result = await neurolink.generate({
+   *   input: { text: "Solve this complex problem..." },
+   *   provider: "google-ai",
+   *   model: "gemini-3.1-pro-preview",
+   *   thinkingConfig: {
+   *     thinkingLevel: "high"
+   *   }
+   * });
+   * ```
+   *
+   * @example Anthropic with budget tokens
+   * ```typescript
+   * const result = await neurolink.generate({
+   *   input: { text: "Solve this complex math problem..." },
+   *   provider: "anthropic",
+   *   model: "claude-3-7-sonnet-20250219",
+   *   thinkingConfig: {
+   *     enabled: true,
+   *     budgetTokens: 10000
+   *   }
+   * });
+   * ```
+   */
+  thinkingConfig?: {
+    enabled?: boolean;
+    type?: "enabled" | "disabled";
+    /** Token budget for thinking (Anthropic models) */
+    budgetTokens?: number;
+    /** Thinking level for Gemini 3 models: minimal, low, medium, high */
+    thinkingLevel?: "minimal" | "low" | "medium" | "high";
+  };
+
+  // Core options (inherited from TextGenerationOptions)
+  provider?: AIProviderName | string;
+  model?: string;
+  region?: string;
+  temperature?: number;
+  maxTokens?: number;
+  /**
+   * Fraction of the model's context window at which history is compacted for
+   * this request, replacing the 0.8 default. Filled in per request by the
+   * classifier router when a decision provider is configured; always at or
+   * below the default, never above. See `TextGenerationOptions`.
+   */
+  compactionThreshold?: number;
+  /** Top-p (nucleus) sampling parameter. Controls diversity of generated tokens. */
+  topP?: number;
+  /** Top-k sampling parameter. Limits the number of tokens considered. (Google/Gemini models only) */
+  topK?: number;
+  /** Stop sequences that will halt generation when encountered. */
+  stopSequences?: string[];
+  systemPrompt?: string;
+  /**
+   * Opt-in terminal agent mode: prepends Neurolink's versioned autonomous-agent
+   * instructions to `systemPrompt`. Omitted means no change in behaviour.
+   */
+  agentMode?: TerminalAgentModeOption;
+  /**
+   * Zod schema for structured output validation
+   *
+   * @important Google GEMINI limitation (Gemini models only)
+   * Gemini models (Google AI Studio, and Vertex GEMINI models) cannot combine
+   * function calling with schema-enforced structured output — a Gemini API
+   * limitation ("Function calling with a response mime type:
+   * 'application/json' is unsupported"). Vertex CLAUDE models and all other
+   * providers support tools + schema simultaneously.
+   *
+   * You do NOT need to set `disableTools` yourself: when the combination is
+   * impossible, NeuroLink automatically falls back to text-mode JSON coercion
+   * (see `coerceJsonToSchema`), and `disableTools: true` remains available as
+   * an explicit override.
+   *
+   * On the native Anthropic Messages surface (provider "anthropic", including
+   * via a proxy) tools + schema are honored through an internal `final_result`
+   * tool the model calls with the structured answer — invisible to callers: it
+   * never appears in `toolCalls` / `toolExecutions`.
+   *
+   * @example
+   * ```typescript
+   * // ✅ Vertex + Claude: tools AND schema together are fully supported
+   * const result = await neurolink.generate({
+   *   schema: MySchema,
+   *   provider: "vertex",
+   *   model: "claude-sonnet-4-6",
+   * });
+   *
+   * // ✅ Direct Anthropic + tools: schema honored via the final_result tool
+   * const result = await neurolink.generate({
+   *   schema: MySchema,
+   *   provider: "anthropic",
+   * });
+   *
+   * // ✅ Gemini + tools: SDK auto-falls back to coerced text-mode JSON
+   * const result = await neurolink.generate({
+   *   schema: MySchema,
+   *   provider: "google-ai",
+   *   model: "gemini-2.5-pro",
+   * });
+   * ```
+   *
+   * @see https://ai.google.dev/gemini-api/docs/function-calling
+   */
+  schema?: ValidationSchema;
+  tools?: Record<string, Tool>;
+  /**
+   * Filter available tools by name.
+   * Only tools with names in this array will be made available.
+   * Used by dynamic arguments to dynamically select which tools to enable.
+   *
+   * @example
+   * ```typescript
+   * await neurolink.generate({
+   *   input: { text: "Search for information" },
+   *   enabledToolNames: ["websearchGrounding", "readFile"]
+   * });
+   * ```
+   */
+  enabledToolNames?: string[];
+  /**
+   * Request timeout (e.g. 30000, '30s', '2m').
+   *
+   * PER-STEP semantics in agentic loops: on providers that run a native
+   * multi-step tool loop (Vertex Gemini / Vertex Claude), this bounds EACH
+   * model call in the loop, not the whole turn — a tool-heavy turn may run
+   * far longer than this value in total. Size it for the slowest single
+   * step (default 300s), and use `turnTimeoutMs` (or `abortSignal`) for a
+   * total-turn deadline.
+   *
+   * On the AI-SDK loop path (direct Anthropic, litellm, OpenAI-compatible)
+   * the same split holds only when `turnTimeoutMs` is ALSO set: then this
+   * value bounds each model call and `turnTimeoutMs` bounds the turn. With
+   * `turnTimeoutMs` unset, this value bounds the WHOLE turn there (the
+   * pre-existing defensive behavior, kept for backward compatibility).
+   *
+   * When set explicitly, a step timeout is surfaced immediately instead of
+   * burning internal retries/fallbacks that would re-run the same
+   * provider+model with the same doomed budget.
+   */
+  timeout?: number | string;
+  /**
+   * Hard wall-clock cap for the WHOLE agentic turn (all model calls + tool
+   * executions), in milliseconds. When the deadline passes the turn ends
+   * gracefully with `stopReason: "time-limit"` and an honest time message —
+   * never the step-cap text. Unset = no turn-level deadline (the library
+   * imposes no product policy).
+   *
+   * Enforced by the native Vertex loops (Gemini + Claude) AND the AI-SDK
+   * loop path (direct Anthropic, litellm and other OpenAI-compatible
+   * providers). On the AI-SDK path this value also owns the whole-turn hard
+   * abort: when set, `timeout` keeps its per-model-call meaning instead of
+   * bounding the entire loop. An explicit `timeout` also engages the same
+   * wrap-up when `turnTimeoutMs` is unset. Once the wrap-up window begins (see
+   * `wrapupTimeLeadMs`), the loop forcibly sets `toolChoice: "none"` for the
+   * remaining steps — overriding any caller-supplied `toolChoice` or
+   * `prepareStep` tool selection — and appends an honest time message that a
+   * caller's `prepareStep` callback does not observe (it runs before the
+   * wrap-up nudge is applied). An honest partial beats a discarded turn.
+   */
+  turnTimeoutMs?: number;
+  /**
+   * Maximum time with NO progress — no stream chunk received, no tool
+   * execution started or finished, no step started — before the turn ends
+   * with `stopReason: "stalled"`. Catches wedged tools and hung model calls
+   * that a whole-turn deadline would let run to the bitter end.
+   * Unset = disabled.
+   *
+   * Enforced by the native Vertex loops (Gemini + Claude) ONLY. Unlike
+   * `turnTimeoutMs`, the AI-SDK loop path does not implement stall detection,
+   * so setting this on any other provider has no effect — the turn runs until
+   * it finishes, times out some other way, or the caller aborts. The narrower
+   * scope is stated here because the option itself is accepted everywhere:
+   * without this note a caller would reasonably read silence as coverage.
+   */
+  stallTimeoutMs?: number;
+  /**
+   * When the remaining turn time drops below this, a wrap-up nudge rides the
+   * next tool-result turn telling the model to consolidate what it has and
+   * produce its final answer. Defaults to 120_000 when `turnTimeoutMs` is
+   * set; ignored when it is not.
+   *
+   * On the AI-SDK loop path the lead is clamped to a quarter of the turn
+   * budget (so short budgets don't wrap up on step one) and wrap-up steps
+   * run with a forced `toolChoice: "none"` — see `turnTimeoutMs` for the
+   * exact override semantics.
+   */
+  wrapupTimeLeadMs?: number;
+  /**
+   * Per-tool-execution timeout in milliseconds (default 300_000), or `null`
+   * for no bound at all.
+   *
+   * A tool that exceeds it is told to stop — the AbortSignal it was handed is
+   * aborted — and then fails with an error tool_result costing one step, so
+   * the turn continues instead of hanging on a wedged tool. A tool that
+   * ignores its signal keeps running to completion in the background; nothing
+   * here can stop it, and its eventual result is discarded.
+   *
+   * `null` removes the bound and awaits `execute` unguarded, which is what the
+   * native loops did before they had a per-tool timer. It is the way to keep a
+   * legitimately long-running tool, since a finite number is always a ceiling
+   * and `Infinity` silently becomes `setTimeout`'s ~24.9-day cap. The one
+   * combination refused is `null` together with
+   * `executionControl.lifetimeTimeoutMs: null`, which would leave the turn
+   * with no bound anywhere.
+   */
+  toolTimeoutMs?: number | null;
+  /** AbortSignal for external cancellation of the AI call */
+  abortSignal?: AbortSignal;
+  /**
+   * Bounds for the per-call tool execution records surfaced on
+   * `GenerateResult.toolExecutions`. Capture is on by default
+   * (maxResultChars 8192, maxRecords 500); pass larger caps when the caller
+   * needs full result texts.
+   */
+  toolExecutionCapture?: ToolExecutionCaptureOptions;
+  /** Disable the schema-driven tool call repair mechanism (BZ-665). Default: false (repair enabled). */
+  disableToolCallRepair?: boolean;
+  /**
+   * Disable tool execution (including built-in tools)
+   *
+   * Optional with schemas: the tools↔schema exclusion applies only to Google
+   * GEMINI models (Google AI Studio / Vertex Gemini — a Gemini API
+   * limitation), and NeuroLink handles it automatically by falling back to
+   * text-mode JSON coercion. Vertex CLAUDE models support tools + schema
+   * together. Set this only when you explicitly want a tool-free call.
+   *
+   * @example
+   * ```typescript
+   * // Explicit override: schema-only call with no tools at all
+   * await neurolink.generate({
+   *   schema: MySchema,
+   *   provider: "google-ai",
+   *   disableTools: true
+   * });
+   * ```
+   */
+  disableTools?: boolean;
+
+  /** Include only these tools by name (whitelist). If set, only matching tools are available. */
+  toolFilter?: string[];
+
+  /** Exclude these tools by name (blacklist). Applied after toolFilter. */
+  excludeTools?: string[];
+
+  /**
+   * Skip injecting tool schemas into the system prompt.
+   * When true, tools are ONLY passed natively via the provider's `tools` parameter,
+   * avoiding duplicate tool definitions (~30K tokens savings per call).
+   * Default: false (backward compatible — tool schemas are injected into system prompt).
+   */
+  skipToolPromptInjection?: boolean;
+
+  /** Disable tool result caching for this request (overrides global mcp.cache.enabled) */
+  disableToolCache?: boolean;
+
+  /**
+   * Disable NeuroLink's internal fallback for this request: the static
+   * provider-priority walk that runs when no provider was requested, and the
+   * catalog model-fallback walk a provider performs when its model is
+   * rejected as invalid. Callers that own fallback order (a caller-supplied
+   * `providerFallback` / `modelChain`, or a router that retries on its own,
+   * as the Claude proxy does for its streams) set this so an invalid model
+   * or an unavailable provider surfaces as exactly that.
+   * A configured `ModelPool`, `providerFallback` and `modelChain` are the
+   * caller's own fallback and are unaffected. Mirrors the same flag on
+   * `StreamOptions`.
+   */
+  disableInternalFallback?: boolean;
+
+  /** Maximum number of tool execution steps (default: 200) */
+  maxSteps?: number;
+
+  /**
+   * Directories the built-in file tools and bash's `cwd` argument may touch
+   * for this call. Can only narrow the instance's `tools.fileRoots` (or the
+   * working-directory default); a root outside them is rejected before any
+   * model call. An empty array denies all file access.
+   */
+  toolRoots?: string[];
+
+  /**
+   * Tool choice configuration for the generation.
+   * Controls whether and which tools the model must call.
+   *
+   * - `"auto"` (default): the model can choose whether and which tools to call
+   * - `"none"`: no tool calls allowed
+   * - `"required"`: the model must call at least one tool
+   * - `{ type: "tool", toolName: string }`: the model must call the specified tool
+   *
+   * A forced choice (`"required"` or a named tool) is applied only to the
+   * first `toolChoiceSteps` steps of the `maxSteps` loop (default 1) and the
+   * model is then free to answer. Holding a forced choice on every step would
+   * compel a tool call on every step, and the loop would only end when
+   * `maxSteps` ran out. `"auto"` and `"none"` are applied unchanged on every
+   * step. Vertex, Google AI Studio and Bedrock do not honour `toolChoice`.
+   *
+   * A named tool that the request does not declare is not sent, because the
+   * provider would reject the request: a warning is logged and the step uses
+   * `"auto"`.
+   */
+  toolChoice?: ToolChoice<Record<string, Tool>>;
+
+  /**
+   * How many leading steps a forced `toolChoice` (`"required"` or a named
+   * tool) stays in force; from that step on the model chooses (`"auto"`).
+   * A non-negative integer, default 1. `0` never forces. Ignored for
+   * `"auto"` and `"none"`. A `prepareStep` result that names a `toolChoice`
+   * overrides this for that step.
+   */
+  toolChoiceSteps?: number;
+
+  /**
+   * How this request replays the session's stored tool steps
+   * (`tool_call` / `tool_result` rows in `conversationMessages`) into the
+   * prompt: `"full"` (real tool-call / tool-result turns), `"marker"` (a
+   * compact `[called <tool> → ok]` line per call, the default) or `"off"`.
+   * Overrides `conversationMemory.replayToolSteps` for this request.
+   */
+  replayToolSteps?: ToolReplayMode;
+
+  /**
+   * Optional callback that runs before each step in a multi-step generation.
+   *
+   * Honoured field of the result: `toolChoice`, applied to that step only
+   * and taking precedence over `toolChoice` / `toolChoiceSteps`. A named tool
+   * the request does not declare is ignored with a warning, as if the hook had
+   * returned no `toolChoice`.
+   *
+   * Not honoured — accepted for source compatibility with the former Vercel
+   * AI SDK `experimental_prepareStep` shape, but ignored by every native
+   * loop: `model` (the turn's model cannot change mid-loop) and
+   * `experimental_activeTools` (tool visibility is fixed for the turn; use
+   * `toolFilter` / `excludeTools` instead).
+   *
+   * `steps` carries one record per completed step (content, text, tool calls,
+   * tool results, finish reason, usage); `model` is the resolved model id.
+   *
+   * @example Force a specific tool on step 0, then switch to auto:
+   * ```typescript
+   * prepareStep: async ({ stepNumber }) => {
+   *   if (stepNumber === 0) {
+   *     return {
+   *       toolChoice: { type: 'tool', toolName: 'myTool' }
+   *     };
+   *   }
+   *   return { toolChoice: 'auto' };
+   * }
+   * ```
+   */
+  prepareStep?: (options: {
+    steps: StepResult<Record<string, Tool>>[];
+    stepNumber: number;
+    maxSteps: number;
+    model: LanguageModel;
+  }) => PromiseLike<
+    | {
+        model?: LanguageModel;
+        toolChoice?: ToolChoice<Record<string, Tool>>;
+        experimental_activeTools?: string[];
+      }
+    | undefined
+  >;
+
+  // Analytics and Evaluation
+  enableEvaluation?: boolean;
+  enableAnalytics?: boolean;
+  context?: StandardRecord & NeurolinkTraceContext;
+
+  // Domain-aware evaluation
+  evaluationDomain?: string;
+  toolUsageContext?: string;
+  /**
+   * @deprecated Use `conversationMessages` instead. This field uses a simple `{role, content}` shape
+   * that is not consumed by `buildMessagesArray()` — messages passed here will NOT reach the AI model
+   * as proper conversation turns. `conversationMessages` uses the full `ChatMessage` type and is
+   * correctly wired through the entire generate pipeline.
+   */
+  conversationHistory?: Array<{ role: string; content: string }>;
+
+  /**
+   * Previous conversation as a ChatMessage array.
+   * Messages are injected as proper multi-turn conversation history before the current prompt,
+   * so the AI model sees them as real prior exchanges (not text dumped into the prompt).
+   * Used by task continuation mode and available to external callers.
+   */
+  conversationMessages?: ChatMessage[];
+
+  // Factory configuration support
+  factoryConfig?: {
+    domainType?: string;
+    domainConfig?: StandardRecord;
+    enhancementType?:
+      | "domain-configuration"
+      | "streaming-optimization"
+      | "mcp-integration"
+      | "legacy-migration"
+      | "context-conversion";
+    preserveLegacyFields?: boolean;
+    validateDomainData?: boolean;
+  };
+
+  // Streaming configuration support
+  streaming?: {
+    enabled?: boolean;
+    chunkSize?: number;
+    bufferSize?: number;
+    enableProgress?: boolean;
+    fallbackToGenerate?: boolean;
+  };
+
+  // Workflow engine integration
+  workflow?: string; // Use predefined workflow ID
+  workflowConfig?: WorkflowConfig; // Or inline workflow config
+
+  /**
+   * RAG (Retrieval-Augmented Generation) configuration.
+   *
+   * When provided, NeuroLink automatically loads the specified files, chunks them,
+   * generates embeddings, and creates a search tool that the AI model can invoke
+   * on demand to find relevant context before answering.
+   *
+   * @example Basic RAG
+   * ```typescript
+   * const result = await neurolink.generate({
+   *   input: { text: "What is RAG?" },
+   *   provider: "vertex",
+   *   rag: {
+   *     files: ["./docs/guide.md"],
+   *   }
+   * });
+   * ```
+   *
+   * @example Advanced RAG with options
+   * ```typescript
+   * const result = await neurolink.generate({
+   *   input: { text: "Explain chunking strategies" },
+   *   provider: "vertex",
+   *   rag: {
+   *     files: ["./docs/guide.md", "./docs/api.md"],
+   *     strategy: "markdown",
+   *     chunkSize: 512,
+   *     topK: 5,
+   *   }
+   * });
+   * ```
+   */
+  rag?: RAGConfig;
+
+  /**
+   * Maximum budget in USD for this session. When the accumulated cost of all
+   * generate() calls on this NeuroLink instance exceeds this value, subsequent
+   * calls will throw a budget-exceeded error before making the API request.
+   *
+   * @example
+   * ```typescript
+   * const result = await neurolink.generate({
+   *   input: { text: "Summarize this" },
+   *   maxBudgetUsd: 1.00
+   * });
+   * ```
+   */
+  maxBudgetUsd?: number;
+
+  /**
+   * Optional request identifier for observability and log correlation.
+   * When provided, this ID is forwarded to spans, logs, and telemetry so
+   * callers can correlate generation traces back to their own request lifecycle.
+   */
+  requestId?: string;
+
+  /**
+   * File reference registry for on-demand file processing.
+   *
+   * When set, files above the "tiny" size tier (>10KB) will be registered
+   * as lightweight references instead of being fully loaded into the prompt.
+   * The LLM can then access file content on-demand via file tools
+   * (list_attached_files, read_file_section, search_in_file).
+   *
+   * @internal Set by NeuroLink SDK — not typically used directly by consumers.
+   */
+  fileRegistry?: unknown;
+  /**
+   * Resolved attachment policy (roots, URL rules, size cap) the file and URL
+   * loaders apply on this call. Stamped from the instance's `attachments`
+   * config; the environment-derived default applies when absent.
+   *
+   * @internal Set by NeuroLink SDK — not typically used directly by consumers.
+   */
+  attachmentPolicy?: AttachmentPolicy;
+
+  /** Per-call middleware configuration. */
+  middleware?: MiddlewareFactoryOptions;
+
+  /** Callback invoked when generation completes successfully. */
+  onFinish?: OnFinishCallback;
+
+  /** Callback invoked when generation encounters an error. */
+  onError?: OnErrorCallback;
+
+  /** Pre-validated user context for the request */
+  requestContext?: Record<string, unknown>;
+
+  /**
+   * Opt this generation call into the knowledge grounding configured on the
+   * NeuroLink instance. Defaults to `false` when omitted.
+   */
+  useKnowledgeGrounding?: boolean;
+
+  /**
+   * Enabled integrations used to scope knowledge retrieval for this turn.
+   * Used only when `useKnowledgeGrounding` is true and knowledge grounding is
+   * enabled on the NeuroLink instance.
+   */
+  knowledgeContext?: KnowledgeRequestScope;
+
+  /** Raw auth token — validated by configured auth provider */
+  auth?: { token: string };
+
+  /**
+   * Per-provider credential overrides for this request.
+   * Overrides instance-level credentials set in `new NeuroLink({ credentials })`.
+   * Unset providers fall through to instance credentials, then environment variables.
+   */
+  credentials?: NeurolinkCredentials;
+
+  /**
+   * Curator P2-3: per-call fallback callback. Overrides any
+   * instance-level `providerFallback` set on `new NeuroLink({...})`.
+   * Invoked for any error except a genuine caller cancel — i.e. this
+   * call's `abortSignal` fired (network errors, 5xx, timeouts, auth
+   * failures, model-access-denied, and internal watchdog aborts all invoke
+   * it); receives the error unmodified. Return `{ provider, model }` to
+   * retry, `null` to bubble.
+   */
+  providerFallback?: (
+    error: unknown,
+  ) => Promise<{ provider?: string; model?: string } | null>;
+
+  /**
+   * Curator P2-3: per-call ordered model chain. Overrides any
+   * instance-level `modelChain`. Without an explicit `providerFallback`
+   * callback the chain only advances on model-access-denied errors —
+   * other failures (network, 5xx, timeouts) bubble immediately.
+   */
+  modelChain?: string[];
+
+  /**
+   * Per-call memory control.
+   *
+   * Override the global memory SDK behavior for this specific call.
+   * All flags default to `true` when the global memory SDK is enabled.
+   * If the global memory SDK is disabled, these flags have no effect.
+   * Shared with `StreamOptions` — see `MemoryCallOptions`.
+   */
+  memory?: MemoryCallOptions;
+
+  /**
+   * PII detection — scans and optionally redacts PII from input before the LLM call.
+   * @example { enabled: true, action: "redact", detectTypes: ["ssn", "email"] }
+   */
+  piiDetection?: {
+    enabled?: boolean;
+    action?: "redact" | "abort" | "warn";
+    detectTypes?: Array<
+      | "email"
+      | "phone"
+      | "ssn"
+      | "creditCard"
+      | "ipAddress"
+      | "address"
+      | "name"
+      | "dateOfBirth"
+      | "passport"
+      | "driversLicense"
+    >;
+    customPatterns?: RegExp[];
+    allowList?: string[];
+    redactionText?: string;
+  };
+
+  /**
+   * Response validation — validates and optionally transforms the LLM response.
+   * Supports retry-with-feedback when `retryOnFailure: true`.
+   * @example { maxLength: 5000, truncationAction: "truncate", retryOnFailure: true }
+   */
+  responseValidation?: {
+    minLength?: number;
+    maxLength?: number;
+    requiredPhrases?: string[];
+    forbiddenPhrases?: string[];
+    jsonSchema?: Record<string, unknown>;
+    customValidator?: (text: string) => {
+      category: string;
+      severity: "error" | "warning" | "info";
+      message: string;
+    } | null;
+    truncationAction?: "abort" | "retry" | "truncate" | "warn";
+    truncationSuffix?: string;
+    retryOnFailure?: boolean;
+    maxRetries?: number;
+  };
+
+  /** Input validation — validates input text before any processing. */
+  inputValidation?: {
+    trimWhitespace?: boolean;
+    minLength?: number;
+    maxLength?: number;
+    requireContent?: boolean;
+  };
+
+  /**
+   * @deprecated Use `piiDetection`, `responseValidation`, and `inputValidation` instead.
+   */
+  processors?: ProcessorPipelineConfig;
+
+  /**
+   * Per-call skills control. Only effective when the instance was
+   * constructed with `skills.enabled: true`. Lets a call disable the
+   * prompt index, or narrow it by scope/tags. Per-call wins over
+   * instance config.
+   */
+  skills?: SkillsCallOptions;
+};
+
+/**
+ * Represents an additional user whose memory should be included in a generate/stream call.
+ * Allows per-user prompt overrides for different memory condensation strategies
+ * (e.g. personal preferences vs org-level policies).
+ */
+export type AdditionalMemoryUser = {
+  /** The user/owner ID to retrieve or store memory for. */
+  userId: string;
+  /**
+   * Human-readable label used in the formatted memory context.
+   * E.g. "Organization Policy", "Team Context", "User Preferences".
+   * If not provided, defaults to userId.
+   */
+  label?: string;
+  /** Whether to read this user's memory and include in context. Defaults to true. */
+  read?: boolean;
+  /** Whether to write conversation into this user's memory. Defaults to true. */
+  write?: boolean;
+  /**
+   * Custom condensation prompt for this user. Overrides the instance prompt.
+   * Must contain `{{OLD_MEMORY}}` and `{{NEW_CONTENT}}`; a template missing
+   * either is logged and this owner falls back to the instance prompt.
+   */
+  prompt?: string;
+  /** Max words for this user's condensed memory. Overrides the default maxWords. */
+  maxWords?: number;
+};
+
+/**
+ * One real tool invocation captured during an agentic turn.
+ *
+ * Replaces the historical `{name, input, output}` stub on `GenerateResult`:
+ * every record is produced at the actual execution site (AI-SDK loop and the
+ * native Gemini/Anthropic loops alike), so `params`, timing, and error status
+ * reflect what really ran — consumers no longer need proxy "recorder" tools
+ * to observe their own tool traffic.
+ */
+export type ToolExecutionRecord = {
+  /** Tool name as the model called it. */
+  toolName: string;
+  /** Parameters the tool was invoked with, as parsed by the loop. */
+  params: unknown;
+  /**
+   * Serialized tool result (JSON when serializable, else String()), bounded
+   * by `toolExecutionCapture.maxResultChars` (default ~8KB). Truncated text
+   * ends with a `…[truncated N chars]` marker.
+   */
+  resultText: string;
+  /** True when the execution threw or returned an error-shaped result. */
+  isError: boolean;
+  /** Epoch milliseconds when the execution started. */
+  startedAt: number;
+  /** Wall-clock duration of the execution in milliseconds. */
+  durationMs: number;
+};
+
+/**
+ * Bounds for per-call tool execution capture (see `ToolExecutionRecord`).
+ * Capture is ON by default with these caps; raise them when a caller needs
+ * full result texts (e.g. caller-side evidence verification).
+ */
+export type ToolExecutionCaptureOptions = {
+  /** Max serialized result characters kept per record (default 8192). */
+  maxResultChars?: number;
+  /** Max records kept per turn; oldest are dropped first (default 500). */
+  maxRecords?: number;
+  /**
+   * Fire-and-forget per-record callback, invoked as each tool execution
+   * completes. Listener errors — synchronous throws AND async rejections —
+   * are swallowed; they never break the turn. Used by supervisors (e.g. the
+   * isolated-agent runner's waste detection) and callers that stream
+   * evidence as it is gathered.
+   */
+  onRecord?: (record: ToolExecutionRecord) => void | Promise<void>;
+};
+
+/**
+ * Why an agentic turn ended — the discriminator consumers should branch on
+ * instead of sniffing the provider-shaped `finishReason` (whose values are
+ * overloaded: e.g. "tool-calls" historically covered both step-cap exits and
+ * Gemini MALFORMED_FUNCTION_CALL provider errors).
+ *
+ * - `completed` — the model finished on its own (text answer or final_result)
+ * - `step-cap` — the `maxSteps` budget ran out while the model still wanted tools
+ * - `context-cap` — the in-loop context guard stopped the tool loop because the
+ *   accumulated conversation approached the model's context window (and the
+ *   terminal synthesis could not produce an answer); without the guard these
+ *   turns died mid-loop on a provider 400 "prompt is too long"
+ * - `time-limit` — the `turnTimeoutMs` wall-clock deadline passed
+ * - `stalled` — no progress (no chunk, no tool start/finish) for `stallTimeoutMs`
+ * - `aborted` — the caller's `abortSignal` ended the turn
+ * - `provider-error` — the provider/model failed the turn (e.g. persistent
+ *   MALFORMED_FUNCTION_CALL after retry); usually worth a caller-side retry
+ */
+export type GenerateStopReason =
+  | "completed"
+  | "step-cap"
+  | "context-cap"
+  | "time-limit"
+  | "stalled"
+  | "aborted"
+  | "provider-error";
+
+/**
+ * Media generation/processing outputs shared by GenerateResult and
+ * TextGenerationResult. Extracted so both result types intersect (&) this
+ * single definition instead of each declaring its own drifting copy of the
+ * same audio/video/avatar/music/ppt/image/transcription fields.
+ */
+export type MediaGenerationOutputs = {
+  /**
+   * Text-to-Speech audio result
+   *
+   * Contains the generated audio buffer and metadata when TTS is enabled.
+   * Generated by TTSProcessor.synthesize() using the specified provider.
+   *
+   * @example Accessing TTS audio
+   * ```typescript
+   * const result = await neurolink.generate({
+   *   input: { text: "Hello world" },
+   *   provider: "google-ai",
+   *   tts: { enabled: true, voice: "en-US-Neural2-C" }
+   * });
+   *
+   * if (result.audio) {
+   *   console.log(`Audio size: ${result.audio.size} bytes`);
+   *   console.log(`Format: ${result.audio.format}`);
+   *   if (result.audio.duration) {
+   *     console.log(`Duration: ${result.audio.duration}s`);
+   *   }
+   *   if (result.audio.voice) {
+   *     console.log(`Voice: ${result.audio.voice}`);
+   *   }
+   *   // Save or play the audio buffer
+   *   fs.writeFileSync('output.mp3', result.audio.buffer);
+   * }
+   * ```
+   */
+  audio?: TTSResult;
+  /**
+   * What happened during TTS synthesis, including why it failed.
+   *
+   * `generate()` degrades gracefully when synthesis fails: it returns the text
+   * and omits `audio`. Without this field a caller cannot tell a request that
+   * never asked for audio from one whose provider rejected the credentials —
+   * an invalid key produces a silent, indistinguishable absence.
+   *
+   * BaseProvider has always recorded this on EnhancedGenerateResult; it was
+   * declared there but never forwarded by the result builders, so callers
+   * reading it got `undefined`. Same defect the `reasoning` comment in
+   * neurolink.ts describes, on a different field.
+   */
+  ttsMetadata?: TTSMetadata;
+
+  /**
+   * Video generation result
+   *
+   * Contains the generated video buffer and metadata when video mode is enabled.
+   * Present when `output.mode` is set to "video" in GenerateOptions.
+   *
+   * @example Accessing generated video
+   * ```typescript
+   * const result = await neurolink.generate({
+   *   input: { text: "Product showcase", images: [imageBuffer] },
+   *   provider: "vertex",
+   *   model: "veo-3.1",
+   *   output: { mode: "video", video: { resolution: "1080p" } }
+   * });
+   *
+   * if (result.video) {
+   *   fs.writeFileSync('output.mp4', result.video.data);
+   *   console.log(`Duration: ${result.video.metadata?.duration}s`);
+   *   console.log(`Dimensions: ${result.video.metadata?.dimensions?.width}x${result.video.metadata?.dimensions?.height}`);
+   * }
+   * ```
+   */
+  video?: VideoGenerationResult;
+  /**
+   * Avatar (talking-head) generation result (present when output.mode is "avatar")
+   */
+  avatar?: AvatarResult;
+  /**
+   * Music generation result (present when output.mode is "music")
+   */
+  music?: MusicResult;
+  /**
+   * PowerPoint generation result (present when output.mode is "ppt")
+   *
+   * @example
+   * ```typescript
+   * const result = await neurolink.generate({
+   *   input: { text: "Introducing Our New Product" },
+   *   model: "gemini-pro",
+   *   output: { mode: "ppt", ppt: { pages: 10, theme: "modern" } }
+   * });
+   *
+   * if (result.ppt) {
+   *   console.log(`Generated ${result.ppt.totalSlides} slides`);
+   *   console.log(`Saved at: ${result.ppt.filePath}`);
+   * }
+   * ```
+   */
+  ppt?: PPTGenerationResult;
+  /**
+   * Standard format for image generation. `mimeType` is set when the provider
+   * can identify the encoded format (sniffed from the image bytes, e.g.
+   * Recraft returns WebP), so callers do not have to assume PNG.
+   */
+  imageOutput?: { base64: string; mimeType?: string } | null;
+  /** STT transcription result (present when stt.enabled is true and audio input was provided) */
+  transcription?: STTResult;
+};
+
+/**
+ * Generate function result type - Primary output format
+ * Future-ready for multi-modal outputs while maintaining text focus
+ */
+export type GenerateResult = {
+  content: string; // Primary output
+  /** Knowledge-grounding diagnostics for this turn (present only when grounding ran). */
+  knowledge?: KnowledgeGroundingMetadata;
+  /** Terminal agent instructions version applied (present only with `agentMode`). */
+  agentModeVersion?: TerminalAgentModeVersion;
+  /**
+   * Parsed structured object when a `schema` was requested. Populated from
+   * AI-SDK experimental_output, or from text-mode coercion (balanced-scan +
+   * jsonrepair). Prefer this over JSON.parse(content) — it never requires the
+   * caller to re-parse hand-escaped model text.
+   */
+  structuredData?: unknown;
+  outputs?: { text: string }; // Future extensible for multi-modal
+
+  // Provider information
+  provider?: string;
+  model?: string;
+
+  // Finish reason from the AI provider (e.g., "stop", "length", "tool-calls")
+  finishReason?: string;
+
+  /**
+   * Why the agentic turn ended, independent of the provider-shaped
+   * `finishReason`. Populated by the native Vertex loops (Gemini + Claude);
+   * undefined on providers that don't run a native loop — fall back to
+   * `finishReason` heuristics there.
+   */
+  stopReason?: GenerateStopReason;
+  /**
+   * Verbatim provider finish/stop reason for the turn's terminal model call
+   * (e.g. "MALFORMED_FUNCTION_CALL", "MAX_TOKENS", "max_tokens", "tool_use").
+   */
+  rawFinishReason?: string;
+  /** Number of agentic steps (model calls) the turn used. */
+  stepsUsed?: number;
+
+  /**
+   * True when the schema JSON in `content`/`structuredData` was repaired from
+   * malformed model text (jsonrepair ran). The result is still valid JSON.
+   */
+  jsonRepaired?: boolean;
+  /**
+   * True when the schema JSON appears truncated — the model hit the output
+   * token cap (finishReason="length") or the recovered object came from an
+   * unclosed span. `structuredData` may be incomplete; raise `maxTokens`.
+   */
+  jsonTruncated?: boolean;
+
+  // Usage and performance
+  usage?: TokenUsage;
+  responseTime?: number;
+
+  // Tool integration
+  toolCalls?: Array<{
+    toolCallId: string;
+    toolName: string;
+    args: StandardRecord;
+  }>;
+  toolResults?: unknown[]; // Results from tool execution (Vercel AI SDK)
+  toolsUsed?: string[];
+  /**
+   * Real per-call tool execution records captured in the tool loop —
+   * params, bounded serialized result, error flag, and timing per call.
+   * Populated on the AI-SDK loop and the native agentic loops alike.
+   * Bounded by `toolExecutionCapture` (default on, ~8KB per result).
+   */
+  toolExecutions?: ToolExecutionRecord[];
+  enhancedWithTools?: boolean;
+  availableTools?: Array<{
+    name: string;
+    description: string;
+    parameters: StandardRecord;
+  }>;
+
+  // Analytics and evaluation
+  analytics?: AnalyticsData;
+  evaluation?: EvaluationData;
+
+  // Factory enhancement metadata
+  factoryMetadata?: {
+    enhancementApplied: boolean;
+    enhancementType?: string;
+    domainType?: string;
+    processingTime?: number;
+    configurationUsed?: StandardRecord;
+    migrationPerformed?: boolean;
+    legacyFieldsPreserved?: boolean;
+  };
+
+  // Streaming integration metadata
+  streamingMetadata?: {
+    streamingUsed: boolean;
+    fallbackToGenerate?: boolean;
+    chunkCount?: number;
+    streamingDuration?: number;
+    streamId?: string;
+    bufferOptimization?: boolean;
+  };
+
+  // Workflow engine integration data
+  workflow?: {
+    originalResponse: string; // Raw best response before processing
+    processedResponse: string; // After conditioning (currently same as original)
+    ensembleResponses: Array<{
+      provider: string;
+      model: string;
+      content: string;
+      responseTime: number;
+      status: "success" | "failure" | "timeout" | "partial";
+      error?: string;
+    }>;
+    judgeScores?: {
+      scores: Record<string, number>; // 0-100 scale
+      reasoning?: string;
+      selectedModel: string;
+    };
+    selectedModel: string; // Which model was chosen as best
+    metrics: {
+      totalTime: number;
+      ensembleTime: number;
+      judgeTime?: number;
+      conditioningTime?: number;
+    };
+    workflowId: string;
+    workflowName: string;
+  };
+
+  /** Thinking/reasoning text from provider (Anthropic thinking blocks, Gemini thought parts) */
+  reasoning?: string;
+  /** Token count for reasoning content */
+  reasoningTokens?: number;
+
+  // NL-007: Retry metadata for observability
+  retries?: {
+    count: number;
+    errors: Array<{ code: string; message: string }>;
+  };
+
+  /**
+   * Account limit state for this request, parsed from Anthropic's
+   * `anthropic-ratelimit-*` response headers (plus the NeuroLink Claude
+   * proxy's `x-neurolink-*` additions when routed through it).
+   *
+   * Subscription windows report utilization, so headroom is a percentage
+   * (`sessionLeftPct`) rather than an absolute count — Anthropic publishes no
+   * remaining message or token figure for them. API-key accounts do carry
+   * absolute `requestsRemaining` / `tokensRemaining`.
+   */
+  limits?: ClaudeLimitSnapshot;
+} & MediaGenerationOutputs;
+
+/**
+ * Unified options for both generation and streaming
+ * Supports factory patterns and domain configuration
+ */
+export type UnifiedGenerationOptions = GenerateOptions & {
+  // Streaming preference (if enabled, attempts streaming first)
+  preferStreaming?: boolean;
+  streamingFallback?: boolean;
+};
+
+/**
+ * Enhanced provider type with generate method
+ */
+export type EnhancedProvider = {
+  generate(options: GenerateOptions): Promise<GenerateResult>;
+  getName(): string;
+  isAvailable(): Promise<boolean>;
+};
+
+/**
+ * Factory-enhanced provider type
+ * Supports domain configuration and streaming optimizations
+ */
+export type FactoryEnhancedProvider = EnhancedProvider & {
+  generateWithFactory(
+    options: UnifiedGenerationOptions,
+  ): Promise<GenerateResult>;
+  getDomainSupport(): string[];
+  getStreamingCapabilities(): {
+    supportsStreaming: boolean;
+    maxChunkSize: number;
+    bufferOptimizations: boolean;
+  };
+};
+
+/**
+ * Text generation options type (consolidated from core types)
+ * Extended to support video generation mode
+ */
+export type TextGenerationOptions = {
+  prompt?: string;
+  /**
+   * Fraction of the model's context window at which compaction runs for this
+   * request, replacing the 0.8 default.
+   *
+   * A request that needs only the current message does not need the whole
+   * window kept warm for it, and compacting earlier is free; a request that
+   * depends on the entire conversation should compact as late as possible.
+   * When the classifier router runs with a decision model it fills this in
+   * per request — always at or below the default, never above, because a
+   * request that overflows the window fails hard and `ModelPool` records that
+   * failure as a permanent cooldown.
+   */
+  compactionThreshold?: number;
+  /**
+   * Alternative input format for multimodal SDK operations.
+   *
+   * NOTE: This field is only used by the higher-level `generate()` API
+   * (NeuroLink.generate, BaseProvider.generate). Legacy `generateText()`
+   * callers must still use the `prompt` field directly.
+   *
+   * Supports text, images, and other multimodal inputs.
+   */
+  input?: {
+    /** Prompt text. Optional for media-only modes (avatar, music) that are driven by uploaded files rather than a prompt. */
+    text?: string;
+    /**
+     * Images to include in the request.
+     * For video generation, the first image is used as the source frame.
+     */
+    images?: Array<Buffer | string | ImageWithAltText>;
+    pdfFiles?: Array<Buffer | string>; // Support for PDF inputs (for image generation with Vertex AI)
+    /**
+     * CSV files to inline as tabular text, with tool instructions appended.
+     *
+     * Declared here because `processExplicitCsvFiles` has always read it and
+     * the internal `GenerateOptions` has always carried it — it was missing
+     * only from the public type, so callers reaching the shipped behaviour had
+     * to widen the type themselves to do it.
+     */
+    csvFiles?: Array<Buffer | string>;
+    files?: Array<Buffer | string | FileWithMetadata>; // Auto-detect file types (including video for analysis)
+    /** Director Mode segments (2-10). When provided, Director Mode is activated. */
+    segments?: DirectorSegment[];
+  };
+  provider?: AIProviderName;
+  model?: string;
+  region?: string;
+  temperature?: number;
+  maxTokens?: number;
+  /** Top-p (nucleus) sampling parameter. Controls diversity of generated tokens. */
+  topP?: number;
+  /** Top-k sampling parameter. Limits the number of tokens considered. (Google/Gemini models only) */
+  topK?: number;
+  /** Stop sequences that will halt generation when encountered. */
+  stopSequences?: string[];
+  systemPrompt?: string;
+  schema?: ZodUnknownSchema | Schema<unknown>;
+  /**
+   * Output configuration options
+   *
+   * @example Video generation
+   * ```typescript
+   * output: {
+   *   mode: "video",
+   *   video: { resolution: "1080p", length: 8 }
+   * }
+   * ```
+   */
+  output?: {
+    format?: "text" | "structured" | "json";
+    /**
+     * Output mode - determines the type of content generated
+     * - "text": Standard text generation (default)
+     * - "video": Video generation using models like Veo 3.1
+     * - "ppt": PowerPoint presentation generation
+     * - "avatar": Talking-head / lip-sync video (D-ID, HeyGen, Replicate-MuseTalk)
+     * - "music": Music / sound generation (Beatoven, ElevenLabs Music, Lyria, Replicate)
+     */
+    mode?: "text" | "video" | "ppt" | "avatar" | "music";
+    /**
+     * Video generation configuration (used when mode is "video")
+     */
+    video?: VideoOutputOptions;
+    /**
+     * PowerPoint generation configuration (used when mode is "ppt")
+     */
+    ppt?: PPTOutputOptions;
+    /**
+     * Director Mode configuration (only used when input.segments is provided)
+     */
+    director?: DirectorModeOptions;
+    /**
+     * Avatar generation configuration (used when mode is "avatar")
+     */
+    avatar?: AvatarOptions;
+    /**
+     * Music generation configuration (used when mode is "music")
+     */
+    music?: MusicOptions;
+  };
+  tools?: Record<string, Tool>; // Enable MCP tools integration
+  /**
+   * Filter available tools by name.
+   * Only tools with names in this array will be made available.
+   * Used by dynamic arguments to dynamically select which tools to enable.
+   * Merged into `toolFilter` before tool filtering runs.
+   *
+   * @example
+   * ```typescript
+   * await neurolink.generate({
+   *   input: { text: "Search for information" },
+   *   enabledToolNames: ["websearchGrounding", "readFile"]
+   * });
+   * ```
+   */
+  enabledToolNames?: string[];
+  timeout?: number | string; // Optional timeout (e.g., 30000, '30s', '2m', '1h')
+  /** Wall-clock cap for the whole agentic turn (ms). See GenerateOptions.turnTimeoutMs. */
+  turnTimeoutMs?: number;
+  /** Max time with no progress before the turn ends as "stalled" (ms). See GenerateOptions.stallTimeoutMs. */
+  stallTimeoutMs?: number;
+  /** Remaining-time threshold that triggers the wrap-up nudge (ms). See GenerateOptions.wrapupTimeLeadMs. */
+  wrapupTimeLeadMs?: number;
+  /** Per-tool-execution timeout (ms, default 300_000; `null` for no bound). See GenerateOptions.toolTimeoutMs. */
+  toolTimeoutMs?: number | null;
+  /** AbortSignal for external cancellation of the AI call */
+  abortSignal?: AbortSignal;
+  /** Bounds for tool execution capture. See GenerateOptions.toolExecutionCapture. */
+  toolExecutionCapture?: ToolExecutionCaptureOptions;
+  /**
+   * Per-call ToolExecutionRecorder instance riding on the request so provider
+   * loops and result assembly see the same capture state.
+   *
+   * @internal Set by BaseProvider — not for external callers.
+   */
+  toolExecutionRecorder?: unknown;
+  disableTools?: boolean; // Disable tools (tools are enabled by default)
+  /** Disable the schema-driven tool call repair mechanism (BZ-665). Default: false (repair enabled). */
+  disableToolCallRepair?: boolean;
+  maxSteps?: number; // Maximum tool execution steps (default: 200)
+  /** Directories the built-in file tools may touch for this call; see GenerateOptions.toolRoots. */
+  toolRoots?: string[];
+
+  /** Include only these tools by name (whitelist). If set, only matching tools are available. */
+  toolFilter?: string[];
+
+  /** Exclude these tools by name (blacklist). Applied after toolFilter. */
+  excludeTools?: string[];
+
+  /** Disable tool result caching for this request (overrides global mcp.cache.enabled) */
+  disableToolCache?: boolean;
+
+  /**
+   * Caller owns fallback order. Read in two places: `directProviderGeneration`
+   * bounds its static provider-priority walk to one candidate, and
+   * `BaseProvider.generate()` skips the catalog model-fallback walk so an
+   * invalid-model error surfaces as itself. Mapped from
+   * `GenerateOptions.disableInternalFallback`.
+   */
+  disableInternalFallback?: boolean;
+
+  /**
+   * Tool choice configuration for the generation.
+   * Controls whether and which tools the model must call.
+   *
+   * - `"auto"` (default): the model can choose whether and which tools to call
+   * - `"none"`: no tool calls allowed
+   * - `"required"`: the model must call at least one tool
+   * - `{ type: "tool", toolName: string }`: the model must call the specified tool
+   *
+   * A forced choice is applied only to the first `toolChoiceSteps` steps
+   * (default 1); see GenerateOptions.toolChoice.
+   */
+  toolChoice?: ToolChoice<Record<string, Tool>>;
+
+  /** Leading steps a forced `toolChoice` stays in force (default 1). See GenerateOptions.toolChoiceSteps. */
+  toolChoiceSteps?: number;
+
+  /** How stored tool steps are replayed into the prompt. See GenerateOptions.replayToolSteps. */
+  replayToolSteps?: ToolReplayMode;
+
+  /**
+   * Optional callback that runs before each step in a multi-step generation.
+   * Only a returned `toolChoice` is honoured (for that step); `model` and
+   * `experimental_activeTools` are accepted but ignored. See
+   * GenerateOptions.prepareStep.
+   */
+  prepareStep?: (options: {
+    steps: StepResult<Record<string, Tool>>[];
+    stepNumber: number;
+    maxSteps: number;
+    model: LanguageModel;
+  }) => PromiseLike<
+    | {
+        model?: LanguageModel;
+        toolChoice?: ToolChoice<Record<string, Tool>>;
+        experimental_activeTools?: string[];
+      }
+    | undefined
+  >;
+
+  /**
+   * Text-to-Speech (TTS) configuration
+   *
+   * Enable audio generation from text. Behavior depends on `tts.mode`
+   * (explicit) or the legacy `useAiResponse` flag:
+   * - `mode: "direct"` / useAiResponse false or undefined (default): TTS
+   *   synthesizes the input text directly, with no LLM call — `usage` is
+   *   zero and `content` echoes the input. A direct request that also
+   *   carries LLM-shaped options (tools, systemPrompt, messages, schema,
+   *   conversationMemory) logs a warning, since those options have no effect
+   *   in this mode.
+   * - `mode: "response"` / useAiResponse true: TTS synthesizes the
+   *   AI-generated response after generation completes.
+   *
+   * `result.ttsMetadata.mode` reports which one ran. Set `tts.sanitize` to
+   * strip markdown, URLs and emoji before synthesis.
+   *
+   * @example Using input text (default)
+   * ```typescript
+   * const neurolink = new NeuroLink();
+   * const result = await neurolink.generate({
+   *   input: { text: "Hello world" },
+   *   provider: "google-ai",
+   *   tts: { enabled: true, voice: "en-US-Neural2-C" }
+   * });
+   * // TTS synthesizes "Hello world" directly, no AI generation
+   * ```
+   *
+   * @example Using AI response
+   * ```typescript
+   * const neurolink = new NeuroLink();
+   * const result = await neurolink.generate({
+   *   input: { text: "Tell me a joke" },
+   *   provider: "google-ai",
+   *   tts: { enabled: true, useAiResponse: true, voice: "en-US-Neural2-C" }
+   * });
+   * // AI generates the joke, then TTS synthesizes the AI's response
+   * ```
+   */
+  tts?: TTSOptions;
+
+  /**
+   * Speech-to-Text (STT) configuration
+   *
+   * Enable audio transcription. When enabled, the audio provided via `stt.audio`
+   * will be transcribed to text and used as the prompt.
+   *
+   * @example
+   * ```typescript
+   * const neurolink = new NeuroLink();
+   * const result = await neurolink.generate({
+   *   input: { text: "" },
+   *   provider: "openai",
+   *   stt: { enabled: true, provider: "whisper", language: "en-US", audio: audioBuffer }
+   * });
+   * // STT transcribes the audio, result.transcription contains the transcription
+   * ```
+   */
+  stt?: STTOptions & { provider?: string; audio?: Buffer | ArrayBuffer };
+
+  // NEW: Analytics and Evaluation Support
+  enableEvaluation?: boolean; // Default: false - AI quality scoring
+  enableAnalytics?: boolean; // Default: false - Usage tracking
+  context?: Record<string, JsonValue>; // Default: undefined - Custom context
+
+  // NEW: Domain-Aware Evaluation
+  evaluationDomain?: string; // Domain expertise (e.g., "general AI assistant", "D2C analytics expert")
+  toolUsageContext?: string; // Tools/MCPs used in this interaction
+  conversationHistory?: Array<{ role: string; content: string }>; // Previous conversation context
+
+  // NEW: Message Array Support for Conversation Memory
+  conversationMessages?: ChatMessage[]; // Previous conversation as message array
+
+  // NEW: Conversation Memory Configuration
+  conversationMemoryConfig?: Partial<ConversationMemoryConfig>;
+  originalPrompt?: string; // Original prompt for context summarization
+
+  // NEW: Middleware related configs
+  middleware?: MiddlewareFactoryOptions;
+
+  // Lifecycle callbacks. Forwarded from `GenerateOptions.onFinish` /
+  // `GenerateOptions.onError` so non-AI-SDK provider paths (Vertex's
+  // native @google/genai, native Bedrock, Ollama) can still invoke them
+  // — Pipeline A providers ALSO honour these via the AI SDK middleware
+  // wrapper installed by `applyGenerateLifecycleMiddleware`, and the two
+  // wires never both fire because non-AI-SDK paths bypass that wrapper.
+  onFinish?: OnFinishCallback;
+  onError?: OnErrorCallback;
+
+  // NEW: Evaluation Context Parameters
+  expectedOutcome?: string; // Expected outcome for evaluation
+  evaluationCriteria?: string[]; // Criteria for evaluation
+
+  // NEW: CSV Processing Options (#379: canonical shape — see above)
+  csvOptions?: CSVProcessorOptions;
+
+  /**
+   * Video processing options (#478, #433).
+   *
+   * Reconstructed option objects have to carry this the same way they carry
+   * `csvOptions` and `pdfOptions`: the message builder hands it to the
+   * detector, which hands it to `VideoProcessor`, and anything that rebuilds
+   * the options along the way and omits it restores the defaults without
+   * saying so.
+   */
+  videoOptions?: VideoProcessorOptions;
+
+  /**
+   * Office document processing options. Currently consumed by the XLSX path
+   * (`sheetName`, `formatStyle`); see OfficeProcessorOptions.
+   */
+  officeOptions?: OfficeProcessorOptions;
+
+  /** PDF processing options (#258). */
+  pdfOptions?: {
+    /** Password for an encrypted PDF (image-conversion fallback path). */
+    password?: string;
+    /** Max rendered-canvas pixels per page (#260 memory guard); oversized pages auto-downscale. */
+    maxCanvasPixels?: number;
+    /** Render scale for the image fallback (#297); defaults to PDF_LIMITS.DEFAULT_SCALE. */
+    scale?: number;
+    /** Max pages converted by the image fallback (#297); defaults to PDF_LIMITS.DEFAULT_MAX_PAGES. */
+    maxPages?: number;
+  };
+
+  /**
+   * Options for images that need transcoding before a vision provider can
+   * read them (HEIC, TIFF, BMP, ICO, JPEG 2000, AVIF — see
+   * `adapters/imageFormatSupport.ts`). Mirrors `GenerateOptions.imageOptions`;
+   * this is the shape that actually reaches `MessageBuilder` for providers
+   * built on `BaseProvider`.
+   */
+  imageOptions?: {
+    /**
+     * Transcode target for an incompatible image. Defaults to `"png"` — the
+     * module's own default, unchanged unless a caller opts in here.
+     */
+    outputFormat?: VisionImageOutputFormat;
+  };
+
+  /**
+   * Audio transcription options for attached audio files (#413/#440).
+   *
+   * Mirrors `GenerateOptions.audioOptions`; declared here because
+   * `buildGenerateTextOptions` rebuilds options field by field, so anything
+   * missing from this type cannot reach the message builder at all.
+   */
+  audioOptions?: {
+    /** Backend: "openai" (aliases "whisper"), "google" or "azure". */
+    provider?: string;
+    /** Transcription model, e.g. "whisper-1". Backend-specific. */
+    transcriptionModel?: string;
+    /** Language hint, e.g. "en". */
+    language?: string;
+    /** OpenAI/Whisper-only context prompt to bias transcription; ignored by Google and Azure. */
+    prompt?: string;
+  };
+
+  enableSummarization?: boolean; // Enable/disable summarization for this specific request
+
+  /**
+   * File reference registry for on-demand file processing (internal).
+   *
+   * When set, files above the "tiny" size tier (>10KB) will be registered
+   * as lightweight references instead of being fully loaded into the prompt.
+   * The LLM can then access file content on-demand via file tools.
+   *
+   * @internal Set by NeuroLink SDK — not typically used directly by consumers.
+   */
+  fileRegistry?: unknown;
+  /**
+   * Resolved attachment policy (roots, URL rules, size cap) the file and URL
+   * loaders apply on this call. Stamped from the instance's `attachments`
+   * config; the environment-derived default applies when absent.
+   *
+   * @internal Set by NeuroLink SDK — not typically used directly by consumers.
+   */
+  attachmentPolicy?: AttachmentPolicy;
+  /**
+   * Skip injecting tool schemas into the system prompt.
+   * When true, tools are ONLY passed natively via the provider's `tools` parameter,
+   * avoiding duplicate tool definitions (~30K tokens savings per call).
+   * Default: false (backward compatible — tool schemas are injected into system prompt).
+   */
+  skipToolPromptInjection?: boolean;
+
+  /**
+   * ## Extended Thinking Options
+   *
+   * NeuroLink provides multiple ways to configure extended thinking/reasoning.
+   * These options interact as follows:
+   *
+   * ### Option Hierarchy (Priority: thinkingConfig > individual options)
+   *
+   * 1. **`thinkingConfig`** (recommended) - Full configuration object, highest priority
+   * 2. **`thinking`**, **`thinkingBudget`**, **`thinkingLevel`** - Simplified CLI-friendly options
+   *
+   * When both are provided, `thinkingConfig` takes precedence. The simplified options
+   * are automatically merged into `thinkingConfig` internally.
+   *
+   * ### Provider-Specific Behavior
+   *
+   * **Anthropic Claude (claude-3-7-sonnet, etc.):**
+   * - Use `thinkingConfig.budgetTokens` or `thinkingBudget`
+   * - Range: 5000-100000 tokens
+   * - `thinkingLevel` is ignored for Anthropic
+   *
+   * **Google Gemini 2.5 and 3 (gemini-2.5-pro/flash/flash-lite,
+   * gemini-3.1-pro-preview, gemini-3-flash-preview), via `thinkingConfig`:**
+   * - Use `thinkingConfig.thinkingLevel` (the public contract is the same
+   *   `thinkingLevel` lever for the whole Gemini family)
+   * - Levels: minimal, low, medium, high
+   * - `thinkingConfig.budgetTokens` is not read for Gemini — the wire-level
+   *   Vertex/native-SDK request always carries a level-derived value.
+   *   Internally, Gemini 3 sends the vendor's `thinkingLevel` field as-is;
+   *   Gemini 2.5 has no such field (Vertex rejects it with INVALID_ARGUMENT
+   *   "thinking_level not supported by this model") and the requested level
+   *   is translated to the vendor's numeric `thinkingBudget` within that
+   *   model's verified range instead. That translation is an implementation
+   *   detail of the provider — callers keep using `thinkingLevel` either way.
+   *
+   * ### Option Compatibility Matrix
+   *
+   * | Option         | Anthropic | Gemini 2.5 / 3 | Other Providers |
+   * |----------------|-----------|----------------|------------------|
+   * | thinking       | Yes       | Yes            | Ignored          |
+   * | thinkingBudget | Yes       | Ignored        | Ignored          |
+   * | thinkingLevel  | Ignored   | Yes            | Ignored          |
+   * | thinkingConfig | Yes       | Yes            | Ignored          |
+   *
+   * ### Examples
+   *
+   * ```typescript
+   * // Simplified (CLI-friendly) - Anthropic
+   * { thinking: true, thinkingBudget: 10000 }
+   *
+   * // Simplified (CLI-friendly) - Gemini 3
+   * { thinking: true, thinkingLevel: "high" }
+   *
+   * // Full config (recommended for SDK)
+   * { thinkingConfig: { enabled: true, budgetTokens: 10000 } } // Anthropic
+   * { thinkingConfig: { thinkingLevel: "high" } }              // Gemini 3
+   * ```
+   */
+
+  /**
+   * Enable extended thinking capability (simplified option).
+   * Equivalent to `thinkingConfig.enabled = true`.
+   * Works with both Anthropic and Gemini 3 models.
+   */
+  thinking?: boolean;
+
+  /**
+   * Token budget for thinking (Anthropic models only).
+   * Equivalent to `thinkingConfig.budgetTokens`.
+   * Range: 5000-100000 tokens. Ignored for Gemini models.
+   */
+  thinkingBudget?: number;
+
+  /**
+   * Thinking level for Gemini 3 models only.
+   * Equivalent to `thinkingConfig.thinkingLevel`.
+   * - `minimal` - Near-zero thinking (Flash only)
+   * - `low` - Light reasoning
+   * - `medium` - Balanced reasoning/latency
+   * - `high` - Deep reasoning (Pro default)
+   * Ignored for Anthropic models.
+   */
+  thinkingLevel?: "minimal" | "low" | "medium" | "high";
+
+  /**
+   * Full thinking/reasoning configuration (recommended for SDK usage).
+   * Takes precedence over simplified options (thinking, thinkingBudget, thinkingLevel).
+   *
+   * @see Above documentation for provider-specific behavior and option compatibility.
+   */
+  thinkingConfig?: {
+    /** Enable extended thinking. Default: false */
+    enabled?: boolean;
+    /** Explicit enable/disable type. Alternative to `enabled` boolean. */
+    type?: "enabled" | "disabled";
+    /** Token budget for thinking (Anthropic: 5000-100000). Ignored for Gemini. */
+    budgetTokens?: number;
+    /** Thinking level (Gemini 3: minimal|low|medium|high). Ignored for Anthropic. */
+    thinkingLevel?: "minimal" | "low" | "medium" | "high";
+  };
+
+  /**
+   * Per-provider credential overrides for this request.
+   * Overrides instance-level credentials set in `new NeuroLink({ credentials })`.
+   * Unset providers fall through to instance credentials, then environment variables.
+   */
+  credentials?: NeurolinkCredentials;
+
+  /**
+   * Optional request identifier for observability and log correlation.
+   * When provided, this ID is forwarded to spans, logs, and telemetry so
+   * callers can correlate generation traces back to their own request lifecycle.
+   */
+  requestId?: string;
+
+  /** PII detection config — forwarded from GenerateOptions/StreamOptions. */
+  piiDetection?: GenerateOptions["piiDetection"];
+
+  /** Response validation config — forwarded from GenerateOptions/StreamOptions. */
+  responseValidation?: GenerateOptions["responseValidation"];
+
+  /** Input validation config — forwarded from GenerateOptions/StreamOptions. */
+  inputValidation?: GenerateOptions["inputValidation"];
+
+  /** @deprecated Use `piiDetection`, `responseValidation`, `inputValidation` instead. */
+  processors?: ProcessorPipelineConfig;
+};
+
+/**
+ * Text generation result (consolidated from core types)
+ */
+export type TextGenerationResult = {
+  /** Ordered tool and host events persisted with the conversation turn. */
+  events?: StreamEventSequence[];
+  content: string;
+  /** Parsed structured object when a `schema` was requested (see GenerateResult.structuredData). */
+  structuredData?: unknown;
+  finishReason?: string;
+  /** Turn-exit discriminator from native agentic loops (see GenerateStopReason). */
+  stopReason?: GenerateStopReason;
+  /** Verbatim provider finish/stop reason for the turn's terminal model call. */
+  rawFinishReason?: string;
+  /** Number of agentic steps (model calls) the turn used. */
+  stepsUsed?: number;
+  /** True when the schema JSON was repaired from malformed model text. */
+  jsonRepaired?: boolean;
+  /** True when the schema JSON appears truncated (output hit the token cap). */
+  jsonTruncated?: boolean;
+  provider?: string;
+  model?: string;
+  usage?: TokenUsage;
+  responseTime?: number;
+  /** The executed tool calls of a native turn — the same shape `GenerateResult` exposes. */
+  toolCalls?: Array<{
+    toolCallId: string;
+    toolName: string;
+    args: StandardRecord;
+  }>;
+  toolsUsed?: string[];
+  toolExecutions?: Array<{
+    toolName: string;
+    executionTime: number;
+    success: boolean;
+    serverId?: string;
+  }>;
+  enhancedWithTools?: boolean;
+  availableTools?: Array<{
+    name: string;
+    description: string;
+    server: string;
+    category?: string;
+  }>;
+  // Analytics and evaluation data
+  analytics?: AnalyticsData;
+  evaluation?: EvaluationData;
+  /** Gemini 3 thought signature for reasoning continuity across turns */
+  thoughtSignature?: string;
+  /** Thinking/reasoning text from provider (Anthropic thinking blocks, Gemini thought parts, DeepSeek/NIM reasoning_content) */
+  reasoning?: string;
+  /** Token count for reasoning content */
+  reasoningTokens?: number;
+  // NL-007: Retry metadata for observability
+  retries?: {
+    count: number;
+    errors: Array<{ code: string; message: string }>;
+  };
+} & MediaGenerationOutputs;
+
+/**
+ * Enhanced result type with optional analytics/evaluation
+ */
+export type TTSMetadata = {
+  /** Whether TTS synthesis was invoked. False indicates TTS was skipped. */
+  attempted: boolean;
+  /** Whether TTS synthesis completed successfully. */
+  success: boolean;
+  /**
+   * What was synthesized: the input text (`"direct"`) or the model's reply
+   * (`"response"`). Set by `generate()`; `stream()` always synthesizes the
+   * response and reports `"response"` where it records metadata.
+   */
+  mode?: TTSSynthesisMode;
+  /** Structured synthesis error details, present only when synthesis failed. */
+  error?: {
+    code: string;
+    message: string;
+    retriable?: boolean;
+  };
+  /** TTS synthesis time in milliseconds. */
+  latency?: number;
+};
+
+export type EnhancedGenerateResult = GenerateResult & {
+  analytics?: AnalyticsData;
+  evaluation?: EvaluationData;
+  /** Outcome metadata when TTS was enabled for this generation. */
+};
+
+/**
+ * NL-004: Model alias/deprecation configuration.
+ * Allows mapping deprecated model names to their replacements.
+ */
+export type ModelAliasConfig = {
+  aliases: Record<
+    string,
+    {
+      target: string;
+      action: "warn" | "redirect" | "block";
+      reason?: string;
+    }
+  >;
+};
+
+/**
+ * Internal alias used by messageBuilder helpers after the entry-point
+ * (`buildMultimodalMessagesArray`) has guaranteed that `input` is non-null.
+ * All private helper functions that receive post-normalised options should
+ * accept this type to avoid repetitive null checks on every `input.*` access.
+ */
+export type GenerateOptionsNormalized = GenerateOptions & {
+  input: NonNullable<GenerateOptions["input"]>;
+};
+
+/**
+ * The per-step hook shape every native loop calls: the narrowest common form
+ * of the `prepareStep` callbacks declared on GenerateOptions, StreamOptions
+ * and TextGenerationOptions, each of which is assignable to it. The loops
+ * read only `toolChoice` off the result.
+ */
+export type NativeLoopPrepareStep = (options: {
+  steps: StepResult<Record<string, Tool>>[];
+  stepNumber: number;
+  maxSteps: number;
+  model: LanguageModel;
+}) => PromiseLike<
+  { toolChoice?: ToolChoice<Record<string, Tool>> } | undefined
+>;
+
+/**
+ * What `resolveStepToolChoice` needs to decide one step's tool choice.
+ * Shared by the native generate loop and both stream loops so the
+ * `toolChoiceSteps` / `prepareStep` rule cannot drift between them.
+ */
+export type StepToolChoiceInput = {
+  /** The turn's resolved tool choice in NeuroLink shape, or undefined. */
+  base: unknown;
+  /** Zero-based step index. */
+  step: number;
+  toolChoiceSteps?: number;
+  prepareStep?: NativeLoopPrepareStep;
+  /** Records of the steps completed so far, handed to `prepareStep`. */
+  steps: StepResult<Record<string, Tool>>[];
+  maxSteps: number;
+  /** The resolved model id (always a string at runtime), handed to `prepareStep`. */
+  model: string;
+  /** The turn's abort signal; a pending `prepareStep` is released when it fires. */
+  abortSignal?: AbortSignal;
+  /**
+   * The tools this request declares, keyed by SDK-side tool name. When given,
+   * a forced single-tool choice naming a tool outside it is not sent: a
+   * provider answers a request that forces a function its own tools list
+   * lacks with a 400. A loop that re-declares hydrated tools in the same
+   * step (the streaming loops) passes the live record, because discovery
+   * hydrates tools into it between steps; a loop that sends a fixed tools
+   * array (the shared generate loop) passes the names of that array.
+   * Absent means the choice is not checked.
+   */
+  declaredTools?: Readonly<Record<string, unknown>>;
+};
+
+/**
+ * Inputs to the shared native generate loop (`core/nativeGenerateLoop.ts`).
+ * One loop serves every provider whose delegating model exposes a v3-shaped
+ * `doGenerate`; the provider supplies the wire details.
+ */
+export type NativeGenerateLoopArgs = {
+  /** Observed usage for calibrating the next step against the last request. */
+  observeUsage?: (usage: unknown) => void;
+  /**
+   * Per-step context reclaim, called before every model call with the
+   * conversation as it now stands. Return a replacement to have the loop adopt
+   * it, or undefined to leave it untouched. The provider owns this because the
+   * reclaim has to understand its wire shape.
+   */
+  guardConversation?: (
+    conversation: Array<Record<string, unknown>>,
+  ) => Array<Record<string, unknown>> | undefined;
+  doGenerate: (
+    options: Record<string, unknown>,
+  ) => Promise<Record<string, unknown>>;
+  /** Conversation in the message-builder shape each doGenerate converts itself. */
+  conversation: Array<Record<string, unknown>>;
+  /** Tool declarations in the v3 shape doGenerate already knows how to convert. */
+  tools?: Array<Record<string, unknown>>;
+  /**
+   * Registered tools, used to execute a call the model asks for. Typed
+   * `Record<string, Tool>`; it was `Record<string, unknown>` before discovery
+   * learned to declare tools that join it mid-turn, so a caller that builds
+   * this record from loosely typed tools now needs a cast to `Tool`.
+   */
+  toolsRecord: Record<string, Tool>;
+  /**
+   * Builds the declaration for a tool that joined `toolsRecord` mid-turn
+   * (discovery's search_tools loads tools into it). Optional: by default the
+   * loop declares such a tool in the provider-neutral shape every provider's
+   * `doGenerate` converts (`toNativeToolDeclaration`), for every provider that
+   * runs this loop. Set it only to declare in another shape. The loop appends
+   * the declarations to `tools` in place.
+   */
+  declareTool?: (name: string, tool: Tool) => Record<string, unknown>;
+  /** The turn's resolved tool choice, applied per step via `resolveStepToolChoice`. */
+  toolChoice?: unknown;
+  /** Leading steps a forced `toolChoice` stays in force (default 1). */
+  toolChoiceSteps?: number;
+  /** Caller's per-step hook; only its `toolChoice` is honoured. */
+  prepareStep?: NativeLoopPrepareStep;
+  /** Resolved model id, handed to `prepareStep` as its `model` argument. */
+  modelId: string;
+  /** Provider name recorded on each step's generation and used to price it. */
+  provider: string;
+  responseFormat?: Record<string, unknown>;
+  providerOptions?: Record<string, Record<string, unknown>>;
+  maxSteps: number;
+  maxOutputTokens?: number;
+  temperature?: number;
+  abortSignal?: AbortSignal;
+  /** Per-tool-execution cap, forwarded into `guardToolExecutor`. `null` for no bound. */
+  toolTimeoutMs?: number | null;
+  /** Wraps one step: retry ladder plus provider error classification. */
+  runStep: (
+    call: () => Promise<Record<string, unknown>>,
+  ) => Promise<Record<string, unknown>>;
+  /**
+   * Called for a tool call the loop rejects before any execute runs (unknown
+   * tool, arguments the schema rejected), so the provider can emit the
+   * `tool:start` / `tool:end` pair no executor will.
+   */
+  onRejectedToolCall?: (
+    toolName: string,
+    error: string,
+    toolCallId: string,
+  ) => void;
+};
+
+export type NativeGenerateLoopResult = {
+  text: string;
+  /**
+   * Joined reasoning content parts from EVERY step, when the vendor sent any.
+   *
+   * Was final-step-only until the native generate loop began accumulating
+   * across steps; a multi-step turn would otherwise report only the reasoning
+   * that happened after its last tool call.
+   */
+  reasoning?: string;
+  finishReason: string;
+  rawFinishReason?: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  toolsUsed: string[];
+  steps: number;
+};
+
+export type SingleShotRequest = {
+  system?: string;
+  prompt: string;
+  maxOutputTokens?: number;
+  temperature?: number;
+  abortSignal?: AbortSignal;
+};
+
+export type SingleShotResult = {
+  text: string;
+  usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
+  finishReason?: string;
+};

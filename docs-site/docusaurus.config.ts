@@ -9,7 +9,7 @@ import { redirectsPluginConfig } from "./config/redirects";
 const config: Config = {
   title: "NeuroLink",
   tagline:
-    "Enterprise AI Development Platform - Universal provider support, MCP integration, and professional CLI",
+    "Enterprise AI Development Platform - broad provider support, MCP integration, and professional CLI",
   favicon: "img/favicon.svg",
 
   // Production URL - custom domain
@@ -55,11 +55,50 @@ const config: Config = {
       },
     },
     {
-      tagName: "link",
+      tagName: "script",
       attributes: {
-        rel: "stylesheet",
-        href: "https://fonts.googleapis.com/css2?family=Hack:wght@400;700&display=swap",
+        type: "application/ld+json",
       },
+      innerHTML: JSON.stringify({
+        "@context": "https://schema.org",
+        "@type": "Organization",
+        name: "Juspay Technologies",
+        url: "https://juspay.io",
+        logo: "https://docs.neurolink.ink/img/logo-light.svg",
+        sameAs: ["https://github.com/juspay/neurolink"],
+      }),
+    },
+    {
+      tagName: "script",
+      attributes: {
+        type: "application/ld+json",
+      },
+      innerHTML: JSON.stringify({
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        name: "NeuroLink",
+        applicationCategory: "DeveloperApplication",
+        operatingSystem: "Cross-platform",
+        offers: {
+          "@type": "Offer",
+          price: "0",
+          priceCurrency: "USD",
+        },
+      }),
+    },
+    {
+      tagName: "script",
+      attributes: {
+        type: "application/ld+json",
+      },
+      innerHTML: JSON.stringify({
+        "@context": "https://schema.org",
+        "@type": "SoftwareSourceCode",
+        name: "NeuroLink SDK",
+        programmingLanguage: "TypeScript",
+        codeRepository: "https://github.com/juspay/neurolink",
+        license: "https://opensource.org/licenses/MIT",
+      }),
     },
   ],
 
@@ -94,9 +133,10 @@ const config: Config = {
       "classic",
       {
         docs: {
-          routeBasePath: "/docs", // Serve docs from /docs, landing page at /
+          routeBasePath: "docs", // Docs at /docs, root redirects to getting-started
           sidebarPath: "./sidebars.ts",
-          editUrl: "https://github.com/juspay/neurolink/tree/main/docs-site/",
+          editUrl:
+            "https://github.com/juspay/neurolink/tree/release/docs-site/",
           exclude: [
             "**/api/**",
             "**/cli-guide.md",
@@ -129,15 +169,33 @@ const config: Config = {
           changefreq: "weekly",
           priority: 0.5,
           filename: "sitemap.xml",
+          createSitemapItems: async (params) => {
+            const { defaultCreateSitemapItems, ...rest } = params;
+            const items = await defaultCreateSitemapItems(rest);
+            return items.map((item) => {
+              if (item.url.includes("/getting-started")) {
+                return { ...item, priority: 1.0, changefreq: "daily" };
+              }
+              if (item.url.includes("/sdk") || item.url.includes("/cli")) {
+                return { ...item, priority: 0.9 };
+              }
+              if (
+                item.url.includes("/features/") ||
+                item.url.includes("/examples")
+              ) {
+                return { ...item, priority: 0.8 };
+              }
+              return item;
+            });
+          },
         },
-        ...(process.env.GA_TRACKING_ID
-          ? {
-              gtag: {
-                trackingID: process.env.GA_TRACKING_ID,
-                anonymizeIP: true,
-              },
-            }
-          : {}),
+        ...(process.env.NODE_ENV === "production" &&
+          process.env.GA_TRACKING_ID && {
+            gtag: {
+              trackingID: process.env.GA_TRACKING_ID,
+              anonymizeIP: true,
+            },
+          }),
       } satisfies Preset.Options,
     ],
   ],
@@ -145,10 +203,27 @@ const config: Config = {
   themeConfig: {
     image: "img/neurolink-social-card.png",
 
+    metadata: [
+      { property: "og:type", content: "website" },
+      { property: "og:site_name", content: "NeuroLink" },
+      { name: "twitter:card", content: "summary_large_image" },
+      { name: "twitter:site", content: "@jaborhey" },
+      { name: "twitter:creator", content: "@jaborhey" },
+    ],
+
     colorMode: {
       defaultMode: "dark",
       disableSwitch: false,
       respectPrefersColorScheme: true,
+    },
+
+    announcementBar: {
+      id: "decide_inference_type_launch",
+      content:
+        'New: <code>decide()</code> — a third inference type for typed, calibrated judgements with no text. <a href="/docs/features/decide-inference-type">Read the docs</a>',
+      backgroundColor: "var(--neurolink-accent)",
+      textColor: "#ffffff",
+      isCloseable: true,
     },
 
     docs: {
@@ -188,6 +263,11 @@ const config: Config = {
           position: "left",
         },
         {
+          href: "https://blog.neurolink.ink",
+          label: "Blog",
+          position: "left",
+        },
+        {
           href: "https://www.npmjs.com/package/@juspay/neurolink",
           label: "NPM",
           position: "right",
@@ -217,6 +297,10 @@ const config: Config = {
           title: "Features",
           items: [
             {
+              label: "Decide (typed judgements)",
+              to: "/docs/features/decide-inference-type",
+            },
+            {
               label: "MCP Integration",
               to: "/docs/features/mcp-tools-showcase",
             },
@@ -226,6 +310,7 @@ const config: Config = {
         {
           title: "Community",
           items: [
+            { label: "Blog", href: "https://blog.neurolink.ink" },
             { label: "GitHub", href: "https://github.com/juspay/neurolink" },
             {
               label: "GitHub Discussions",
@@ -243,7 +328,12 @@ const config: Config = {
             { label: "Juspay", href: "https://juspay.io" },
             {
               label: "Contributing",
-              href: "https://github.com/juspay/neurolink/blob/main/CONTRIBUTING.md",
+              href: "https://github.com/juspay/neurolink/blob/release/CONTRIBUTING.md",
+            },
+            { label: "llms.txt", href: "pathname:///llms.txt" },
+            {
+              label: "llms-full.txt",
+              href: "pathname:///llms-full.txt",
             },
           ],
         },
@@ -275,13 +365,43 @@ const config: Config = {
     // Client-side redirects for legacy paths, SEO, and URL migrations
     redirectsPluginConfig,
 
-    // NOTE: docusaurus-plugin-new-docs is available but disabled.
-    // Location: plugins/docusaurus-plugin-new-docs/index.js
-    // Purpose: Auto-detect new/modified docs via Git history for "NEW" badges.
-    // Status: Disabled due to Docusaurus 3.9.2 generatedFilesDir compatibility issue.
-    // Workaround: Badge detection handled via frontmatter tags and sync-docs.ts.
-    // To re-enable: Uncomment the plugin config below after fixing generatedFilesDir issue.
-    // See: https://github.com/facebook/docusaurus/issues (search generatedFilesDir)
+    // Auto-detect new/modified docs via Git history for sidebar badges
+    [
+      "./plugins/docusaurus-plugin-new-docs",
+      {
+        mode: "both",
+        docsDir: "docs",
+        daysThreshold: 30,
+        debug: process.env.NODE_ENV === "development",
+      },
+    ],
+
+    // Local search index generation (fallback when Algolia is not configured)
+    "./plugins/docusaurus-plugin-search-index",
+
+    // Generate unique OG images per page at build time (satori + resvg)
+    "./plugins/docusaurus-plugin-og-images",
+
+    // Fix server bundle: handle Node-only native modules
+    // (protobufjs from posthog→opentelemetry, ws from jsdom, fsevents, etc.)
+    function serverExternalsPlugin() {
+      return {
+        name: "server-externals",
+        configureWebpack(_config, isServer) {
+          if (isServer) {
+            return {
+              externals: [
+                /^(protobufjs|long|ws|bufferutil|utf-8-validate|fsevents)$/,
+              ],
+              module: {
+                rules: [{ test: /\.node$/, use: "null-loader" }],
+              },
+            };
+          }
+          return {};
+        },
+      };
+    },
   ],
 };
 

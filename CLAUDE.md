@@ -1,1065 +1,1589 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code when working in this repository.
+
+## Contents
+
+1. [Project Overview](#project-overview)
+2. [Critical Rules](#critical-rules)
+3. [Architecture](#architecture)
+4. [Key Files](#key-files)
+5. [Development Commands](#development-commands)
+6. [How-To Guides](#how-to-guides)
+7. [Common Patterns](#common-patterns)
+
+---
 
 ## Project Overview
 
-NeuroLink is an enterprise AI development platform that provides unified access to 12+ AI providers (OpenAI, Anthropic, Google AI Studio, AWS Bedrock, Azure, Vertex, Mistral, LiteLLM, SageMaker, Hugging Face, Ollama, and OpenAI-compatible endpoints) through a single consistent API. It ships as both a TypeScript SDK and a professional CLI.
+NeuroLink is a unified AI development platform shipping as both a **TypeScript SDK** and **CLI**. It wraps AI providers across four inference types (`generate`, `stream`, `decide`, `transcribe`) (OpenAI, Anthropic, Google AI Studio, Vertex, AWS Bedrock, Azure, Mistral, LiteLLM, SageMaker, Hugging Face, Ollama, OpenAI-compatible, DeepSeek, NVIDIA NIM, LM Studio, llama.cpp, OpenRouter, Cerebras, SambaNova, ElevenLabs, Deepgram, Azure Speech, Fish Audio, Cartesia, and more) behind a single consistent API, with full MCP support, multimodal file processing, voice (TTS/STT/realtime), media generation (image / video / music / avatar with Kling / Runway / Replicate / Beatoven / Lyria / D-ID / HeyGen handlers), RAG pipelines, observability, and a workflow engine.
 
-**Key characteristics:**
+---
 
-- Extracted from production systems at Juspay
-- Battle-tested at enterprise scale
-- Opinionated factory architecture with provider registry pattern
-- Comprehensive multimodal support (text, images, PDFs, CSV, Excel, Word, RTF, JSON, YAML, XML, HTML, SVG, Markdown, 50+ code languages)
-- Full MCP (Model Context Protocol) integration with 58+ external servers
-- Multiple MCP transports: stdio (local), HTTP/Streamable HTTP (remote), SSE, WebSocket
-- Production-ready enterprise features (Redis memory, failover, telemetry)
+## Critical Rules
 
-## Essential Development Commands
+These are non-negotiable. Violating them breaks the build or introduces bugs.
 
-### Building
+1. **Dynamic imports only in registry** — All providers must use dynamic imports inside factory functions in `providerRegistry.ts`. Static imports create circular dependencies.
+2. **Types in canonical location** — All type definitions go in `src/lib/types/`. Never create type files inside feature subdirectories.
+3. **Gemini tools + JSON schema are mutually exclusive** — Google AI Studio and Vertex **Gemini** models cannot use tools and `structuredOutput` with a JSON schema simultaneously (a Gemini API limitation). This does **not** apply to Vertex **Claude** models, which support both at once — the exclusion is gated on `isGeminiProvider` in `structuredOutputPolicy.ts`, not on the Vertex provider as a whole. Providers that reject the combination at runtime (e.g. Groq) are detected via `isToolsSchemaConflictError` and transparently retried without structured output. Regardless of provider, `generate({ schema })` is guaranteed to return valid JSON in `content` plus a parsed `structuredData` object (see `coerceJsonToSchema`).
+   - **Huge-text / truncation:** the native Claude paths (Vertex+Claude, direct Anthropic) must default `max_tokens` to the model's real output ceiling via `resolveClaudeMaxTokens` (Sonnet 4.x → 64K, Opus 4.x → 32K), **never** the legacy hard-coded 4096 that silently truncated large structured responses mid-JSON. The direct Anthropic non-streaming path also passes an explicit request `timeout` so the SDK's "streaming is required for long requests" pre-flight guard doesn't reject a large `max_tokens`. When output still hits the cap, truncation is surfaced — not silent: `coerceJsonToSchema` returns `{ repaired, truncated }`, and `GenerateResult` exposes `jsonRepaired` / `jsonTruncated` (set when `finishReason==="length"` or the recovered JSON came from an unclosed span) plus a WARN log. A truncated response must still yield a **partial object** — never a raw string: `coerceJsonToSchema` prefers the candidate starting at the document's real root (so a bracket pair scraped from inside a string value can't win), and backs off to the last completed field when jsonrepair can't close the span. That recovered `structuredData` is a **plain object, not necessarily a schema-valid one** — when the response was cut short it may be partial — and `jsonTruncated` is set in exactly that case (`jsonRepaired` when the JSON had to be recovered), so a caller can distinguish a salvaged object from a complete one. A caller that needs schema-valid data must check `jsonTruncated` before trusting the object; a caller that wants best-effort data can use it as is. Only schema-rejected **scalar** roots (e.g. a raw string under an object schema) are suppressed via `schemaAccepts`, since they carry no recoverable structure.
+4. **CLI ≠ SDK** — CLI can use manual MCP connections; the SDK cannot. Keep concerns separate.
+5. **Backward compatibility** — Public SDK API must not break existing callers.
+6. **`formatProviderError` must return, never throw** — Any provider error formatter must return the error object, not throw it.
+7. **Zero `interface` — always use `type`** — Never use `interface`. Always use `type X = { ... }`. The only exception is `declare global { interface Window { ... } }` which TypeScript requires for declaration merging. Use intersection (`&`) instead of `extends`.
+8. **No "Types" suffix in type filenames** — Files inside `src/lib/types/` must not contain "Types" or "Type" in their name. The folder IS the types folder — `mcp.ts` not `mcpTypes.ts`, `auth.ts` not `authTypes.ts`.
+9. **Unique type names across all files** — Every exported type name must be globally unique across all files in `src/lib/types/`. Use domain prefixes to disambiguate:
+   - Client SDK types: `Client*` prefix (e.g., `ClientAuthConfig`, `ClientToolInfo`, `ClientStreamResult`)
+   - CLI types: `Cli*` prefix (e.g., `CliGenerateResult`, `CliStreamChunk`)
+   - Server types: `Server*` prefix (e.g., `ServerAuthConfig`)
+   - Stream types: `Stream*` prefix (e.g., `StreamToolCall`, `StreamToolResult`)
+   - Processor types: `Processor*` prefix (e.g., `ProcessorRetryConfig`)
+   - Workflow judge types: `Judge*` prefix (e.g., `JudgeScoreResult`)
+10. **Barrel uses `export *` only** — `src/lib/types/index.ts` must only contain `export * from "./file.js"` lines. No selective exports (`export type { X, Y }`), no aliases (`X as Y`). If adding `export *` causes a name collision, rename the type at the source with a domain prefix per rule 9.
+11. **No local `types/` directories** — There must be no `types/` directory anywhere except `src/lib/types/`. No `src/lib/observability/types/`, no `src/lib/workflow/core/types/`, etc. Move those types into the canonical `src/lib/types/` folder.
+12. **No type re-exports from non-type files** — Files outside `src/lib/types/` must not re-export types (`export type { X } from`). Consumers should import types from `src/lib/types/` directly. Module `index.ts` files should only re-export runtime values (classes, functions, constants), never types.
 
-```bash
-# Full build (SDK + CLI)
-pnpm run build
+13. **Barrel-only imports for internal types** — Code outside `src/lib/types/` must import internal types from the barrel (`../types/index.js` or `../types`), never from specific type files (`../types/rag.js`, `../types/mcp.js`). External library types (`zod`, `@anthropic-ai/sdk`, etc.) can be imported normally. Files inside `src/lib/types/` are exempt (they import from each other).
 
-# CLI only (for rapid testing)
-pnpm run build:cli
+14. **No double type assertions** — Never cast through `unknown`/`any` (`x as unknown as T`, `x as any as T`). A double assertion defeats the compiler's structural-overlap check entirely — the value is trusted as `T` with zero validation. Fix the type at the source, narrow with a runtime-validating type guard, or use a single `as T` (still overlap-checked). Applies to `src/`; test files are exempt. The rare genuine type-system boundary requires `// eslint-disable-next-line no-restricted-syntax -- <reason>`.
 
-# Complete build pipeline with validation
-pnpm run build:complete
+15. **Tests are end-to-end only** — Every suite must exercise a surface this package actually ships: construct `NeuroLink` and call `generate()` / `stream()`, drive the built CLI via `runCLI` (`node dist/cli/index.js`), or exercise the package's public exports from `dist/index.js` (no runtime imports from `src/lib/`). A suite that imports a module out of `src/lib/` to assert on it directly is a unit test and does not belong here. The point is to test what callers can reach — across providers, adapters and file types — not internal shapes that are free to change. If a behaviour seems reachable only from the inside, that is usually a sign it needs a public surface, not a unit test.
+
+    **Import the built entry, not the source.** Anything the package exports — `NeuroLink`, `ModelPool`, `AIProviderFactory`, `MCPToolRegistry`, the vector stores — comes from `../dist/index.js`. Importing the same class from `src/lib/` tests a copy callers never load. Confirm a symbol is really exported by listing the **runtime** exports of `dist/index.js`, not by grepping `dist/index.d.ts`: that file re-exports under aliases, so `NeuroLinkError as ClientNeuroLinkError` makes `NeuroLinkError` look public when only `ClientNeuroLinkError` exists at runtime.
+
+    **⚠️ One module graph per suite.** `dist/index.js` is a separate bundled copy of everything in `src/lib/`. Mixing the two inside one file breaks anything that depends on object identity — stubs, spies, `instanceof` — and it breaks _silently_, with a clean typecheck. Three ways this has already bitten:
+    - `stub(AIProviderFactory, "createProvider")` on the `src` copy while `NeuroLink` came from `dist` → the stub was inert and the suite started making real network calls. It went from 0.01s / 21 passing to 45s with one skip and one failure.
+    - `logger` imported from `dist` while the code under test logged through `src`'s logger → six log-assertion tests failed because the spy watched a different instance.
+    - `instanceof NeuroLinkError` across the two copies → never true.
+
+    So: a suite that drives only the public surface takes everything from `dist`. A suite operating under the determinism exception below takes everything from `src`. Never both.
+
+    **The one exception is determinism.** A test may sit outside this rule only when it needs deterministic control that a live call cannot give — a pure translation table, a fixed set of inputs, a recorded backend. The vector-store suites are the standing example: they drive real backends (pglite in-process Postgres, recorded fixtures) and cover filter-dialect translation that no live `generate()` could be made to emit. Convenience, speed, and "it is easier to assert on the internal" are not exceptions. When you take the exception, say so in the file's header and name what determinism buys.
+
+**Enforcement:** Rules 2, 6 and 7-15 are enforced via ESLint. Rules 2, 6, 7-13 and 15 use custom rules in `eslint-rules/`; rule 14 uses core `no-restricted-syntax` AST selectors in `eslint.config.js`. Run `pnpm run lint` (or the pre-commit hook) — no shell scripts, no regex heuristics, everything AST-based.
+
+Rule 15's determinism exception is the `allow` list on `neurolink/e2e-tests-only` in `eslint.config.js`. Adding a file to it is a review decision, and the file's own header must say what determinism buys — it is not a way to silence the rule. (A closed "Grandfathered" block of legacy suites near the end of the list is exempt from the header requirement and must not grow.) The rule ignores type-only imports (`import type`, and `{ type A }` where every specifier is type-only) because they are erased and assert nothing.
+
+| Rule     | ESLint rule                               |
+| -------- | ----------------------------------------- |
+| 2        | `neurolink/no-local-type-alias`           |
+| 6        | `neurolink/format-provider-error-returns` |
+| 7        | `neurolink/no-interface`                  |
+| 8        | `neurolink/no-types-suffix-filename`      |
+| 9        | `neurolink/unique-type-names`             |
+| 10       | `neurolink/types-barrel-exports-only`     |
+| 11 & 11b | `neurolink/no-local-types-folder`         |
+| 12       | `neurolink/no-type-export-outside-types`  |
+| 13       | `neurolink/barrel-type-imports`           |
+| 14       | `no-restricted-syntax` (AST selectors)    |
+| 15       | `neurolink/e2e-tests-only`                |
+
+---
+
+## Architecture
+
+### Four inference types
+
+`generate`, `stream`, `decide` and `transcribe` are peers. The first two assume
+the model emits text; `decide` does not — a decision model takes one `state`
+plus a map of named typed questions and returns one typed, calibrated answer
+each in a single parallel pass, with no text anywhere. `transcribe` starts from
+audio instead of text (see "The `transcribe` inference type" below); it has its
+own descriptor list and is not an `inferenceKinds` value.
+
+The discriminator is one field on `ProviderDescriptor`:
+
+```ts
+inferenceKinds?: readonly ("generate" | "stream" | "decide")[]
 ```
 
-### Testing
+Omitted means `["generate","stream"]`, so every text provider keeps its
+meaning. This is the **only declarative statement of provider modality** in the
+codebase — before it, modality was implied by `toolSupport`, `healthCheck` and
+the auto-select ranks, which is why embedding-only providers (voyage, jina)
+have to implement `getAISDKModel()` as a throw. Anything that builds a
+generation fallback chain, runs the health sweep or offers model choices must
+filter on `inferenceKinds` rather than special-casing a provider name.
 
-```bash
-# Run all tests
-pnpm test
+`AIProvider.decide?()` is optional and `BaseProvider` supplies a throwing
+default, exactly as `embed()` does. Public surface is `neurolink.decide()` and
+`neurolink.tryDecide()` — the fail-open variant, which returns `null` on any
+failure and is what every internal consumer uses — plus the CLI's
+`neurolink decide [state]`, a thin wrapper over `decide()` (`src/cli/commands/decide.ts`).
 
-# Run tests once (CI mode)
-pnpm run test:run
+**Decision providers; descriptor order is precedence.** TypeSafe (Jev,
+hosted), Laya (open weights, at a configured base URL — there is no default),
+XOR (open weights that also reads an image and audio and extracts typed values,
+likewise at a configured base URL), SubQ (`subq`, described below), Perplexity (`perplexity-decider`, the hosted Decisions API; it also reads
+images, no video, at the public `https://api.perplexity.ai`, so a key alone
+configures it), Cloudflare Clef (`cloudflare-clef`, on Workers AI; it also reads
+images, no video, at Cloudflare's own API, so a token and an account id configure
+it) and OpenAI Decisions (`openai-decisions`, OpenAI's hosted Decisions API in
+public beta; it also reads images, no video, at the public `https://api.openai.com`,
+so a key alone configures it) and ScaleDown (`scaledown`, hosted Classify models,
+text only, at the public `https://api.scaledown.xyz`, so a key alone configures
+it; described below) all extend `SystemOneDecisionProvider` in
+`src/lib/providers/systemOneDecision.ts`,
+which owns the request loop, retries, the auth circuit breaker and answer
+parsing; each provider supplies only its endpoint, headers, body and error
+parsing. OpenAI Decisions is the one whose wire is not System One's (named
+questions in an array, an array of answers), so its catalog entry names
+`decide.dialect: "openai-decisions"`, translated by
+`src/lib/providers/decide/dialects/openaiDecisions.ts`; the Laya, XOR and SubQ entries
+use the `system-one` dialect, as does ScaleDown. `resolveDefaultDecisionProvider()` returns the first
+`DECISION_PROVIDERS` entry that is fully configured (a key, plus a base URL for
+Laya and XOR, which have no built-in endpoint), in descriptor order, so TypeSafe's
+entry sitting before Laya's, Laya's before XOR's, XOR's before SubQ's, SubQ's before
+Perplexity's, Perplexity's before Clef's, Clef's before OpenAI Decisions', and OpenAI
+Decisions' before ScaleDown's, is what makes
+TypeSafe win whenever either of its keys (`TYPESAFE_API_KEY`, `AI_GATEWAY_API_KEY`)
+is set alongside `LAYA_API_KEY`, `XOR_API_KEY`, `SUBQ_API_KEY`, `PERPLEXITY_API_KEY`,
+`CLOUDFLARE_API_KEY`, `OPENAI_API_KEY` or `SCALEDOWN_API_KEY`. Reordering them changes which model
+every built-in consumer uses. The three providers whose keys
+are shared with a text provider (Perplexity, Clef and OpenAI Decisions) stay
+behind every provider a host sets up on purpose, except ScaleDown (below): a provider added after
+them would be displaced by an ambient key. SubQ sits ahead of them only because
+`SUBQ_API_KEY` belongs to no other provider. ScaleDown's key belongs to no other
+provider either, yet ScaleDown sits last, after those three, by the owner's decision of
+2026-10-15 (`decide.order` 8): an ambient `OPENAI_API_KEY`, `PERPLEXITY_API_KEY` or
+Cloudflare pair outranks a `SCALEDOWN_API_KEY` a host set on purpose, and ScaleDown
+is reached by naming it. Test 18.4 pins `scaledown` as the last entry.
 
-# Run specific test suites
-pnpm run test:suites           # All suites
-pnpm run test:integration      # Integration tests only
-pnpm run test:tool-discovery   # Tool discovery tests
-pnpm run test:consistency      # Provider consistency tests
+**SubQ comes after XOR and ahead of Perplexity, Clef and OpenAI Decisions, and it is a catalog entry, not a class.**
+`src/lib/providers/catalog/subq.json` describes Subquadratic's hosted SubQ Snap
+(`subq`, aliases `subquadratic` and `subq-snap`; `decide.order` 4) and
+`ConfiguredDecisionProvider` runs it, on the System One wire at
+`https://api.subq.ai/v1/systemone` (`wire.baseURL` is the default base, so
+`SUBQ_BASE_URL` and `credentials.subq.baseURL` replace it). `SUBQ_API_KEY` alone
+configures it, so any test that asserts the "nothing configured" path must blank
+it with the other decision keys. Its `decisionLimits` are `advisory`: 376,000
+estimated state tokens is a margin under the largest request SubQ answered
+(376,180 input tokens), and the entry's `contextWindow: 393216` is the maximum
+model length SubQ's own HTTP 400 response states (both observed live on
+2026-10-13). Both are advisory and neither is a guarantee, and no test or doc may
+word them as what SubQ accepts; an over-length request is refused with a 400 that
+NeuroLink classifies as `invalid_request`. It declares no media, because SubQ wants image objects (`mediaType` plus `base64`)
+that the catalog cannot describe yet. 402 and 403 are `invalid_request`, not
+`authentication`, so a top-up needs no new instance. Its fixture's 200 body was
+captured on 2026-10-13, and one error row (the over-length 400) is a saved live body; every other error body in it is a stand-in.
 
-# Smart test runner (adaptive)
-pnpm run test:smart
+**Perplexity's key is shared with the `perplexity` text provider.** Both read
+`PERPLEXITY_API_KEY`, so an ambient key set only for Sonar also configures
+`decide`, as the fallback after TypeSafe, Laya, XOR and SubQ. Any test that asserts the
+"nothing configured" path must blank `PERPLEXITY_API_KEY` as well as the other
+decision keys, and docs must say so plainly. `credentials.perplexity` (the text
+provider's slice) does not configure it; `credentials.perplexityDecider` does.
 
-# Coverage report
-pnpm run test:coverage
+**OpenAI Decisions' key is shared with the `openai` chat provider.** Both read
+`OPENAI_API_KEY`, so an ambient key set only for chat (or for `whisper`, which
+reads it too) also configures `decide`, as the default after TypeSafe,
+Laya, XOR, SubQ, Perplexity and Clef (descriptor order 7; only ScaleDown, order 8, follows it). The five internal consumers
+(routing, tool routing, context relevance, the summary gate, RAG planning) and
+the STT correction guard (for a host that passes a dictionary) then make paid
+decision calls, though they still fail open. A test that asserts the "nothing
+configured" path must blank `OPENAI_API_KEY` too (and `OPENAI_DECISIONS_*`), and
+docs must say so plainly. `credentials.openai` (the chat provider's slice) does not
+configure it; `credentials.openaiDecisions` does. **A gateway's key is never used
+for the default.** `OPENAI_API_KEY` is also the key of every OpenAI-compatible
+gateway, so the entry carries `decide.ambientKeyGuard` (`baseURLEnvVars`
+`OPENAI_BASE_URL` and `OPENAI_API_BASE`, `credentialBaseURLs`
+`credentials.openai.baseURL`, which the chat provider prefers over the variable,
+`trustedOrigins` `https://api.openai.com`): `resolveDefaultDecisionProvider()`
+skips a key found only in the environment while a listed variable, or a listed
+field of the credentials it is given (the instance's merged with the call's), is
+set to something whose origin (scheme, host, port, case-insensitive; path,
+trailing slash and `/v1` ignored) is not trusted, and an unparseable, non-text or
+non-http(s) value counts as untrusted. It does not apply when
+`OPENAI_DECISIONS_BASE_URL` is set (the host routed this provider on purpose) or
+when `credentials.openaiDecisions` supplies a key or a base URL, and never to a
+call that names `provider: "openai-decisions"`, which uses the environment key
+whatever `OPENAI_BASE_URL` or `credentials.openai.baseURL` says and sends it to
+`https://api.openai.com`; so a gateway host must route this provider with
+`OPENAI_DECISIONS_BASE_URL` or `credentials.openaiDecisions`, or not use it, and
+must not name it. It is data on the entry, read by `isDecisionProviderConfigured`,
+and no other provider has one. Any test that asserts a default must also blank
+`OPENAI_BASE_URL` and `OPENAI_API_BASE`, and pass no `credentials.openai.baseURL`.
+`neurolink.decide()` builds a
+fresh provider for every call, so a rejected ambient key costs one failing request
+per decision site and the 401 breaker never latches across public calls. The model
+resolves from `OPENAI_DECISIONS_MODEL`, never from the chat provider's
+`OPENAI_MODEL`: `AIProviderFactory.resolveModelFromEnvironment` skips a descriptor
+whose `inferenceKinds` is exactly `["decide"]`, because it picks its variable group
+by substring and `"openai-decisions"` contains `"openai"`. Its `decisionLimits` row
+is `advisory: true` (922,000 state tokens from the model page, reported and never
+enforced) with `maxQuestions: 200` (the figure in OpenAI's Python SDK, "Ask 1–200
+questions about the input", read from documentation: `tryDecide()` splits at it and
+host additions stop at it, but `decide()` does not refuse above it) and `media` of
+up to 8 images, no video and a 32 MiB body; those last three are NeuroLink's own
+allowance, not OpenAI's. What the public-beta endpoint accepts beyond that (what
+it does with more than 200 questions, option counts, image formats, rate limits,
+how it rounds probabilities) is not established: no live request has been made, so
+docs and comments say "not measured" and never state a result about its accuracy,
+speed or cost.
+
+**Clef's token and account id are shared with the `cloudflare` text provider, and
+the Workers AI endpoint ignored state text past about 2,048 tokens until
+2026-10-04 and read far more on 2026-10-07 (hosted service or model: unknown).** `CLOUDFLARE_API_KEY` and
+`CLOUDFLARE_ACCOUNT_ID` also configure `decide`, as a fallback after TypeSafe, Laya,
+XOR, SubQ and Perplexity (OpenAI Decisions and ScaleDown come after it); a test that
+asserts the "nothing configured" path must blank both (and `CLOUDFLARE_CLEF_*`).
+`credentials.cloudflare` does not configure it; `credentials.cloudflareClef` does,
+and its `accountId` stands in for `CLOUDFLARE_ACCOUNT_ID` through the descriptor's
+`extraRequiredCredentialFields`. Cloudflare documents a 64K context. Workers AI
+ignored text past about 2,048 tokens without an error until 2026-10-04 (both
+models) and on 2026-10-07 read at least 190,153 tokens (`clef-flash`) and 52,154
+(`clef`, which answered HTTP 529 for the 190,153-token array), so the descriptor
+declares 16,000 estimated tokens (at most about 18,400 real ones, 2.8 times
+fewer than `clef` was seen to read), `digitTokensPerChar: 1` (the tokenizer reads
+every digit alone) and 1.5 tokens per non-ASCII character, and the provider adds
+250 ms of default timeout per 1,000 estimated tokens. The encoded request cap stays
+256,000 bytes. On 2026-10-03,
+`clef-flash` accepted 262,000 text characters and refused 270,000. On 2026-10-04
+both models accepted 520,000 text characters and refused 525,000 with 413/code 5021. Refusal estimates are the encoded body bytes / 4 (rounded up in seven of eight refusals, one lower in the eighth); what
+changed was the threshold, from between 65,527 accepted / 67,527 refused to
+130,026 / 131,276 (`clef`) and 130,027 / 131,277 (`clef-flash`). The error still
+prints 65,536. Inference:
+the new interval contains 131,072, twice that figure; the reason is unknown.
+Four images and `image/jpg` succeeded on both models; Clef normalizes the alias
+to `image/jpeg`. Natural-script and many-key-object cuts fit the existing rates. The decide
+suite's live canaries 19.10 and 19.10b fail if the service stops reading a state just under
+NeuroLink's own limit on either model, and 19.11 if the text-only request ceiling moves. On
+2026-10-07 the endpoint read states of at least 190,153 tokens (`clef-flash`) and 52,154 (`clef`),
+which is why the limit above went from 1,500 to 16,000 estimated tokens.
+Only a 401 trips Clef's auth breaker (a 403 was never seen and must not latch the
+instance), and a `credentials.cloudflareClef` slice that names its own `baseURL`
+never borrows `CLOUDFLARE_API_KEY`.
+
+**ScaleDown is the last decision provider, it is a catalog entry, and its key is its own.**
+`src/lib/providers/catalog/scaledown.json` describes ScaleDown's hosted Classify
+models (`scaledown`, alias `scaledown-classify`; `decide.order` 8) and
+`ConfiguredDecisionProvider` runs it on the System One wire at
+`https://api.scaledown.xyz/v1/scaledown` (`wire.baseURL` is the default base, so
+`SCALEDOWN_BASE_URL` and `credentials.scaledown.baseURL` replace it; an origin or an
+origin with a path prefix, trailing slashes dropped). `SCALEDOWN_API_KEY` alone
+configures it and no other provider reads it, so any test that asserts the "nothing
+configured" path must blank it (and `SCALEDOWN_BASE_URL` and `SCALEDOWN_MODEL`) with
+the other decision keys. Two optional `decide` fields exist for it, and an entry that
+omits them behaves exactly as before: `decide.authHeader` (`"x-api-key"` sends
+`x-api-key: <key>` and no `Authorization` header at all; omitted or `"bearer"` is the
+Bearer header every other entry sends; decide-local, `quirks.authHeaderStyle` is the
+chat path's and is not read here) and `decide.stateEncoding` (`"text"` makes the state
+always a string: a string unchanged and untrimmed, any other value as its JSON text,
+so `{}` and `[]` go out as text, and a string that is blank after trimming is refused
+locally, before any request, as an `invalid_request` that names the rule and never the
+state). It declares no `decisionLimits` and no media, so media is refused before any
+request (that refusal wins over the blank-state check) and nothing is refused on
+size. A 401 trips the auth breaker; 402 and 422 are `invalid_request` and do not
+latch; 429 is `rate_limit`; 502 is `server`; a server-sent 504 is `timeout` and is not
+retried. Its price is a list price (USD 0.05 per million input tokens, output free; source:
+ScaleDown's launch post and the response's `usage.cost`, as reported by the marketing
+session on 2026-10-15), in `pricing.ts`'s `_default` row only. The wire facts
+(`x-api-key` only, the models `classify-1` and `classify`, 255 options answered and
+300 refused with 502, the limit between them not mapped and no local cap, the 429 and 504 texts) come from ScaleDown's documentation and
+the marketing session's probes of 2026-10-15, **not from this project**: every reply in
+the contract fixture and every 200 reply in the tests is an invented stand-in (the mocked
+suite's error texts are the ones the marketing session reported), and the catalog's `contextWindow`
+128000 and `maxOutputTokens` 1 are placeholders the schema requires, not ScaleDown
+statements. Docs and comments say "not measured" for context size, latency, rate
+limits and the option, question and level maximums, and never state an accuracy, a
+benchmark or a latency.
+
+**`decisionLimits` refuses what a model cannot read.** A descriptor may declare
+`decisionLimits: { maxStateTokens, maxQuestions?, models, media? }`; the base refuses an
+over-limit request with `max_tokens_exceeded` before any network call, and every
+internal consumer then fails open as usual. The exception is the question cap:
+`decide()` refuses a longer map (except for an `advisory` row such as OpenAI
+Decisions, whose server is left to answer it), but `tryDecide()` (the door every
+consumer uses) splits it at the cap, runs up to four batches at a time and joins the
+answers, so a consumer that asks 300 questions of a 64-question provider still
+gets its decision. A failed batch loses only its own answers. Laya declares 768 state tokens on
+`typed-decisions` and `multilingual`, 320 on `english`, `auto` and any unlisted
+name, and 64 questions, because its server answers a longer state from the
+first 1,024 tokens without saying so. Non-ASCII characters are charged at a
+measured per-checkpoint rate (`nonAsciiTokensPerChar`: 1.5, or 0.6 on
+`multilingual`), since the ~4-characters-per-token estimate is several times
+too generous for non-Latin scripts. TypeSafe's row is `advisory: true` —
+33,000 state tokens, no question-count cap (it bounds a request by tokens) —
+so `decisionLimits()` reports it while the pre-flight check skips it and its
+server keeps refusing; adding a plain (non-advisory) row to a descriptor
+silently turns on local refusal for that provider. XOR declares what was measured
+through its LiteLLM gateway in October 2026: 120,000 state tokens on `xor-latest`
+and 28,000 on `xor-omni` and any other name (windows of 131,072 and 32,768), 128
+questions, `maxChoiceOptions: 64` (counting `unknown`; 64 plus `unknown` crashed
+the server) and `maxScoreLevels: 10`, and `media` of one image, no video (the
+gateway drops a video without a word, so a blind answer is refused locally) and
+one audio clip (`audio: { maxSeconds: 30 }`: the model hears the first 30 seconds,
+so a longer WAV, FLAC or Ogg is refused; AAC/M4A is refused because it decodes
+to nothing), with a 25 MB body against the server's 24 MiB, all prepared by
+`src/lib/utils/decisionMedia.ts`. Its timeout scales with the state
+(`timeouts.decideMsPerKStateTokens: 150` on top of `decideMs`), and a 5xx
+wrapping the backend's 4xx (`backend 400: …`) is a final `invalid_request`, not a
+retried `server`. `decide.capableModel` sends a request with media or a `value`
+question to `xor-omni` (and checks its 28,000-token window) when nobody chose a
+model — the gateway would otherwise hand it there from `xor-latest` past a
+120,000 check. **`decisionLimits.questionTypes` lists what a provider reads**
+(absent: `boolean`, `choice`, `score`); XOR adds `value` and `choice-unknown` (a
+choice with `unknown: true`). Anything else is refused before any request even on
+an `advisory` row, and `siteDecide` drops such a host question on its own, as it
+does one past `maxChoiceOptions` / `maxScoreLevels`; the check is
+`unsupportedDecisionQuestion` in `utils/decisionLimits.ts`. Perplexity declares a 100,000-token state
+window, 128 questions and `media` of up to 8 images and no video, with a 32 MiB
+body. Measured on a real account in October 2026: the 128-question and 8-image
+caps, the 262,144-token input ceiling (images count toward it, one token for
+each 32 × 32 tile), the non-ASCII rates, and the stall on large images with its
+2,048-tile rule checked at the edge (each side rounds to the nearest 32; 2,048
+tiles fits, 2,050 stalls). Taken from Perplexity's documentation and not
+measured: the 32 MiB body. The 100,000 is a deliberate local
+window, not a measurement and not the server's limit: the server reads 262,144
+input tokens in all and refuses more with an explicit 400, which the provider
+reports as `max_tokens_exceeded`. Non-ASCII text is charged 0.5 per character
+(measured: CJK 0.46, Devanagari 0.44), a ninth image is refused with a 400, and
+the estimate (3.81 characters per token) over-counts English prose (4.34
+measured) and runs about 13% low on minified JSON (3.36), which stays far under
+the ceiling at the window (about 113,000 real tokens), and much lower on log lines
+(1.35, about 281,000 real tokens at the window) and arrays of numbers (1.16, about
+328,000), so a state of either, or emoji-heavy text, can pass the window and
+still be refused. The
+provider also checks image format and the 2,048-tile cap per image locally,
+because a larger image stalls the API for about a minute before an HTML 504. XOR,
+Perplexity, Cloudflare Clef and OpenAI Decisions are the providers with `media`;
+XOR alone takes audio and none takes video; every other provider, ScaleDown
+included, refuses media before any request. `maxQuestions` is optional
+in `DecisionLimits` and in the `decisionLimits()` reading: absent means "no count
+cap", never `Infinity`.
+
+**Not to be confused with `evaluate()`**, which scores an already-generated
+response with RAGAS scorers. Different feature, different word, ~20
+`Evaluation*` types already taken.
+
+**The degradation contract.** Every internal consumer of `decide` fails open:
+with no decision provider configured, behaviour is exactly what it was before.
+That is deliberate and load-bearing — and it is also why each consumer records
+telemetry even when it does nothing, because a decision path that silently
+stopped working is otherwise indistinguishable from one that was never
+configured. Decisions carry their own span type (`SpanType.MODEL_DECISION`),
+never `MODEL_GENERATION`: folding them together would distort generation
+counts, latency percentiles and the output-token aggregate at once.
+
+**Five `decide()` call sites, in four files** — verified with
+`grep -rn 'await decide(' src/lib`:
+
+| Call site                         | Powers                                                                                              |
+| --------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `routing/classifierStrategies.ts` | model routing, the model catalogue AND the per-request context budget — one request, three features |
+| `context/contextDecision.ts` (×2) | relevance compaction, and the summary-quality gate                                                  |
+| `core/toolRoutingDecision.ts`     | tool / MCP server routing                                                                           |
+| `rag/retrieval/searchDecision.ts` | per-query RAG planning (opt-in: `RAGPipeline` only, not the `rag: {}` shortcut)                     |
+
+`routing/modelCatalog.ts` and `context/budgetChecker.ts` are NOT callers: the
+catalogue renders candidate lines that the routing call's `model` question
+chooses between, and the budget threshold is read out of that same call's
+`context` answer. Neither costs a second round trip.
+
+**All five stamp a `site` and funnel through `NeuroLink.siteDecide`.** Each
+call site sets `site: "<DecisionSite>"` on the options it hands its injected
+`DecisionCallerFn` (`routing`, `toolRouting`, `contextRelevance`,
+`summaryGate`, `ragPlan`), and the three internal lambdas that used to call
+`tryDecide` directly — the classifier's constructor dep, `contextCompactorDeps`,
+tool routing's `decideFn` — now call the private `siteDecide(request, outer)`,
+where `outer` carries the surrounding request's per-call `credentials`,
+`abortSignal`, `sessionId` and `requestId` (the classifier's arrive on
+`ClassifierRouterInput` instead, since its caller is fixed at construction).
+`tryDecide` itself routes a stamped request through `siteDecide`, which is how
+a host-wired `RAGPipeline` or `ClassifierRouter` gets the same treatment. That
+one path runs the host's `decisionHooks` (namespacing host questions as
+`host__N`, capping them at the provider's `maxQuestions` when it declares one
+— Laya, XOR, Cloudflare Clef, Perplexity and OpenAI Decisions do; TypeSafe does
+not, and takes every well-formed addition; a host question the provider cannot
+answer is dropped on its own —
+splitting answers back), emits `decision:before` / `decision:after`, and adds `decision.site` +
+`decision.host_question_count` to the `MODEL_DECISION` span. Without hooks or
+listeners the decision payload (state and questions) is unchanged; per-call
+`credentials` are still forwarded, so the account and base URL on the wire can
+differ from the instance's. The path is fail-open by construction: without a
+decision provider it runs no hook and emits no event (null, as before hooks
+existed); everything host-facing runs inside one `try`, so a host throw falls
+back to the answers already obtained or to a call with NeuroLink's own
+questions; and every host-facing value is a `structuredClone` — of the state,
+the questions and the result only, never of the request's `images` / `video` / `audio`,
+which ride through to the wire as the caller's own Buffers (and the result
+keeps `mediaBytes`), so an XOR request gets the same funnel. The wire call
+dispatches through `this.decide()`, so an override or patch on the public
+method sees every site call. `decisionLimits()` / `estimateDecisionStateTokens`
+expose the pre-flight check's own flattening and estimator
+(`utils/decisionLimits.ts`); `decisionLimits()` reports the model `decide()`
+would send — the one registered for the provider, not a fresh read of
+`LAYA_MODEL`. TypeSafe's descriptor row is `advisory: true` and is reported,
+never enforced. XOR's reading on `xor-latest` is `{ maxStateTokens: 120000,
+maxQuestions: 128, questionTypes: [boolean, choice, score, value,
+choice-unknown], maxScoreLevels: 10, maxChoiceOptions: 64,
+nonAsciiTokensPerChar: 1, media: { maxImages: 1, video: false,
+maxRequestBytes: 25000000, audio: { maxSeconds: 30 } }, enforcedLocally: true }`.
+TypeSafe's has no `maxQuestions` key at all — test for the key, never compare
+against `Infinity`.
+
+### The `transcribe` inference type
+
+`neurolink.transcribe()` (a whole recording: Buffer, path, `file://` or
+`http(s)://` URL) and `neurolink.transcribeStream()` (PCM16LE frames →
+`interim` / `final` / `corrected` / `silence` events), the CLI's
+`neurolink transcribe <file>` (`src/cli/commands/transcribe.ts`), and the
+server's `POST /api/agent/transcribe` and OpenAI-compatible
+`POST /v1/audio/transcriptions` (`server/routes/transcribeRoutes.ts`). Audio
+attached to `generate()` (`AudioProcessor` / `VideoProcessor`) picks its engine
+by the same rule.
+
+**STT providers; descriptor order is precedence.** `STT_PROVIDER_DESCRIPTORS`
+in `src/lib/factories/sttDescriptors.ts` is the single source of truth for
+every STT provider's name, aliases, credentials slice, env vars and
+capabilities, exactly as `DECISION_PROVIDERS` is for `decide`. With no
+provider named, `resolveDefaultSTTProvider()` returns `NEUROLINK_STT_PROVIDER`
+(a shipped name, alias, or a `NEUROLINK_STT_ENDPOINTS` endpoint), else the
+first configured descriptor — `whisper`, `deepgram`, `elevenlabs-stt`,
+`google-stt`, `azure-stt` — else **Whistle**, the built-in local engine.
+Reordering the list changes which engine every implicit transcription uses.
+Note that `OPENAI_API_KEY` configures `whisper` and the Google AI Studio keys
+configure `google-stt`, so an ambient text-provider key silently becomes the
+STT default; a test asserting the Whistle default must blank them.
+
+**Whistle is the zero-config default, and it ships with the package.**
+`voice/providers/WhistleSTT.ts` runs a 17 MB model in WebAssembly on this
+machine. Its three files are committed under `models/whistle/` (pinned
+Hugging Face revisions, Apache-2.0, verified by SHA-256 in
+`voice/whistle/assets.ts` before use) and listed in package.json `files`, so a
+fresh install transcribes with no network. The directory order is an explicit
+`credentials.stt.whistle.modelDir` / `NEUROLINK_WHISTLE_DIR`, then
+`NEUROLINK_MODEL_DIR/whistle`, then the bundled copy (found by walking up from
+the module to the package's own `package.json`), then
+`~/.neurolink/models/whistle`, the only directory a download ever writes to and
+now a fallback for installs that lost the bundled files. Whistle counts as
+configured whenever its files are present **or** it may download them, so "no
+STT backend configured" is only reachable with an **explicit, empty** model dir
+(`NEUROLINK_WHISTLE_DIR` / `modelDir`, which skips the bundled copy) **and**
+`NEUROLINK_WHISTLE_AUTO_DOWNLOAD=0` (or `credentials.stt.whistle.autoDownload:
+false`). Tests that assert "no backend" must set both.
+
+**The correction layer fails open through `tryDecide`.**
+`voice/correction/` finds dictionary aliases in the transcript, asks the
+decision provider per candidate whether the speaker meant the term or the
+literal word (a `choice`, never a leading yes/no), then optionally rewrites the
+text with a `generate`/`stream` call. With no decision provider, on the 4 s
+guard timeout, or on any error, the dictionary is applied as is and every
+`STTDecisionRecord` carries a `note` saying why — the same degradation contract
+as the five `decide` call sites above (the guard calls `tryDecide` directly, so
+it is not one of the `await decide(` sites). A lone `OPENAI_API_KEY` now counts as
+a decision provider, so a host that set it for `whisper` and passes a dictionary
+sends the first 4,000 characters of the transcript to OpenAI's Decisions endpoint;
+a test of the "no decision provider" note must blank it.
+
+**Nothing may lose words.** Each layer keeps the text it was given when it
+fails: a rewrite that drops more than `maxDropRatio` (0.25) of the words, times
+out or errors is discarded; a correction that returns nothing keeps the engine
+text; a failed fallback or second opinion keeps the primary; a streamed final
+pass that comes back empty or with fewer than half the words already shown
+keeps the live text; LocalAgreement's committed prefix only grows while passes
+keep their words (it is capped at the newest pass's length); and an
+utterance no engine could read is reported as a `silence` event with its length
+rather than disappearing. `steps` on every result records which of these
+happened. Covered by `pnpm run test:transcribe` (public surface, stub engines,
+CLI, routes) and `pnpm run test:transcribe:stream` (the chunked adapter under
+the determinism exception).
+
+**The endpointer is a public, dependency-free subpath.**
+`@juspay/neurolink/voice/endpointer` (package.json `exports`) points at
+`dist/voice/streaming/endpointer.js`, so a browser app can find where a spoken
+turn starts and ends without bundling the `voice` entry, which pulls in Node
+built-ins. The file must stay free of runtime imports (type-only imports are
+erased and fine): `test:transcribe` reads the shipped file and fails if an
+`import` or `require` appears. Put a shared helper inside the file, not behind
+an import.
+
+### Pattern: Factory + Registry
+
+Every extensible system (providers, processors, chunkers, rerankers) follows the same pattern:
+
+```
+Factory  →  creates instances
+Registry →  holds factory functions (via dynamic import)
 ```
 
-### Linting and Formatting
+- `ProviderFactory` + `ProviderRegistry` — AI providers
+- `ProcessorRegistry` — file/multimodal processors
+- `ChunkerFactory` + `ChunkerRegistry` — RAG chunking strategies
+- `RerankerFactory` + `RerankerRegistry` — RAG rerankers
 
-```bash
-# Check formatting and lint
-pnpm run lint
-
-# Auto-format code
-pnpm run format
-
-# Check all quality metrics
-pnpm run check:all
-```
-
-### Development
-
-```bash
-# Start development server
-pnpm run dev
-
-# Build and run CLI locally
-pnpm run build:cli && pnpm run cli
-
-# Type checking
-pnpm run check
-pnpm run check:watch  # Watch mode
-```
-
-### Environment Validation
-
-```bash
-# Validate environment setup
-pnpm run env:validate
-
-# Setup environment
-pnpm run env:setup
-
-# Complete setup with validation
-pnpm run setup:complete
-```
-
-## High-Level Architecture
-
-### Core Architecture Pattern: Factory + Registry
-
-NeuroLink uses a **factory pattern with dynamic provider registration** to avoid circular dependencies and enable lazy loading:
-
-1. **ProviderFactory** (`src/lib/factories/providerFactory.ts`) - Central factory for creating provider instances
-2. **ProviderRegistry** (`src/lib/factories/providerRegistry.ts`) - Registers all providers with factory functions using dynamic imports
-3. **NeuroLink** (`src/lib/neurolink.ts`) - Main SDK class that orchestrates providers, tools, and memory
-
-**Critical design decision:** All providers are loaded via dynamic imports to break circular dependency chains. Never use static imports for providers in the registry.
-
-### Directory Structure
+### Directory Map
 
 ```
 src/
-├── lib/                    # Core SDK implementation
-│   ├── neurolink.ts       # Main SDK entry point
-│   ├── providers/         # AI provider implementations (13 providers)
-│   ├── factories/         # Provider factory and registry
-│   ├── adapters/          # Provider-specific adapters (image, PDF, etc.)
-│   ├── utils/             # Utilities (messageBuilder, transformations, etc.)
-│   ├── types/             # TypeScript type definitions (28+ type files)
-│   ├── mcp/              # MCP tool registry and integration
-│   ├── memory/           # Conversation memory (Redis, in-memory)
-│   ├── middleware/       # Request/response middleware system
-│   ├── core/             # Core factory and constants
-│   │   └── infrastructure/ # Base factories, registries, errors
-│   ├── config/           # Configuration management
-│   ├── hitl/             # Human-in-the-loop workflows
-│   └── models/           # Model definitions and utilities
-├── cli/                   # CLI implementation
-│   ├── factories/        # Command factories
-│   ├── commands/         # CLI command implementations
-│   ├── loop/             # Interactive loop session
-│   └── utils/            # CLI-specific utilities
-└── test/                  # Test suites
-
-docs/
-└── implementation-guides/  # Feature implementation docs and guides
-
-dist/                      # Build output (generated)
+├── lib/
+│   ├── neurolink.ts          # Main SDK entry point
+│   ├── providers/            # AI provider implementations
+│   ├── factories/            # ProviderFactory + ProviderRegistry
+│   ├── core/                 # BaseProvider, constants, infrastructure
+│   ├── adapters/             # Provider-specific content adapters (image, TTS, video)
+│   ├── utils/                # MessageBuilder, FileDetector, transformations
+│   ├── types/                # ALL type definitions (103 files)
+│   ├── mcp/                  # MCPToolRegistry, client factory, HTTP transport
+│   ├── memory/               # Redis + in-memory conversation memory
+│   ├── context/              # Context compaction, budget checking
+│   ├── processors/           # File processors (17+ types)
+│   ├── rag/                  # Chunkers, hybrid search, rerankers, pipeline
+│   ├── evaluation/           # RAGAS-based evaluator (no unit tests yet)
+│   ├── telemetry/            # OpenTelemetry + Langfuse observability
+│   ├── workflow/             # Workflow engine (ensemble, judge, fallback, adaptive)
+│   ├── server/               # Hono/Express/Fastify/Koa adapters
+│   ├── config/               # Configuration management
+│   └── models/               # Model definitions per provider
+├── cli/
+│   ├── index.ts              # CLI entry point
+│   ├── factories/            # CommandFactory (yargs)
+│   ├── commands/             # Individual command implementations
+│   └── loop/                 # Interactive REPL session
+└── test/
+    ├── continuous-test-suite.ts              # Main orchestrator (pnpm test)
+    ├── continuous-test-suite-<name>.ts       # Per-domain suites (auth, mcp, rag, ppt, …)
+    └── fixtures/                             # CSVs, PDFs, PNG, JSON used by suites
 ```
 
-### Provider System Architecture
+### Message Flow
 
-**Provider Implementation Pattern:**
-
-1. Each provider extends a base provider or implements the provider interface
-2. Providers are registered in `ProviderRegistry.registerAllProviders()` with:
-   - Provider name (from `AIProviderName` enum)
-   - Factory function (async, uses dynamic import)
-   - Default model
-   - Aliases (e.g., "gpt", "chatgpt" for OpenAI)
-
-**Example provider registration:**
-
-```typescript
-ProviderFactory.registerProvider(
-  AIProviderName.GOOGLE_AI,
-  async (modelName?, _providerName?, sdk?) => {
-    const { GoogleAIStudioProvider } = await import(
-      "../providers/googleAiStudio.js"
-    );
-    return new GoogleAIStudioProvider(modelName, sdk as NeuroLink | undefined);
-  },
-  GoogleAIModels.GEMINI_2_5_FLASH,
-  ["googleAiStudio", "google", "gemini", "google-ai"],
-);
+```
+User input (text + files)
+  → MessageBuilder (src/lib/utils/messageBuilder.ts)
+  → FileDetector detects MIME types
+  → ProcessorRegistry selects processor per file
+  → ProviderImageAdapter formats for target provider
+  → Provider sends to AI API
 ```
 
-**Key provider files:**
+### Context Compaction Pipeline
 
-- `src/lib/providers/openAI.ts` - OpenAI integration
-- `src/lib/providers/anthropic.ts` - Anthropic Claude
-- `src/lib/providers/googleAiStudio.ts` - Google AI Studio (Gemini 2.x and Gemini 3)
-- `src/lib/providers/googleVertex.ts` - Google Vertex AI
-- `src/lib/providers/amazonBedrock.ts` - AWS Bedrock
-- `src/lib/providers/azureOpenai.ts` - Azure OpenAI
-- `src/lib/providers/mistral.ts` - Mistral AI
-- `src/lib/providers/litellm.ts` - LiteLLM proxy (100+ models)
-- `src/lib/providers/amazonSagemaker.ts` - AWS SageMaker
-- `src/lib/providers/ollama.ts` - Ollama (local models)
-- `src/lib/providers/huggingFace.ts` - Hugging Face
+`BudgetChecker` fires before every LLM call. If context exceeds the threshold
+(80% of the model window by default, and only ever _lowered_ per request by the
+context-budget decision — see rule 4 in "Where the architecture will fight us"),
+`ContextCompactor` runs 5 stages:
 
-### Message Building and Multimodal Support
+0. **Relevance drop** — one boolean per message, batched. The only stage that
+   asks what a message is _for_ rather than how old it is. Needs a decision
+   provider; skipped entirely without one, which is why it is additive.
+1. Tool output pruning (protect recent 40K tokens)
+2. File read deduplication
+3. LLM summarization (10-section structured summary), now behind a gate — a
+   summary that loses a decision or an open question is rejected and the
+   messages are left for a later stage
+4. Sliding window truncation
 
-**MessageBuilder** (`src/lib/utils/messageBuilder.ts`) is the central component for constructing messages:
+`CompactionStage` in `src/lib/types/context.ts` is the source of truth for the
+list: `relevance | prune | deduplicate | summarize | truncate`.
 
-- Handles text, images, PDFs, CSV, and 17+ file types via ProcessorRegistry
-- Converts between different message formats (NeuroLink → CoreMessage for ai SDK)
-- Integrates with `FileDetector` to automatically detect file types
-- Uses `ProviderImageAdapter` for provider-specific image formatting
-- Processes PDFs with `PDFProcessor` for native document support
-- Delegates to specialized file processors for documents, data, markup, and code files
+### MCP Transport Protocols
 
-**Flow:**
+| Transport   | Config key        | Use case                    |
+| ----------- | ----------------- | --------------------------- |
+| `stdio`     | `command`, `args` | Local server via subprocess |
+| `http`      | `url`, `headers`  | Remote HTTP/Streamable HTTP |
+| `sse`       | `url`, `headers`  | Server-Sent Events          |
+| `websocket` | `url`, `headers`  | WebSocket connection        |
 
-1. User provides input (text + files)
-2. `MessageBuilder` detects file types via `FileDetector`
-3. `ProcessorRegistry` selects appropriate processor based on MIME type and priority
-4. Files are processed (images → base64, PDFs → structured content, documents → extracted text)
-5. Provider-specific adapters format content for each provider's API
-6. Messages are sent to the AI provider
+---
 
-**Key files:**
+## Key Files
 
-- `src/lib/utils/messageBuilder.ts` - Message construction
-- `src/lib/adapters/providerImageAdapter.ts` - Provider-specific image formatting
-- `src/lib/utils/fileDetector.ts` - File type detection
-- `src/lib/utils/pdfProcessor.ts` - PDF processing
-- `src/lib/utils/imageProcessor.ts` - Image processing
-- `src/lib/processors/registry/` - ProcessorRegistry for file processor selection
-- `src/lib/processors/base/` - BaseFileProcessor abstract class
+| File                                               | Purpose                                                                                                                  |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `src/lib/neurolink.ts`                             | Main SDK class — orchestrates everything                                                                                 |
+| `src/lib/factories/providerRegistry.ts`            | Provider registration (use dynamic imports here)                                                                         |
+| `src/lib/providers/catalog/`                       | One JSON per Tier-2 provider — the source of truth for its whole integration (`schema.ts` validates, `loader.ts` builds) |
+| `src/lib/providers/systemOneDecision.ts`           | Shared base for `decide` providers: request loop, retries, auth breaker, answer parsing, `decisionLimits`                |
+| `src/lib/factories/sttDescriptors.ts`              | `STT_PROVIDER_DESCRIPTORS` — STT provider metadata; order is default-provider precedence (Whistle last)                  |
+| `src/lib/voice/transcribe.ts`                      | `transcribe()` orchestration: audio loading, provider resolution, fallback, second opinion, correction                   |
+| `src/lib/voice/transcribeStream.ts`                | `transcribeStream()`: native handler streams, or the chunked adapter in `voice/streaming/` for batch engines             |
+| `src/lib/voice/correction/`                        | Dictionary candidates → `tryDecide` guard (fails open) → LLM rewrite; never returns fewer words than it was given        |
+| `src/lib/voice/providers/WhistleSTT.ts`            | Built-in local STT engine (WASM, zero-config default); files and download in `voice/whistle/assets.ts`                   |
+| `src/lib/core/baseProvider.ts`                     | Base class all providers extend; central `stream()` tool merge                                                           |
+| `src/lib/utils/messageBuilder.ts`                  | Constructs messages; handles all file types                                                                              |
+| `src/lib/adapters/providerImageAdapter.ts`         | Per-provider multimodal formatting + vision capability map                                                               |
+| `src/lib/adapters/tts/`                            | TTS provider handlers (Google TTS, Cartesia); new handlers go here                                                       |
+| `src/lib/mcp/toolRegistry.ts`                      | Tool management + MCP server registry                                                                                    |
+| `src/lib/mcp/mcpClientFactory.ts`                  | Creates MCP clients for all transport types                                                                              |
+| `src/lib/processors/registry/ProcessorRegistry.ts` | Selects file processor by MIME type + priority                                                                           |
+| `src/lib/types/index.ts`                           | Main type exports (start here for any type lookup)                                                                       |
+| `src/lib/types/providers.ts`                       | `AIProvider` type, `NeurolinkCredentials`, `ProviderDescriptor` type                                                     |
+| `src/lib/factories/providerDescriptors.ts`         | `PROVIDER_DESCRIPTORS` — single source of truth for provider metadata (aliases, credentials key, env vars, tool support) |
+| `src/lib/providers/openaiCompatCatalog.ts`         | `OPENAI_COMPAT_CATALOG` — data rows for zero-quirk OpenAI-wire-compatible providers (Tier 2 onboarding)                  |
+| `docs/provider-integration/tiers/README.md`        | Tiered new-provider onboarding guide — start here for any new provider                                                   |
+| `src/lib/types/mcp.ts`                             | `MCPTransportType` and MCP config types                                                                                  |
+| `src/lib/constants/enums.ts`                       | `AIProviderName` enum (the actual location — not `types/providers.ts`)                                                   |
+| `src/lib/constants/contextWindows.ts`              | Per-provider, per-model context window sizes                                                                             |
+| `src/lib/context/contextCompactor.ts`              | Multi-stage context reduction orchestrator                                                                               |
+| `src/lib/context/budgetChecker.ts`                 | Pre-call budget validation                                                                                               |
+| `src/lib/rag/ragIntegration.ts`                    | `prepareRAGTool()` — auto RAG setup for generate/stream                                                                  |
+| `src/cli/factories/commandFactory.ts`              | All CLI command options and flag definitions                                                                             |
+| `src/lib/server/routes/agentRoutes.ts`             | HTTP server routes including `/api/agent/embed`                                                                          |
+| `src/lib/server/routes/claudeProxyRoutes.ts`       | Anthropic pool engine — account routing, retry, SSE relay                                                                |
+| `src/lib/server/routes/codexProxyRoutes.ts`        | Codex (ChatGPT) pool engine — `/backend-api/codex/responses`                                                             |
+| `src/lib/auth/codexOAuth.ts`                       | Codex OAuth: `auth.json` import, refresh, account-id resolution                                                          |
 
-### Tool System (MCP Integration)
+### Proxy pool engines
 
-**MCPToolRegistry** (`src/lib/mcp/toolRegistry.ts`) manages all tools:
+The proxy runs two independent subscription pool engines that share the token
+store and the cooldown/quota persistence layer:
 
-- Built-in tools (getCurrentTime, readFile, writeFile, listDirectory, calculateMath, websearchGrounding)
-- External MCP servers (GitHub, PostgreSQL, Google Drive, etc.)
-- Custom tools defined by users
+|                    | Anthropic (Claude)              | Codex (ChatGPT)                           |
+| ------------------ | ------------------------------- | ----------------------------------------- |
+| Inbound route      | `POST /v1/messages`             | `POST /backend-api/codex/responses`       |
+| Upstream           | `api.anthropic.com/v1/messages` | `chatgpt.com/backend-api/codex/responses` |
+| Wire format        | Anthropic Messages              | OpenAI Responses                          |
+| Token-store prefix | `anthropic:`                    | `codex:`                                  |
+| Quota windows      | unified 5h / 7d                 | primary / secondary                       |
 
-**MCP Transport Protocols:**
+Both engines key **cooldowns** by the full account key. **Quota** is keyed by the
+full key on the Codex side but by the bare label (`foo`, not `anthropic:foo`) on
+the Anthropic side — a historical asymmetry, not a pattern to copy. Either way
+`codex:foo` cannot collide with an Anthropic entry, because no bare label
+contains a `:` prefix. Prefer the full key in new code; when reading quota for an
+Anthropic account you must use `account.label`.
 
-NeuroLink supports multiple transport protocols for MCP servers:
+**Migrating the Anthropic side to full keys** (not done, deliberately): the bare
+label is persisted in `~/.neurolink/account-quotas.json` on every user's machine,
+so a change of key means either losing every stored snapshot — which blinds
+quota-aware routing until each account is observed again — or a one-time
+migration that rewrites `<label>` to `anthropic:<label>` on load and tolerates
+both shapes for a release. Until that is worth doing, treat the bare label as
+load-bearing for Anthropic quota and use the full key everywhere else.
 
-| Transport     | Use Case                                | Configuration                  |
-| ------------- | --------------------------------------- | ------------------------------ |
-| **stdio**     | Local MCP servers via command execution | `command`, `args`, `env`       |
-| **http**      | Remote HTTP/Streamable HTTP servers     | `url`, `headers`, HTTP options |
-| **sse**       | Server-Sent Events connections          | `url`, `headers`               |
-| **websocket** | WebSocket connections                   | `url`, `headers`               |
+When adding a third provider, follow the Codex pattern: a new
+`<provider>OAuth.ts`, a `<provider>AccountUsage.ts` quota parser, and a
+`<provider>ProxyRoutes.ts` engine — do not modify the Anthropic hot path.
+See `docs/features/codex-proxy-support.md`.
 
-**HTTP Transport Features:**
+---
 
-- URL-based server configuration (vs command-based for stdio)
-- Authentication via custom headers (Bearer tokens, API keys)
-- HTTP options: `timeout`, `retries`, `healthCheckInterval`
-- Rate limiting with configurable limits
-- Automatic retry with exponential backoff
-- Session management via `Mcp-Session-Id` header
-
-**Example configurations:**
-
-```typescript
-// stdio transport (local server)
-await neurolink.addExternalMCPServer("github", {
-  command: "npx",
-  args: ["-y", "@modelcontextprotocol/server-github"],
-  transport: "stdio",
-  env: { GITHUB_TOKEN: process.env.GITHUB_TOKEN },
-});
-
-// HTTP transport (remote server)
-await neurolink.addExternalMCPServer("github-copilot", {
-  transport: "http",
-  url: "https://api.githubcopilot.com/mcp",
-  headers: { Authorization: "Bearer YOUR_TOKEN" },
-  timeout: 15000,
-  retries: 5,
-});
-```
-
-**Tool execution flow:**
-
-1. Tools registered with MCPToolRegistry
-2. Available tools transformed to provider-specific format
-3. AI model calls tools during generation
-4. Tool results sent back to AI for continued reasoning
-
-**Key files:**
-
-- `src/lib/mcp/toolRegistry.ts` - Tool registry
-- `src/lib/mcp/mcpClientFactory.ts` - MCP client creation for all transports
-- `src/lib/mcp/externalServerManager.ts` - External server lifecycle management
-- `src/lib/mcp/httpRetryHandler.ts` - HTTP retry with exponential backoff
-- `src/lib/mcp/httpRateLimiter.ts` - Rate limiting for HTTP transport
-- `src/lib/utils/transformationUtils.ts` - Tool format transformations
-- `src/lib/types/mcpTypes.ts` - MCP type definitions (includes `MCPTransportType`)
-- `src/lib/types/externalMcp.ts` - External MCP server types
-- `src/lib/types/tools.ts` - Tool type definitions
-
-### Type System
-
-NeuroLink has a comprehensive TypeScript type system with 28+ type definition files:
-
-**Critical type files:**
-
-- `src/lib/types/index.ts` - Main type exports
-- `src/lib/types/providers.ts` - Provider types
-- `src/lib/types/generateTypes.ts` - Generate operation types
-- `src/lib/types/streamTypes.ts` - Streaming operation types
-- `src/lib/types/mcpTypes.ts` - MCP integration types
-- `src/lib/types/conversation.ts` - Conversation and memory types
-- `src/lib/types/tools.ts` - Tool definition types
-- `src/lib/types/common.ts` - Shared common types
-
-**Type organization principle:** Types are organized by domain (providers, generation, streaming, MCP, etc.) to avoid circular dependencies.
-
-### CLI Architecture
-
-**CommandFactory Pattern** (`src/cli/factories/commandFactory.ts`):
-
-- Creates yargs command modules
-- Handles common options (provider, model, temperature, etc.)
-- Integrates with global session state for loop mode
-- Supports multimodal inputs (--image, --pdf, --csv flags)
-
-**Loop Mode** (`src/cli/loop/session.ts`):
-
-- Interactive REPL-style session
-- Persistent conversation memory
-- Session-wide configuration (set provider, set temperature, etc.)
-- Command history and context preservation
-
-**Key CLI files:**
-
-- `src/cli/index.ts` - CLI entry point
-- `src/cli/factories/commandFactory.ts` - Command creation
-- `src/cli/commands/` - Individual command implementations
-- `src/cli/loop/session.ts` - Interactive loop session
-
-### Build System
-
-**Dual Build Process:**
-
-1. **SDK Build** (via SvelteKit): Outputs to `dist/` for npm package
-2. **CLI Build** (via TypeScript): Compiles CLI to `dist/cli/` with executable
-
-**Build configuration:**
-
-- `vite.config.ts` - Vite configuration for SDK
-- `tsconfig.json` - Main TypeScript config
-- `tsconfig.cli.json` - CLI-specific TypeScript config
-- `svelte.config.js` - SvelteKit packaging config
-
-**Build process:**
+## Development Commands
 
 ```bash
-# Full build executes:
-1. vite build         # Build SDK with Vite
-2. svelte-kit sync    # Sync SvelteKit types
-3. svelte-package     # Package for npm
-4. tsc --project tsconfig.cli.json  # Build CLI
-5. publint           # Validate package
+# Build
+pnpm run build            # Full SDK + CLI build
+pnpm run build:cli        # CLI only (faster iteration)
+pnpm run build:complete   # Build + validation
+
+# Type checking
+pnpm run check            # Type check
+pnpm run check:watch      # Watch mode
+
+# Quality
+pnpm run lint             # Check lint + format
+pnpm run format           # Auto-format
+pnpm run check:all        # All quality checks
+pnpm run check:docs-api   # Regenerate docs/api and fail if it differs from src/
+# validate and validate:all do NOT include that docs/api check. CI runs it as
+# its own step, so a green validate:all can still fail the required `test`.
+
+# Testing — every suite is end-to-end (see "Tests are end-to-end only" below).
+# All suites run via tsx; there is no vitest runner despite vitest.config.ts existing.
+pnpm test                 # Main suite (test/continuous-test-suite.ts)
+pnpm run test:ci          # test + test:client
+pnpm run test:client      # SDK client suite
+pnpm run test:decide      # The decide inference type: offline cases, then live (gateway half skips without AI_GATEWAY_API_KEY)
+pnpm run test:transcribe  # The transcribe inference type: SDK, CLI and routes (no API; Whistle cases skip without its files or macOS `say`)
+pnpm run test:transcribe:stream  # Chunked streaming adapter: endpointer, LocalAgreement, takeover (no API; determinism exception)
+pnpm run test:context     # Context compaction + file handling
+pnpm run test:mcp         # MCP infrastructure (no-API; mcp-infra.ts)
+pnpm run test:mcp:http    # HTTP-transport suite (mcp-http.ts) — live
+pnpm run test:mcp:sdk     # Live SDK MCP enhancements (mcp-sdk.ts)
+pnpm run test:mcp:cli     # Live CLI MCP suite (mcp-cli.ts)
+pnpm run test:mcp:registry # MCPRegistryClient remote lookup vs a local mock registry (mcp-registry.ts) — no API
+pnpm run test:mcp:spans   # Issue#5 span attributes (mcp-spans.ts) — no API
+pnpm run test:mcp:full    # All mcp-* suites in dependency order
+pnpm run test:rag         # RAG suite
+pnpm run test:skills      # Native skills suite (mostly no-API; live test skips without keys)
+pnpm run test:providers   # Provider-specific feature tests
+pnpm run test:matrix      # Capability sweep across every registered provider
+pnpm run test:media       # Media generation suite
+pnpm run test:memory      # Memory suite (incl. session-memory-bug regressions)
+pnpm run test:observability  # Includes tracing + telemetry-gaps + issue-04
+pnpm run test:ppt
+pnpm run test:servers
+pnpm run test:tts
+pnpm run test:workflow
+pnpm run test:credentials # Includes issue-01 model-access regression
+pnpm run test:evaluation  # Includes evaluation-scoring sub-suite
+pnpm run test:middleware
+pnpm run test:autoresearch       # E2E + live (live half skips without keys)
+pnpm run test:docs-snippets      # Docs' new NeuroLink({...}) options vs the built d.ts (no-API; needs a build; CI does NOT run it); :update regenerates its ledger
+pnpm run test:docs-methods       # Docs' neurolink.<method>() calls vs the built NeuroLink class (no-API; needs a build; CI runs it in the `types` shard); a block can be marked `planned` on its fence line
+pnpm run test:provider-model-resolution  # Which model each registered provider name resolves from the environment (no-API; needs a build; CI does NOT run it)
+
+# What CI actually gates — NOT test:unit.
+# .github/workflows/ci.yml has two required jobs over test/, and both are
+# sharded behind an aggregator of the same name. Branch protection requires the
+# aggregator, so the required name is never a job that runs a suite:
+#   provider-safety-net → build, then `contract` (test:providers-mocked) and
+#     `rest` (test:provider-structure, test:error-classifier-contract, the
+#     bedrock/sagemaker/anthropic/aistudio characterization suites, and
+#     verify:provider-onboarding).
+#   test → `lint` (format-check, eslint), `validate` (validate:all, docs:api
+#     currency, check:deps), `types` (check:ci-scripts, check:test-parse,
+#     check:tools-tests, check:dts, test:docs-methods, both builds).
+# The pre-push hook is a DIFFERENT set, not a subset: check:deps,
+# check:docs-api, build, test:provider-structure, test:model-manifests.
+# test:providers-mocked is deliberately not in it — 259s, and
+# provider-safety-net already gates it.
+# Everything else in test/ runs only when someone runs it, so adding a suite
+# does not make it a gate.
+
+# Run a single suite directly
+pnpm exec tsx test/continuous-test-suite-<name>.ts
+
+# Environment
+pnpm run env:validate     # Validate .env setup
+pnpm run env:setup        # Interactive setup
+
+# CLI smoke test
+pnpm run build:cli && pnpm run cli <command>
 ```
 
-## Working with Providers
+**Workflow:** edit → `pnpm run check` → `pnpm run lint` → `pnpm test` → `pnpm run build`
+
+### ⚠️ Keep payloads out of assertion messages
+
+`defineSuite`'s `test()` classifies a thrown error as **SKIP** — not FAIL — when
+it is a `Skip`, when the message starts with `SKIP:`, **or when the message
+matches `isExpectedProviderError()`**. That last clause reads the message text,
+so an assertion message that merely _quotes_ provider-ish content is downgraded
+to a skip and the run still exits 0.
+
+```ts
+// DON'T — dumping the actual value into the message. If the payload contains
+// something like "stream_error", "502" or "ECONNREFUSED", a genuine failure is
+// reported as ⊘ skipped and CI stays green.
+assert(ok, `terminal journal wrong — got ${JSON.stringify(actual)}`);
+
+// DO — describe the discrepancy without quoting the payload.
+assert(ok, `terminal journal wrong — mismatch at ${keyPath}`);
+```
+
+This bit during the Vitest migration: three real failures in
+`continuous-test-suite-proxy-terminal-errors.ts` reported as `Passed: 2,
+Skipped: 3` with exit 0. An audit of the 26 no-API suites found no _existing_
+suite affected, but the docs search-index suite later hit it for real: its
+assertions quote names like `OPENAI_API_KEY`, and a deliberately broken control
+reported `2 skipped` and `RESULT: PASS`.
+
+The structural fix is to declare a suite that makes no network call `offline`:
+`defineSuite("…", { offline: true })`. The matcher is then never consulted — only
+an explicit `Skip` or a `SKIP:` message skips, and a per-test timeout fails too.
+Do this for any suite whose only upstream is a loopback stand-in, a mock or a
+fixture. A suite that also has a live, key-gated case cannot (that case needs
+the provider-error-to-skip route), so split it: the offline cases go in a suite
+declared `offline`, the live ones in a `-live` file that keeps the skip route,
+and the original script name chains the two (`test:decide`, `test:model-pool`
+and `test:agent-delegation` do this). Shared setup goes in `test/helpers/`
+(`decideSuiteShared.ts` for the decide pair).
+
+When adding a suite, sanity-check it by breaking one assertion on purpose and
+confirming it reports `✗` and exits non-zero rather than `⊘`.
+
+### ⚠️ Never write a CI-skip directive into a commit message
+
+GitHub honours `[skip ci]`, `[ci skip]`, `[no ci]`, `[skip actions]` and
+`[actions skip]` **anywhere in a commit message — subject or body**. It does not
+care whether you meant it or were quoting it. A commit that contains one runs
+**no workflows at all** for its push.
+
+This is not a hypothetical. A PR merged to `release` quoting semantic-release's
+own `chore(release): x.y.z [skip ci]` template, while documenting that those
+commits were going away, and the merge ran nothing: no CI, no release job. The
+failure is invisible by construction — a suppressed run looks exactly like a run
+that was never required — and it surfaced only because the branch's check list
+looked implausibly short an hour later.
+
+If you need to write about a directive, break up the literal (`skip-ci`) or put
+the explanation in the **PR body**, which GitHub does not scan. GitHub skips the
+`push` and `pull_request` runs when the PR's head commit holds a directive, so
+the required `🔒 Single Commit Policy Validation` check never reports: it stays
+Pending and blocks the merge. `Reject CI-Skip Directives` in
+`single-commit-enforcement.yml` (it reads the full message with `%B`) is only a
+backstop and cannot report that case, and its regex does not cover a
+`skip-checks:` trailer. The older `Validate Commit Message Format` step reads
+only `%s`, but that is not why this got through: GitHub skipped the whole
+workflow before any step ran, so even a check that read the full message would
+never have run.
+
+### ⚠️ Required status checks and the release bot
+
+`release` carries **five** required status checks, and they live on **two
+different layers** that GitHub enforces as a union:
+
+| check                                | ruleset `11413189` | classic branch protection |
+| ------------------------------------ | ------------------ | ------------------------- |
+| `test`                               | ✅                 | ✅                        |
+| `provider-safety-net`                | ✅                 | ✅                        |
+| `build-check`                        | ✅                 | ✅                        |
+| `🔒 Single Commit Policy Validation` | ✅                 | ✅                        |
+| `security-suites`                    | ❌                 | ✅                        |
+
+**Querying only the ruleset API under-reports the list.** `gh api
+repos/juspay/neurolink/rulesets/11413189` returns four contexts and no mention
+of `security-suites`; `gh api repos/juspay/neurolink/branches/release/protection`
+returns all five. Check both, or you will conclude a required check is optional
+— and a red `security-suites` will block a merge you were sure it could not.
+
+The two layers also differ in who can bypass them. The ruleset has
+`bypass_actors: []`, so its four are unbypassable by anyone. Classic protection
+has `enforce_admins: false`, so the classic layer — which is the only place
+`security-suites` is required — does not apply to admins. Net effect: four
+checks nobody can bypass, plus a fifth that a repository admin can.
+
+**A migration to rulesets would silently drop `security-suites`.** GitHub has
+been steering repositories off classic protection, and the migration is
+per-layer: switching classic off removes every requirement that exists only
+there. Four of the five are duplicated on the ruleset and would survive. The
+fifth is not, and would simply stop gating — no warning, no failed merge, no
+visible change on any pull request. What makes it invisible is that the check
+keeps running and keeps reporting: a green `security-suites` looks identical
+whether it is blocking the merge or merely describing it, and the way you find
+out it stopped blocking is that something red merges. Before disabling classic
+protection, add the context to ruleset `11413189` first and confirm with
+`gh api repos/juspay/neurolink/rulesets/11413189` that it comes back — the same
+call that under-reports the list today is the one that proves the migration is
+safe.
+
+Anything that pushes **directly** to `release` — rather than through a PR —
+carries no check runs, so every required check reads as missing and the push is
+declined:
+
+```
+GH013: Repository rule violations found for refs/heads/release
+- 4 of 4 required status checks are expected.
+! [remote rejected]   HEAD -> release
+```
+
+(That message is quoted verbatim from the original failure and counts only the
+ruleset's four — another reason the ruleset view alone is misleading.)
+
+This blocked publishing entirely when the checks were first enabled, because
+`@semantic-release/git` pushed the version bump back to the branch. The usual
+remedy — allowing the GitHub Actions app to bypass — **cannot be configured at
+repository level**; that actor must belong to the owner organization. The fix
+was to drop `@semantic-release/git` so nothing pushes to the branch at all.
+
+Consequences worth knowing before you go looking for them:
+
+- `CHANGELOG.md` is **not** committed to the repo any more. It is still
+  generated and still ships inside the published package, and the notes remain
+  on the GitHub Release.
+- `package.json`'s version in git no longer tracks the published version.
+  semantic-release derives the next version from **tags**, so publishing is
+  correct, but `--version` from a git clone reports whatever was last committed.
+- There are no more `chore(release): x.y.z [skip ci]` commits on the branch.
+
+**Before adding anything that writes to `release`, check whether it pushes
+directly.** If it does, it will be rejected, and the failure appears as a
+release-job error rather than anything resembling a permissions problem.
+
+### Stacked pull requests, and why they used to be unmergeable
+
+A **stacked** pull request is one whose base is another feature branch rather
+than `release`, opened so dependent work can proceed before its parent merges.
+They work now. They did not before, and the reason is worth keeping because it
+is invisible in exactly the way this repository keeps getting caught by.
+
+Four of the five required status contexts — `test`, `provider-safety-net`,
+`security-suites`, `build-check` — are **jobs inside `ci.yml`**. The fifth,
+`🔒 Single Commit Policy Validation`, comes from a separate workflow,
+`single-commit-enforcement.yml`. So a base-branch filter on `ci.yml`'s
+`pull_request` trigger does not decide whether those four checks pass. It
+decides whether they are **created at all**. Scoped to `branches: [release]`, a
+stacked PR got none of those four, and a check that was never created reports as
+_missing_, not as failing — which on a pull request is indistinguishable from
+"still queued". PR #1670 sat at **1 of 5** required contexts from the day it was
+opened, with nothing red to explain why.
+
+`single-commit-enforcement.yml` broke them a second, independent way. Its
+`pull_request` trigger was scoped to `[release, main]`, so a stacked PR fell
+through to the **push-event** path, which hardcoded `BASE_BRANCH="origin/release"`.
+Counting commits from `release` on a branch stacked on another feature branch
+includes the parent's commit, so a single-commit PR was reported as carrying two
+and failed a policy it had not broken.
+
+Both `pull_request` triggers are now unfiltered by base branch. The
+pull-request path already resolved the real base from `github.base_ref`; it was
+simply never reached. The push path now asks for the branch's open PR and uses
+its base, falling back to `release` when there is none.
+
+Two things to know when stacking:
+
+- **`push` in `ci.yml` is still scoped to `release`,** deliberately. Only
+  pull-request handling was widened.
+- **Merge the parent first, then rebase each child by hand.** Do not expect
+  GitHub to retarget a child for you, and omit `--delete-branch` on a parent
+  that still has an open child: deleting the base can **close** the child
+  outright rather than retarget it, which is the `#1696` incident recorded in
+  "⚠️ Merging a stack: `--delete-branch` closes the child" below. Rebase-merge
+  also replays the parent's commit under a new SHA, so the child still carries
+  the parent's old commit and fails the single-commit policy until it is
+  rebased — see "rebase-merge rewrites the parent, so rebase each child" for
+  the `git rebase --onto origin/release <parent-old-head>` recipe.
+
+  The same applies to a parent that is merely **force-pushed while still
+  open**, which is the more common case: rebasing a parent orphans the copy of
+  its commit that each child carries, and every child flips to `CONFLICTING`
+  the moment the parent is pushed. Rebasing #1668 and #1647 onto a moved
+  `release` did exactly that to #1670 and #1648, each of which needed
+  `git rebase --onto origin/<parent-branch> <parent-old-head>` before it was
+  mergeable again. Expect to fix up the whole stack, bottom-up, after touching
+  any link in it. A force-push does re-trigger stale bot reviews on the child,
+  but that is a cost of the rebase, not a reason to skip it.
+
+### ⚠️ Reading a CI result: seven ways this repo has misread one
+
+Every incident below produced a confident wrong answer. Incidents 1, 2 and 4
+are the same mistake — treating the _absence_ of a signal as a signal — and 3 is
+its inverse, a surplus read as a miscount. The last three are its close
+relatives: reading a signal the tool never emitted, getting the same wrong
+answer twice from two passes that shared an input, and reading a signal that
+belongs to a commit you have already replaced. They are recorded together
+because each one cost real time before it was spotted.
+
+**1. `CANCELLED` is not a failure.** Superseded runs report `CANCELLED`, and this
+workflow cancels its own in-progress runs (`concurrency.cancel-in-progress`), so
+an amend-and-force-push routinely leaves cancelled runs behind. A check written
+as `conclusion != "SUCCESS"` therefore alarms on healthy history: three runs
+fired for one SHA in 28 seconds on #1552 and the first was cancelled by the
+second. Classify `CANCELLED` as _no result_, never as red.
+
+**2. A check that has not appeared has not passed.** `pending == 0` is true both
+when every check finished and when none has been created yet. GitHub takes a
+while to register a workflow's check runs, and a pull request polled inside that
+window looks green with a handful of unrelated checks while four of the five
+required contexts are simply missing. Gate on the required contexts being
+**present** before reading their state:
+
+```bash
+gh pr view <N> --json statusCheckRollup --jq \
+  '[.statusCheckRollup[] | select((.name//.context) | IN(
+     "test","provider-safety-net","build-check",
+     "🔒 Single Commit Policy Validation","security-suites"))
+   | (.name//.context)] | unique | length'   # must be 5 before the result means anything
+```
+
+**3. Count required checks as distinct contexts.** `🔒 Single Commit Policy
+Validation` reliably appears **twice** in `statusCheckRollup`, so a naive count
+reports six-of-five and a comparison written as `== 5` fails on a green pull
+request. Deduplicate by name, as above.
+
+**4. `gh pr checks --json` returns empty in some environments.** It exits
+successfully and prints nothing, which reads as "no failures". Use
+`gh pr view <N> --json statusCheckRollup` instead — the failure mode of the
+wrong command here is silence, not an error.
+
+**5. An exit code from the shell is not a result from the tool.** The four
+above are all "the tool ran and the signal was misread". This one is worse:
+the tool never ran. A gate invoked as `pnpm run check > "$out"` where `$out`
+is a directory fails in the redirect, before the command starts, and reports
+exit 1 — indistinguishable at a glance from a real failure, while the output
+file is empty in exactly the way a clean run also leaves it. It was hit twice
+in one day, and in both directions: once read as a broken build, once as a
+clean one. Check that the output actually contains the tool's own output
+before believing either verdict, and prefer a path you created over one you
+assumed was a file.
+
+**6. A verifier that shares an input with the claim it checks is not
+adversarial about that input.** An adversarial review pass exists to refute a
+finding, but it can only do that on evidence the finding did not supply. Two
+reviewers in this repo both read `pull/<N>/head` from a shared clone while
+other agents were fetching different pull requests into it, so `FETCH_HEAD`
+had moved: the first produced a finding that was already false at the head it
+was told to read, and the second "confirmed" it from the same stale object.
+The result was a confident, verified, wrong finding reported to another
+author. Pin to the sha — `gh api repos/<owner>/<repo>/pulls/<N> --jq
+.head.sha` — at **both** stages, and treat any check that reuses the input,
+tooling or assumption under test as unverified. This is the same failure as
+the probe below, one level up: agreement between two passes is not evidence
+when they share the thing that is wrong.
+
+The same rule generalises past CI, and is worth applying to any probe: **an
+assertion about something NOT happening needs a precondition proving the thing
+under test actually ran.** A probe once reported `LEAK: socket still open` for a
+Bedrock request, on a run where the request never left the machine —
+`closedAt === null` meant "nothing happened", not "still open". Three successive
+probe designs agreed with each other and were all wrong for the same reason,
+because they shared an unstated assumption about the transport. Assert the
+precondition first, in the probe, and make it fail loudly when it does not hold.
+
+**7. A pull request's check rollup can describe the PREVIOUS head.** Incident 2
+above is the one about a check that has not appeared yet — 1, 3 and 4 are a
+cancelled run, a duplicated context and a command that printed nothing. This is
+incident 2's mirror image: a check that appeared, passed, and belongs to a commit
+you have just replaced.
+Immediately after an amend-and-force-push, `gh pr view <N> --json
+statusCheckRollup` can still serve the outgoing head's runs — so the gate reads
+a clean `5/5 SUCCESS` for a SHA that no longer exists on the branch, seconds
+after a push that has not started a single job. It was hit while merging a
+rebased stack: the rollup said five green, and `commits/<new-sha>/check-runs`
+said three present and all `in_progress`.
+
+Ask the commit, not the pull request:
+
+```bash
+SHA=$(gh api repos/juspay/neurolink/pulls/<N> --jq .head.sha)
+gh api "repos/juspay/neurolink/commits/$SHA/check-runs?per_page=100"
+```
+
+and re-read `.head.sha` on every poll, so a gate aborts rather than reports
+when the head moves underneath it. `mergeable_state` is not a substitute —
+it read `unknown` through the whole window. This is incident 6 again in a
+different costume: the stale object was a check run rather than a `FETCH_HEAD`,
+and a rollup that is merely _late_ is indistinguishable from one that is
+_right_ unless you pin the sha yourself.
+
+### ⚠️ A "regenerate and diff" check needs a reproducible generator first
+
+`docs/api` currency works because typedoc is a pure function of the source.
+`docs-site/static/{llms.txt,llms-full.txt,search-index.json}` were not, and a
+naive currency check over them would have been **permanently red** — the same
+shape of always-failing required check the ffmpeg incident below produced.
+
+(Only `search-index.json` is committed now. The two llms files are gitignored:
+they are not in package.json `files`, so they never shipped, and committing a
+9.5 MB whole-file regeneration conflicted on nearly every docs pull request.
+The reproducibility lesson below still stands — it is what lets the remaining
+artifact be diffed at all.)
+
+Two separate causes, and the second is the one that hides:
+
+1. `build-llms-txt.ts` stamped `new Date().toISOString()` into both llms files.
+   Obvious once you look, and trivially fatal to any diff.
+2. `docFiles.sort((a, b) => a.order - b.order)` is **not a total order** — many
+   files share one `order`. `Array.prototype.sort` is stable, so ties fell back
+   to the input order, which came from `glob()`, which is filesystem order. Two
+   consecutive builds of an unchanged tree differed by **215,862 lines**.
+   `sortSections` had the same defect: every section outside `SECTION_ORDER`
+   scores 999, so their ties came from Map insertion order.
+
+Both are fixed **in the llms generator**, and those two artifacts are now
+byte-identical across runs.
+
+**`search-index.json` was never fixed, and this file said otherwise for
+months.** The fix commit `ef125b2bd` touched five paths — the workflow, this
+file, `build-llms-txt.ts`, and the two llms artifacts. `grep -c search-index`
+over that file list returns 0. Its generator,
+`docs-site/plugins/docusaurus-plugin-search-index/index.js`, still walks
+`fs.readdirSync` with **no sort at all**, and still numbers entries with a
+positional counter (`objectID: String(id++)`), so any reordering rewrites every
+subsequent id and amplifies a one-file change into a whole-file diff. A rebuild
+on an unchanged tree differs by ~1,640 positions, and the entry count moves —
+which a reorder alone cannot do, and which the sync-docs collision below
+explains. Tracked in issue #1749.
+
+Note what that leaves: the only one of the three artifacts still committed, and
+therefore the only one a currency check actually diffs, is the one whose
+generator was never made reproducible.
+
+The reason the claim survived is the lesson restated. `ef125b2bd`'s message said
+the change "leaves search-index.json byte-identical" — true of the run that was
+observed, and never a property established in code. An observation from one run
+was written down as an invariant, in the very section warning against exactly
+that. So: when adding any generator whose output is committed, prove it by
+building twice and `cmp`-ing, before writing a check that assumes it — and
+before writing down that it holds. Tiebreak with a codepoint
+comparison, not `localeCompare` — collation depends on the Node ICU build, so
+it can order CI and a laptop differently.
+
+Note also why the artifacts drifted in the first place, and why the check lives
+on the pull request rather than in `docs-deploy.yml`: that workflow runs
+post-merge with `contents: read`, and giving it write access would not help,
+because a push to `release` from outside a pull request carries no check runs
+and is declined by branch protection. See the required-status-checks section
+above.
+
+### ⚠️ `pnpm --filter ./docs-site` matches nothing and exits 0
+
+`pnpm-workspace.yaml` deliberately sets no `packages:` field — the cooldown
+policy lives there, and `docs-site/` stays an independent project. So a
+`--filter ./docs-site` selector matches no project. pnpm prints _"No projects
+matched the filters"_ and **exits 0**, which means every script written that way
+succeeds while doing nothing.
+
+The four `docs:*` scripts were written that way, including the `docs:build` that
+the artifact-currency check printed as its own remediation. Running exactly what
+the error message told you to run left the artifacts stale and reported success.
+Use `pnpm --dir docs-site <script>`, which does not depend on workspace
+membership.
+
+The general trap: a command that exits 0 is not evidence it did anything. Check
+that the work landed — a changed file, a written artifact — not the status code.
+
+And the sharper version of that trap: the artifact **was** written, and is still
+wrong. `pnpm run docs:api` used to do exactly this whenever the checkout's
+absolute path contained a directory named `test`. `typedoc.json` excluded
+`**/test/**`, typedoc matches `exclude` against absolute paths, and
+`cleanOutputDir` wipes the output first — so every file under `src/lib/` was
+excluded, the entry point converted to an empty module, and the run deleted 3545
+of 3546 files and wrote the module README. Exit 0. No errors, no warnings,
+`markdown generated at ./docs/api`, and a working tree holding a mass deletion
+that looked like a clean regeneration.
+
+It is not a hypothetical path: `workforge create -t test -n <name>` puts the
+worktree under a directory named for the branch type, so any worktree opened for
+test work sat on it. Two worktrees at the same commit, same lockfile, same
+`tsc --listFiles` output of 4847 files, disagreed by 3545 files, and neither
+reinstalling nor rebuilding changed anything — the only difference was the path.
+
+The pattern is now anchored to the project root (`./test/**`), which cannot
+match an ancestor of the repository. When adding an `exclude`, `ignore` or
+`files` pattern to any tool config, anchor directory patterns to the root:
+a bare `**/<name>/**` is a claim about every directory between `/` and the
+repository, not just the one you meant. CI never saw this — GitHub checks out at
+`/home/runner/work/neurolink/neurolink` — which is its own lesson about where a
+path-dependent bug hides.
+
+### ⚠️ Merging a stack: `--delete-branch` closes the child
+
+The house recipe is `gh pr merge <n> --rebase --delete-branch`, and on a
+pull request that targets `release` it is correct. On a **stacked** pull request
+— one whose base is another open PR's branch — the `--delete-branch` half is
+actively destructive: GitHub does not always retarget a child onto the merged
+PR's base. It can simply **close** it, because the branch the child was opened
+against no longer exists.
+
+That happened to #1696 when #1649 landed. The child's own branch was untouched,
+so no work was lost, but the pull request went to `state=closed, merged=false`
+and could not be reopened — `PATCH /pulls/1696 -f state=open` returns
+
+```
+state cannot be changed. The fix/campaign-followups-closeout branch has been deleted.
+```
+
+Recovery is to recreate the base branch at the SHA it had before the merge,
+reopen the child, retarget it to `release`, and only then delete the temporary
+ref:
+
+```bash
+# The base ref is already deleted, so <pre-merge-sha> is not rev-parseable from
+# any branch — read it from the reflog, which still holds the deleted tip.
+deleted_base=<deleted-base>
+gh api -X POST repos/juspay/neurolink/git/refs \
+  -f ref="refs/heads/$deleted_base" \
+  -f sha="$(git reflog -1 --format=%H "$deleted_base")"
+gh api -X PATCH repos/juspay/neurolink/pulls/<child> -f state=open
+gh api -X PATCH repos/juspay/neurolink/pulls/<child> -f base=release
+```
+
+Approvals and review threads survive that round trip. Before deleting the
+recreated ref, confirm its content really landed — after a rebase-merge the SHA
+differs, so `git merge-base --is-ancestor` reports NOT_MERGED on a branch that
+is fully merged. Compare trees instead: `git rev-parse <branch>^{tree}` against
+`git rev-parse <merge-commit>^{tree}`.
+
+**So: omit `--delete-branch` for any PR that still has an open child**, and let
+it run only on the last link. The repository's own auto-delete-on-merge handles
+the rest.
+
+### ⚠️ Merging a stack: rebase-merge rewrites the parent, so rebase each child
+
+**Rebase and merge** replays the parent's commit onto `release` under a _new_
+SHA. The child's branch still carries the parent's _old_ commit, which is now on
+no branch — so the moment the child is retargeted to `release` it reports **two
+commits** and fails `🔒 Single Commit Policy Validation`, a policy it has not
+broken.
+
+Rebase each child onto the new tip between merges. Use `--onto` with the
+parent's old head, which replays only the child's own commit and never asks
+about the parent's:
+
+```bash
+git fetch origin release
+git switch <child>
+git rebase --onto origin/release <parent-old-head>
+```
+
+`git switch` first is not optional: `--onto` replays whatever is on `HEAD`, and
+between merges the operator is often standing on a sibling link of the stack.
+Without it the command silently rebases the wrong branch.
+
+A plain `git rebase origin/release` does **not** recognise the parent's commit
+as already landed — the rebase-merge rewrote it, and any regeneration folded in
+on top changed its tree — so it replays it and conflicts. `--onto` avoids the
+`--skip` dance entirely.
+
+Expect `docs-site/static/search-index.json` to conflict on every link of a
+stack: it is generated, committed, and touched by almost everything. Resolve it
+by regenerating rather than by picking a side — `pnpm run build`, `pnpm run
+docs:api`, then `pnpm --dir docs-site run build` — and fold the result into the
+single commit. See the reproducible-generator section above for why a second
+build must produce zero drift.
+
+### ⚠️ `reset --soft` onto a newer base reverts everything in between
+
+Squashing a branch to one commit is routine here — the single-commit policy
+requires it. This is the wrong way to do it, and it produced **three silent
+reversions in a single day**:
+
+```bash
+git reset --hard origin/<branch>     # take the branch's tree
+git reset --soft origin/release      # move the pointer to the new base
+git commit                           # <- reverts everything in between
+```
+
+No conflict is involved, which is what makes it so easy to do. The sequence
+**reparents** a stale tree onto a new base instead of replaying content onto
+it, so git faithfully records the difference: every line `release` gained
+since the branch point becomes a **deletion** in a commit whose parent is
+`release` itself. A squash has to replay — `git rebase -i`, or rebase then
+squash. `reset --soft` onto a newer base is a reversion generator.
+
+One such commit was **206 files, +1316, -3390**: whole test suites
+(`tools-manager-truncation` -568, `native-vendor-recovery` -443),
+`nativeGenerateGuard.ts` -234, `ToolsManager.ts` -241, 156 lines of this file.
+Its actual purpose was to add two catalog JSON files.
+
+**Nothing on the pull request catches it.** It reported `mergeable: clean`,
+zero conflicts, 5/5 required checks green, one commit, valid subject. Each
+gate is blind for a structural reason: `git merge-tree` finds no conflict
+because the deletions are the commit's own content; CI passes because
+**deleting a test suite does not fail a test run**; the single-commit check
+counts commits, not damage. The only signal is the diffstat.
+
+**A tree-hash check does not save you either**, and this is the part worth
+carrying, because it is a real check, correctly executed, answering the
+adjacent question. Comparing `HEAD^{tree}` before and after the squash and
+getting an exact match proves the squash preserved the _pre-squash tip's_
+tree. It says nothing about whether that tip was stale relative to the new
+base. It cannot detect this failure, and it reads as reassuring.
+
+The check that does work, before pushing any squashed or rebased branch:
+
+```bash
+git diff --numstat "$(git merge-base HEAD origin/release)" HEAD \
+  | awk -F'\t' '$2 > 0 && $3 !~ /^docs\/api(\/|$)/ { print $3 }'
+# must print nothing
+```
+
+**Measure against the merge base, never against `release`.** On a branch cut
+weeks ago a release-relative diff reports every commit since as a deletion:
+one audit that way reported 50,787 deletions and 117 deleted files on a branch
+that deleted nothing, and 14 of 16 pull requests were wrongly flagged as
+reverting work before the error was spotted. Against the merge base, 12 of
+those 16 deleted nothing at all. The same trap catches a **stacked** pull
+request from the other direction — diff a child against `release` rather than
+against its parent branch and a clean single commit reads as a large revert.
+
+When a rebase touches generated files, **regenerate instead of resolving**:
+`pnpm run codegen:catalog`, `pnpm run docs:api`, the docs-site build. Reset to
+the new tip, re-apply only the branch's own hand-written changes, re-run the
+generators. There is then nothing to resolve, which removes the failure mode
+rather than avoiding it one more time.
+
+### ⚠️ The stash list is shared by every worktree, so `stash@{0}` is a race
+
+`git stash` writes to the **shared** `.git` directory. The stash list is
+therefore common to every worktree of a repository, not per-worktree — which
+makes every index-based reference (`stash@{0}`, `stash@{1}`) a race against
+whatever else is running.
+
+This is not hypothetical. With nine agents working in parallel across separate
+worktrees of this repository, one pushed a stash, another pushed one before the
+first popped, and the first agent's `git stash pop` applied **someone else's**
+five files into its worktree and dropped that entry from the list. The victim
+was mid-change on an unrelated branch.
+
+It recovered only because a stash commit is an ordinary immutable commit: the
+SHA was still reachable, so `git stash store -m "<original message>" <sha>`
+put it back with its content intact. Had the SHA not been captured, the entry
+would have been unreferenced and the work gone at the next `gc`.
+
+What makes it dangerous is that nothing looks wrong at the time. `git stash
+pop` succeeds, reports files restored, and exits 0. The applying worktree gets
+extra modified files that may look like its own half-finished work, and the
+owning worktree's stash simply is not in the list any more.
+
+So, whenever more than one worktree is in play:
+
+- **Never address a stash by index.** And do not capture the SHA as a second
+  command either — `git stash push` followed by `git rev-parse "stash@{0}"`
+  is the same race in miniature: another worktree's `stash push` can land in
+  the gap between the two, and `stash@{0}` then resolves to _that_ stash, not
+  yours. Capture it atomically instead: `git stash create` builds the stash
+  commit and prints its SHA on its own, without reading or writing the shared
+  stash list, so there is no gap for another worktree to land in —
+  `sha=$(git stash create)` — then register it under that known SHA with
+  `git stash store -m "<message>" "$sha"` and clear the working tree with
+  `git reset --hard`. Use that SHA for every later `apply`/`drop`. A SHA
+  identifies one specific stash; an index identifies whatever happens to be
+  on top when you get there.
+- **Prefer not stashing at all.** Reading one file's other version is what
+  `git show <sha>:<path>` is for, and a scratch copy outside the repository
+  costs nothing. Neither touches shared state.
+- Note the same sharing applies to other `.git`-level state — refs, the reflog,
+  `gc` — so a worktree is not the isolation boundary it looks like.
+
+### ⚠️ The advisory gate is time-dependent: a green run expires
+
+`scripts/security-check.ts` — the "🔒 Security & Environment Validation" step
+inside `test-shards (validate)`, and therefore inside the required `test`
+check — runs `pnpm audit --prod --json` **live** against the advisory
+database. Nothing about its verdict is pinned to the commit.
+
+Two consequences, both of which have already produced wrong conclusions here:
+
+**A pull request's green is a statement about when it ran, not about its
+diff.** When the js-yaml and hono advisories were published, one PR's
+`validate` shard had run at 20:05 UTC and passed; another ran at 02:03 UTC
+and failed. Identical dependency trees. The first PR looked green and
+mergeable and was neither — a re-run would have failed it. **Do not treat a
+green `test` older than the newest advisory publication as current**, and
+never conclude from "this PR is green and that one is red" that the
+difference is in their diffs.
+
+**A red gate usually is not yours.** Because the audit is repo-wide and
+live, a newly published advisory turns `test` red on _every_ open pull
+request simultaneously, including ones that touch no manifest at all. The
+check's own output says so — it appends a note about the branch being behind
+`origin/release` and warns that the failure "may not originate in your
+changes." Before investigating your own diff, reproduce on the untouched
+`release` tip:
+
+```bash
+# A fixed path is not re-runnable: the second call dies with
+# `fatal: '/tmp/nl-audit' already exists` instead of auditing. Take a unique
+# directory, and remove the worktree outside the `&&` chain so a failed audit
+# still cleans up after itself. The chain sits in an `if` condition, which
+# `set -e` does not act on, so a failing audit cannot end a `set -e` caller's
+# shell before the cleanup below runs and leave the worktree registered.
+audit_dir="$(mktemp -d)/nl-audit"
+if git fetch origin release \
+  && git worktree add "$audit_dir" origin/release \
+  && ( cd "$audit_dir" && pnpm install --frozen-lockfile \
+       && pnpm exec tsx scripts/security-check.ts ); then
+  audit_status=0
+else
+  audit_status=$?
+fi
+# Guarded: if the fetch or the `worktree add` failed, there is nothing to
+# remove, and an unguarded remove prints `fatal: ... is not a working tree`
+# on exactly the failure path this section exists to de-confuse.
+[ -d "$audit_dir" ] && git worktree remove --force "$audit_dir"
+rm -rf "$(dirname "$audit_dir")"
+# Cleanup runs unconditionally, so the block's own exit status would otherwise
+# be the `rm`'s — 0 — and a caller that wraps this diagnostic in a script reads
+# a red gate as a pass, which is the exact misreading this section exists to
+# prevent. Restore the audit's status. `( exit N )` and not a bare
+# `exit "$audit_status"`: the latter closes the interactive shell you pasted
+# this into, while the subshell form still leaves `$?` correct for a script.
+( exit "$audit_status" )
+```
+
+Note `origin/release`, not `release`: the check reports how far behind
+`origin/release` you are, so auditing a stale local ref reproduces a tree CI
+never ran and sends you chasing a difference that is your own checkout. The
+throwaway worktree keeps it read-only — `git stash && git checkout` mutates
+the tree you are debugging, which is a poor trade for a diagnostic whose
+whole question is "was it already broken without me?" And `--frozen-lockfile`
+because that is how every CI job installs: a plain `pnpm install` may
+re-resolve a transitive range and hand you a tree CI never audited, which is
+the same class of mistake this whole section is about.
+
+If it fails there too, the fix belongs in its own dependency PR, not in
+whatever you were working on.
+
+**Fixing it: raise the floor, and move the override band with it.** Prefer
+bumping the declared range over adding an accepted-risk entry — an accepted
+risk silences the gate for everyone, while a floor bump is what actually
+protects downstream consumers, who resolve from `package.json` and never see
+our lockfile. Two things are easy to get wrong:
+
+- **A lockfile-only bump is not a fix.** It greens CI and leaves every
+  installer of the published package on the vulnerable version.
+- **A raised floor with a stale `pnpm.overrides` band is worse than no
+  override.** The entries lift transitive consumers to a version that was
+  patched for an _older_ advisory, which can sit inside the _new_ one's
+  vulnerable range.
+
+  The worked example is historical, and deliberately so — the repository has
+  since been fixed, so do not expect `package.json` to still show the broken
+  state. `GHSA-2883-xcg3-v3hh` covers `>=3.0.0 <3.15.2` **and**
+  `>=4.0.0 <4.3.2`; the js-yaml overrides then read `>=3.14.2` / `>=4.1.1`,
+  which are the fixes for an _earlier_ js-yaml advisory and sit **inside**
+  both of this one's bands. They now read `>=3.15.2` / `>=4.3.2`, on the band
+  edges, which is what correct looks like. The trap is the shape, not those
+  numbers: an override target that was patched for the advisory you fixed
+  last time.
+
+  A lockfile that happens to resolve a safe version hides this, so CI stays
+  green and the pin re-manifests on the next install that re-resolves a
+  transitive range. Note also that `pnpm audit` printed only the 4.x range —
+  the 3.x half was invisible. Check every range on the GHSA record, not just
+  the one the audit showed you:
+
+  ```bash
+  gh api graphql -f query='{securityVulnerabilities(first:10, ecosystem:NPM,
+    package:"<pkg>"){nodes{advisory{ghsaId} vulnerableVersionRange
+    firstPatchedVersion{identifier}}}}'
+  ```
+
+  `fast-xml-parser`, `undici` and now `js-yaml` in the same table are the
+  worked examples of a band kept in step with its floor.
+
+### ⚠️ ffmpeg is deliberately not installed in CI
+
+Nothing CI runs needs it. No package script invokes it, nothing installs it as a
+dependency, and `src/` shells out to ffmpeg only at **runtime** (frame
+extraction, video merging, audio playback) — never during install, lint,
+typecheck, build or pack, which is all the CI jobs do. `provider-safety-net` has
+always built the package and run its suites without it.
+
+It was removed after breaking CI four ways in a single day: a corrupt published
+asset, a version pin that stopped resolving, a step deadline too tight for a
+slow mirror, and an Ubuntu mirror returning `Ign:` for every index while apt sat
+for fourteen minutes. Because `build-check` is a required check, each of those
+blocked **every open pull request** on a dependency none of the jobs use.
+
+If a job ever genuinely exercises media, install ffmpeg **in that job only**, and
+bound every wait — `DPkg::Lock::Timeout`, `Acquire::http::Timeout`,
+`Acquire::https::Timeout` — plus a step `timeout-minutes`. An unbounded `apt-get`
+waits forever on the dpkg lock that `unattended-upgrades` holds.
+
+---
+
+## How-To Guides
 
 ### Adding a New Provider
 
-1. Create provider file in `src/lib/providers/yourProvider.ts`
-2. Implement provider interface (extend base provider if available)
-3. Register in `ProviderRegistry.registerAllProviders()` using dynamic import
-4. Add provider name to `AIProviderName` enum in `src/lib/types/index.ts`
-5. Add model definitions to appropriate model enum
-6. Update vision capabilities in `src/lib/adapters/providerImageAdapter.ts` if multimodal
-7. Add to CLI choices in `src/cli/factories/commandFactory.ts`
-8. Add tests in `test/suites/` and `test/integration/`
+**Start at `docs/provider-integration/tiers/README.md`** — it routes you to one of four tiers by actual effort required, not a one-size-fits-all checklist:
+
+- **Tier 1 — aggregator passthrough** (a model already served by LiteLLM/OpenRouter): zero code, just a model id. See `tiers/tier-1-aggregator-passthrough.md`.
+- **Tier 2 — catalog entry** (OpenAI-wire-compatible, zero behavioral quirks — most new providers): **one JSON file**, `src/lib/providers/catalog/<id>.json`, then `pnpm run codegen:catalog && pnpm run build`. Zero hand-written source edits and zero test edits — the enum member, `<Name>Models` enum and `NeurolinkCredentials` key are machine-generated into marked regions, and the descriptor, config, context windows, pricing, vision map, model choices and every test row/count derive from the same file. See `tiers/tier-2-catalog-entry.md` for the field reference and the mandatory live probes.
+- **Tier 3 — adapter-based native** (own SDK/wire format, still a normal HTTP request/response lifecycle): a `src/lib/providers/<name>.ts` class extending `BaseProvider`, days. See `tiers/tier-3-adapter-native.md`.
+- **Tier 4 — full custom** (SageMaker-class: non-HTTP protocol or SDK-signed auth): everything Tier 3 needs plus a custom lifecycle, and a written `tier4Justification` in its manifest. See `tiers/tier-4-full-custom.md`.
+
+`AIProviderName` lives in `src/lib/constants/enums.ts` (not `src/lib/types/providers.ts`), and for catalog providers its members sit in a **generated region** — never hand-edit them; edit the JSON and re-run codegen. Every tier that adds an `AIProviderName` member must end with a green `pnpm run verify:provider-onboarding` — a required CI gate. For Tier 2 that gate reads the catalog JSON and requires `evidence.rosterVerified` + `evidence.addedInPR`; Tier 3/4 still use a manifest at `docs/provider-integration/manifests/<name>.json`. Tier 1 adds no `AIProviderName` member, so the gate doesn't apply — see `tiers/tier-1-aggregator-passthrough.md`. Use `pnpm run scaffold:provider` (`tools/scaffold-provider.ts`) to start: Tier 2 emits a pre-filled catalog JSON plus a probe checklist, Tier 3/4 emit source snippets.
+
+### Adding a New File Processor
+
+1. Create processor in the appropriate category under `src/lib/processors/`:
+   - `document/` — Excel, Word, RTF, OpenDocument
+   - `data/` — JSON, YAML, XML
+   - `markup/` — HTML, SVG, Markdown, Text
+   - `code/` — source code, config files
+   - `media/` — video, audio
+   - `archive/` — zip, tar, gz
+2. Extend `BaseFileProcessor` and implement `canProcess()`, `process()`, `getInfo()`
+3. Register in `ProcessorRegistry` with a priority (lower number = higher priority)
+4. Add MIME type mappings in `src/lib/processors/config/mimeTypes.ts`
+5. Add tests to the closest existing suite (e.g. `test/continuous-test-suite-context.ts` for file-handling, or `continuous-test-suite.ts` for CLI-level coverage). There is no dedicated `file-processor-test-suite.ts`.
 
 ### Modifying Message Building
 
-When changing how messages are constructed:
+1. Core logic: `src/lib/utils/messageBuilder.ts`
+2. Provider formatting: `src/lib/adapters/` (add provider-specific adapter if needed)
+3. Type changes: `src/lib/types/conversation.ts`
+4. Ensure backward compatibility — existing message formats must still work
 
-1. Modify `src/lib/utils/messageBuilder.ts` for core logic
-2. Update adapters in `src/lib/adapters/` for provider-specific formatting
-3. Ensure backward compatibility with existing message formats
-4. Add tests for new message types
-5. Update type definitions in `src/lib/types/conversation.ts`
+### Working with Embeddings
 
-### Working with Multimodal Content
+Nine providers implement embeddings natively: OpenAI, Google AI Studio, Google Vertex, Amazon Bedrock, Cohere, Ollama, LiteLLM, Voyage, Jina. All expose `embed()` / `embedMany()`; everything else inherits `BaseProvider`'s throwing default. Voyage and Jina are embedding-only (their `getAISDKModel()` throws); the rest also serve `generate()`/`stream()`.
 
-**For images:**
+Server endpoints: `POST /api/agent/embed` and `POST /api/agent/embed-many` in `src/lib/server/routes/agentRoutes.ts`.
 
-- Add to `ProviderImageAdapter.VISION_CAPABILITIES` if new model supports vision
-- Update `ProviderImageAdapter.adaptImageForProvider()` for provider-specific formatting
-- Test with `--image` flag in CLI
+### RAG Integration
 
-**For PDFs:**
+**Simple path** — pass `rag` config directly to `generate()` or `stream()`:
 
-- Modify `PDFProcessor` (`src/lib/utils/pdfProcessor.ts`) for processing logic
-- Update provider-specific handling in message builder
-- Currently supported: Vertex AI, Anthropic, Bedrock, AI Studio
-
-**For CSV:**
-
-- Modify `FileDetector` for CSV detection
-- Update message builder to handle CSV content
-- Test with `--csv` flag in CLI
-
-**For Documents (Excel, Word, RTF, OpenDocument):**
-
-- Processors in `src/lib/processors/document/`
-- `ExcelProcessor` - Handles `.xlsx`, `.xls` files with sheet extraction
-- `WordProcessor` - Handles `.docx` files with text extraction
-- `RtfProcessor` - Handles `.rtf` files
-- `OpenDocumentProcessor` - Handles `.odt`, `.ods`, `.odp` files
-- Test with `--file` flag in CLI
-
-**For Data Files (JSON, YAML, XML):**
-
-- Processors in `src/lib/processors/data/`
-- Auto-validates and formats data for AI consumption
-- Supports syntax highlighting in prompts
-- Test with `--file` flag in CLI
-
-**For Markup (HTML, SVG, Markdown, Text):**
-
-- Processors in `src/lib/processors/markup/`
-- `SvgProcessor` - Sanitizes SVG and injects as text (not binary image)
-- `HtmlProcessor` - OWASP-compliant HTML sanitization
-- `MarkdownProcessor` - Preserves formatting
-- `TextProcessor` - Plain text handling
-- Test with `--file` flag in CLI
-
-**For Source Code (50+ languages):**
-
-- Processors in `src/lib/processors/code/`
-- `SourceCodeProcessor` - Handles `.ts`, `.js`, `.py`, `.java`, `.go`, etc.
-- `ConfigProcessor` - Handles `.env`, `.ini`, `.toml`, `.cfg` files
-- Auto-detects language from extension
-- Adds syntax metadata for AI context
-- Test with `--file` flag in CLI
-
-**Adding a New File Processor:**
-
-1. Create processor class extending `BaseFileProcessor` in appropriate category folder
-2. Implement `canProcess()`, `process()`, and `getInfo()` methods
-3. Register in `ProcessorRegistry` with priority (lower = higher priority)
-4. Add MIME type mappings in `src/lib/processors/config/mimeTypes.ts`
-5. Update `FileDetector` if new file type detection needed
-6. Add tests in `test/file-processor-test-suite.ts`
-
-## Testing Strategy
-
-**Test organization:**
-
-- `test/suites/` - Feature-specific test suites (tool discovery, business tools, file operations, consistency)
-- `test/integration/` - Integration tests with real providers
-- Vitest as test runner
-
-**Running specific tests:**
-
-```bash
-vitest run test/suites/tool-discovery.test.ts
-vitest run test/integration/openai.test.ts
+```typescript
+const result = await neurolink.generate({
+  prompt: "What are the key features?",
+  rag: {
+    files: ["./docs/guide.md", "./docs/api.md"],
+    strategy: "markdown", // auto-detected from extension if omitted
+    chunkSize: 512, // default: 1000
+    topK: 5, // default: 5
+  },
+});
 ```
 
-**Test best practices:**
+CLI equivalent: `neurolink generate "query" --rag-files ./docs/guide.md --rag-strategy markdown`
 
-- Mock external API calls for unit tests
-- Use real API calls sparingly in integration tests
-- Test provider consistency across all providers
-- Validate multimodal content handling
+NeuroLink creates a `search_knowledge_base` tool the model can call. For full control (custom vector stores, embeddings), use `createVectorQueryTool` from `src/lib/rag/retrieval/vectorQueryTool.ts` directly.
+
+**Chunking strategies:** `character`, `recursive`, `sentence`, `token`, `markdown`, `html`, `json`, `latex`, `semantic`, `semantic-markdown`
+
+**Rerankers:** `simple` (TF-IDF, no LLM), `llm`, `batch`, `cross-encoder` (stub), `cohere` (stub)
+
+### Observability (Langfuse + OTEL)
+
+Set `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` (optionally `LANGFUSE_BASE_URL`, `LANGFUSE_TRACING_ENVIRONMENT`, `LANGFUSE_RELEASE`) and tracing turns on with no config. `observability: { langfuse: false }` disables it; `observability: { langfuse: { publicKey, secretKey, baseUrl, environment, release, mask, exportMode, flushAt, flushInterval } }` overrides env. Full input and output are captured by default; use `mask` for sensitive data.
+
+One instrumentation, one pipeline: OTEL spans -> `ExporterSpanProcessor` -> `SpanData` -> `ExporterRegistry` -> exporters. NeuroLink's own provider registers `LangfuseExporter` (OTLP/HTTP JSON to `POST /api/public/otel/v1/traces`) in the shared registry, plus an OTLP processor when `OTEL_EXPORTER_OTLP_ENDPOINT` is set; Observations keep their native types and carry user/session on every span. If the host already registered a global `TracerProvider`, NeuroLink creates no provider but still registers `LangfuseExporter` on the shared registry when Langfuse is configured; the host adds `createExporterSpanProcessor()` (recommended) to its provider, or `new LangfuseSpanProcessor()` (`@langfuse/otel`, a devDependency only) with its own keys and without NeuroLink's mask, chunking or retry. OpenTelemetry stays generic: other backends use their own span processor on the host provider, or `OTEL_EXPORTER_OTLP_ENDPOINT`.
+
+Per-call attributes go on `generate({ context: { userId, sessionId, tags, metadata, traceName, conversationId, requestId } })`, or wrap code in `setLangfuseContext(params, fn)`. Observation attributes are written by NeuroLink; do not hand-write `langfuse.*` keys.
+
+Key exports: `flushOpenTelemetry`, `shutdownOpenTelemetry` (terminal; the last holder shuts down), `setLangfuseContext`, `getLangfuseHealthStatus`, `isOpenTelemetryInitialized`. Details and the migration table: `docs/features/observability.md`.
+
+### Thinking Level
+
+Supported by Anthropic Claude, Gemini 2.5+, Gemini 3:
+
+```typescript
+await neurolink.generate({ prompt: "...", thinkingLevel: "high" });
+// CLI: neurolink generate "..." --thinking-level high
+```
+
+Levels: `minimal` | `low` | `medium` (default) | `high`
+
+### Per-Request Credentials
+
+Pass provider credentials at instance level or per-call. Per-call wins over instance, instance wins over env vars.
+
+```typescript
+// Instance-level default
+const nl = new NeuroLink({
+  credentials: { openai: { apiKey: "sk-..." } },
+});
+
+// Per-call override
+await nl.generate({
+  input: { text: "hello" },
+  provider: "openai",
+  credentials: { openai: { apiKey: "sk-user-key" } },
+});
+```
+
+Credentials flow through the factory chain (`neurolink.ts` → `core/factory.ts` → `providerFactory.ts` → `providerRegistry.ts` → provider constructor). Each provider's constructor accepts a provider-scoped slice (e.g. `{ apiKey }` for OpenAI, `{ accessKeyId, secretAccessKey }` for Bedrock, `{ projectId, serviceAccountKey }` for Vertex).
+
+CLI-only usage still relies on env vars — credentials field is excluded from `textGenerationOptionsSchema` to avoid shell-history leaks.
+
+See `docs/features/per-request-credentials.md` for the full provider reference.
+
+---
 
 ## Common Patterns
 
 ### Error Handling
 
-- Use `ErrorFactory` for creating typed errors
-- Wrap async operations with `withTimeout` utility
-- Implement graceful degradation with provider fallback
+- Use `ErrorFactory` for typed errors
+- Wrap async calls with `withTimeout` utility
+- `formatProviderError` must **return** errors, never throw
 
-### Transformation Utilities
+### Tool Transformations
 
-- `transformToolExecutions()` - Convert tool results for providers
-- `transformAvailableTools()` - Format tools for AI models
-- `transformParamsForLogging()` - Safe parameter logging
+- `transformToolExecutions()` — convert tool results for providers
+- `transformAvailableTools()` — format tools for AI model calls
+- `transformParamsForLogging()` — safely strip secrets before logging
 
-### Configuration Management
+### Memory
 
-- Environment variables loaded from `.env`
-- Configuration validated with `env:validate` script
-- Config manager in `src/cli/commands/config.ts`
+- Development: in-memory store
+- Production: Redis (set `REDIS_URL`)
+- Long conversations auto-compact via `SummarizationEngine` + `BudgetChecker`
 
-### Thinking Level Configuration
+### Streaming Tool Injection
 
-The `thinkingLevel` option controls extended thinking for supported models (Anthropic Claude, Gemini 2.5+, Gemini 3):
+`BaseProvider.stream()` merges base tools (MCP/built-in) with user-provided tools before calling provider-specific `executeStream()`. Individual providers use `options.tools || await this.getAllTools()` as fallback. This is the canonical pattern — do not bypass it.
 
-- `"minimal"` - Minimal thinking budget (fastest responses)
-- `"low"` - Low thinking budget
-- `"medium"` - Moderate thinking budget (default)
-- `"high"` - Maximum thinking budget (deep reasoning)
+### Logger Guard
 
-**Usage in SDK:**
-
-```typescript
-const result = await neurolink.generate({
-  prompt: "Complex reasoning task",
-  thinkingLevel: "high",
-});
-```
-
-**Usage in CLI:**
-
-```bash
-neurolink generate "Complex task" --thinking-level high
-```
-
-Note: When `thinkingLevel` is enabled, some providers may have limitations (see Important Constraints).
-
-### External TracerProvider Support
-
-NeuroLink supports integration with applications that have existing OpenTelemetry instrumentation:
-
-**Configuration Options:**
-
-- `useExternalTracerProvider: true` - Skip TracerProvider creation/registration
-- `autoDetectExternalProvider: true` - Auto-detect existing provider
-
-**Exports for External Provider Integration:**
-
-- `getSpanProcessors()` - Returns [ContextEnricher, LangfuseSpanProcessor]
-- `createContextEnricher()` - Factory for ContextEnricher
-- `isUsingExternalTracerProvider()` - Check if in external mode
-
-**Context Management Exports:**
-
-- `setLangfuseContext<T>(context, callback?)` - Set context with extended fields, returns callback result
-- `getLangfuseContext()` - Read current context from AsyncLocalStorage
-- `getTracer(name?, version?)` - Get OpenTelemetry Tracer for custom spans
-
-**Extended Context Fields:**
-
-- `userId`, `sessionId` - User and session identification
-- `conversationId` - Group related traces by conversation/thread
-- `requestId` - Correlate with application logs
-- `traceName` - Custom trace names in Langfuse UI
-- `metadata` - Custom key-value metadata on spans
-
-**Type Exports:**
-
-- `LangfuseSpanAttributes` - GenAI semantic convention attributes from Vercel AI SDK
-
-**Use Case:** When your application already initializes OpenTelemetry (e.g., for HTTP/DB tracing to Jaeger), enable external mode to avoid "duplicate registration" errors.
-
-**Example - External Provider Mode:**
-
-```typescript
-import { NeuroLink, getSpanProcessors } from "@juspay/neurolink";
-import { NodeSDK } from "@opentelemetry/sdk-node";
-
-// Initialize NeuroLink with external provider mode
-const neurolink = new NeuroLink({
-  observability: {
-    langfuse: {
-      enabled: true,
-      publicKey: process.env.LANGFUSE_PUBLIC_KEY,
-      secretKey: process.env.LANGFUSE_SECRET_KEY,
-      useExternalTracerProvider: true,
-    },
-  },
-});
-
-// Add NeuroLink's processors to your existing OTEL setup
-import { BatchSpanProcessor } from "@opentelemetry/sdk-trace-base";
-
-const sdk = new NodeSDK({
-  spanProcessors: [
-    new BatchSpanProcessor(yourExistingExporter),
-    ...getSpanProcessors(),
-  ],
-});
-```
-
-**Example - Enhanced Context with Callback:**
-
-```typescript
-import {
-  setLangfuseContext,
-  getLangfuseContext,
-  getTracer,
-} from "@juspay/neurolink";
-
-// Set context and get result from callback
-const result = await setLangfuseContext(
-  {
-    userId: "user-123",
-    sessionId: "session-456",
-    conversationId: "conv-789",
-    requestId: "req-abc",
-    traceName: "chat-completion",
-    metadata: { feature: "customer-support", tier: "premium" },
-  },
-  async () => {
-    return await neurolink.generate({ prompt: "Hello" });
-  },
-);
-
-// Read current context
-const context = getLangfuseContext();
-console.log(context?.userId, context?.conversationId);
-
-// Create custom spans
-const tracer = getTracer("my-app");
-const span = tracer.startSpan("custom-operation");
-try {
-  // ... do work
-} finally {
-  span.end();
-}
-```
-
-### Operation Name Support
-
-NeuroLink automatically detects and includes operation names in trace naming for better observability in Langfuse.
-
-**Auto-detection:**
-
-- Automatically detects operation names from Vercel AI SDK spans (`ai.streamText`, `ai.generateText`, etc.)
-- Falls back to `unknown` if no operation can be detected
-
-**Trace Name Format:**
-
-- Default format: `userId:operationName` (e.g., `user@email.com:ai.streamText`)
-- When userId is not set: uses just the operation name
-- Customizable via `traceNameFormat` function
-
-**Configuration Options:**
-
-- `autoDetectOperationName: boolean` (default: `true`) - Enable/disable automatic operation detection from spans
-- `traceNameFormat: TraceNameFormat` - Custom function to format trace names
-- `operationName` in context - Explicit operation name override (takes precedence over auto-detection)
-
-**Example - Custom Trace Name Format:**
-
-```typescript
-import { NeuroLink, setLangfuseContext } from "@juspay/neurolink";
-
-const neurolink = new NeuroLink({
-  observability: {
-    langfuse: {
-      enabled: true,
-      publicKey: process.env.LANGFUSE_PUBLIC_KEY,
-      secretKey: process.env.LANGFUSE_SECRET_KEY,
-      autoDetectOperationName: true, // default
-      traceNameFormat: (context) => {
-        // Custom format: "op/streamText/user@email.com"
-        return `op/${context.operationName}/${context.userId || "anonymous"}`;
-      },
-    },
-  },
-});
-
-// Explicit operation name override in context
-await setLangfuseContext(
-  {
-    userId: "user@email.com",
-    operationName: "customer-support-chat", // overrides auto-detected operation
-  },
-  async () => {
-    return await neurolink.stream({ prompt: "Hello" });
-  },
-);
-```
-
-**Wrapper Span Support:**
-
-When host apps create wrapper spans before AI operations, auto-detection in `onStart()` fails because the AI span does not exist yet. NeuroLink handles this automatically by detecting operations from child spans and updating the trace name in `onEnd()` of the wrapper span. No code changes required.
-
-### Memory Management
-
-- Redis for distributed memory (production)
-- In-memory store for development
-- Conversation summarization for long contexts
-
-### RAG Document Processing
-
-NeuroLink provides a comprehensive RAG (Retrieval-Augmented Generation) processing system for document chunking, hybrid search, and result reranking. The system follows the Factory + Registry pattern used throughout NeuroLink, enabling extensible and pluggable components for building production RAG pipelines.
-
-**Chunking Strategies:**
-
-NeuroLink supports 10 chunking strategies via `ChunkerFactory` and `ChunkerRegistry`:
-
-| Strategy            | Description                                     | Use Case                    |
-| ------------------- | ----------------------------------------------- | --------------------------- |
-| `character`         | Fixed character-count chunks with overlap       | Simple text, logs           |
-| `recursive`         | Hierarchical splitting by separators            | General-purpose documents   |
-| `sentence`          | Sentence-boundary aware splitting               | Natural language text       |
-| `token`             | Token-count based chunks (model-aware)          | LLM context optimization    |
-| `markdown`          | Markdown structure-aware (headers, code blocks) | Documentation, READMEs      |
-| `html`              | HTML element-aware parsing                      | Web content, scraped pages  |
-| `json`              | JSON structure-preserving chunks                | API responses, config files |
-| `latex`             | LaTeX document structure (sections, equations)  | Academic papers, math docs  |
-| `semantic`          | Semantic similarity-based chunking              | Context-aware splitting     |
-| `semantic-markdown` | Semantic sections within markdown               | Technical documentation     |
-
-**Reranker Types:**
-
-NeuroLink provides 5 reranker types via `RerankerFactory` and `RerankerRegistry`:
-
-| Type            | LLM Required | Status      | Description                                 |
-| --------------- | ------------ | ----------- | ------------------------------------------- |
-| `simple`        | No           | Functional  | Keyword/TF-IDF based scoring, fast and free |
-| `llm`           | Yes          | Functional  | Single LLM call for relevance scoring       |
-| `batch`         | Yes          | Functional  | Batched LLM calls for large result sets     |
-| `cross-encoder` | No           | Placeholder | Cross-encoder model integration (future)    |
-| `cohere`        | No           | Placeholder | Cohere Rerank API integration (future)      |
-
-**Hybrid Search:**
-
-Combines BM25 lexical search with vector similarity for improved retrieval accuracy:
-
-- **BM25 Index:** In-memory BM25 implementation (`InMemoryBM25Index`) for keyword matching
-- **Vector Search:** Integrates with NeuroLink's vector store adapters
-- **Fusion Methods:**
-  - `reciprocalRankFusion` (RRF) - Rank-based combination, robust to score scale differences
-  - `linearCombination` - Weighted score combination with configurable alpha
-
-**Key Exports:**
-
-```typescript
-// Chunking
-import {
-  createChunker,
-  ChunkerRegistry,
-  getAvailableStrategies,
-} from "@juspay/neurolink";
-
-// Reranking
-import {
-  createReranker,
-  RerankerRegistry,
-  simpleRerank,
-} from "@juspay/neurolink";
-
-// Hybrid Search
-import {
-  createHybridSearch,
-  InMemoryBM25Index,
-  reciprocalRankFusion,
-} from "@juspay/neurolink";
-
-// Pipeline
-import { RAGPipeline, MDocument, loadDocument } from "@juspay/neurolink";
-```
-
-**Example - Complete RAG Workflow:**
-
-```typescript
-import {
-  createChunker,
-  createHybridSearch,
-  createReranker,
-  MDocument,
-  InMemoryBM25Index,
-} from "@juspay/neurolink";
-
-// 1. Chunk documents
-const chunker = createChunker("recursive", {
-  chunkSize: 512,
-  chunkOverlap: 50,
-});
-
-const doc = new MDocument({ content: documentText, type: "text" });
-const chunks = await chunker.chunk(doc);
-
-// 2. Build search indices
-const bm25Index = new InMemoryBM25Index();
-await bm25Index.addDocuments(chunks.map((c) => c.content));
-
-// 3. Hybrid search (BM25 + vector)
-const hybridSearch = createHybridSearch({
-  bm25Index,
-  vectorStore, // Your configured vector store
-  fusionMethod: "rrf",
-  bm25Weight: 0.3,
-  vectorWeight: 0.7,
-});
-
-const searchResults = await hybridSearch.search(query, { topK: 20 });
-
-// 4. Rerank results
-const reranker = createReranker("simple", {
-  weights: { keywordMatch: 0.4, positionBoost: 0.3, lengthPenalty: 0.3 },
-});
-
-const rerankedResults = await reranker.rerank(query, searchResults, {
-  topK: 5,
-});
-
-// 5. Use top results for generation
-const context = rerankedResults.map((r) => r.content).join("\n\n");
-const response = await neurolink.generate({
-  prompt: `Context:\n${context}\n\nQuestion: ${query}`,
-});
-```
-
-**Key Files:**
-
-| File                                           | Purpose                                 |
-| ---------------------------------------------- | --------------------------------------- |
-| `src/lib/rag/ChunkerFactory.ts`                | Factory for creating chunker instances  |
-| `src/lib/rag/ChunkerRegistry.ts`               | Registry for chunking strategies        |
-| `src/lib/rag/reranker/RerankerFactory.ts`      | Factory for creating reranker instances |
-| `src/lib/rag/reranker/RerankerRegistry.ts`     | Registry for reranker types             |
-| `src/lib/rag/retrieval/hybridSearch.ts`        | Hybrid search implementation            |
-| `src/lib/rag/retrieval/vectorQueryTool.ts`     | createVectorQueryTool factory           |
-| `src/lib/rag/retrieval/InMemoryVectorStore.ts` | In-memory vector store for testing      |
-| `src/lib/rag/pipeline/RAGPipeline.ts`          | End-to-end RAG pipeline orchestration   |
-
-**Configuration Options:**
-
-Chunkers and rerankers can be configured via options:
-
-```typescript
-// Chunker options
-const chunker = createChunker("token", {
-  chunkSize: 256, // Target chunk size
-  chunkOverlap: 32, // Overlap between chunks
-  tokenizer: "cl100k_base", // Tokenizer for token-based chunking
-});
-
-// Reranker options
-const reranker = createReranker("llm", {
-  model: "gpt-4o-mini", // LLM model for scoring
-  batchSize: 10, // Documents per batch
-  scoreThreshold: 0.5, // Minimum relevance score
-});
-
-// Hybrid search options
-const hybridSearch = createHybridSearch({
-  fusionMethod: "linear", // 'rrf' or 'linear'
-  rrf_k: 60, // RRF constant (default: 60)
-  alpha: 0.5, // Linear combination weight for vector scores
-});
-```
-
-### RAG Integration with generate()/stream()
-
-**Simplified API (Recommended):** Pass `rag: { files: [...] }` directly to `generate()` or `stream()`. NeuroLink handles file loading, chunking, embedding, vector storage, and tool creation automatically. The AI model receives a `search_knowledge_base` tool it can invoke to search the indexed documents.
-
-```typescript
-import { NeuroLink } from "@juspay/neurolink";
-
-const neurolink = new NeuroLink();
-
-// Generate with RAG - just pass files
-const result = await neurolink.generate({
-  prompt: "What are the key features described in the docs?",
-  rag: {
-    files: ["./docs/guide.md", "./docs/api.md"],
-    strategy: "markdown", // Optional: auto-detected from extension
-    chunkSize: 512, // Optional: default 1000
-    chunkOverlap: 50, // Optional: default 200
-    topK: 5, // Optional: default 5
-  },
-});
-
-// Stream with RAG - same API
-const stream = await neurolink.stream({
-  prompt: "Summarize the architecture",
-  rag: { files: ["./docs/architecture.md"] },
-});
-```
-
-**`RAGConfig` type:**
-
-```typescript
-type RAGConfig = {
-  files: string[]; // Required: file paths to load
-  strategy?: ChunkingStrategy; // Default: auto-detected from file extension
-  chunkSize?: number; // Default: 1000
-  chunkOverlap?: number; // Default: 200
-  topK?: number; // Default: 5
-  toolName?: string; // Default: "search_knowledge_base"
-  toolDescription?: string; // Custom tool description for the AI
-  embeddingProvider?: string; // Defaults to generation provider
-  embeddingModel?: string; // Defaults to provider's default
-};
-```
-
-**CLI Usage:**
-
-```bash
-neurolink generate "What is this about?" --rag-files ./docs/guide.md
-neurolink generate "Explain chunking" --rag-files ./docs/guide.md --rag-strategy markdown --rag-chunk-size 512
-neurolink stream "Summarize" --rag-files ./docs/a.md ./docs/b.md --rag-top-k 10
-```
-
-**Advanced API:** For full control over embeddings and vector stores, use `createVectorQueryTool` directly:
-
-```typescript
-const ragTool = createVectorQueryTool(config, vectorStore);
-
-const result = await neurolink.generate({
-  input: { text: "query" },
-  tools: { [ragTool.name]: ragTool },
-});
-```
-
-**Streaming Tool Architecture:**
-
-`BaseProvider.stream()` centrally pre-merges base tools (MCP/built-in) with user-provided tools (including RAG) into `options.tools` before calling provider-specific `executeStream()`. All 10 providers now support external tools in streaming via this central merge pattern. Individual providers use `options.tools || await this.getAllTools()` as a defensive fallback.
-
-**Key Files:**
-
-| File                                           | Purpose                                      |
-| ---------------------------------------------- | -------------------------------------------- |
-| `src/lib/rag/ragIntegration.ts`                | `prepareRAGTool()` - auto RAG pipeline setup |
-| `src/lib/rag/types.ts`                         | `RAGConfig` type definition                  |
-| `src/lib/rag/retrieval/vectorQueryTool.ts`     | `createVectorQueryTool` factory (Zod params) |
-| `src/lib/rag/retrieval/InMemoryVectorStore.ts` | In-memory vector store for testing           |
-| `src/lib/core/baseProvider.ts`                 | Central tool merge in `stream()`             |
-| `src/lib/neurolink.ts`                         | RAG auto-injection in generate/stream        |
-| `src/cli/factories/commandFactory.ts`          | CLI `--rag-files` flags                      |
-
-## Important Constraints
-
-1. **No Circular Dependencies:** All providers use dynamic imports in registry
-2. **Type Safety:** Maintain strict TypeScript across all modules
-3. **Provider Consistency:** All providers must support same core interface
-4. **Backward Compatibility:** SDK changes must maintain existing API
-5. **File Size Limits:** Consider token limits for multimodal content
-6. **Environment Isolation:** CLI and SDK have separate concerns (CLI can use manual MCP, SDK cannot)
-7. **Gemini Tool + JSON Schema Limitation:** Google Gemini models (AI Studio and Vertex) cannot use tools and JSON schema output simultaneously. When `structuredOutput` with a JSON schema is specified, tools must be disabled. This is a limitation of the Gemini API. Design workflows to either use tools OR structured JSON output, not both together.
-
-## Development Workflow
-
-1. Make changes in `src/`
-2. Run `pnpm run check` to validate types
-3. Run `pnpm run lint` and `pnpm run format` for code quality
-4. Run relevant tests with `pnpm test` or `pnpm run test:run`
-5. Build with `pnpm run build`
-6. Test CLI with `pnpm run build:cli && pnpm run cli <command>`
-7. Validate all changes with `pnpm run validate:all`
-
-## Key Files to Know
-
-| File                                       | Purpose                                       |
-| ------------------------------------------ | --------------------------------------------- |
-| `src/lib/neurolink.ts`                     | Main SDK class, orchestrates everything       |
-| `src/lib/factories/providerRegistry.ts`    | Provider registration with dynamic imports    |
-| `src/lib/utils/messageBuilder.ts`          | Central message construction logic            |
-| `src/lib/adapters/providerImageAdapter.ts` | Multimodal content adaptation                 |
-| `src/lib/mcp/toolRegistry.ts`              | Tool management and MCP integration           |
-| `src/lib/mcp/mcpClientFactory.ts`          | MCP client creation for all transports        |
-| `src/lib/mcp/externalServerManager.ts`     | External MCP server lifecycle management      |
-| `src/lib/processors/index.ts`              | I/O Processor exports (pipeline, registry)    |
-| `src/lib/processors/pipeline.ts`           | ProcessorPipeline for input/output processing |
-| `src/lib/processors/registry.ts`           | ProcessorRegistry for processor management    |
-| `src/cli/factories/commandFactory.ts`      | CLI command creation                          |
-| `src/lib/types/index.ts`                   | Main type definitions and exports             |
-| `src/lib/types/externalMcp.ts`             | External MCP server types (HTTP config, etc.) |
-
-## New set of Features
-
-NeuroLink has been enhanced with new set of features to transform it from a unified AI provider SDK into a comprehensive AI application development platform. **ALL 19 features are now at 100%** as verified via worktree analysis (January 31, 2026).
-
-### Implementation Status
-
-| Feature                      | Progress | Status      | Notes                                                                        |
-| ---------------------------- | -------- | ----------- | ---------------------------------------------------------------------------- |
-| **Gateway Provider**         | 100%     | ✅ Complete | 69+ providers, CLI support, full integration                                 |
-| **Workflow System**          | 100%     | ✅ Complete | Full engine with fluent API, checkpointing, HITL, all step types             |
-| **Three-Layer Memory**       | 100%     | ✅ Complete | All 3 layers, 6 embedders, 5 vector stores, MemoryCoordinator, 97 tests      |
-| **Vector Stores**            | 100%     | ✅ Complete | 22 of 22 adapters implemented with 23,119 test lines                         |
-| **I/O Processors**           | 100%     | ✅ Complete | 52 files, 17+ file type processors, ProcessorRegistry, security sanitization |
-| **Evaluation/Scoring**       | 100%     | ✅ Complete | 14 scorers (10 LLM + 4 rule), unit tests, CLI complete                       |
-| **Multi-Agent Networks**     | 100%     | ✅ Complete | Agent, AgentNetwork, RoutingAgent, 3 topologies, 190 tests                   |
-| **Voice/Speech**             | 100%     | ✅ Complete | 8 TTS, 6 STT, 2 Realtime providers, audio-utils, stream-handler              |
-| **Observability**            | 100%     | ✅ Complete | 100% pattern compliance, 9 exporters, 9 samplers                             |
-| **Server Adapters**          | 100%     | ✅ Complete | 4 adapters (Hono, Express, Fastify, Koa), 5 route groups                     |
-| **RAG Processing**           | 100%     | ✅ Complete | 9 chunkers, hybrid search, RerankerFactory/Registry                          |
-| **MCP Enhancements**         | 100%     | ✅ Complete | ToolRouter, ToolCache, RequestBatcher (1,702 new lines)                      |
-| **Streaming Architecture**   | 100%     | ✅ Complete | All 4 streaming patterns, 24 event types, backpressure                       |
-| **Hooks/Events**             | 100%     | ✅ Complete | HooksManager (518 lines), PubSubManager (378 lines), 117 tests               |
-| **Storage Abstraction**      | 100%     | ✅ Complete | 8 adapters, 3 middleware, MigrationRunner, 282 tests                         |
-| **Dynamic Arguments**        | 100%     | ✅ Complete | CLI context flags, runtime resolution, 269 tests                             |
-| **Authentication Providers** | 100%     | ✅ Complete | 8 providers + middleware, session management                                 |
-| **Client SDKs**              | 100%     | ✅ Complete | 6 React hooks, AI SDK adapter, 226 tests                                     |
-| **Deployment System**        | 100%     | ✅ Complete | 6 deployers, 2 bundlers, 3 CLI commands                                      |
-
-### Key New Capabilities
-
-**Workflow Engine:**
-
-- Graph-based step execution with checkpointing
-- Human-in-the-loop suspend/resume patterns
-- Fluent builder API: `.then()`, `.branch()`, `.parallel()`
-- Redis-backed state persistence
-
-**Three-Layer Memory System:**
-
-- Conversation History: Recent messages (thread-scoped)
-- Semantic Recall: Vector-based retrieval (resource-scoped)
-- Working Memory: Structured user profile (persistent)
-
-**Vector Store Integrations:**
-
-- `VectorStoreFactory` with dynamic registration
-- 22 adapters: Pinecone, Qdrant, pgvector, Chroma, Weaviate, Milvus, Zilliz, Redis, Elasticsearch, OpenSearch, MongoDB Atlas, Astra DB, Azure AI Search, Vertex AI Vector Search, Upstash, LanceDB, DuckDB, LibSQL, SQLite-VSS, Cloudflare Vectorize, Couchbase, Faiss
-- Metadata filtering with query DSL (translated per backend)
-- Batch operations and index management
-- 1,500+ comprehensive tests across all adapters
-
-**Multi-Agent Networks:**
-
-- `Agent` class with execute/stream methods, schema validation, event emission (450 LOC)
-- `AgentNetwork` for multi-agent orchestration with routing (650 LOC)
-- `RoutingAgent` for LLM-based task delegation with confidence scoring (500 LOC)
-- `AgentFactory` and `AgentRegistry` following Factory + Registry patterns
-- Communication: `MessageBus` (pub/sub, request/response) and `Protocol` handlers
-- Topologies: `HubSpokeTopology`, `MeshTopology`, `HierarchicalTopology`
-- 190 tests across 10 test files (187 passing)
-- Total: 7,011 lines across 13 files
-
-### New Directory Structure
-
-```
-src/lib/core/infrastructure/    # Base factories, registries, errors
-src/lib/workflow/               # Workflow engine (100% complete)
-src/lib/vector/                 # Vector store integrations (100% complete)
-src/lib/agents/                 # Multi-agent system (100% complete)
-src/lib/processors/             # I/O processors (100% complete)
-src/lib/voice/                  # Voice/speech integration (100% complete)
-src/lib/rag/                    # RAG processing pipeline (100% complete)
-src/lib/hooks/                  # Event hooks system (100% complete)
-src/lib/storage/                # Storage abstraction layer (100% complete)
-src/lib/auth/                   # Authentication providers (100% complete)
-src/lib/deployment/             # Deployment system (100% complete)
-```
-
-### Feature Documentation
-
-Full implementation guides in `docs/implementation-guides/`:
-
-| Document                            | Purpose                                        |
-| ----------------------------------- | ---------------------------------------------- |
-| `00-MASTER-IMPLEMENTATION-GUIDE.md` | Comprehensive reference with progress tracking |
-| `02-advanced-workflow-system.md`    | Workflow engine design and API                 |
-| `03-three-layer-memory-system.md`   | Memory architecture details                    |
-| `04-vector-store-integrations.md`   | Vector store adapter patterns                  |
-| `07-multi-agent-networks.md`        | Agent orchestration design                     |
-| `20-implementation-roadmap.md`      | Phase timeline and dependencies                |
-
-### Core Infrastructure (Implemented)
-
-New core infrastructure in `src/lib/core/infrastructure/`:
-
-```typescript
-// BaseFactory - Factory pattern foundation
-// BaseRegistry - Dynamic feature registration
-// NeuroLinkFeatureError - Typed error hierarchy
-// TypedEventEmitter - Type-safe events
-// withRetry - Configurable retry utility
-```
-
-### Production Status Summary
-
-**All 19 Features Fully Implemented (100%):**
-
-- Gateway Provider, Workflow System, Multi-Agent Networks, I/O Processors, Storage Abstraction, Dynamic Arguments, Client SDKs, Deployment System, Server Adapters, Vector Stores (22 adapters), Three-Layer Memory, RAG Processing, MCP Enhancements, Streaming Architecture, Hooks/Events, Evaluation/Scoring, Voice/Speech, Observability, Authentication Providers
-
-**Key Notes:**
-
-- Type-safe implementations using TypeScript strict mode
-- All implemented features integrate with existing Factory + Registry patterns
-- Backward compatibility with existing SDK APIs maintained
-- Several features have CLI support but may lack comprehensive tests
-
-## Documentation
-
-- Full documentation in `docs/` directory
-- README.md has comprehensive feature overview
-- Each major feature has dedicated guide in `docs/features/`
-- Implementation guides in `docs/implementation-guides/`
-- API reference in `docs/sdk/api-reference.md`
-- CLI reference in `docs/cli/commands.md`
+Always wrap expensive serialization with `logger.shouldLog("debug")` before calling it.

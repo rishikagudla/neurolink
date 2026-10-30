@@ -6,40 +6,11 @@
  */
 
 import type {
+  DeprecatedRouteInfo,
+  DeprecationConfig,
   MiddlewareDefinition,
   RouteDefinition,
-  RouteDeprecation,
-} from "../types.js";
-
-/**
- * Deprecation middleware configuration
- */
-export type DeprecationConfig = {
-  /**
-   * Array of route definitions to check for deprecation
-   * Routes with `deprecated.enabled: true` will have deprecation headers added
-   */
-  routes: RouteDefinition[];
-
-  /**
-   * Custom header name for deprecation notice (default: "X-Deprecation-Notice")
-   */
-  noticeHeader?: string;
-
-  /**
-   * Whether to include Link header for alternative routes (default: true)
-   */
-  includeLink?: boolean;
-};
-
-/**
- * Internal type for deprecated route lookup
- */
-type DeprecatedRouteInfo = {
-  method: string;
-  path: string;
-  deprecation: RouteDeprecation;
-};
+} from "../../types/index.js";
 
 /**
  * Build a lookup map of deprecated routes

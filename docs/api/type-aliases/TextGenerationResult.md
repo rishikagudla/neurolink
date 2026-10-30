@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v8.32.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -6,156 +6,134 @@
 
 # Type Alias: TextGenerationResult
 
-> **TextGenerationResult** = `object`
-
-Defined in: [types/generateTypes.ts:653](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L653)
+> **TextGenerationResult** = `object` & [`MediaGenerationOutputs`](MediaGenerationOutputs.md)
 
 Text generation result (consolidated from core types)
 
-## Properties
+## Type Declaration
+
+### events?
+
+> `optional` **events?**: [`StreamEventSequence`](StreamEventSequence.md)[]
+
+Ordered tool and host events persisted with the conversation turn.
 
 ### content
 
 > **content**: `string`
 
-Defined in: [types/generateTypes.ts:654](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L654)
+### structuredData?
 
----
+> `optional` **structuredData?**: `unknown`
+
+Parsed structured object when a `schema` was requested (see GenerateResult.structuredData).
+
+### finishReason?
+
+> `optional` **finishReason?**: `string`
+
+### stopReason?
+
+> `optional` **stopReason?**: [`GenerateStopReason`](GenerateStopReason.md)
+
+Turn-exit discriminator from native agentic loops (see GenerateStopReason).
+
+### rawFinishReason?
+
+> `optional` **rawFinishReason?**: `string`
+
+Verbatim provider finish/stop reason for the turn's terminal model call.
+
+### stepsUsed?
+
+> `optional` **stepsUsed?**: `number`
+
+Number of agentic steps (model calls) the turn used.
+
+### jsonRepaired?
+
+> `optional` **jsonRepaired?**: `boolean`
+
+True when the schema JSON was repaired from malformed model text.
+
+### jsonTruncated?
+
+> `optional` **jsonTruncated?**: `boolean`
+
+True when the schema JSON appears truncated (output hit the token cap).
 
 ### provider?
 
-> `optional` **provider**: `string`
-
-Defined in: [types/generateTypes.ts:655](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L655)
-
----
+> `optional` **provider?**: `string`
 
 ### model?
 
-> `optional` **model**: `string`
-
-Defined in: [types/generateTypes.ts:656](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L656)
-
----
+> `optional` **model?**: `string`
 
 ### usage?
 
-> `optional` **usage**: `TokenUsage`
-
-Defined in: [types/generateTypes.ts:657](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L657)
-
----
+> `optional` **usage?**: [`TokenUsage`](TokenUsage.md)
 
 ### responseTime?
 
-> `optional` **responseTime**: `number`
+> `optional` **responseTime?**: `number`
 
-Defined in: [types/generateTypes.ts:658](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L658)
+### toolCalls?
 
----
+> `optional` **toolCalls?**: `object`[]
+
+The executed tool calls of a native turn — the same shape `GenerateResult` exposes.
 
 ### toolsUsed?
 
-> `optional` **toolsUsed**: `string`[]
-
-Defined in: [types/generateTypes.ts:659](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L659)
-
----
+> `optional` **toolsUsed?**: `string`[]
 
 ### toolExecutions?
 
-> `optional` **toolExecutions**: `object`[]
-
-Defined in: [types/generateTypes.ts:660](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L660)
-
-#### toolName
-
-> **toolName**: `string`
-
-#### executionTime
-
-> **executionTime**: `number`
-
-#### success
-
-> **success**: `boolean`
-
-#### serverId?
-
-> `optional` **serverId**: `string`
-
----
+> `optional` **toolExecutions?**: `object`[]
 
 ### enhancedWithTools?
 
-> `optional` **enhancedWithTools**: `boolean`
-
-Defined in: [types/generateTypes.ts:666](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L666)
-
----
+> `optional` **enhancedWithTools?**: `boolean`
 
 ### availableTools?
 
-> `optional` **availableTools**: `object`[]
-
-Defined in: [types/generateTypes.ts:667](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L667)
-
-#### name
-
-> **name**: `string`
-
-#### description
-
-> **description**: `string`
-
-#### server
-
-> **server**: `string`
-
-#### category?
-
-> `optional` **category**: `string`
-
----
+> `optional` **availableTools?**: `object`[]
 
 ### analytics?
 
-> `optional` **analytics**: [`AnalyticsData`](AnalyticsData.md)
-
-Defined in: [types/generateTypes.ts:674](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L674)
-
----
+> `optional` **analytics?**: [`AnalyticsData`](AnalyticsData.md)
 
 ### evaluation?
 
-> `optional` **evaluation**: [`EvaluationData`](EvaluationData.md)
+> `optional` **evaluation?**: [`EvaluationData`](EvaluationData.md)
 
-Defined in: [types/generateTypes.ts:675](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L675)
+### thoughtSignature?
 
----
+> `optional` **thoughtSignature?**: `string`
 
-### audio?
+Gemini 3 thought signature for reasoning continuity across turns
 
-> `optional` **audio**: `TTSResult`
+### reasoning?
 
-Defined in: [types/generateTypes.ts:676](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L676)
+> `optional` **reasoning?**: `string`
 
----
+Thinking/reasoning text from provider (Anthropic thinking blocks, Gemini thought parts, DeepSeek/NIM reasoning_content)
 
-### video?
+### reasoningTokens?
 
-> `optional` **video**: `VideoGenerationResult`
+> `optional` **reasoningTokens?**: `number`
 
-Defined in: [types/generateTypes.ts:678](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L678)
+Token count for reasoning content
 
-Video generation result
+### retries?
 
----
+> `optional` **retries?**: `object`
 
-### imageOutput?
+#### retries.count
 
-> `optional` **imageOutput**: \{ `base64`: `string`; \} \| `null`
+> **count**: `number`
 
-Defined in: [types/generateTypes.ts:680](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L680)
+#### retries.errors
 
-Image generation output
+> **errors**: `object`[]

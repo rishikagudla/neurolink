@@ -3,8 +3,12 @@
  * Centralizes repeated object transformation patterns to improve code reuse and maintainability
  */
 
-import type { UnknownRecord } from "../types/common.js";
-import type { StandardRecord, StringArray } from "../types/typeAliases.js";
+import type {
+  UnknownRecord,
+  StandardRecord,
+  StringArray,
+} from "../types/index.js";
+
 import { logger } from "./logger.js";
 import { inlineJsonSchema } from "./schemaConversion.js";
 
@@ -83,9 +87,10 @@ export function transformToolExecutions(toolExecutions?: unknown[]): Array<{
       parameterExtractionData,
     );
 
-    // Enhanced input extraction
+    // Enhanced input extraction (params = ToolExecutionRecord)
     let input =
       (teRecord.input as StandardRecord) ||
+      (teRecord.params as StandardRecord) ||
       (teRecord.parameters as StandardRecord) ||
       (teRecord.args as StandardRecord) ||
       {};
@@ -212,14 +217,17 @@ export function transformToolExecutions(toolExecutions?: unknown[]): Array<{
     );
 
     // Enhanced output extraction with success indication
+    // (resultText = ToolExecutionRecord — preserve the captured result)
     const output =
-      (teRecord.output as unknown) ||
-      (teRecord.result as unknown) ||
-      (teRecord.response as unknown) ||
+      (teRecord.output as unknown) ??
+      (teRecord.result as unknown) ??
+      (teRecord.response as unknown) ??
+      (teRecord.resultText as unknown) ??
       "success";
 
-    // Enhanced duration extraction
+    // Enhanced duration extraction (durationMs = ToolExecutionRecord)
     const duration =
+      (teRecord.durationMs as number) ??
       (teRecord.duration as number) ??
       (teRecord.executionTime as number) ??
       (teRecord.responseTime as number) ??
@@ -245,6 +253,11 @@ export function transformToolExecutionsForMCP(
   executionTime: number;
   success: boolean;
   serverId?: string;
+  params?: unknown;
+  output?: unknown;
+  startedAt?: number;
+  isError?: boolean;
+  error?: string;
 }> {
   if (!toolExecutions || !Array.isArray(toolExecutions)) {
     return [];
@@ -276,8 +289,9 @@ export function transformToolExecutionsForMCP(
       toolName = `mcp_tool_execution_${index}`;
     }
 
-    // Enhanced execution time extraction
+    // Enhanced execution time extraction (durationMs = ToolExecutionRecord)
     const executionTime =
+      (teRecord.durationMs as number) ??
       (teRecord.duration as number) ??
       (teRecord.executionTime as number) ??
       (teRecord.responseTime as number) ??
@@ -286,8 +300,10 @@ export function transformToolExecutionsForMCP(
     // Enhanced success detection - check for actual success indicators
     let success = true; // Default to true
 
-    // Check for explicit success/error indicators
-    if (teRecord.success !== undefined) {
+    // Check for explicit success/error indicators (isError = ToolExecutionRecord)
+    if (teRecord.isError !== undefined) {
+      success = !teRecord.isError;
+    } else if (teRecord.success !== undefined) {
       success = Boolean(teRecord.success);
     } else if (teRecord.error !== undefined) {
       success = false;
@@ -316,11 +332,58 @@ export function transformToolExecutionsForMCP(
         undefined;
     }
 
+    // Pass the execution payload through instead of discarding it. This
+    // transform used to keep only {toolName, executionTime, success,
+    // serverId}; toToolExecutionRecords() downstream then found no
+    // input/output on the entries and emitted params:{} with
+    // resultText:"undefined" for every tool execution on the MCP path —
+    // even when the source entry was a full record with real args and a
+    // real result. Field names chosen to match what
+    // toToolExecutionRecords() reads (input/params, output/result/
+    // resultText, startedAt, isError).
+    const params =
+      teRecord.params ?? teRecord.input ?? teRecord.args ?? undefined;
+    const output =
+      teRecord.output ??
+      teRecord.result ??
+      teRecord.response ??
+      (typeof teRecord.resultText === "string"
+        ? teRecord.resultText
+        : undefined);
     return {
       toolName: toolName,
       executionTime: executionTime,
       success: success,
       serverId: serverId,
+      ...(params !== undefined ? { params } : {}),
+      ...(output !== undefined ? { output } : {}),
+      ...(typeof teRecord.startedAt === "number"
+        ? { startedAt: teRecord.startedAt }
+        : {}),
+      ...(teRecord.isError !== undefined
+        ? { isError: teRecord.isError === true }
+        : { isError: !success }),
+      ...(typeof teRecord.error === "string" ? { error: teRecord.error } : {}),
+    };
+  });
+}
+
+/**
+ * Convert ToolExecutionRecord entries (or legacy-shaped entries) to the
+ * TaskRunResult.toolCalls shape. Single source for the task executors so the
+ * name fallback (`toolName` → legacy `name`) can't drift between them.
+ */
+export function toolExecutionRecordsToToolCalls(
+  records:
+    | Array<{ toolName?: string; params?: unknown; resultText?: string }>
+    | undefined,
+): Array<{ name: string; input: unknown; output: unknown }> | undefined {
+  return records?.map((te) => {
+    const legacy = te as Record<string, unknown>;
+    return {
+      name: te.toolName ?? (legacy.name as string) ?? "unknown",
+      input: te.params ?? legacy.input,
+      output: te.resultText ?? legacy.output,
     };
   });
 }

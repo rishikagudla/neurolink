@@ -1,0 +1,52 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / AuthErrorInfo
+
+# Type Alias: AuthErrorInfo
+
+> **AuthErrorInfo** = `Error` & `object`
+
+Auth error information with additional context.
+
+Renamed from `AuthError` to `AuthErrorInfo` to avoid collision with the
+`createErrorFactory` result that is named `AuthError` in errors.ts.
+
+## Type Declaration
+
+### code
+
+> **code**: [`AuthErrorCode`](AuthErrorCode.md)
+
+Error code
+
+### provider?
+
+> `optional` **provider?**: [`AuthProviderType`](AuthProviderType.md)
+
+Provider that threw the error
+
+### statusCode?
+
+> `optional` **statusCode?**: `number`
+
+HTTP status code
+
+### retryable?
+
+> `optional` **retryable?**: `boolean`
+
+Whether the error is retryable
+
+### context?
+
+> `optional` **context?**: `Record`\<`string`, [`JsonValue`](JsonValue.md)\>
+
+Additional error context
+
+### cause?
+
+> `optional` **cause?**: `Error`
+
+Original error if wrapped

@@ -1,0 +1,910 @@
+import type {
+  RollingCandidateWorker,
+  RollingManagedWorker,
+  RollingQueuedSocket,
+  RollingSocketAdmission,
+  RollingWorkerFailureDetails,
+  RollingWorkerHandle,
+  RollingWorkerSupervisorOptions,
+  RollingWorkerSupervisorEvent,
+  RollingWorkerSupervisorSnapshot,
+  TransferableProxySocket,
+} from "../types/index.js";
+import { ErrorFactory } from "../utils/errorHandling.js";
+import {
+  PROXY_SOCKET_OFFER_TIMEOUT,
+  PROXY_SOCKET_COMMIT_TIMEOUT,
+} from "./rollingWorkerProtocol.js";
+
+const DEFAULT_READY_TIMEOUT_MS = 120_000;
+const DEFAULT_SOCKET_QUEUE_LIMIT = 1_024;
+const DEFAULT_SOCKET_QUEUE_TIMEOUT_MS = 30_000;
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 30_000;
+const DEFAULT_SOCKET_TRANSFER_TIMEOUT_MS = 60_000;
+const MAX_RECENT_SUPERVISOR_EVENTS = 100;
+
+/**
+ * Owns worker generations while the caller owns the public listening socket.
+ * Sockets are transferred once to the active worker, so response bytes never
+ * traverse a supervisor-side proxy hop.
+ */
+export class RollingWorkerSupervisor {
+  private readonly options: Required<
+    Pick<
+      RollingWorkerSupervisorOptions,
+      | "readyTimeoutMs"
+      | "socketQueueLimit"
+      | "maxPendingTransfers"
+      | "socketQueueTimeoutMs"
+      | "shutdownTimeoutMs"
+    >
+  > &
+    RollingWorkerSupervisorOptions;
+  private generation = 0;
+  private active: RollingManagedWorker | null = null;
+  private candidate: RollingCandidateWorker | null = null;
+  private readonly draining = new Map<number, RollingManagedWorker>();
+  private readonly queuedSockets: RollingQueuedSocket[] = [];
+  private flushingSockets = false;
+  private consecutiveOfferTimeouts = 0;
+  private lastStallReplacementAt = 0;
+  private transferStateTimer: NodeJS.Timeout | undefined;
+  private replacement: Promise<RollingWorkerSupervisorSnapshot> | null = null;
+  private rejectedSockets = 0;
+  private failedTransfers = 0;
+  private readonly recentEvents: RollingWorkerSupervisorEvent[] = [];
+  private lastFailure: RollingWorkerSupervisorSnapshot["lastFailure"] = null;
+  private closed = false;
+  private shutdownPromise: Promise<void> | null = null;
+  private readonly shutdownWaiters = new Set<() => void>();
+
+  constructor(options: RollingWorkerSupervisorOptions) {
+    this.options = {
+      ...options,
+      readyTimeoutMs: options.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS,
+      socketQueueLimit: options.socketQueueLimit ?? DEFAULT_SOCKET_QUEUE_LIMIT,
+      maxPendingTransfers: Math.max(1, options.maxPendingTransfers ?? 16),
+      socketQueueTimeoutMs:
+        options.socketQueueTimeoutMs ?? DEFAULT_SOCKET_QUEUE_TIMEOUT_MS,
+      shutdownTimeoutMs:
+        options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS,
+    };
+  }
+
+  snapshot(): RollingWorkerSupervisorSnapshot {
+    return {
+      generation: this.generation,
+      active: this.active
+        ? {
+            pid: this.active.handle.pid,
+            version: this.active.version,
+            generation: this.active.generation,
+          }
+        : null,
+      candidate: this.candidate
+        ? {
+            pid: this.candidate.handle.pid,
+            expectedVersion: this.candidate.expectedVersion,
+            generation: this.candidate.generation,
+          }
+        : null,
+      draining: [...this.draining.values()].map((worker) => ({
+        pid: worker.handle.pid,
+        version: worker.version,
+        generation: worker.generation,
+      })),
+      queuedSockets: this.queuedSockets.length,
+      pendingTransfers:
+        (this.active?.pendingTransfers ?? 0) +
+        [...this.draining.values()].reduce(
+          (total, worker) => total + worker.pendingTransfers,
+          0,
+        ),
+      rejectedSockets: this.rejectedSockets,
+      failedTransfers: this.failedTransfers,
+      recentEvents: [...this.recentEvents],
+      lastFailure: this.lastFailure,
+    };
+  }
+
+  start(expectedVersion: string): Promise<RollingWorkerSupervisorSnapshot> {
+    if (this.active) {
+      return this.active.version === expectedVersion
+        ? Promise.resolve(this.snapshot())
+        : this.replace(expectedVersion);
+    }
+    return this.replace(expectedVersion);
+  }
+
+  replace(expectedVersion: string): Promise<RollingWorkerSupervisorSnapshot> {
+    if (this.closed) {
+      return Promise.reject(
+        ErrorFactory.proxyWorkerLifecycle(
+          "rolling worker supervisor is closed",
+        ),
+      );
+    }
+    if (!/^\d+\.\d+\.\d+$/.test(expectedVersion)) {
+      return Promise.reject(
+        ErrorFactory.proxyWorkerLifecycle(
+          `invalid expected worker version: ${expectedVersion}`,
+          { expectedVersion },
+        ),
+      );
+    }
+    if (this.replacement) {
+      return this.candidate?.expectedVersion === expectedVersion
+        ? this.replacement
+        : Promise.reject(
+            ErrorFactory.proxyWorkerLifecycle(
+              `worker replacement for v${this.candidate?.expectedVersion ?? "unknown"} is already in progress`,
+              { requestedVersion: expectedVersion },
+            ),
+          );
+    }
+
+    this.replacement = this.spawnCandidate(expectedVersion).finally(() => {
+      this.replacement = null;
+    });
+    return this.replacement;
+  }
+
+  /**
+   * Admit a paused socket to the active generation or the bounded
+   * readiness queue.
+   */
+  acceptSocket(socket: TransferableProxySocket): void {
+    socket.pause();
+    if (this.closed) {
+      this.rejectSocket(socket, undefined, undefined, "supervisor_closed");
+      return;
+    }
+    const admission: RollingSocketAdmission = {
+      socket,
+      // Preserve the original offer + commit allowance. Queued sockets also
+      // retain their existing queue wait, but no retry ever renews this budget.
+      deadlineAt:
+        Date.now() +
+        (this.active?.handle.socketTransferTimeoutMs ??
+          DEFAULT_SOCKET_TRANSFER_TIMEOUT_MS),
+      retried: false,
+    };
+    if (
+      this.active &&
+      this.queuedSockets.length === 0 &&
+      this.active.pendingTransfers < this.options.maxPendingTransfers
+    ) {
+      this.transferSocket(this.active, admission);
+      return;
+    }
+    admission.deadlineAt += this.options.socketQueueTimeoutMs;
+    this.queueSocket(admission);
+    this.flushQueuedSockets();
+  }
+
+  /**
+   * Retain a socket only within the queue capacity and deadline, recording
+   * classified rejection.
+   */
+  private queueSocket(admission: RollingSocketAdmission): void {
+    const { socket } = admission;
+    if (this.queuedSockets.length >= this.options.socketQueueLimit) {
+      this.rejectSocket(socket, undefined, undefined, "queue_capacity");
+      return;
+    }
+
+    const queued: RollingQueuedSocket = {
+      ...admission,
+      timeout: setTimeout(
+        () => {
+          const index = this.queuedSockets.indexOf(queued);
+          if (index >= 0) {
+            this.queuedSockets.splice(index, 1);
+            this.rejectSocket(socket, undefined, undefined, "queue_timeout");
+          }
+        },
+        Math.max(
+          0,
+          Math.min(
+            this.options.socketQueueTimeoutMs,
+            admission.deadlineAt - Date.now(),
+          ),
+        ),
+      ),
+    };
+    queued.timeout.unref?.();
+    this.queuedSockets.push(queued);
+    this.scheduleTransferState();
+  }
+
+  close(): Promise<void> {
+    if (this.shutdownPromise) {
+      return this.shutdownPromise;
+    }
+    this.closed = true;
+    this.shutdownPromise = this.closeWorkers();
+    return this.shutdownPromise;
+  }
+
+  private async closeWorkers(): Promise<void> {
+    for (const queued of this.queuedSockets.splice(0)) {
+      clearTimeout(queued.timeout);
+      this.rejectSocket(queued.socket);
+    }
+    if (this.candidate) {
+      this.candidate.settle(
+        new Error("rolling worker supervisor closed during replacement"),
+      );
+    }
+    if (this.active) {
+      this.requestWorkerShutdown(this.active);
+    }
+    for (const worker of this.draining.values()) {
+      this.requestWorkerShutdown(worker);
+    }
+    this.publishState();
+
+    if (!this.active && this.draining.size === 0) {
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      const finish = (): void => {
+        clearTimeout(timeout);
+        this.shutdownWaiters.delete(finish);
+        resolve();
+      };
+      const timeout = setTimeout(() => {
+        this.forceTerminateWorkers();
+        finish();
+      }, this.options.shutdownTimeoutMs);
+      timeout.unref?.();
+      this.shutdownWaiters.add(finish);
+    });
+  }
+
+  private requestWorkerShutdown(worker: RollingManagedWorker): void {
+    try {
+      worker.handle.sendControl({
+        type: "proxy-worker:shutdown",
+        generation: worker.generation,
+      });
+    } catch {
+      worker.handle.terminate("SIGTERM");
+    }
+  }
+
+  private forceTerminateWorkers(): void {
+    if (this.active) {
+      this.active.handle.terminate("SIGTERM");
+      this.active.dispose();
+      this.active = null;
+    }
+    for (const worker of this.draining.values()) {
+      worker.handle.terminate("SIGTERM");
+      worker.dispose();
+    }
+    this.draining.clear();
+    this.publishState();
+  }
+
+  private notifyShutdownWaiters(): void {
+    if (!this.closed || this.active || this.draining.size > 0) {
+      return;
+    }
+    for (const finish of [...this.shutdownWaiters]) {
+      finish();
+    }
+  }
+
+  /**
+   * Validate candidate readiness and activation while preserving an
+   * independent listener for actual exit.
+   */
+  private spawnCandidate(
+    expectedVersion: string,
+  ): Promise<RollingWorkerSupervisorSnapshot> {
+    const generation = ++this.generation;
+    let workerProcessInstanceId: string | undefined;
+    let handle: RollingWorkerHandle;
+    try {
+      handle = this.options.spawnWorker(generation, expectedVersion);
+    } catch (error) {
+      this.recordFailure(
+        generation,
+        expectedVersion,
+        "startup",
+        error instanceof Error ? error.message : String(error),
+      );
+      this.publishState();
+      return Promise.reject(
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    }
+
+    // Keep this evidence listener until actual exit, even when candidate
+    // failure or a fatal message detaches the operational state listeners.
+    handle.onExit((code, signal) => {
+      this.recordEvent({
+        type: "worker_exit",
+        generation,
+        version: expectedVersion,
+        workerPid: handle.pid,
+        workerProcessInstanceId,
+        workerExitCode: code,
+        workerExitSignal: signal,
+      });
+    });
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (
+        error?: Error,
+        phase: "startup" | "activation" = "startup",
+        details?: RollingWorkerFailureDetails,
+      ): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(readyTimeout);
+        if (error) {
+          if (!this.closed) {
+            this.recordFailure(
+              generation,
+              expectedVersion,
+              phase,
+              error.message,
+              details,
+            );
+          }
+          if (this.candidate?.generation === generation) {
+            this.candidate = null;
+          }
+          // A candidate that never became ready may also ignore SIGTERM.
+          // Bound its cleanup independently of the still-serving generation.
+          const killTimeout = setTimeout(
+            () => handle.terminate("SIGKILL"),
+            1_000,
+          );
+          killTimeout.unref?.();
+          const offCandidateExit = handle.onExit(() => {
+            clearTimeout(killTimeout);
+            offCandidateExit();
+          });
+          handle.terminate("SIGTERM");
+          dispose();
+          this.publishState();
+          reject(error);
+          return;
+        }
+        resolve(this.snapshot());
+      };
+      const offMessage = handle.onMessage((message) => {
+        if (message.generation !== generation || message.pid !== handle.pid) {
+          return;
+        }
+        if (message.type === "proxy-worker:fatal") {
+          const error = new Error(
+            `worker ${handle.pid} failed: ${message.message}`,
+          );
+          if (this.candidate?.generation === generation) {
+            finish(error);
+          } else if (this.active?.generation === generation) {
+            this.active.dispose();
+            this.active = null;
+            handle.terminate("SIGTERM");
+            this.recordFailure(
+              generation,
+              expectedVersion,
+              "runtime",
+              message.message,
+            );
+            this.options.log?.(
+              `[proxy-supervisor] active worker reported fatal generation=${generation} pid=${handle.pid}: ${message.message}`,
+            );
+            this.publishState();
+            this.notifyShutdownWaiters();
+          } else if (this.draining.has(generation)) {
+            // A retiring generation still owns requests and budget leases.
+            // Preserve its fatal cause without dropping actual-exit tracking.
+            this.recordFailure(
+              generation,
+              expectedVersion,
+              "runtime",
+              message.message,
+              { workerPid: handle.pid },
+            );
+            this.options.log?.(
+              `[proxy-supervisor] draining worker reported fatal generation=${generation} pid=${handle.pid}: ${message.message}`,
+            );
+            this.publishState();
+          }
+          return;
+        }
+        if (message.type === "proxy-worker:replacement-requested") {
+          if (this.active?.generation === generation) {
+            this.options.onReplacementRequested?.({
+              generation,
+              pid: handle.pid,
+              reason: message.reason,
+            });
+          }
+          return;
+        }
+        if (message.type === "proxy-worker:ready") {
+          workerProcessInstanceId = message.processInstanceId;
+          if (message.version !== expectedVersion) {
+            finish(
+              new Error(
+                `worker ${handle.pid} reported v${message.version}; expected v${expectedVersion}`,
+              ),
+            );
+            return;
+          }
+          const candidate = this.candidate;
+          if (!candidate) {
+            return;
+          }
+          if (!candidate.activationRequested) {
+            try {
+              handle.sendControl({
+                type: "proxy-worker:activate",
+                generation,
+              });
+              candidate.activationRequested = true;
+            } catch (error) {
+              finish(
+                error instanceof Error ? error : new Error(String(error)),
+                "activation",
+              );
+            }
+          }
+          return;
+        }
+        if (message.type !== "proxy-worker:activated") {
+          return;
+        }
+        if (!this.candidate?.activationRequested) {
+          finish(
+            new Error(
+              `worker ${handle.pid} acknowledged activation before readiness`,
+            ),
+            "activation",
+          );
+          return;
+        }
+
+        const previous = this.active;
+        const activated: RollingManagedWorker = {
+          handle,
+          generation,
+          version: expectedVersion,
+          dispose,
+          pendingTransfers: 0,
+          drainRequested: false,
+        };
+        this.active = activated;
+        this.consecutiveOfferTimeouts = 0;
+        this.candidate = null;
+        this.flushQueuedSockets();
+        if (previous) {
+          this.draining.set(previous.generation, previous);
+          // A worker can still own socket transfers accepted before this
+          // activation. Draining it before their IPC commits makes those
+          // clients fail even though the replacement is healthy.
+          previous.drainRequested = true;
+          this.maybeDrainWorker(previous);
+        }
+        this.options.log?.(
+          `[proxy-supervisor] activated generation=${generation} pid=${handle.pid} version=${expectedVersion}`,
+        );
+        this.recordEvent({
+          type: "activated",
+          generation,
+          version: expectedVersion,
+        });
+        this.publishState();
+        finish();
+      });
+      const offExit = handle.onExit((code, signal) => {
+        if (this.candidate?.generation === generation) {
+          finish(
+            new Error(
+              `worker ${handle.pid} exited before readiness (code=${code ?? "none"}, signal=${signal ?? "none"})`,
+            ),
+            "startup",
+            {
+              workerPid: handle.pid,
+              workerExitCode: code,
+              workerExitSignal: signal,
+            },
+          );
+          return;
+        }
+        if (this.active?.generation === generation) {
+          this.active.dispose();
+          this.active = null;
+          if (!this.closed) {
+            this.recordFailure(
+              generation,
+              expectedVersion,
+              "runtime",
+              `worker exited (code=${code ?? "none"}, signal=${signal ?? "none"})`,
+              {
+                workerPid: handle.pid,
+                workerExitCode: code,
+                workerExitSignal: signal,
+              },
+            );
+          }
+          this.options.log?.(
+            `[proxy-supervisor] active worker exited generation=${generation} pid=${handle.pid} code=${code ?? "none"} signal=${signal ?? "none"}`,
+          );
+        }
+        const drained = this.draining.get(generation);
+        if (drained) {
+          drained.dispose();
+          this.draining.delete(generation);
+        }
+        this.publishState();
+        this.notifyShutdownWaiters();
+      });
+      const dispose = (): void => {
+        offMessage();
+        offExit();
+      };
+      const readyTimeout = setTimeout(() => {
+        finish(
+          new Error(
+            `worker ${handle.pid} did not become ready within ${this.options.readyTimeoutMs}ms`,
+          ),
+        );
+      }, this.options.readyTimeoutMs);
+      readyTimeout.unref?.();
+
+      this.candidate = {
+        handle,
+        generation,
+        version: expectedVersion,
+        pendingTransfers: 0,
+        drainRequested: false,
+        expectedVersion,
+        activationRequested: false,
+        dispose,
+        settle: finish,
+      };
+      this.publishState();
+    });
+  }
+
+  private flushQueuedSockets(): void {
+    if (this.flushingSockets) {
+      return;
+    }
+    this.flushingSockets = true;
+    try {
+      while (
+        this.active &&
+        this.queuedSockets.length > 0 &&
+        this.active.pendingTransfers < this.options.maxPendingTransfers
+      ) {
+        const queued = this.queuedSockets.shift();
+        if (!queued) {
+          break;
+        }
+        clearTimeout(queued.timeout);
+        this.transferSocket(this.active, queued);
+      }
+    } finally {
+      this.flushingSockets = false;
+    }
+  }
+
+  private transferSocket(
+    worker: RollingManagedWorker,
+    admission: RollingSocketAdmission,
+  ): void {
+    const { socket } = admission;
+    if (Date.now() >= admission.deadlineAt) {
+      this.rejectSocket(
+        socket,
+        worker.generation,
+        worker.version,
+        "admission_timeout",
+      );
+      return;
+    }
+    worker.pendingTransfers += 1;
+    this.scheduleTransferState();
+    let settled = false;
+    const complete = (error?: Error | null): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      worker.pendingTransfers = Math.max(0, worker.pendingTransfers - 1);
+      if (error) {
+        this.handleTransferFailure(worker, admission, error);
+      } else if (this.active?.generation === worker.generation) {
+        this.consecutiveOfferTimeouts = 0;
+      }
+      this.maybeDrainWorker(worker);
+      this.flushQueuedSockets();
+      this.scheduleTransferState();
+    };
+    try {
+      worker.handle.sendSocket(
+        worker.generation,
+        socket,
+        complete,
+        admission.deadlineAt,
+      );
+    } catch (error) {
+      complete(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  private maybeDrainWorker(worker: RollingManagedWorker): void {
+    if (
+      !worker.drainRequested ||
+      worker.pendingTransfers > 0 ||
+      !this.draining.has(worker.generation)
+    ) {
+      return;
+    }
+    worker.drainRequested = false;
+    try {
+      worker.handle.sendControl({
+        type: "proxy-worker:drain",
+        generation: worker.generation,
+      });
+    } catch {
+      worker.handle.terminate("SIGTERM");
+    }
+  }
+
+  /**
+   * Cancel the affected handoff and request bounded replacement without
+   * killing unrelated streams.
+   */
+  private handleTransferFailure(
+    worker: RollingManagedWorker,
+    admission: RollingSocketAdmission,
+    error: unknown,
+  ): void {
+    const { socket } = admission;
+    this.failedTransfers += 1;
+    const detail = this.describeTransferError(error);
+    this.recordEvent({
+      type: "failed_transfer",
+      generation: worker.generation,
+      version: worker.version,
+      phase: "transfer",
+      reason: detail,
+    });
+    const lifecycle = this.extractLifecycleFailureDetails(
+      error,
+      worker.handle.pid,
+    );
+    const cancelledOffer =
+      error instanceof Error &&
+      (error as NodeJS.ErrnoException).code === PROXY_SOCKET_OFFER_TIMEOUT;
+    const commitTimeout =
+      error instanceof Error &&
+      (error as NodeJS.ErrnoException).code === PROXY_SOCKET_COMMIT_TIMEOUT;
+    if (
+      !lifecycle.observedExit &&
+      this.active?.generation === worker.generation
+    ) {
+      this.consecutiveOfferTimeouts += 1;
+      // Persistent stalls need recovery, but keep serving existing streams
+      // until a replacement activates. Avoid accumulating draining workers or
+      // spawning repeatedly when the whole host is under pressure.
+      if (
+        (this.consecutiveOfferTimeouts >= 3 || !cancelledOffer) &&
+        !this.candidate &&
+        this.draining.size === 0 &&
+        Date.now() - this.lastStallReplacementAt >= 60_000 &&
+        !this.closed
+      ) {
+        this.lastStallReplacementAt = Date.now();
+        this.options.onReplacementRequested?.({
+          generation: worker.generation,
+          pid: worker.handle.pid,
+          reason: commitTimeout
+            ? "socket_commit_timeout"
+            : cancelledOffer
+              ? "socket_offer_timeout"
+              : "socket_transfer_failure",
+        });
+      }
+    }
+    this.recordFailure(
+      worker.generation,
+      worker.version,
+      "transfer",
+      `worker ${worker.handle.pid} socket transfer failed: ${detail}`,
+      {
+        ...lifecycle.details,
+        // If the error already records an exit, the supervisor did not cause
+        // that exit. Otherwise this captures the deliberate cleanup following
+        // the failed transfer, not a claimed root cause for the failure.
+        supervisorAction: cancelledOffer
+          ? "cancel_uncommitted_socket"
+          : lifecycle.observedExit
+            ? "none"
+            : "cancel_socket_replace_before_drain",
+      },
+    );
+    this.options.log?.(
+      `[proxy-supervisor] socket transfer failed generation=${worker.generation} pid=${worker.handle.pid}: ${detail}`,
+    );
+    // A failed handoff is not evidence that every connection on this worker
+    // failed. Cancel only the affected socket and activate a replacement before
+    // draining existing streams. Actual exits are handled by onExit below.
+    const replacement = this.active;
+    if (
+      cancelledOffer &&
+      error instanceof Error &&
+      "socketNeverTransferred" in error &&
+      error.socketNeverTransferred === true &&
+      !lifecycle.observedExit &&
+      !admission.retried &&
+      !this.closed &&
+      replacement &&
+      replacement.generation !== worker.generation &&
+      replacement.pendingTransfers < this.options.maxPendingTransfers &&
+      Date.now() < admission.deadlineAt
+    ) {
+      // Only negotiated control-only offers retain every byte on this parent.
+      // Legacy descriptor offers can buffer bytes before commit and never retry.
+      // The removed IPC entry also prevents a late acceptance issuing a commit.
+      // Every other failure is ambiguous and must never replay request bytes.
+      this.transferSocket(replacement, { ...admission, retried: true });
+      return;
+    }
+    this.rejectSocket(
+      socket,
+      worker.generation,
+      worker.version,
+      "transfer_failure",
+    );
+  }
+
+  /**
+   * Record a classified admission rejection before releasing the
+   * parent-owned socket.
+   */
+  private rejectSocket(
+    socket: TransferableProxySocket,
+    generation: number | null = this.active?.generation ?? null,
+    version: string | null = this.active?.version ?? null,
+    reason = "unavailable",
+  ): void {
+    this.rejectedSockets += 1;
+    this.recordEvent({
+      type: "rejected_socket",
+      generation,
+      version,
+      reason,
+    });
+    socket.destroy();
+    this.publishState();
+  }
+
+  private describeTransferError(error: unknown): string {
+    if (!(error instanceof Error)) {
+      return String(error ?? "unknown transfer failure");
+    }
+    const code = (error as NodeJS.ErrnoException).code;
+    return code ? `${code}: ${error.message}` : error.message;
+  }
+
+  private extractLifecycleFailureDetails(
+    error: unknown,
+    fallbackPid: number,
+  ): { details: RollingWorkerFailureDetails; observedExit: boolean } {
+    const context =
+      error &&
+      typeof error === "object" &&
+      "context" in error &&
+      (error as { context?: unknown }).context &&
+      typeof (error as { context?: unknown }).context === "object"
+        ? ((error as { context: Record<string, unknown> }).context ?? {})
+        : {};
+    const workerPid =
+      typeof context.workerPid === "number" ? context.workerPid : fallbackPid;
+    const hasExitCode =
+      typeof context.exitCode === "number" || context.exitCode === null;
+    const hasExitSignal =
+      typeof context.signal === "string" || context.signal === null;
+    return {
+      details: {
+        workerPid,
+        ...(hasExitCode
+          ? { workerExitCode: context.exitCode as number | null }
+          : {}),
+        ...(hasExitSignal
+          ? { workerExitSignal: context.signal as string | null }
+          : {}),
+      },
+      observedExit: hasExitCode || hasExitSignal,
+    };
+  }
+
+  /**
+   * Retain the latest failure and its observed process evidence in the
+   * incident journal.
+   */
+  private recordFailure(
+    generation: number,
+    version: string,
+    phase: NonNullable<RollingWorkerSupervisorSnapshot["lastFailure"]>["phase"],
+    message: string,
+    details: RollingWorkerFailureDetails = {},
+  ): void {
+    this.lastFailure = {
+      at: new Date().toISOString(),
+      generation,
+      version,
+      phase,
+      message: message.slice(0, 1_000),
+      ...details,
+    };
+    this.recordEvent({
+      type: "failure",
+      generation,
+      version,
+      phase,
+      reason: message,
+      ...details,
+    });
+  }
+
+  /**
+   * Publish an independent incident record and retain only a bounded
+   * recent summary.
+   */
+  private recordEvent(event: Omit<RollingWorkerSupervisorEvent, "at">): void {
+    const recorded: RollingWorkerSupervisorEvent = {
+      at: new Date().toISOString(),
+      ...event,
+      ...(event.reason ? { reason: event.reason.slice(0, 1_000) } : {}),
+    };
+    this.recentEvents.push(recorded);
+    try {
+      this.options.onEvent?.(recorded);
+    } catch (error) {
+      this.options.log?.(
+        `[proxy-supervisor] event journal failed: ${String(error)}`,
+      );
+    }
+    if (this.recentEvents.length > MAX_RECENT_SUPERVISOR_EVENTS) {
+      this.recentEvents.splice(
+        0,
+        this.recentEvents.length - MAX_RECENT_SUPERVISOR_EVENTS,
+      );
+    }
+  }
+
+  private scheduleTransferState(): void {
+    if (this.closed || this.transferStateTimer || !this.options.onStateChange) {
+      return;
+    }
+    // The installed supervisor persists each notification. Keep diagnostics
+    // fresh without adding a synchronous disk write to every socket handoff.
+    this.transferStateTimer = setTimeout(() => this.publishState(), 250);
+    this.transferStateTimer.unref();
+  }
+
+  private publishState(): void {
+    clearTimeout(this.transferStateTimer);
+    this.transferStateTimer = undefined;
+    try {
+      this.options.onStateChange?.(this.snapshot());
+    } catch (error) {
+      this.options.log?.(
+        `[proxy-supervisor] failed to persist supervisor state: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+}

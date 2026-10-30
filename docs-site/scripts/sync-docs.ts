@@ -17,6 +17,7 @@ import { GitChangeDetector, type GitChangeInfo } from "./gitChangeDetector.js";
 
 // Configuration
 const SOURCE_DIR = path.resolve(__dirname, "../../docs");
+const PROVIDER_DOCS_DIR = path.join(SOURCE_DIR, "getting-started/providers");
 const TARGET_DIR = path.resolve(__dirname, "../docs");
 const STATIC_DIR = path.resolve(__dirname, "../static");
 
@@ -72,11 +73,13 @@ const FILE_MAPPINGS: Record<string, string> = {
   "mcp-concurrency-guide.md": "mcp/concurrency.md",
   "mcp-testing-guide.md": "mcp/testing.md",
   "mcp-latency-optimization-implementation-guide.md": "mcp/optimization.md",
+  "mcp-docs-server.md": "mcp/docs-server.md",
 
   // Memory docs -> memory/
   "conversation-memory.md": "memory/conversation.md",
   "context-summarization.md": "memory/summarization.md",
-  "mem0-integration.md": "memory/mem0.md",
+  "features/memory.md": "features/memory.md",
+  "advanced/memory-integration.md": "advanced/memory-integration.md",
 
   // Workflow docs -> workflows/
   "advanced-orchestration.md": "workflows/orchestration.md",
@@ -136,16 +139,16 @@ const FILE_MAPPINGS: Record<string, string> = {
   "large-context-handling-design-doc.md": "development/large-context-design.md",
 };
 
-interface TransformResult {
+type TransformResult = {
   content: string;
   frontmatter: Record<string, unknown>;
-}
+};
 
-interface FileInfo {
+type FileInfo = {
   sourcePath: string;
   relativePath: string;
   targetPath: string;
-}
+};
 
 /**
  * Convert MkDocs admonitions to Docusaurus format
@@ -374,33 +377,108 @@ function removeAttributeSyntax(content: string): string {
  */
 function convertGridCards(content: string): string {
   // Unwrap <div class="grid cards" markdown> containers, keeping inner content
-  // This preserves the content while removing the container divs
+  // This preserves the content while removing the container divs and *** separators
   return content.replace(
     /<div\s+class="grid\s+cards"[^>]*markdown>\s*([\s\S]*?)\s*<\/div>/gi,
     (match, innerContent) => {
-      return innerContent.trim();
+      // Remove *** thematic breaks used as card separators in MkDocs grid cards
+      return innerContent.replace(/^\s*\*\*\*\s*$/gm, "").trim();
     },
   );
 }
 
 /**
- * Convert material icons to text or emoji alternatives
- * :material-icon-name: -> descriptive text
+ * Convert material icons to Unicode emoji alternatives
+ * :material-icon-name: -> Unicode emoji
+ * Also strips MkDocs attribute syntax like { .class title="..." }
  */
 function convertMaterialIcons(content: string): string {
   const iconMap: Record<string, string> = {
-    "material-clock-fast": "clock:",
-    "material-download": "download:",
-    "material-key": "key:",
-    "material-cog": "settings:",
-    "material-check": "check:",
-    "material-close": "close:",
-    "material-alert": "alert:",
-    "material-information": "info:",
+    "material-clock-fast": "⏱️",
+    "material-clock-outline": "🕐",
+    "material-download": "📥",
+    "material-key": "🔑",
+    "material-cog": "⚙️",
+    "material-check": "✅",
+    "material-close": "❌",
+    "material-alert": "⚠️",
+    "material-alert-circle": "⚠️",
+    "material-information": "ℹ️",
+    "material-rocket": "🚀",
+    "material-console": "💻",
+    "material-console-line": "💻",
+    "material-code": "💻",
+    "material-code-block-tags": "📝",
+    "material-star": "⭐",
+    "material-lightbulb": "💡",
+    "material-briefcase": "💼",
+    "material-help-circle": "❓",
+    "material-frequently-asked-questions": "❓",
+    "material-shield-check": "🛡️",
+    "material-shield-lock": "🔐",
+    "material-compare": "⚖️",
+    "material-camera": "📷",
+    "material-play-circle": "▶️",
+    "material-web": "🌐",
+    "material-book-open": "📖",
+    "material-heart": "❤️",
+    "material-test-tube": "🧪",
+    "material-sitemap": "🗺️",
+    "material-factory": "🏭",
+    "material-tag-multiple": "🏷️",
+    "material-link-variant": "🔗",
+    "material-connection": "🔌",
+    "material-chart-line": "📈",
+    "material-chart-timeline": "📊",
+    "material-chart-box": "📊",
+    "material-refresh": "🔄",
+    "material-wave": "🌊",
+    "material-middleware": "🔧",
+    "material-video": "🎬",
+    "material-image": "🖼️",
+    "material-image-plus": "🖼️",
+    "material-image-text": "🖼️",
+    "material-microphone": "🎤",
+    "material-server": "🖥️",
+    "material-server-network": "🌐",
+    "material-database-search": "🔍",
+    "material-database-export": "📤",
+    "material-database-cog": "🗄️",
+    "material-security": "🔒",
+    "material-tools": "🛠️",
+    "material-hand-pointing-up": "👆",
+    "material-brain": "🧠",
+    "material-brain-circuit": "🧠",
+    "material-aws": "☁️",
+    "material-table-large": "📊",
+    "material-file-pdf-box": "📄",
+    "material-file-word": "📝",
+    "material-earth": "🌍",
+    "material-speedometer": "⚡",
+    "material-flash": "⚡",
+    "material-new-box": "🆕",
+    "material-api": "📡",
   };
 
+  // First strip MkDocs attribute syntax: { .class title="..." }
+  content = content.replace(/:material-[a-z-]+:\{[^}]*\}/g, (match) => {
+    const iconMatch = match.match(/:material-([a-z-]+):/);
+    if (iconMatch) {
+      const replacement = iconMap[`material-${iconMatch[1]}`];
+      if (!replacement) {
+        console.warn(`  ⚠️  Unmapped material icon: :material-${iconMatch[1]}:`);
+      }
+      return replacement || "";
+    }
+    return "";
+  });
+
+  // Then convert remaining material icons
   return content.replace(/:material-([a-z-]+):/g, (match, iconName) => {
     const replacement = iconMap[`material-${iconName}`];
+    if (!replacement) {
+      console.warn(`  ⚠️  Unmapped material icon: :material-${iconName}:`);
+    }
     return replacement || "";
   });
 }
@@ -590,7 +668,7 @@ function processFrontmatter(
     }
     if (!processed.description) {
       processed.description =
-        "Enterprise AI Development Platform - Universal provider support, MCP integration, and professional CLI";
+        "Enterprise AI Development Platform - unified provider support, MCP integration, and professional CLI";
     }
     processed.slug = "/";
   }
@@ -778,14 +856,14 @@ const LINK_MAPPINGS: Record<string, string> = {
   "mcp-testing-guide": "/mcp/testing",
   "mcp-testing-guide.md": "/mcp/testing",
   "mcp-latency-optimization-implementation-guide": "/mcp/optimization",
+  "mcp-docs-server": "/mcp/docs-server",
+  "mcp-docs-server.md": "/mcp/docs-server",
 
   // Memory reorganization
   "conversation-memory": "/memory/conversation",
   "conversation-memory.md": "/memory/conversation",
   "context-summarization": "/memory/summarization",
   "context-summarization.md": "/memory/summarization",
-  "mem0-integration": "/memory/mem0",
-  "mem0-integration.md": "/memory/mem0",
 
   // Workflow reorganization
   "advanced-orchestration": "/workflows/orchestration",
@@ -824,6 +902,8 @@ const LINK_MAPPINGS: Record<string, string> = {
   "troubleshooting.md": "/reference/troubleshooting",
   "provider-comparison": "/reference/provider-comparison",
   "provider-behavior": "/reference/provider-behavior",
+  "provider-feature-compatibility": "/reference/provider-feature-compatibility",
+  "provider-feature-compatibility.md": "/reference/provider-feature-compatibility",
   "factory-pattern-migration": "/development/factory-migration",
   "factory-pattern-migration.md": "/development/factory-migration",
 
@@ -840,8 +920,36 @@ const LINK_MAPPINGS: Record<string, string> = {
   "guardrails-ai-integration": "/features/guardrails-ai",
   "image-generation-streaming": "/features/image-generation",
   "real-time-speech-agents": "/features/speech-agents",
+  "livekit-voice-agent": "/features/livekit-voice-agent",
+  "livekit-voice-agent.md": "/features/livekit-voice-agent",
   streaming: "/advanced/streaming",
   "features/streaming": "/advanced/streaming",
+  "context-compaction": "/features/context-compaction",
+  "context-compaction.md": "/features/context-compaction",
+  "thinking-configuration": "/features/thinking-configuration",
+  "thinking-configuration.md": "/features/thinking-configuration",
+  "claude-proxy": "/features/claude-proxy",
+  "claude-proxy.md": "/features/claude-proxy",
+  "claude-proxy-architecture": "/features/claude-proxy-architecture",
+  "claude-proxy-architecture.md": "/features/claude-proxy-architecture",
+  "claude-proxy-config-reference": "/features/claude-proxy-config-reference",
+  "claude-proxy-config-reference.md": "/features/claude-proxy-config-reference",
+  "claude-proxy-troubleshooting": "/features/claude-proxy-troubleshooting",
+  "claude-proxy-troubleshooting.md": "/features/claude-proxy-troubleshooting",
+  // The rest of the proxy family. Without an entry the rewriter drops the
+  // `features/` segment and emits /docs/<name>, which is not a page — a
+  // relative link from features/index.md then fails the Docusaurus broken-link
+  // check even though the doc is copied and reachable.
+  "proxy-accounts-endpoint": "/features/proxy-accounts-endpoint",
+  "proxy-accounts-endpoint.md": "/features/proxy-accounts-endpoint",
+  "proxy-cli-onboarding": "/features/proxy-cli-onboarding",
+  "proxy-cli-onboarding.md": "/features/proxy-cli-onboarding",
+  "codex-proxy-support": "/features/codex-proxy-support",
+  "codex-proxy-support.md": "/features/codex-proxy-support",
+  "opencode-proxy-support": "/features/opencode-proxy-support",
+  "opencode-proxy-support.md": "/features/opencode-proxy-support",
+  "claude-proxy-observability": "/features/claude-proxy-observability",
+  "claude-proxy-observability.md": "/features/claude-proxy-observability",
 
   // Provider guides -> getting-started/providers
   "ollama-setup": "/getting-started/providers/ollama",
@@ -862,6 +970,10 @@ const LINK_MAPPINGS: Record<string, string> = {
   "session-management-guide": "/guides/session-management",
 
   // Features - absolute paths often used
+  memory: "/features/memory",
+  "memory.md": "/features/memory",
+  "features/memory": "/features/memory",
+  "features/memory.md": "/features/memory",
   guardrails: "/features/guardrails",
   hitl: "/features/hitl",
   multimodal: "/features/multimodal",
@@ -878,9 +990,22 @@ const LINK_MAPPINGS: Record<string, string> = {
   "auto-evaluation": "/features/auto-evaluation",
   interactive: "/demos/interactive",
   "video-generation": "/features/video-generation",
+  "ppt-generation": "/features/ppt-generation",
   "conversation-history": "/features/conversation-history",
   "mcp-tools-showcase": "/features/mcp-tools-showcase",
   "provider-orchestration": "/features/provider-orchestration",
+  "claude-subscription": "/features/claude-subscription",
+  "claude-subscription.md": "/features/claude-subscription",
+  "claude-subscription-testing": "/features/claude-subscription-testing",
+  "claude-subscription-testing.md": "/features/claude-subscription-testing",
+  "mcp-enhancements": "/features/mcp-enhancements",
+  "mcp-enhancements.md": "/features/mcp-enhancements",
+  "mcp-enhancements-diagrams": "/features/mcp-enhancements-diagrams",
+  "mcp-enhancements-diagrams.md": "/features/mcp-enhancements-diagrams",
+  "client-sdk": "/features/client-sdk",
+  "client-sdk.md": "/features/client-sdk",
+  autoresearch: "/features/autoresearch",
+  "autoresearch.md": "/features/autoresearch",
 
   // Cookbook - absolute paths
   "batch-processing": "/cookbook/batch-processing",
@@ -893,6 +1018,8 @@ const LINK_MAPPINGS: Record<string, string> = {
   "tool-chaining": "/cookbook/tool-chaining",
   "context-window-management": "/cookbook/context-window-management",
   "conversation-summarization": "/cookbook/conversation-summarization",
+  "autoresearch-quickstart": "/cookbook/autoresearch-quickstart",
+  "autoresearch-quickstart.md": "/cookbook/autoresearch-quickstart",
 
   // Getting started - absolute paths
   "provider-setup": "/getting-started/provider-setup",
@@ -923,6 +1050,16 @@ const LINK_MAPPINGS: Record<string, string> = {
   // Provider paths
   "openai-compatible": "/getting-started/providers/openai-compatible",
   "providers/openrouter": "/getting-started/providers/openrouter",
+  "providers/anthropic": "/getting-started/providers/anthropic",
+  anthropic: "/getting-started/providers/anthropic",
+  // Bare provider names so sibling-relative `./<name>.md` links inside
+  // docs/getting-started/providers/ resolve to the canonical Docusaurus path
+  // instead of falling through to the generic `/docs/<name>` (which 404s).
+  ollama: "/getting-started/providers/ollama",
+  deepseek: "/getting-started/providers/deepseek",
+  "nvidia-nim": "/getting-started/providers/nvidia-nim",
+  "lm-studio": "/getting-started/providers/lm-studio",
+  llamacpp: "/getting-started/providers/llamacpp",
 
   // MCP additional
   "mcp/server-catalog": "/guides/mcp/server-catalog",
@@ -976,6 +1113,10 @@ const LINK_MAPPINGS: Record<string, string> = {
   "builtin-middleware": "/advanced/builtin-middleware",
   "google-vertex": "/getting-started/providers/google-vertex",
   huggingface: "/getting-started/providers/huggingface",
+  "openai-tts": "/getting-started/providers/openai-tts",
+  elevenlabs: "/getting-started/providers/elevenlabs",
+  deepgram: "/getting-started/providers/deepgram",
+  "azure-speech": "/getting-started/providers/azure-speech",
 
   // API documentation paths - these need /api/ prefix
   "enumerations/AIProviderName": "/api/enumerations/AIProviderName",
@@ -990,7 +1131,6 @@ const LINK_MAPPINGS: Record<string, string> = {
   "type-aliases/MiddlewareFactoryOptions": "/api/type-aliases/MiddlewareFactoryOptions",
   "type-aliases/MCPOAuthConfig": "/api/type-aliases/MCPOAuthConfig",
   "type-aliases/McpMetadata": "/api/type-aliases/McpMetadata",
-  "type-aliases/LangfuseConfig": "/api/type-aliases/LangfuseConfig",
   "type-aliases/GenerateOptions": "/api/type-aliases/GenerateOptions",
   "type-aliases/AIModelProviderConfig": "/api/type-aliases/AIModelProviderConfig",
   "classes/RateLimiterManager": "/api/classes/RateLimiterManager",
@@ -1006,11 +1146,49 @@ const LINK_MAPPINGS: Record<string, string> = {
   MiddlewareConfig: "/api/type-aliases/MiddlewareConfig",
   McpMetadata: "/api/type-aliases/McpMetadata",
   MCPCircuitBreaker: "/api/classes/MCPCircuitBreaker",
-  LangfuseConfig: "/api/type-aliases/LangfuseConfig",
   HTTPRateLimiter: "/api/classes/HTTPRateLimiter",
   GenerateResult: "/api/type-aliases/GenerateResult",
   ExecutionContext: "/api/type-aliases/ExecutionContext",
   AIModelProviderConfig: "/api/type-aliases/AIModelProviderConfig",
+
+  // Server Adapters - bare names (from relative ./hono.md links within server-adapters/)
+  hono: "/guides/server-adapters/hono",
+  "hono.md": "/guides/server-adapters/hono",
+  security: "/guides/server-adapters/security",
+  "security.md": "/guides/server-adapters/security",
+  deployment: "/guides/server-adapters/deployment",
+  "deployment.md": "/guides/server-adapters/deployment",
+  koa: "/guides/server-adapters/koa",
+  "koa.md": "/guides/server-adapters/koa",
+  websocket: "/guides/server-adapters/websocket",
+  "websocket.md": "/guides/server-adapters/websocket",
+  errors: "/guides/server-adapters/errors",
+  "errors.md": "/guides/server-adapters/errors",
+
+  // Server Adapters - prefixed paths (from relative ./server-adapters/X links)
+  "server-adapters": "/guides/server-adapters",
+  "server-adapters/index": "/guides/server-adapters",
+  "server-adapters/index.md": "/guides/server-adapters",
+  "server-adapters/hono": "/guides/server-adapters/hono",
+  "server-adapters/hono.md": "/guides/server-adapters/hono",
+  "server-adapters/express": "/guides/server-adapters/express",
+  "server-adapters/express.md": "/guides/server-adapters/express",
+  "server-adapters/fastify": "/guides/server-adapters/fastify",
+  "server-adapters/fastify.md": "/guides/server-adapters/fastify",
+  "server-adapters/koa": "/guides/server-adapters/koa",
+  "server-adapters/koa.md": "/guides/server-adapters/koa",
+  "server-adapters/security": "/guides/server-adapters/security",
+  "server-adapters/security.md": "/guides/server-adapters/security",
+  "server-adapters/deployment": "/guides/server-adapters/deployment",
+  "server-adapters/deployment.md": "/guides/server-adapters/deployment",
+  "server-adapters/streaming": "/guides/server-adapters/streaming",
+  "server-adapters/streaming.md": "/guides/server-adapters/streaming",
+  "server-adapters/websocket": "/guides/server-adapters/websocket",
+  "server-adapters/websocket.md": "/guides/server-adapters/websocket",
+  "server-adapters/errors": "/guides/server-adapters/errors",
+  "server-adapters/errors.md": "/guides/server-adapters/errors",
+  "server-adapters/middleware": "/guides/server-adapters/middleware",
+  "server-adapters/middleware.md": "/guides/server-adapters/middleware",
 
   // Server Adapters - path-prefixed versions for explicit reference
   // NOTE: Simple names like "hono", "express" etc. should use guides/server-adapters/ paths
@@ -1040,8 +1218,8 @@ const LINK_MAPPINGS: Record<string, string> = {
   "guides/server-adapters/index.md": "/guides/server-adapters",
   "server-configuration": "/reference/server-configuration",
   "server-configuration.md": "/reference/server-configuration",
-  "features/observability": "/observability/health-monitoring",
-  "features/observability.md": "/observability/health-monitoring",
+  "features/observability": "/features/observability",
+  "features/observability.md": "/features/observability",
   observability: "/observability/health-monitoring",
   "observability.md": "/observability/health-monitoring",
 
@@ -1061,7 +1239,6 @@ const LINK_MAPPINGS: Record<string, string> = {
   "type-aliases/MiddlewarePreset": "/api/type-aliases/MiddlewarePreset",
   "type-aliases/MCPServerInfo": "/api/type-aliases/MCPServerInfo",
   ToolContext: "/api/type-aliases/ToolContext",
-  OpenTelemetryConfig: "/api/type-aliases/OpenTelemetryConfig",
   MiddlewareFactoryOptions: "/api/type-aliases/MiddlewareFactoryOptions",
   GenerateOptions: "/api/type-aliases/GenerateOptions",
 
@@ -1153,8 +1330,6 @@ const LINK_MAPPINGS: Record<string, string> = {
   "functions/createAIProviderWithFallback": "/api/functions/createAIProviderWithFallback",
   "functions/createBestAIProvider": "/api/functions/createBestAIProvider",
   "functions/generateText": "/api/functions/generateText",
-  "functions/initializeTelemetry": "/api/functions/initializeTelemetry",
-  "functions/getTelemetryStatus": "/api/functions/getTelemetryStatus",
   "functions/createOAuthProviderFromConfig": "/api/functions/createOAuthProviderFromConfig",
   "functions/isTokenExpired": "/api/functions/isTokenExpired",
   "functions/calculateExpiresAt": "/api/functions/calculateExpiresAt",
@@ -1166,16 +1341,122 @@ const LINK_MAPPINGS: Record<string, string> = {
   "functions/executeMCP": "/api/functions/executeMCP",
   "functions/getMCPStats": "/api/functions/getMCPStats",
   "functions/validateTool": "/api/functions/validateTool",
-  "functions/initializeOpenTelemetry": "/api/functions/initializeOpenTelemetry",
   "functions/flushOpenTelemetry": "/api/functions/flushOpenTelemetry",
   "functions/shutdownOpenTelemetry": "/api/functions/shutdownOpenTelemetry",
   "functions/getLangfuseHealthStatus": "/api/functions/getLangfuseHealthStatus",
   "functions/setLangfuseContext": "/api/functions/setLangfuseContext",
-  "functions/buildObservabilityConfigFromEnv": "/api/functions/buildObservabilityConfigFromEnv",
   "functions/getBestProvider": "/api/functions/getBestProvider",
   "functions/getAvailableProviders": "/api/functions/getAvailableProviders",
   "functions/isValidProvider": "/api/functions/isValidProvider",
+
+  // ── New provider getting-started guides (feat/more-providers) ─────────
+  xai: "/getting-started/providers/xai",
+  groq: "/getting-started/providers/groq",
+  cerebras: "/getting-started/providers/cerebras",
+  sambanova: "/getting-started/providers/sambanova",
+  replicate: "/getting-started/providers/replicate",
+  voyage: "/getting-started/providers/voyage",
+  stability: "/getting-started/providers/stability",
+  "fish-audio": "/getting-started/providers/fish-audio",
+  cohere: "/getting-started/providers/cohere",
+  jina: "/getting-started/providers/jina",
+  "together-ai": "/getting-started/providers/together-ai",
+  together: "/getting-started/providers/together-ai",
+  fireworks: "/getting-started/providers/fireworks",
+  perplexity: "/getting-started/providers/perplexity",
+  cloudflare: "/getting-started/providers/cloudflare",
+  ideogram: "/getting-started/providers/ideogram",
+  recraft: "/getting-started/providers/recraft",
+  heygen: "/getting-started/providers/heygen",
+  "d-id": "/getting-started/providers/d-id",
+  did: "/getting-started/providers/d-id",
+  musetalk: "/getting-started/providers/musetalk",
+  lyria: "/getting-started/providers/lyria",
+  beatoven: "/getting-started/providers/beatoven",
+  "elevenlabs-music": "/getting-started/providers/elevenlabs-music",
+  kling: "/getting-started/providers/kling",
+  runway: "/getting-started/providers/runway",
+  cartesia: "/getting-started/providers/cartesia",
+
+  // ── New provider-integration guides + their cross-refs ────────────────
+  "00-architecture": "/provider-integration/00-architecture",
+  "01-shared-changes": "/provider-integration/01-shared-changes",
+  "02-deepseek": "/provider-integration/02-deepseek",
+  "03-nvidia-nim": "/provider-integration/03-nvidia-nim",
+  "04-lm-studio": "/provider-integration/04-lm-studio",
+  "05-llamacpp": "/provider-integration/05-llamacpp",
+  "06-testing": "/provider-integration/06-testing",
+  "07-implementation-order": "/provider-integration/07-implementation-order",
+  "08-feature-matrix": "/provider-integration/08-feature-matrix",
+  "09-test-suite-spec": "/provider-integration/09-test-suite-spec",
+  "10-test-results-final": "/provider-integration/10-test-results-final",
+  "11-test-failure-investigation":
+    "/provider-integration/11-test-failure-investigation",
+  "12-pr-analysis": "/provider-integration/12-pr-analysis",
+  "13-code-review": "/provider-integration/13-code-review",
+  "14-voice-speech-integration":
+    "/provider-integration/14-voice-speech-integration",
+  "15-adding-llm-provider": "/provider-integration/15-adding-llm-provider",
+  "16-adding-tts-provider": "/provider-integration/16-adding-tts-provider",
+  "17-adding-stt-provider": "/provider-integration/17-adding-stt-provider",
+  "18-adding-realtime-provider":
+    "/provider-integration/18-adding-realtime-provider",
+  "19-adding-video-provider": "/provider-integration/19-adding-video-provider",
+  "20-adding-image-gen-provider":
+    "/provider-integration/20-adding-image-gen-provider",
+  "21-adding-new-modality": "/provider-integration/21-adding-new-modality",
+  "22-adding-multimodal-provider":
+    "/provider-integration/22-adding-multimodal-provider",
+  CHECKLIST: "/provider-integration/checklist",
+  checklist: "/provider-integration/checklist",
+  "SAFETY-PRIMITIVES": "/provider-integration/safety-primitives",
+  "safety-primitives": "/provider-integration/safety-primitives",
+  // Tiered onboarding playbook. These live in subdirectories, and without an
+  // entry here a link to one resolves against the site root — a link to
+  // tiers/README.md becomes /docs/tiers/readme, which does not exist and
+  // fails the build's broken-link check.
+  "tiers/README": "/provider-integration/tiers/readme",
+  "tiers/tier-1-aggregator-passthrough":
+    "/provider-integration/tiers/tier-1-aggregator-passthrough",
+  "tiers/tier-2-catalog-entry":
+    "/provider-integration/tiers/tier-2-catalog-entry",
+  "tiers/tier-3-adapter-native":
+    "/provider-integration/tiers/tier-3-adapter-native",
+  "tiers/tier-4-full-custom": "/provider-integration/tiers/tier-4-full-custom",
+  "adr/README": "/provider-integration/adr/readme",
+  "adr/0001-provider-descriptor-as-source-of-truth":
+    "/provider-integration/adr/0001-provider-descriptor-as-source-of-truth",
+  "adr/0002-catalog-over-subclass-default":
+    "/provider-integration/adr/0002-catalog-over-subclass-default",
+  "adr/0003-mocked-contract-as-merge-gate":
+    "/provider-integration/adr/0003-mocked-contract-as-merge-gate",
+  "manifests/README": "/provider-integration/manifests/readme",
 };
+
+/**
+ * Bare provider names, derived from the filesystem rather than hand-listed.
+ *
+ * Pages under `docs/getting-started/providers/` link to each other with plain
+ * sibling links (`[Groq](groq.md)`), and `transformLinkPath` resolves those
+ * through LINK_MAPPINGS. A name that is missing falls through to the generic
+ * `/docs/<name>`, which is not a route — so the Docusaurus build fails with
+ * "broken links" for a page that exists and is perfectly well formed.
+ *
+ * That list was maintained by hand and had drifted to 49 of 54 providers.
+ * Deriving it means adding a provider page can never reintroduce the gap:
+ * every `.md` in that directory is mapped by construction, and an explicit
+ * entry above still wins for anything needing a special case.
+ */
+for (const file of fs.existsSync(PROVIDER_DOCS_DIR)
+  ? fs.readdirSync(PROVIDER_DOCS_DIR)
+  : []) {
+  if (!file.endsWith(".md") || file === "index.md") {
+    continue;
+  }
+  const name = file.slice(0, -3);
+  LINK_MAPPINGS[name] ??= `/getting-started/providers/${name}`;
+  LINK_MAPPINGS[file] ??= `/getting-started/providers/${name}`;
+}
 
 /**
  * Transform a link path to its new location with /docs prefix
@@ -1283,8 +1564,17 @@ function transformImagePaths(content: string): string {
  * Fix internal links to use /docs prefix (since docs are served from /docs/)
  * and transform links to match the new file organization
  */
-function fixInternalLinks(content: string): string {
+function fixInternalLinks(content: string, relativePath: string): string {
   let result = content;
+
+  // The generic passes below drop the directory, so a README link reaches
+  // transformLinkPath as plain "README.md", which has no mapping and falls
+  // through to the nonexistent /docs/readme. A global README mapping would
+  // reroute every ../README.md link under docs/api, so this is scoped to the
+  // one directory that links back to its parent index.
+  if (relativePath.replace(/\\/g, "/").startsWith("provider-integration/tiers/")) {
+    result = result.replace(/\]\(\.\.\/README\.md(#[^)]*)?\)/g, "](/docs/provider-integration/readme$1)");
+  }
 
   // Links with /docs prefix should keep it (docs are served from /docs/)
   // IMPORTANT: Use negative lookbehind (?<!!) to exclude image syntax ![alt](/docs/...)
@@ -1403,7 +1693,7 @@ function transformContent(content: string, relativePath: string, allFiles?: stri
   transformed = convertGridCards(transformed);
   transformed = convertMaterialIcons(transformed);
   transformed = escapeJsxSyntax(transformed);
-  transformed = fixInternalLinks(transformed);
+  transformed = fixInternalLinks(transformed, relativePath);
   transformed = transformImagePaths(transformed);
 
   // Process frontmatter with allFiles for deterministic sidebar positioning
@@ -1473,18 +1763,98 @@ function applyFileMapping(relativePath: string): string {
 }
 
 /**
+ * A page that moved leaves a redirect stub behind at its old path. A stub must
+ * never win a target collision — it would replace the real page with a link to
+ * itself.
+ */
+const REDIRECT_STUB_MARKER = "This page has moved to";
+
+/**
+ * Every source file that is deliberately not published because another file
+ * owns its target path. `FILE_MAPPINGS` is keyed by basename, so a mapping
+ * intended for one root-level file also catches every same-named file deeper
+ * in the tree, and the site has no room for two pages at one URL.
+ *
+ * Keeping the list here rather than letting the sync decide quietly is the
+ * point: a target claimed by a file that is NOT listed fails the sync, so a
+ * new collision has to be looked at instead of silently costing a page. Every
+ * entry but one is a redirect stub left at a page's old path, so losing it
+ * costs nothing: the page it points to is the one the site publishes. Several
+ * of those old URLs are also redirect sources in `config/redirects.ts`, so
+ * publishing a page there would collide with the redirect table. The exception
+ * is `skills/neurolink-guide/troubleshooting.md`: the neurolink-guide skill
+ * reads it by path, so it stays a real file and loses to
+ * `reference/troubleshooting.md` on the site.
+ */
+const KNOWN_SUPERSEDED: ReadonlyArray<{ source: string; target: string }> = [
+  { source: "advanced/api-reference.md", target: "sdk/api-reference.md" },
+  { source: "api-reference.md", target: "sdk/api-reference.md" },
+  { source: "configuration.md", target: "deployment/configuration.md" },
+  { source: "contributing.md", target: "community/contributing.md" },
+  { source: "dynamic-models.md", target: "guides/dynamic-models.md" },
+  { source: "enterprise-proxy-setup.md", target: "deployment/enterprise-proxy.md" },
+  { source: "factory-pattern-migration.md", target: "development/factory-migration.md" },
+  { source: "framework-integration.md", target: "sdk/framework-integration.md" },
+  { source: "getting-started/api-reference.md", target: "sdk/api-reference.md" },
+  { source: "guides/troubleshooting.md", target: "reference/troubleshooting.md" },
+  { source: "human-in-the-loop.md", target: "features/hitl.md" },
+  { source: "litellm-integration.md", target: "getting-started/providers/litellm.md" },
+  { source: "mcp-integration.md", target: "mcp/integration.md" },
+  { source: "mcp-testing-guide.md", target: "mcp/testing.md" },
+  { source: "ollama-setup.md", target: "getting-started/providers/ollama.md" },
+  { source: "provider-comparison.md", target: "reference/provider-comparison.md" },
+  { source: "real-time-services.md", target: "features/real-time-services.md" },
+  { source: "sagemaker-integration.md", target: "getting-started/providers/sagemaker.md" },
+  { source: "skills/neurolink-guide/troubleshooting.md", target: "reference/troubleshooting.md" },
+  { source: "testing.md", target: "development/testing.md" },
+  { source: "troubleshooting.md", target: "reference/troubleshooting.md" },
+];
+
+function isRedirectStub(file: FileInfo): boolean {
+  return fs.readFileSync(file.sourcePath, "utf-8").includes(REDIRECT_STUB_MARKER);
+}
+
+/** Codepoint order — `localeCompare` varies with the Node ICU build. */
+function byCodepoint(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
+ * Pick the one source file that gets written to a target path.
+ *
+ * `FILE_MAPPINGS` is keyed by basename, so every `api-reference.md` anywhere in
+ * the tree resolves to `sdk/api-reference.md` — 17 targets have more than one
+ * candidate. Whoever was written last used to win, and `glob` walks in
+ * filesystem order, so the winner differed by platform: CI published the
+ * 96-byte redirect stub for `sdk/api-reference` while a macOS build published
+ * the real 55 KB page, which made `search-index.json` unreproducible and the
+ * currency check permanently red for one of the two.
+ *
+ * Order: a real page at the target path, then any real page (codepoint-last),
+ * then the same two among stubs. A stub can only win when every candidate is
+ * one.
+ */
+function resolveTargetCollision(candidates: FileInfo[], targetRelative: string): FileInfo {
+  const real = candidates.filter((c) => !isRedirectStub(c));
+  const pool = real.length > 0 ? real : candidates;
+  const atTarget = pool.find((c) => c.relativePath.replace(/\\/g, "/") === targetRelative);
+  return atTarget ?? pool[pool.length - 1];
+}
+
+/**
  * Get all markdown files to process
  */
 async function getMarkdownFiles(sourceDir: string): Promise<FileInfo[]> {
   const pattern = "**/*.md";
   const files = await glob(pattern, { cwd: sourceDir, nodir: true });
 
-  return files
+  const mapped = files
     .filter((file) => {
       // Exclude certain directories
       const parts = file.split(path.sep);
       return !parts.some((part) => EXCLUDED_DIRS.includes(part));
     })
+    .sort(byCodepoint)
     .map((file) => {
       // Apply file mapping to determine target path
       const mappedPath = applyFileMapping(file);
@@ -1496,6 +1866,67 @@ async function getMarkdownFiles(sourceDir: string): Promise<FileInfo[]> {
         targetPath: path.join(TARGET_DIR, mappedPath),
       };
     });
+
+  const byTarget = new Map<string, FileInfo[]>();
+  for (const file of mapped) {
+    const targetRelative = path.relative(TARGET_DIR, file.targetPath).replace(/\\/g, "/");
+    const bucket = byTarget.get(targetRelative);
+    if (bucket) {
+      bucket.push(file);
+    } else {
+      byTarget.set(targetRelative, [file]);
+    }
+  }
+
+  const resolved: FileInfo[] = [];
+  const seenSuperseded = new Set<string>();
+  const unexpected: string[] = [];
+
+  for (const [targetRelative, candidates] of [...byTarget].sort(([a], [b]) => byCodepoint(a, b))) {
+    if (candidates.length === 1) {
+      resolved.push(candidates[0]);
+      continue;
+    }
+    const winner = resolveTargetCollision(candidates, targetRelative);
+    for (const loser of candidates) {
+      if (loser === winner) {
+        continue;
+      }
+      const key = `${loser.relativePath} -> ${targetRelative}`;
+      if (KNOWN_SUPERSEDED.some((k) => k.source === loser.relativePath && k.target === targetRelative)) {
+        seenSuperseded.add(key);
+        console.log(`  Superseded: ${key} (written from ${winner.relativePath})`);
+      } else {
+        unexpected.push(`  ${key} (would be written from ${winner.relativePath})`);
+      }
+    }
+    resolved.push(winner);
+  }
+
+  if (unexpected.length > 0) {
+    console.error(
+      [
+        "",
+        `Error: ${unexpected.length} source file(s) would be silently dropped by a target collision.`,
+        "",
+        ...unexpected,
+        "",
+        "FILE_MAPPINGS is keyed by basename, so a mapping meant for one file also",
+        "catches every same-named file deeper in docs/. Give the file an explicit",
+        "full-path entry in FILE_MAPPINGS so it lands somewhere of its own, or add",
+        "it to KNOWN_SUPERSEDED if losing the page is intended.",
+        "",
+      ].join("\n"),
+    );
+    process.exit(1);
+  }
+
+  const stale = KNOWN_SUPERSEDED.filter((k) => !seenSuperseded.has(`${k.source} -> ${k.target}`));
+  for (const k of stale) {
+    console.warn(`  Note: ${k.source} no longer collides with ${k.target}; drop it from KNOWN_SUPERSEDED.`);
+  }
+
+  return resolved;
 }
 
 /**
@@ -1571,27 +2002,20 @@ async function syncDocs(): Promise<void> {
       // Add auto-detected badges based on git changes
       const finalFrontmatter = addAutoBadges(frontmatter, file.relativePath, gitChanges);
 
-      // Build output with frontmatter
-      const frontmatterYaml = Object.entries(finalFrontmatter)
-        .map(([key, value]) => {
-          if (Array.isArray(value)) {
-            return `${key}:\n${value.map((v) => `  - "${String(v).replace(/"/g, '\\"')}"`).join("\n")}`;
-          }
-          if (typeof value === "string") {
-            // Quote strings that contain special YAML characters
-            const needsQuoting = /[:<>#{}[\]!|>&*?\n"'`\\]/.test(value) || value.trim() !== value;
-            if (needsQuoting) {
-              // Use double quotes and escape internal double quotes and backslashes
-              const escaped = value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-              return `${key}: "${escaped}"`;
-            }
-            return `${key}: ${value}`;
-          }
-          return `${key}: ${value}`;
-        })
-        .join("\n");
-
-      const output = `---\n${frontmatterYaml}\n---\n\n${content}`;
+      // Serialize YAML as a flow mapping so gray-matter's framing trim cannot
+      // remove significant trailing newlines from a final multiline scalar.
+      const serializationOptions = {
+        language: "yaml",
+        flowLevel: 0,
+        noRefs: true,
+        lineWidth: -1,
+      };
+      const output =
+        matter.stringify(
+          { content: "" },
+          finalFrontmatter,
+          serializationOptions,
+        ) + content;
 
       // Ensure target directory exists
       const targetDir = path.dirname(file.targetPath);

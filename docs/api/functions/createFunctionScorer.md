@@ -1,0 +1,59 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / createFunctionScorer
+
+# Function: createFunctionScorer()
+
+> **createFunctionScorer**(`id`, `name`, `scorerFn`, `options?`): [`BaseScorer`](../classes/BaseScorer.md)
+
+Create a simple function-based scorer
+
+## Parameters
+
+### id
+
+`string`
+
+### name
+
+`string`
+
+### scorerFn
+
+[`ScorerFunction`](../type-aliases/ScorerFunction.md)
+
+### options?
+
+#### description?
+
+`string`
+
+#### category?
+
+[`ScorerCategory`](../type-aliases/ScorerCategory.md)
+
+#### type?
+
+[`ScorerType`](../type-aliases/ScorerType.md)
+
+#### version?
+
+`string`
+
+#### requiredInputs?
+
+keyof [`ScorerInput`](../type-aliases/ScorerInput.md)[]
+
+#### optionalInputs?
+
+keyof [`ScorerInput`](../type-aliases/ScorerInput.md)[]
+
+#### config?
+
+[`ScorerConfig`](../type-aliases/ScorerConfig.md)
+
+## Returns
+
+[`BaseScorer`](../classes/BaseScorer.md)

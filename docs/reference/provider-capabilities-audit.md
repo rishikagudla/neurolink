@@ -1,9 +1,11 @@
 # Provider Capabilities Audit
 
-Comprehensive audit of all 13 AI providers supported by NeuroLink. This document serves as the source of truth for understanding each provider's capabilities, limitations, and configuration requirements.
+Capability audit for the **13 text/multimodal AI providers** historically tracked in this matrix. NeuroLink ships many provider integrations — the additional providers added since this audit was first written (DeepSeek, NVIDIA NIM, LM Studio, llama.cpp, xAI, Groq, Cerebras, SambaNova, Together AI, Fireworks, Perplexity, Cloudflare, Cohere, TypeSafe Jev, and more), the voice providers (OpenAI TTS, ElevenLabs, Deepgram, Azure Speech, Whisper, OpenAI Realtime, Gemini Live), and the embedding/media-only providers are documented in the per-provider docs under [/docs/getting-started/providers/](https://github.com/juspay/neurolink/tree/main/docs/getting-started/providers) and the [Voice Features](https://github.com/juspay/neurolink/blob/main/docs/features/index.md#voice) index, not in this capability matrix.
 
-**Last Updated:** January 1, 2026
-**NeuroLink Version:** 8.26.1
+For the canonical product surface, see the [README](https://github.com/juspay/neurolink/blob/main/README.md).
+
+**Last Updated:** May 2026
+**NeuroLink Version:** 9.62.0
 
 ---
 
@@ -462,9 +464,7 @@ BEDROCK_MODEL=anthropic.claude-3-sonnet-20240229-v1:0
 
 #### Streaming ⚠️
 
-- **Not fully implemented** (as of v8.26.1)
-- Coming in next phase
-- Returns 501 error currently
+- **Not fully implemented for SageMaker custom endpoints**. Streaming returns a 501 error from SageMaker custom inference endpoints; non-streaming generation works.
 
 #### Tool Calling ✓
 
@@ -657,9 +657,9 @@ MISTRAL_MODEL=mistral-small-2506
 
 ## 9. HuggingFace Provider
 
-**File:** `src/lib/providers/huggingFace.ts`
+**File:** `src/lib/providers/huggingFace/client.ts`
 **Provider Name:** `huggingface`
-**Default Model:** `microsoft/DialoGPT-medium`
+**Default Model:** `Qwen/Qwen2.5-72B-Instruct`
 
 ### Capabilities
 
@@ -674,23 +674,27 @@ MISTRAL_MODEL=mistral-small-2506
 - Real-time streaming via unified router
 - OpenAI-compatible endpoint
 
-#### Tool Calling ⚠️
+#### Tool Calling ✓
 
-**Model-Dependent Support:**
+Tools are offered to every model; capability is resolved by the shared
+`modelSupports()` facade rather than a provider-local list.
 
-**Supported Models:**
+A 13-entry model-name allowlist used to gate this. It was written for the
+retired per-model Inference API, where many endpoints rejected the OpenAI
+`tools` field. Measured against the 142 models the router served on
+2026-09-13, it admitted **1** and blocked 141 — including
+`Qwen/Qwen2.5-72B-Instruct`,
+`zai-org/GLM-5.3-Flash`, `google/gemma-4-31B-it` and
+`deepseek-ai/DeepSeek-V4-Flash`, every one of which returns HTTP 200 with
+`tool_calls`. No served model rejected the field, so the allowlist was
+removed.
 
-- Llama 3.1 series (8B, 70B, 405B Instruct)
-- Llama 3.1 Nemotron Ultra
-- Hermes 3 Llama 3.2
-- CodeLlama 34B Instruct
-- Mistral 7B Instruct v0.3
+A model that cannot use tools simply does not emit `tool_calls`, which the
+tool loop already handles.
 
-**Unsupported Models:**
-
-- DialoGPT variants (treats tools as conversation)
-- GPT-2, BERT, RoBERTa variants
-- Most pre-2024 models
+Note the legacy ids in the old list (CodeLlama 34B, Mistral 7B Instruct v0.3,
+Hermes 3 Llama 3.2, Llama 3.1 70B/405B) are **not served by the router** —
+they answer 400 regardless of tools.
 
 #### Vision/Multimodal ✗
 
@@ -740,7 +744,7 @@ HUGGINGFACE_MODEL=meta-llama/Llama-3.1-8B-Instruct
 #### Text Generation ✓
 
 - Access to 100+ models via proxy
-- Unified interface for all providers
+- Unified interface across supported providers
 - Cost tracking and analytics
 
 #### Streaming ✓
@@ -1068,7 +1072,7 @@ OPENROUTER_APP_NAME=YourApp
 
 ### BaseProvider Architecture
 
-All providers extend `BaseProvider` class which provides:
+Providers extend the `BaseProvider` class, which provides:
 
 - Unified interface for text generation and streaming
 - Tool registration and execution
@@ -1098,7 +1102,13 @@ Providers are registered via dynamic imports in `ProviderRegistry`:
 
 ## Version History
 
-- **v8.26.1** (January 2026) - Current version, 13 providers
+- **v9.62.0** (May 2026) - Multi-provider voice (TTS/STT/realtime); 24 providers
+- **v9.60.0** (April 2026) - Added DeepSeek, NVIDIA NIM, LM Studio, llama.cpp providers
+- **v9.59.0** - Typed `ModelAccessDeniedError` + `sdk.checkCredentials()`
+- **v9.58.0** - `providerFallback` callback + `modelChain` config
+- **v9.53.0** - AutoResearch autonomous experiment engine
+- **v9.52.0** - Per-request and per-instance credentials for all providers
+- **v8.26.1** (January 2026) - 13 providers (historical)
 - **v8.26.0** - Added video output types
 - **v8.25.0** - Gemini 3 support improvements
 - **v8.24.0** - Enhanced provider capabilities

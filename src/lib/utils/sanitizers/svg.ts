@@ -17,6 +17,8 @@
  * @see https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html
  */
 
+import type { SvgSanitizationResult } from "../../types/index.js";
+
 /**
  * Safe SVG elements (allowlist)
  * Only these elements will be preserved in sanitized output
@@ -229,18 +231,6 @@ const DANGEROUS_SVG_ATTRIBUTES = new Set([
 ]);
 
 /**
- * Result of SVG sanitization including metadata about removed content
- */
-export interface SvgSanitizationResult {
-  /** Sanitized SVG content */
-  content: string;
-  /** Items that were removed during sanitization */
-  removedItems: string[];
-  /** Whether any content was modified */
-  wasModified: boolean;
-}
-
-/**
  * Sanitize SVG content by removing dangerous elements and attributes.
  * Uses OWASP-compliant allowlist approach with regex-based parsing.
  *
@@ -281,7 +271,13 @@ export function sanitizeSvgContentDetailed(
   const originalContent = svgContent;
 
   // 1. Block DOCTYPE and ENTITY declarations (XXE prevention)
-  if (content.includes("<!DOCTYPE") || content.includes("<!ENTITY")) {
+  // Case-insensitive check to prevent XXE bypass via mixed/lowercase declarations (<!doctype, <!entity)
+  const upperContent = content.toUpperCase();
+  if (
+    upperContent.includes("<!DOCTYPE") ||
+    upperContent.includes("<!ENTITY") ||
+    /<!\s*(?:doctype|entity)/i.test(content)
+  ) {
     throw new Error(
       "SVG contains DOCTYPE or ENTITY declarations which are not allowed for security reasons",
     );
@@ -407,9 +403,11 @@ function removeDangerousAttributes(
     const attrRegex =
       /([a-zA-Z][a-zA-Z0-9:_-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
     const safeAttrs: string[] = [];
-    let attrMatch: RegExpExecArray | null = attrRegex.exec(attrs);
-
-    while (attrMatch !== null) {
+    for (
+      let attrMatch = attrRegex.exec(attrs);
+      attrMatch !== null;
+      attrMatch = attrRegex.exec(attrs)
+    ) {
       const attrName = attrMatch[1];
       const attrValue = attrMatch[2] ?? attrMatch[3] ?? "";
       const lowerAttrName = attrName.toLowerCase();
@@ -475,16 +473,15 @@ function removeDangerousAttributes(
 
       // Attribute is safe, keep it
       safeAttrs.push(`${attrName}="${escapeAttributeValue(attrValue)}"`);
-
-      // Get next match
-      attrMatch = attrRegex.exec(attrs);
     }
 
     // Also keep standalone attributes (like xmlns without value in some cases)
     const standaloneAttrRegex = /\s([a-zA-Z][a-zA-Z0-9:_-]*)(?=\s|>|$|\/)/g;
     let standaloneMatch: RegExpExecArray | null =
       standaloneAttrRegex.exec(attrs);
-    while (standaloneMatch !== null) {
+    let iterations = 0;
+    const MAX_ITERATIONS = 1000;
+    while (standaloneMatch !== null && iterations++ < MAX_ITERATIONS) {
       const attrName = standaloneMatch[1];
       // Only keep if it looks like a valid attribute and is safe
       if (
@@ -532,7 +529,11 @@ export function isSvgContentSafe(svgContent: string): boolean {
   const lowerContent = svgContent.toLowerCase();
 
   // Check for XXE
-  if (lowerContent.includes("<!doctype") || lowerContent.includes("<!entity")) {
+  if (
+    lowerContent.includes("<!doctype") ||
+    lowerContent.includes("<!entity") ||
+    /<!\s*(?:doctype|entity)/i.test(svgContent)
+  ) {
     return false;
   }
 

@@ -1,0 +1,28 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / normalizeAndValidate
+
+# Function: normalizeAndValidate()
+
+> **normalizeAndValidate**(`sources`, `options`): `Promise`\<[`KnowledgeNormalizeResult`](../type-aliases/KnowledgeNormalizeResult.md)\>
+
+Resolve and validate every source into normalized entries. `validation.ok`
+is false when any error-level issue was found; the caller (index builder)
+must not swap in an index built from an invalid set. Async so the public
+contract is stable if a future source kind needs asynchronous loading.
+
+## Parameters
+
+### sources
+
+[`KnowledgeSource`](../type-aliases/KnowledgeSource.md)[]
+
+### options
+
+[`KnowledgeNormalizeOptions`](../type-aliases/KnowledgeNormalizeOptions.md)
+
+## Returns
+
+`Promise`\<[`KnowledgeNormalizeResult`](../type-aliases/KnowledgeNormalizeResult.md)\>

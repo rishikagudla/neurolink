@@ -11,68 +11,28 @@ import path from "path";
 import { logger } from "../../lib/utils/logger.js";
 import { NeuroLink } from "../../lib/neurolink.js";
 import { withTimeout } from "../../lib/utils/errorHandling.js";
-import type { ServerFramework } from "../../lib/server/types.js";
 import {
-  isProcessRunning,
-  formatUptime,
+  DEFAULT_SERVER_HOST,
+  SERVER_ALLOW_UNAUTHENTICATED_ENV,
+  SERVER_API_KEY_ENV,
+  clearStateOnExit,
+  createServerApiKeyMiddleware,
   ensureStateDir,
+  formatUptime,
   getNeuroLinkDir,
+  isOtherServerRunning,
+  isProcessRunning,
+  readServerApiKeys,
+  resolveServerPort,
+  unauthenticatedBindRefusal,
 } from "../utils/serverUtils.js";
-
-// ============================================
-// Types
-// ============================================
-
-/**
- * Server command arguments
- */
-type ServerCommandArgs = {
-  port?: number;
-  host?: string;
-  framework?: "hono" | "express" | "fastify" | "koa";
-  basePath?: string;
-  cors?: boolean;
-  rateLimit?: boolean;
-  quiet?: boolean;
-  format?: "text" | "json" | "yaml";
-  output?: string;
-  debug?: boolean;
-};
-
-/**
- * Server status stored in state file
- */
-type ServerState = {
-  pid: number;
-  port: number;
-  host: string;
-  framework: ServerFramework;
-  startTime: string;
-  basePath: string;
-};
-
-/**
- * Server configuration stored in config file
- */
-type ServerConfig = {
-  defaultPort: number;
-  defaultHost: string;
-  defaultFramework: "hono" | "express" | "fastify" | "koa";
-  defaultBasePath: string;
-  cors: {
-    enabled: boolean;
-    origins?: string[];
-  };
-  rateLimit: {
-    enabled: boolean;
-    windowMs?: number;
-    maxRequests?: number;
-  };
-  swagger: {
-    enabled: boolean;
-    path?: string;
-  };
-};
+import type {
+  CliServeFlatRoute,
+  CliServeRouteGroup,
+  ServerCommandArgs,
+  ServerConfig,
+  ServerState,
+} from "../../lib/types/index.js";
 
 // ============================================
 // State Management
@@ -116,7 +76,7 @@ const CONFIG_FILE = path.join(getNeuroLinkDir(), "server-config.json");
 function loadServerConfig(): ServerConfig {
   const defaults: ServerConfig = {
     defaultPort: 3000,
-    defaultHost: "0.0.0.0",
+    defaultHost: DEFAULT_SERVER_HOST,
     defaultFramework: "hono",
     defaultBasePath: "/api",
     cors: { enabled: true },
@@ -276,13 +236,12 @@ export class ServerCommandFactory {
       .option("port", {
         type: "number",
         alias: "p",
-        default: 3000,
-        description: "Port to listen on",
+        description: "Port to listen on (default: $PORT, then 3000)",
       })
       .option("host", {
         type: "string",
         alias: "H",
-        default: "0.0.0.0",
+        default: DEFAULT_SERVER_HOST,
         description: "Host to bind to",
       })
       .option("framework", {
@@ -483,7 +442,7 @@ export class ServerCommandFactory {
     try {
       // Check if server is already running
       const existingState = loadServerState();
-      if (existingState && isProcessRunning(existingState.pid)) {
+      if (existingState && isOtherServerRunning(existingState.pid)) {
         if (spinner) {
           spinner.fail(
             chalk.red(
@@ -501,22 +460,36 @@ export class ServerCommandFactory {
       const neurolink = new NeuroLink();
 
       // Dynamically import server module
-      const { createServer, registerAllRoutes } = await import(
-        "../../lib/server/index.js"
-      );
+      const { createServer, registerAllRoutes } =
+        await import("../../lib/server/index.js");
 
+      const port = resolveServerPort(argv.port);
       const framework = (argv.framework ?? "hono") as
         | "hono"
         | "express"
         | "fastify"
         | "koa";
 
+      // A listener the network can reach with no key is refused unless the
+      // operator asked for exactly that (NEUROLINK_SERVER_ALLOW_UNAUTHENTICATED=1).
+      const bindHost = argv.host ?? DEFAULT_SERVER_HOST;
+      const refusal = unauthenticatedBindRefusal({
+        host: bindHost,
+        apiKeyCount: readServerApiKeys().length,
+        allowUnauthenticated:
+          process.env[SERVER_ALLOW_UNAUTHENTICATED_ENV] === "1",
+      });
+      if (refusal) {
+        logger.error(chalk.red(refusal));
+        process.exit(1);
+      }
+
       // Create server
       const server = await createServer(neurolink, {
         framework,
         config: {
-          port: argv.port ?? 3000,
-          host: argv.host ?? "0.0.0.0",
+          port,
+          host: bindHost,
           basePath: argv.basePath ?? "/api",
           cors: {
             enabled: argv.cors ?? true,
@@ -527,6 +500,14 @@ export class ServerCommandFactory {
           disableBuiltInHealth: true, // We register health routes separately
         },
       });
+
+      // API key (if configured) must be registered ahead of the routes it guards
+      const apiKeys = readServerApiKeys();
+      if (apiKeys.length > 0) {
+        server.registerMiddleware(
+          createServerApiKeyMiddleware(apiKeys, argv.basePath ?? "/api"),
+        );
+      }
 
       // Register all routes
       registerAllRoutes(server, argv.basePath ?? "/api");
@@ -546,13 +527,14 @@ export class ServerCommandFactory {
       // Save state
       const state: ServerState = {
         pid: process.pid,
-        port: argv.port ?? 3000,
-        host: argv.host ?? "0.0.0.0",
+        port,
+        host: argv.host ?? DEFAULT_SERVER_HOST,
         framework,
         startTime: new Date().toISOString(),
         basePath: argv.basePath ?? "/api",
       };
       saveServerState(state);
+      clearStateOnExit(clearServerState);
 
       if (spinner) {
         spinner.succeed(chalk.green("Server started successfully"));
@@ -564,6 +546,9 @@ export class ServerCommandFactory {
       logger.always(`  Framework: ${chalk.cyan(framework)}`);
       logger.always(`  Base Path: ${chalk.cyan(state.basePath)}`);
       logger.always(`  PID: ${chalk.cyan(state.pid)}`);
+      logger.always(
+        `  API Key: ${apiKeys.length > 0 ? chalk.green("required (health routes exempt)") : chalk.yellow(`disabled — set ${SERVER_API_KEY_ENV} before exposing this server`)}`,
+      );
 
       logger.always(chalk.bold("\nAvailable Endpoints:"));
       logger.always(`  ${chalk.green("GET")}  ${state.basePath}/health`);
@@ -801,9 +786,8 @@ export class ServerCommandFactory {
 
     try {
       // Dynamically import OpenAPI generator
-      const { OpenAPIGenerator } = await import(
-        "../../lib/server/openapi/index.js"
-      );
+      const { OpenAPIGenerator } =
+        await import("../../lib/server/openapi/index.js");
 
       const generator = new OpenAPIGenerator({
         basePath: argv.basePath ?? "/api",
@@ -872,32 +856,15 @@ export class ServerCommandFactory {
   ): Promise<void> {
     try {
       // Dynamically import route definitions and types
-      const { createAllRoutes } = await import(
-        "../../lib/server/routes/index.js"
-      );
-
-      type RouteGroup = {
-        prefix: string;
-        routes: Array<{
-          method: string;
-          path: string;
-          description?: string;
-        }>;
-      };
-
-      type FlatRoute = {
-        method: string;
-        path: string;
-        description?: string;
-        group: string;
-      };
+      const { createAllRoutes } =
+        await import("../../lib/server/routes/index.js");
 
       const routeGroups = createAllRoutes(
         argv.basePath ?? "/api",
-      ) as RouteGroup[];
+      ) as CliServeRouteGroup[];
 
       // Flatten route groups into individual routes with group info
-      let flatRoutes: FlatRoute[] = [];
+      let flatRoutes: CliServeFlatRoute[] = [];
       for (const group of routeGroups) {
         // Extract group name from prefix (e.g., "/api/agent" -> "agent")
         const groupName =
@@ -988,10 +955,7 @@ export class ServerCommandFactory {
 
       // Handle --get
       if (argv.get) {
-        const value = getNestedValue(
-          config as unknown as Record<string, unknown>,
-          argv.get,
-        );
+        const value = getNestedValue(config, argv.get);
         if (value === undefined) {
           logger.error(chalk.red(`Unknown config key: ${argv.get}`));
           process.exit(1);
@@ -1013,11 +977,7 @@ export class ServerCommandFactory {
           process.exit(1);
         }
 
-        setNestedValue(
-          config as unknown as Record<string, unknown>,
-          key,
-          parseConfigValue(value),
-        );
+        setNestedValue(config, key, parseConfigValue(value));
         saveServerConfig(config);
         logger.always(chalk.green(`Set ${key} = ${value}`));
         return;

@@ -498,7 +498,9 @@ router.route("stream", async (connection, payload) => {
   // Start streaming
   const socket = connection.socket as { send: (data: string) => void };
 
-  for await (const chunk of neurolink.generateStream({ prompt })) {
+  const result = await neurolink.stream({ input: { text: prompt } });
+
+  for await (const chunk of result.stream) {
     socket.send(JSON.stringify({ type: "chunk", content: chunk.content }));
   }
 
@@ -634,7 +636,7 @@ ws.onmessage = (event) => {
       console.log("Connected:", message.connectionId);
       break;
     case "response":
-      console.log("Response:", message.data);
+      console.log("Response:", message.content);
       break;
     case "stream_start":
       console.log("Stream starting...");
@@ -968,10 +970,10 @@ wsManager.registerHandler("/ws", {
 
 ## Related Documentation
 
-- **[Server Adapters Overview](/guides/server-adapters)** - Getting started with server adapters
-- **[Security Best Practices](/guides/server-adapters/security)** - Authentication patterns
-- **[Hono Adapter](/guides/server-adapters/hono)** - Using WebSocket with Hono
-- **[Configuration Reference](/reference/server-configuration)** - Full configuration options
+- **[Server Adapters Overview](./index.md)** - Getting started with server adapters
+- **[Security Best Practices](./security.md)** - Authentication patterns
+- **[Hono Adapter](./hono.md)** - Using WebSocket with Hono
+- **[Configuration Reference](../../reference/server-configuration.md)** - Full configuration options
 
 ---
 

@@ -95,29 +95,10 @@ const DANGEROUS_EXTENSIONS = new Set([
   ".jar",
 ]);
 
-/**
- * Options for filename sanitization.
- */
-export interface SanitizeFileNameOptions {
-  /** Maximum length for the filename (default: 255) */
-  maxLength?: number;
-  /** Replacement character for invalid chars (default: '_') */
-  replacement?: string;
-  /** Whether to block dangerous extensions (default: true) */
-  blockDangerousExtensions?: boolean;
-  /** Whether to allow hidden files starting with dot (default: false) */
-  allowHiddenFiles?: boolean;
-}
-
-/**
- * Options for display name sanitization.
- */
-export interface SanitizeDisplayNameOptions {
-  /** Maximum length for the name (default: 100) */
-  maxLength?: number;
-  /** Whether to allow unicode characters (default: true) */
-  allowUnicode?: boolean;
-}
+import type {
+  SanitizeFileNameOptions,
+  SanitizeDisplayNameOptions,
+} from "../../types/index.js";
 
 /**
  * Sanitize a filename for safe filesystem storage.

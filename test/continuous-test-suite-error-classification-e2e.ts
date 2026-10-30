@@ -1,0 +1,3561 @@
+#!/usr/bin/env tsx
+import "dotenv/config";
+import http from "node:http";
+import http2 from "node:http2";
+import type { AddressInfo } from "node:net";
+import { z } from "zod";
+import { tool } from "../dist/index.js";
+
+/**
+ * Continuous Test Suite — end-to-end provider error classification.
+ *
+ * ALL-DIST module graph (rule 15): every import below resolves to
+ * `../dist/...`. This suite replaces the src-importing
+ * `continuous-test-suite-error-classifier*.ts` trio, which called
+ * `formatProviderError()` directly on `src/`-constructed provider
+ * instances with hand-built synthetic `Error` objects — a shape no real
+ * HTTP response ever produces. Here, a real local `node:http` mock server
+ * (127.0.0.1, ephemeral port) is driven by `new NeuroLink().generate()`
+ * from the BUILT package, redirected per-provider via the same env-var /
+ * `credentials` hooks a real deployment would use. This is a real
+ * server, not `globalThis.fetch` patching, so Bedrock's native-SDK HTTP
+ * path (which bypasses `fetch` entirely) is covered too.
+ *
+ * Where a case could not be reproduced this way despite being expected to
+ * be — because the current implementation never threads the triggering
+ * field through a real transport — it was demoted to
+ * `continuous-test-suite-error-classifier-contract.ts` instead of being
+ * silently dropped; each demotion is called out in a comment at its
+ * original call site below.
+ *
+ * Run: npx tsx test/continuous-test-suite-error-classification-e2e.ts
+ *      pnpm run test:error-classification-e2e
+ */
+
+// ---------------------------------------------------------------------------
+// Mock server — one real node:http server for the whole suite. Every test
+// re-points its handler via setHandler() immediately before driving a
+// generate() call. All handlers are STATELESS (same response regardless of
+// hit count) so the mandatory "must tolerate being hit 3 times" requirement
+// (provider-side retries: withProviderRetry for the ai-package path, the AWS
+// SDK's own StandardRetryStrategy for Bedrock) is satisfied unconditionally.
+// ---------------------------------------------------------------------------
+
+type MockResponseSpec = {
+  status: number;
+  headers?: Record<string, string>;
+  body: string;
+};
+type MockHandler = () => MockResponseSpec | Promise<MockResponseSpec>;
+
+let currentHandler: MockHandler | null = null;
+let destroySocketOnRequest = false;
+let hitCount = 0;
+// Raw UTF-8 body of the most recent request the mock server received —
+// populated unconditionally on every hit (cheap: a single Buffer.concat),
+// read only by the Gemini tools-vs-schema section below to assert on the
+// real outbound wire body rather than just the parsed response.
+let lastRequestBody = "";
+
+// Shared by both mock servers below — request/response shapes are
+// compatible across node:http and node:http2's server APIs for the
+// subset used here (on("data")/on("end")/writeHead/end/socket.destroy).
+function handleMockRequest(
+  req: {
+    on(ev: string, cb: (...a: never[]) => void): void;
+    socket?: { destroy(): void };
+  },
+  res: {
+    writeHead(status: number, headers: Record<string, string>): void;
+    end(callback?: () => void): void;
+    end(body: string, callback?: () => void): void;
+  },
+): void {
+  hitCount++;
+  if (destroySocketOnRequest) {
+    // Abort the connection mid-flight instead of responding. NOT a real
+    // ECONNRESET, contrary to what this comment used to claim: undici's
+    // native fetch() surfaces this as `TypeError: fetch failed` wrapping a
+    // `SocketError` with message "other side closed" and code
+    // `UND_ERR_SOCKET` on `.cause` — confirmed by live repro through the
+    // actual `createProxyFetch()` path. Never the literal "ECONNRESET"
+    // text or code.
+    req.socket?.destroy();
+    return;
+  }
+  const chunks: Buffer[] = [];
+  req.on("data", (c: Buffer) => chunks.push(c));
+  req.on("end", () => {
+    void (async () => {
+      lastRequestBody = Buffer.concat(chunks).toString("utf8");
+      if (!currentHandler) {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "no mock handler set" } }));
+        return;
+      }
+      try {
+        const spec = await currentHandler();
+        res.writeHead(spec.status, {
+          "content-type": "application/json",
+          ...spec.headers,
+        });
+        res.end(spec.body);
+      } catch (err) {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: { message: `mock handler threw: ${String(err)}` },
+          }),
+        );
+      }
+    })();
+  });
+}
+
+const mockServer = http.createServer((req, res) => handleMockRequest(req, res));
+
+// Amazon Bedrock's SDK hardcodes NodeHttp2Handler as its default request
+// handler (@aws-sdk/client-bedrock-runtime's runtimeConfig.js) regardless of
+// operation — confirmed by direct reproduction: pointing it at the plain
+// HTTP/1.1 mockServer above raises a client-side `NghttpError: Protocol
+// error` (ERR_HTTP2_ERROR) before the mocked response body is ever read, so
+// Bedrock needs its own h2c (cleartext HTTP/2, prior-knowledge) server.
+const bedrockMockServer = http2.createServer((req, res) =>
+  handleMockRequest(req, res),
+);
+
+function setHandler(h: MockHandler): void {
+  currentHandler = h;
+  destroySocketOnRequest = false;
+  hitCount = 0;
+}
+
+function setSocketDestroyHandler(): void {
+  currentHandler = null;
+  destroySocketOnRequest = true;
+  hitCount = 0;
+}
+
+/** Standard `{"error":{"message":...}}` JSON body. 429/5xx always carry
+ * retry-after:0 so withProviderRetry / the AWS SDK's own retry strategy
+ * never wait out a real backoff — mandatory for the suite's ~3min budget. */
+function jsonError(
+  status: number,
+  message: string,
+  extraHeaders?: Record<string, string>,
+): MockHandler {
+  return () => {
+    const headers: Record<string, string> = { ...extraHeaders };
+    if (status === 429 || status >= 500) {
+      headers["retry-after"] = "0";
+    }
+    return { status, headers, body: JSON.stringify({ error: { message } }) };
+  };
+}
+
+/** Google API error body, `{"error":{"code","message","status"}}`, the shape
+ * Vertex answers with. `@google/genai` raises it as an ApiError whose message
+ * is the JSON text of the whole body, so the status name (INVALID_ARGUMENT,
+ * RESOURCE_EXHAUSTED, ...) is part of the text the classifier rules read.
+ * `code` is separate from the HTTP `status` so a case can answer 400 while the
+ * body names another code, the way a relaying gateway does. 429/5xx carry
+ * retry-after:0 for the same reason as in jsonError(). */
+function googleError(
+  status: number,
+  error: { code: number; message: string; status: string },
+): MockHandler {
+  return () => {
+    const headers: Record<string, string> = {};
+    if (status === 429 || status >= 500) {
+      headers["retry-after"] = "0";
+    }
+    const { code, message, status: name } = error;
+    return {
+      status,
+      headers,
+      body: JSON.stringify({ error: { code, message, status: name } }),
+    };
+  };
+}
+
+/** AWS restJson1-shaped error: exception identity comes from the
+ * x-amzn-errortype header (or __type body field — header wins), NOT from
+ * message text. Verified against @aws-sdk/core's loadRestJsonErrorCode(). */
+function bedrockError(
+  status: number,
+  errorType: string,
+  message: string,
+): MockHandler {
+  return () => {
+    const headers: Record<string, string> = { "x-amzn-errortype": errorType };
+    if (status === 429 || status >= 500) {
+      headers["retry-after"] = "0";
+    }
+    return {
+      status,
+      headers,
+      body: JSON.stringify({ __type: errorType, message }),
+    };
+  };
+}
+
+/** A single-chunk `text/event-stream` body shaped like a real
+ * `@google/genai` `streamGenerateContent?alt=sse` response — verified
+ * against the installed SDK's `dist/node/index.cjs`
+ * (`generateContentResponseFromMldev`/`candidateFromMldev` pass `candidates`,
+ * `content`, and `usageMetadata` through field-for-field) so
+ * `client.models.generateContentStream()` parses it without error on both
+ * the generate() and stream() native paths, which both consume this same
+ * call under the hood. */
+function geminiSSEHandler(text: string): MockHandler {
+  return () => {
+    const payload = {
+      candidates: [
+        {
+          content: { role: "model", parts: [{ text }] },
+          finishReason: "STOP",
+        },
+      ],
+      usageMetadata: {
+        promptTokenCount: 3,
+        candidatesTokenCount: 3,
+        totalTokenCount: 6,
+      },
+    };
+    return {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+      body: `data: ${JSON.stringify(payload)}\n\n`,
+    };
+  };
+}
+
+async function startMockServer(
+  server: http.Server | http2.Http2Server,
+): Promise<string> {
+  await new Promise<void>((resolve) => {
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const { port } = server.address() as AddressInfo;
+  return `http://127.0.0.1:${port}`;
+}
+
+/** A server of its own that answers every request with one fixed reply, for
+ * cases that have to run side by side: the shared mock server above has a
+ * single current handler. */
+async function startReplyServer(
+  reply: MockHandler,
+): Promise<{ origin: string; close: () => Promise<void> }> {
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      void (async () => {
+        const spec = await reply();
+        res.writeHead(spec.status, {
+          "content-type": "application/json",
+          ...spec.headers,
+        });
+        res.end(spec.body);
+      })();
+    });
+  });
+  const origin = await startMockServer(server);
+  return {
+    origin,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections?.();
+        server.close(() => resolve());
+      }),
+  };
+}
+
+// A port nothing listens on: connecting here raises a real ECONNREFUSED
+// without needing to bind+close a real server (avoids a reuse race).
+// Deliberately NOT port 1 — undici's Fetch-spec "bad ports" blocklist
+// rejects port 1 (plus a handful of other low ports) before attempting any
+// connection, yielding `.cause = Error("bad port")` with no `.code` at all,
+// which is a client-side misconfiguration, not a transient transport
+// failure — confirmed by live repro through the real `createProxyFetch()`
+// path. 65533 is outside that blocklist and produces a genuine
+// `.cause = Error("connect ECONNREFUSED ...")` with `code: "ECONNREFUSED"`.
+const CLOSED_PORT_ORIGIN = "http://127.0.0.1:65533";
+
+// ---------------------------------------------------------------------------
+// Env var snapshot/restore — cloned from providers-mocked.ts's pattern.
+// ---------------------------------------------------------------------------
+
+const ORIGINAL_ENV: Record<string, string | undefined> = {};
+
+function setEnv(name: string, value: string | undefined): void {
+  if (!(name in ORIGINAL_ENV)) {
+    ORIGINAL_ENV[name] = process.env[name];
+  }
+  if (value === undefined) {
+    delete process.env[name];
+  } else {
+    process.env[name] = value;
+  }
+}
+
+function restoreEnv(): void {
+  for (const [key, value] of Object.entries(ORIGINAL_ENV)) {
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Results harness — boolean-based record()/exit, immune to the
+// isExpectedProviderError() SKIP-hazard (this suite doesn't use defineSuite).
+// ---------------------------------------------------------------------------
+
+type TestRecord = { name: string; ok: boolean; reason?: string };
+const results: TestRecord[] = [];
+
+function record(name: string, ok: boolean, reason?: string): void {
+  results.push({ name, ok, reason });
+  console.log(`${ok ? "✓" : "✗"} ${name}${reason ? ` — ${reason}` : ""}`);
+}
+
+// ---------------------------------------------------------------------------
+// Generic "drive generate(), catch, assert on the classified error" runner.
+// ---------------------------------------------------------------------------
+
+type ErrorCtor = new (...args: never[]) => Error;
+
+async function expectGenerateError(opts: {
+  name: string;
+  run: () => Promise<unknown>;
+  expectClass?: ErrorCtor;
+  notClasses?: ErrorCtor[];
+  messageIncludes?: string[];
+  messageExcludes?: string[];
+}): Promise<void> {
+  try {
+    await opts.run();
+    record(opts.name, false, "generate() resolved without throwing");
+  } catch (err) {
+    const e = err instanceof Error ? err : new Error(String(err));
+    // Captured before any instanceof narrowing — TS's structural instanceof
+    // narrowing collapses `e` to `never` on the negative branch when the
+    // constructor's declared instance type is exactly `Error`.
+    const eCtorName = e.constructor.name;
+    const eMessage = e.message;
+    const problems: string[] = [];
+    const matchesExpected = !opts.expectClass || e instanceof opts.expectClass;
+    if (!matchesExpected) {
+      problems.push(
+        `expected instanceof ${opts.expectClass!.name}, got ${eCtorName}: ${eMessage}`,
+      );
+    }
+    for (const NotCls of opts.notClasses ?? []) {
+      if (e instanceof NotCls) {
+        problems.push(`unexpectedly instanceof ${NotCls.name}`);
+      }
+    }
+    for (const frag of opts.messageIncludes ?? []) {
+      if (!e.message.includes(frag)) {
+        problems.push(`message did not include "${frag}"`);
+      }
+    }
+    for (const frag of opts.messageExcludes ?? []) {
+      if (e.message.includes(frag)) {
+        problems.push(`message unexpectedly included "${frag}"`);
+      }
+    }
+    record(opts.name, problems.length === 0, problems.join("; ") || undefined);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+async function main(): Promise<void> {
+  const mockOrigin = await startMockServer(mockServer);
+  const bedrockMockOrigin = await startMockServer(bedrockMockServer);
+
+  // Anthropic hermeticity pins — force the x-api-key path, never OAuth.
+  setEnv("ANTHROPIC_AUTH_METHOD", "api_key");
+  setEnv("ANTHROPIC_OAUTH_TOKEN", undefined);
+  setEnv("CLAUDE_OAUTH_TOKEN", undefined);
+
+  try {
+    const { NeuroLink, ProviderRegistry } = await import("../dist/index.js");
+    await ProviderRegistry.registerAllProviders();
+    // NOTE: deliberately NOT `../dist/index.js` and NOT `../dist/lib/...`.
+    // `dist/index.js`'s root barrel used to re-export `AuthenticationError`,
+    // `AuthorizationError` and `RateLimitError` a SECOND time from
+    // `./server/index.js` (the server-adapter's own same-named-but-unrelated
+    // classes, extending `ServerAdapterError` rather than `ProviderError`) —
+    // an explicit named export placed after an earlier
+    // `export * from "./types/index.js"` always wins per ESM semantics, so
+    // `dist/index.js`'s public `AuthenticationError`/`AuthorizationError`/
+    // `RateLimitError` were silently the WRONG classes. That has since been
+    // fixed the same way as `TimeoutError`/`ServerTimeoutError` below: the
+    // three server-side exports are now `Server*`-prefixed at both barrels,
+    // so the provider-error classes win the bare names on the public surface
+    // (see the identity + end-to-end regression sections below main's try
+    // block). This suite still imports directly from `dist/types/index.js`
+    // here rather than `dist/index.js`, though — not to route around the bug
+    // any more, but because that's what actually matches the classes
+    // `generate()` throws: providers themselves import error classes via
+    // `../types/index.js` relative to their own file
+    // (`dist/providers/<x>.js` -> `dist/types/index.js`), confirmed by direct
+    // instanceof testing against a provider constructed through this same
+    // dist tree.
+    const {
+      AuthenticationError,
+      RateLimitError,
+      InvalidModelError,
+      NetworkError,
+      ProviderError,
+      ModelAccessDeniedError,
+    } = await import("../dist/types/index.js");
+    const { GoogleVertexProvider } =
+      await import("../dist/providers/googleVertex/client.js");
+
+    function nl() {
+      return new NeuroLink({ conversationMemory: { enabled: false } });
+    }
+
+    async function gen(opts: {
+      provider: string;
+      model?: string;
+      credentials?: Record<string, unknown>;
+      disableInternalFallback?: boolean;
+    }) {
+      return nl().generate({
+        provider: opts.provider,
+        model: opts.model,
+        input: { text: "ping" },
+        disableTools: true,
+        credentials: opts.credentials,
+        disableInternalFallback: opts.disableInternalFallback,
+      } as Parameters<InstanceType<typeof NeuroLink>["generate"]>[0]);
+    }
+
+    // =========================================================================
+    // SECTION: DEFAULT_ERROR_RULES via a real provider (old File1 #2-8,#12)
+    // -------------------------------------------------------------------------
+    // File1 tested classifyProviderError()+DEFAULT_ERROR_RULES directly with a
+    // synthetic "acme" provider name. Every real OpenAI-compat-family provider
+    // spreads ...DEFAULT_ERROR_RULES as its fallback, so mistral (one bespoke
+    // auth-override rule + DEFAULT) exercises the exact same table end-to-end.
+    // =========================================================================
+    {
+      setEnv("MISTRAL_API_KEY", "test-fake-mistral-credential");
+      setEnv("MISTRAL_BASE_URL", mockOrigin);
+
+      // File1 #2: 401 statusCode -> AuthenticationError
+      setHandler(jsonError(401, "denied"));
+      await expectGenerateError({
+        name: "DEFAULT_ERROR_RULES via mistral: 401 statusCode -> AuthenticationError",
+        run: () => gen({ provider: "mistral", model: "mistral-large-latest" }),
+        expectClass: AuthenticationError,
+      });
+
+      // File1 #3: 429 statusCode -> RateLimitError. A 429/5xx status is
+      // retryable by isNonRetryableProviderError()'s own status-code table,
+      // so directProviderGeneration()'s single-provider fallback loop
+      // exhausts its (one-element) provider list and rethrows a plain
+      // `Error("Provider mistral failed: ...")` — the classified
+      // RateLimitError's message text survives verbatim inside it, but its
+      // `instanceof` identity does not. Asserted via message content
+      // instead, matching providers-mocked.ts's documented precedent for
+      // this exact wrapping behavior.
+      setHandler(jsonError(429, "slow down"));
+      await expectGenerateError({
+        name: "DEFAULT_ERROR_RULES via mistral: 429 statusCode -> RateLimitError",
+        run: () => gen({ provider: "mistral", model: "mistral-large-latest" }),
+        messageIncludes: ["mistral rate limit exceeded"],
+      });
+
+      // File1 #4: a model-specific not-found message -> InvalidModelError.
+      setHandler(jsonError(404, "The model does not exist or is unavailable"));
+      await expectGenerateError({
+        name: "DEFAULT_ERROR_RULES via mistral: 404 naming a model -> InvalidModelError naming the model",
+        run: () => gen({ provider: "mistral", model: "mistral-ghost-model" }),
+        expectClass: InvalidModelError,
+        messageIncludes: ["mistral-ghost-model"],
+      });
+
+      // A 404 that names no model is what a wrong base URL answers. It must
+      // stay visible as an HTTP 404 and must not walk the fallback models:
+      // each fallback would repeat the same misdirected request.
+      setHandler(jsonError(404, "nope"));
+      await expectGenerateError({
+        name: "DEFAULT_ERROR_RULES via mistral: 404 naming no model -> ProviderError carrying the vendor text",
+        run: () => gen({ provider: "mistral", model: "mistral-ghost-model" }),
+        notClasses: [InvalidModelError],
+        messageIncludes: ["mistral returned HTTP 404", "nope"],
+      });
+      record(
+        "DEFAULT_ERROR_RULES via mistral: a 404 naming no model is sent once, not once per fallback model",
+        hitCount === 1,
+        hitCount === 1 ? undefined : `server saw ${hitCount} requests`,
+      );
+
+      setHandler(jsonError(404, "The model gateway route is missing"));
+      await expectGenerateError({
+        name: "DEFAULT_ERROR_RULES via mistral: mentioning a model alone does not prove a missing model",
+        run: () => gen({ provider: "mistral", model: "mistral-ghost-model" }),
+        notClasses: [InvalidModelError],
+        messageIncludes: ["returned HTTP 404", "gateway route is missing"],
+      });
+
+      // The same route answer with the absence word first, the model or
+      // deployment word being only a modifier of the route. None of these may
+      // read as a missing model, and none may walk the fallback models.
+      for (const text of [
+        "Not found: model gateway route",
+        "Does not exist: deployment endpoint for this resource",
+        "The model gateway route does not exist",
+        // The named phrases carry the same modifier: a route noun right after
+        // them makes the text about the route, not about the model.
+        "Unknown model gateway route",
+        "Invalid model endpoint for this account",
+        "No such model route",
+        "Unsupported model proxy path",
+      ]) {
+        setHandler(jsonError(404, text));
+        await expectGenerateError({
+          name: `DEFAULT_ERROR_RULES via mistral: a 404 saying "${text}" is a route answer, not a missing model`,
+          run: () => gen({ provider: "mistral", model: "mistral-ghost-model" }),
+          notClasses: [InvalidModelError],
+          messageIncludes: ["mistral returned HTTP 404", text],
+        });
+        record(
+          `DEFAULT_ERROR_RULES via mistral: a route 404 saying "${text}" is sent once, not once per fallback model`,
+          hitCount === 1,
+          hitCount === 1 ? undefined : `server saw ${hitCount} requests`,
+        );
+      }
+
+      // Other ways a vendor says a model is missing at 404, none of which uses
+      // the "does not exist" wording above.
+      for (const text of [
+        "Invalid model: mistral-ghost-model",
+        "No such model: mistral-ghost-model",
+        "Unknown model: mistral-ghost-model",
+        "Unsupported model mistral-ghost-model for this account",
+        "Not found: model mistral-ghost-model",
+        "The requested model is not supported for this account",
+      ]) {
+        setHandler(jsonError(404, text));
+        await expectGenerateError({
+          name: `DEFAULT_ERROR_RULES via mistral: a 404 saying "${text.split(":")[0]}" -> InvalidModelError`,
+          run: () => gen({ provider: "mistral", model: "mistral-ghost-model" }),
+          expectClass: InvalidModelError,
+        });
+      }
+
+      // File1 #5: 5xx statusCode -> generic ProviderError (not a subclass).
+      // 5xx is retryable by status -> wrapped, same as the 429 case above.
+      setHandler(jsonError(503, "boom"));
+      await expectGenerateError({
+        name: "DEFAULT_ERROR_RULES via mistral: 503 statusCode -> generic ProviderError, not a subclass",
+        run: () => gen({ provider: "mistral", model: "mistral-large-latest" }),
+        messageIncludes: ["mistral server error: boom"],
+      });
+
+      // File1 #6: rate-limit substring alone (no 429 statusCode) still matches
+      setHandler(
+        jsonError(400, "upstream said: rate limit exceeded, slow down"),
+      );
+      await expectGenerateError({
+        name: "DEFAULT_ERROR_RULES via mistral: rate-limit substring without statusCode 429 still matches",
+        run: () => gen({ provider: "mistral", model: "mistral-large-latest" }),
+        expectClass: RateLimitError,
+      });
+
+      // File1 #7: real socket death (not a synthetic message string) via
+      // req.socket.destroy(). Node's native fetch (undici) surfaces this as
+      // `TypeError: fetch failed` wrapping a `SocketError` with message
+      // "other side closed" and code `UND_ERR_SOCKET` on `.cause` — NOT the
+      // literal "ECONNRESET" text or code (confirmed by live repro through
+      // the real `createProxyFetch()` path). buildErrorContext() now walks
+      // that `.cause` chain (bounded, cycle-guarded) and composes the
+      // deepest cause's message in, and DEFAULT_ERROR_RULES' NetworkError
+      // rule matches `ctx.errorCode` against a shared transient-code set
+      // (TRANSIENT_NETWORK_CODES, also used by proxyFetch.ts's own retry
+      // gate) in addition to its message regex — so this now correctly
+      // classifies as NetworkError instead of falling through to the
+      // generic fallback. No status code either -> still wrapped by the
+      // provider-fallback loop, so instanceof identity doesn't survive;
+      // asserted via the rule's "Connection error" message text instead,
+      // matching the existing precedent for this exact wrapping behavior.
+      setSocketDestroyHandler();
+      await expectGenerateError({
+        name: "DEFAULT_ERROR_RULES via mistral: real socket death (UND_ERR_SOCKET) -> NetworkError",
+        run: () => gen({ provider: "mistral", model: "mistral-large-latest" }),
+        messageIncludes: ["Connection error"],
+      });
+
+      // File1 #8: unmatched -> generic ProviderError
+      setHandler(jsonError(400, "totally unrecognized upstream failure"));
+      await expectGenerateError({
+        name: "DEFAULT_ERROR_RULES via mistral: unmatched error -> generic ProviderError",
+        run: () => gen({ provider: "mistral", model: "mistral-large-latest" }),
+        notClasses: [AuthenticationError, RateLimitError, InvalidModelError],
+      });
+
+      // File1 #12: provider bracket prefix. Asserted via .includes (not
+      // .startsWith) because directProviderGeneration() may add wrapper text
+      // around the classified message once the retry budget exhausts — same
+      // adaptation providers-mocked.ts documents for this exact reason.
+      setHandler(jsonError(401, "denied"));
+      await expectGenerateError({
+        name: "DEFAULT_ERROR_RULES via mistral: classified message carries the [mistral] provider bracket",
+        run: () => gen({ provider: "mistral", model: "mistral-large-latest" }),
+        messageIncludes: ["[mistral]"],
+      });
+    }
+
+    // =========================================================================
+    // SECTION: OpenAI-compat family shared loop (old File2 Part A, tests b-e)
+    // -------------------------------------------------------------------------
+    // Test 'a' (TimeoutError) is client-side-timeout-triggered and not cheaply
+    // reproducible via real HTTP within the suite's time budget — demoted to
+    // the contract suite for all 19 providers.
+    // =========================================================================
+    type CompatCase = {
+      name: string;
+      model: string;
+      apiKeyEnv?: string;
+      apiKeyValue?: string;
+      baseUrlEnv?: string;
+      extraEnv?: Record<string, string | undefined>;
+      authMarker: string;
+      // Defaults to "<name> rate limit exceeded" (DEFAULT_ERROR_RULES'
+      // lowercase-echo template); a handful of providers have their own
+      // bespoke rate-limit rule with a differently-branded/capitalized name
+      // and override it here.
+      rateLimitMarker?: string;
+      credentials?: (origin: string) => Record<string, unknown>;
+    };
+
+    const compatProviders: CompatCase[] = [
+      {
+        name: "mistral",
+        model: "mistral-large-latest",
+        apiKeyEnv: "MISTRAL_API_KEY",
+        apiKeyValue: "test-fake-mistral-credential",
+        baseUrlEnv: "MISTRAL_BASE_URL",
+        authMarker: "MISTRAL_API_KEY",
+      },
+      {
+        name: "groq",
+        model: "llama-3.3-70b-versatile",
+        apiKeyEnv: "GROQ_API_KEY",
+        apiKeyValue: "test-fake-groq-credential",
+        baseUrlEnv: "GROQ_BASE_URL",
+        authMarker: "GROQ_API_KEY",
+      },
+      {
+        name: "xai",
+        model: "grok-3",
+        apiKeyEnv: "XAI_API_KEY",
+        apiKeyValue: "test-fake-xai-credential",
+        baseUrlEnv: "XAI_BASE_URL",
+        authMarker: "XAI_API_KEY",
+      },
+      {
+        name: "together-ai",
+        model: "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+        apiKeyEnv: "TOGETHER_API_KEY",
+        apiKeyValue: "test-fake-together-ai-credential",
+        baseUrlEnv: "TOGETHER_BASE_URL",
+        authMarker: "api.together.xyz/settings/api-keys",
+      },
+      {
+        name: "fireworks",
+        model: "accounts/fireworks/models/llama-v3p3-70b-instruct",
+        apiKeyEnv: "FIREWORKS_API_KEY",
+        apiKeyValue: "test-fake-fireworks-credential",
+        baseUrlEnv: "FIREWORKS_BASE_URL",
+        authMarker: "fireworks.ai/account/api-keys",
+      },
+      {
+        name: "perplexity",
+        model: "sonar",
+        apiKeyEnv: "PERPLEXITY_API_KEY",
+        apiKeyValue: "test-fake-perplexity-credential",
+        baseUrlEnv: "PERPLEXITY_BASE_URL",
+        authMarker: "perplexity.ai/settings/api",
+      },
+      {
+        name: "cloudflare",
+        model: "@cf/meta/llama-3.1-8b-instruct",
+        // No CLOUDFLARE_BASE_URL env exists — redirect via per-call credentials.
+        credentials: (origin) => ({
+          cloudflare: {
+            apiKey: "test-fake-cloudflare-credential",
+            accountId: "mock-account-id-1234",
+            baseURL: origin,
+          },
+        }),
+        authMarker: "dash.cloudflare.com/profile/api-tokens",
+      },
+      {
+        name: "openai-compatible",
+        model: "gpt-4o-mini",
+        apiKeyEnv: "OPENAI_COMPATIBLE_API_KEY",
+        apiKeyValue: "test-fake-openai-compatible-credential",
+        baseUrlEnv: "OPENAI_COMPATIBLE_BASE_URL",
+        authMarker: "OPENAI_COMPATIBLE_API_KEY",
+      },
+      {
+        name: "openai",
+        model: "gpt-4o-mini",
+        apiKeyEnv: "OPENAI_API_KEY",
+        apiKeyValue: "test-fake-openai-credential",
+        baseUrlEnv: "OPENAI_BASE_URL",
+        // The shared loop's "Invalid API key" input hits openai's own
+        // echo-ternary branch (message matches /Invalid API key/i), so the
+        // classified message literally IS "Invalid API key".
+        authMarker: "Invalid API key",
+        rateLimitMarker: "OpenAI rate limit exceeded",
+      },
+      {
+        name: "deepseek",
+        model: "deepseek-chat",
+        apiKeyEnv: "DEEPSEEK_API_KEY",
+        apiKeyValue: "test-fake-deepseek-credential",
+        baseUrlEnv: "DEEPSEEK_BASE_URL",
+        authMarker: "DEEPSEEK_API_KEY",
+      },
+      {
+        name: "azure",
+        model: "gpt-4o",
+        apiKeyEnv: "AZURE_OPENAI_API_KEY",
+        apiKeyValue: "test-fake-azure-credential",
+        baseUrlEnv: "AZURE_OPENAI_ENDPOINT",
+        extraEnv: {
+          AZURE_API_VERSION: undefined,
+          AZURE_OPENAI_MODEL: undefined,
+          AZURE_OPENAI_DEPLOYMENT: undefined,
+          AZURE_OPENAI_DEPLOYMENT_ID: undefined,
+        },
+        // Azure's own rule only matches a literal "401" substring, not
+        // "Invalid API key" — falls through to DEFAULT_ERROR_RULES, whose
+        // auth message is a template ("Invalid <provider> API key...") using
+        // the provider name, not an echo of the upstream body text.
+        authMarker: "Invalid azure API key",
+      },
+      {
+        name: "litellm",
+        model: "gpt-4o-mini",
+        apiKeyEnv: "LITELLM_API_KEY",
+        apiKeyValue: "test-fake-litellm-credential",
+        baseUrlEnv: "LITELLM_BASE_URL",
+        authMarker: "LITELLM_API_KEY",
+        rateLimitMarker: "LiteLLM rate limit exceeded",
+      },
+      {
+        name: "nvidia-nim",
+        model: "meta/llama-3.1-8b-instruct",
+        apiKeyEnv: "NVIDIA_NIM_API_KEY",
+        apiKeyValue: "test-fake-nvidia-nim-credential",
+        baseUrlEnv: "NVIDIA_NIM_BASE_URL",
+        authMarker: "build.nvidia.com/settings/api-keys",
+        rateLimitMarker: "NVIDIA NIM rate limit exceeded",
+      },
+      {
+        name: "openrouter",
+        model: "openai/gpt-4o-mini",
+        apiKeyEnv: "OPENROUTER_API_KEY",
+        apiKeyValue: "test-fake-openrouter-credential",
+        baseUrlEnv: "OPENROUTER_BASE_URL",
+        authMarker: "OPENROUTER_API_KEY",
+        rateLimitMarker: "OpenRouter rate limit exceeded",
+      },
+      {
+        name: "ollama",
+        model: "llama3.1",
+        baseUrlEnv: "OLLAMA_BASE_URL",
+        // Ollama has no own auth rule at all -> falls through to DEFAULT,
+        // whose auth message is a "Invalid <provider> API key..." template.
+        authMarker: "Invalid ollama API key",
+      },
+      {
+        name: "huggingface",
+        model: "meta-llama/Llama-3.1-8B-Instruct",
+        apiKeyEnv: "HUGGINGFACE_API_KEY",
+        apiKeyValue: "test-fake-huggingface-credential",
+        baseUrlEnv: "HUGGINGFACE_BASE_URL",
+        // Own rule needs "API_TOKEN_INVALID"/"Invalid token" -> falls to
+        // DEFAULT's "Invalid <provider> API key..." template.
+        authMarker: "Invalid huggingface API key",
+        rateLimitMarker: "HuggingFace rate limit exceeded",
+      },
+      {
+        name: "llamacpp",
+        model: "local-model",
+        baseUrlEnv: "LLAMACPP_BASE_URL",
+        // No own auth rule -> DEFAULT's template message.
+        authMarker: "Invalid llamacpp API key",
+      },
+      {
+        name: "lm-studio",
+        model: "local-model",
+        baseUrlEnv: "LM_STUDIO_BASE_URL",
+        // No own auth rule -> DEFAULT's template message.
+        authMarker: "Invalid lm-studio API key",
+      },
+      {
+        name: "cohere",
+        model: "command-r-plus",
+        apiKeyEnv: "COHERE_API_KEY",
+        apiKeyValue: "test-fake-cohere-credential",
+        baseUrlEnv: "COHERE_BASE_URL",
+        // Own rule is case-sensitive lowercase -> DEFAULT's template message.
+        authMarker: "Invalid cohere API key",
+        rateLimitMarker: "Cohere rate limit exceeded",
+      },
+    ];
+
+    for (const c of compatProviders) {
+      if (c.apiKeyEnv) {
+        setEnv(c.apiKeyEnv, c.apiKeyValue);
+      }
+      if (c.baseUrlEnv) {
+        setEnv(c.baseUrlEnv, mockOrigin);
+      }
+      for (const [k, v] of Object.entries(c.extraEnv ?? {})) {
+        setEnv(k, v);
+      }
+      const credentials = c.credentials?.(mockOrigin);
+
+      // b: 401/invalid key -> AuthenticationError naming its credential source
+      setHandler(jsonError(401, "Invalid API key"));
+      await expectGenerateError({
+        name: `${c.name}: 401 'Invalid API key' -> AuthenticationError naming its credential source`,
+        run: () => gen({ provider: c.name, model: c.model, credentials }),
+        expectClass: AuthenticationError,
+        messageIncludes: [c.authMarker],
+      });
+
+      // c: rate limit -> RateLimitError. 429 is retryable by status, so the
+      // single-provider fallback loop always exhausts and wraps it in a
+      // plain Error — asserted via message content, not instanceof (see the
+      // DEFAULT_ERROR_RULES mistral 429 case above for the full rationale).
+      setHandler(jsonError(429, "rate limit exceeded, try later"));
+      await expectGenerateError({
+        name: `${c.name}: 429 rate-limit body -> RateLimitError`,
+        run: () => gen({ provider: c.name, model: c.model, credentials }),
+        messageIncludes: [c.rateLimitMarker ?? `${c.name} rate limit exceeded`],
+      });
+
+      // d: model_not_found -> InvalidModelError
+      setHandler(jsonError(404, "model_not_found: no such model"));
+      await expectGenerateError({
+        name: `${c.name}: 404 model_not_found -> InvalidModelError`,
+        run: () => gen({ provider: c.name, model: c.model, credentials }),
+        expectClass: InvalidModelError,
+      });
+
+      // e: unrecognized -> generic ProviderError (not misclassified)
+      setHandler(jsonError(400, "totally unrecognized upstream failure"));
+      await expectGenerateError({
+        name: `${c.name}: unrecognized error -> generic ProviderError, not misclassified`,
+        run: () => gen({ provider: c.name, model: c.model, credentials }),
+        notClasses: [AuthenticationError, RateLimitError, InvalidModelError],
+      });
+    }
+
+    // =========================================================================
+    // SECTION: OpenAI-compat family dedicated quirks (old File2 Part B)
+    // =========================================================================
+
+    // -- xai: insufficient_quota extra branch ---------------------------------
+    setEnv("XAI_API_KEY", "test-fake-xai-credential");
+    setEnv("XAI_BASE_URL", mockOrigin);
+    setHandler(jsonError(403, "insufficient_quota: account limit reached"));
+    await expectGenerateError({
+      name: "xai: insufficient_quota -> generic ProviderError with top-up URL",
+      run: () => gen({ provider: "xai", model: "grok-3" }),
+      notClasses: [AuthenticationError, RateLimitError, InvalidModelError],
+      messageIncludes: ["console.x.ai"],
+    });
+
+    // -- groq: model_decommissioned extra branch -------------------------------
+    setEnv("GROQ_API_KEY", "test-fake-groq-credential");
+    setEnv("GROQ_BASE_URL", mockOrigin);
+    setHandler(jsonError(404, "model_decommissioned: this model is retired"));
+    await expectGenerateError({
+      name: "groq: model_decommissioned -> InvalidModelError with catalog URL",
+      run: () => gen({ provider: "groq", model: "llama-3.3-70b-versatile" }),
+      expectClass: InvalidModelError,
+      messageIncludes: ["console.groq.com/docs/models"],
+    });
+
+    // -- deepseek: its real unknown-model body ---------------------------------
+    // Recorded live on 2026-09-24. DeepSeek never says "model_not_found": an
+    // unknown id is a 400 whose only model-specific text is the list of
+    // names it does accept.
+    setEnv("DEEPSEEK_API_KEY", "test-fake-deepseek-credential");
+    setEnv("DEEPSEEK_BASE_URL", mockOrigin);
+    setHandler(() => ({
+      status: 400,
+      body: JSON.stringify({
+        error: {
+          message:
+            "The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed deepseek-v3.",
+          type: "invalid_request_error",
+          param: null,
+          code: "invalid_request_error",
+        },
+      }),
+    }));
+    await expectGenerateError({
+      name: "deepseek: real unknown-model 400 -> InvalidModelError naming the live models",
+      run: () => gen({ provider: "deepseek", model: "deepseek-v3" }),
+      expectClass: InvalidModelError,
+      messageIncludes: ["deepseek-flash"],
+    });
+
+    // -- openai-compatible: ECONNREFUSED + 'does not exist' phrasing ----------
+    setEnv(
+      "OPENAI_COMPATIBLE_API_KEY",
+      "test-fake-openai-compatible-credential",
+    );
+    setEnv("OPENAI_COMPATIBLE_BASE_URL", CLOSED_PORT_ORIGIN);
+    // CLOSED_PORT_ORIGIN now points at port 65533 (outside undici's Fetch-spec
+    // "bad ports" blocklist — see that constant's own comment), so this is a
+    // genuine closed-port connection attempt: Node's native fetch surfaces it
+    // as `TypeError: fetch failed` wrapping a real `Error("connect ECONNREFUSED
+    // ...")` with code `ECONNREFUSED` on `.cause` — confirmed by live repro
+    // through the real `createProxyFetch()` path. This provider never reaches
+    // DEFAULT_ERROR_RULES' generic NetworkError rule for this case: its own
+    // formatProviderError() (openaiCompatible/client.ts) checks a bespoke
+    // `/ECONNREFUSED|Failed to fetch/i` rule against ctx.message FIRST, naming
+    // the configured base URL. That rule already existed in wave 2, but never
+    // fired for this test because port 1's "bad port" cause carries no
+    // ECONNREFUSED text at all. buildErrorContext()'s new cause-walk now
+    // composes the deepest cause's message (which does contain "ECONNREFUSED")
+    // into ctx.message, so the provider's own rule matches and this correctly
+    // classifies as NetworkError. Still no status code, so the
+    // provider-fallback loop still wraps it and instanceof identity doesn't
+    // survive — asserted via the provider's bespoke message text (and the
+    // base URL it names) rather than "Connection error", which is
+    // DEFAULT_ERROR_RULES' generic rule 4 format and not what fires here.
+    await expectGenerateError({
+      name: "openai-compatible: real ECONNREFUSED (closed port) -> NetworkError naming the base URL",
+      run: () => gen({ provider: "openai-compatible", model: "gpt-4o-mini" }),
+      messageIncludes: ["OpenAI Compatible endpoint not available", "65533"],
+    });
+
+    setEnv("OPENAI_COMPATIBLE_BASE_URL", mockOrigin);
+    // DEMOTED to contract suite: "duck-typed timeout (name only, not
+    // instanceof) -> NetworkError" (old Part B #4). buildAPIError() (the
+    // hand-rolled OpenAI-compat HTTP client's error constructor) always
+    // builds a plain `new Error(...)`, never assigning `.name`, so a real
+    // HTTP response can never produce the `.name === "TimeoutError"` duck
+    // type this rule branch checks for.
+
+    setHandler(jsonError(404, "The model provided does not exist"));
+    await expectGenerateError({
+      name: "openai-compatible: 'does not exist' model phrasing -> InvalidModelError",
+      run: () => gen({ provider: "openai-compatible", model: "gpt-4o-mini" }),
+      expectClass: InvalidModelError,
+    });
+
+    setHandler(() => ({
+      status: 400,
+      body: JSON.stringify({
+        error: {
+          message: [{ msg: "Model not found in Pydantic validation." }],
+        },
+      }),
+    }));
+    await expectGenerateError({
+      name: "openai-compatible: Pydantic error.message array preserves invalid-model text",
+      run: () => gen({ provider: "openai-compatible", model: "gpt-4o-mini" }),
+      expectClass: InvalidModelError,
+      messageIncludes: ["gpt-4o-mini"],
+    });
+
+    setHandler(() => ({
+      status: 400,
+      body: JSON.stringify({ detail: "Model not found in top-level detail." }),
+    }));
+    await expectGenerateError({
+      name: "openai-compatible: top-level detail preserves invalid-model text",
+      run: () => gen({ provider: "openai-compatible", model: "gpt-4o-mini" }),
+      expectClass: InvalidModelError,
+      messageIncludes: ["gpt-4o-mini"],
+    });
+
+    // -- openai: bad-request precision + missing-model echo -------------------
+    setEnv("OPENAI_API_KEY", "test-fake-openai-credential");
+    setEnv("OPENAI_BASE_URL", mockOrigin);
+
+    setHandler(jsonError(400, "Missing required parameter: 'model'"));
+    await expectGenerateError({
+      name: "openai: bad-request type alone -> NOT AuthenticationError (Reviewer Finding #4)",
+      run: () => gen({ provider: "openai", model: "gpt-4o-mini" }),
+      notClasses: [AuthenticationError],
+    });
+
+    // A compatible endpoint can identify throttling by type without a 429
+    // status or rate-limit wording. The raw chat error retains responseBody,
+    // rather than attaching .type like the embedding transport does.
+    setHandler(() => ({
+      status: 400,
+      body: JSON.stringify({
+        error: { message: "request rejected", type: "rate_limit_error" },
+      }),
+    }));
+    await expectGenerateError({
+      name: "openai: rate_limit_error in the HTTP body is reachable through generate",
+      run: () => gen({ provider: "openai", model: "gpt-4o-mini" }),
+      expectClass: RateLimitError,
+    });
+
+    setHandler(() => ({
+      status: 400,
+      body: JSON.stringify({
+        error: { message: "request rejected", type: "invalid_api_key" },
+      }),
+    }));
+    await expectGenerateError({
+      name: "openai: invalid_api_key in the HTTP body names its own env var",
+      run: () => gen({ provider: "openai", model: "gpt-4o-mini" }),
+      expectClass: AuthenticationError,
+      messageIncludes: ["OPENAI_API_KEY"],
+    });
+
+    setHandler(jsonError(404, "model_not_found: no such model"));
+    await expectGenerateError({
+      name: "openai: missing-model trigger -> InvalidModelError echoing the requested model name",
+      run: () => gen({ provider: "openai", model: "gpt-9-ghost" }),
+      expectClass: InvalidModelError,
+      messageIncludes: ["gpt-9-ghost"],
+    });
+
+    // -- deepseek: account-balance extra branch --------------------------------
+    setEnv("DEEPSEEK_API_KEY", "test-fake-deepseek-credential");
+    setEnv("DEEPSEEK_BASE_URL", mockOrigin);
+    setHandler(jsonError(402, "Insufficient Balance: account has run dry"));
+    await expectGenerateError({
+      name: "deepseek: balance-exhausted trigger -> generic ProviderError with top-up URL",
+      run: () => gen({ provider: "deepseek", model: "deepseek-chat" }),
+      notClasses: [AuthenticationError, RateLimitError, InvalidModelError],
+      messageIncludes: ["platform.deepseek.com/usage"],
+    });
+
+    // -- azure: 401 preserved + 429 fix ----------------------------------------
+    setEnv("AZURE_OPENAI_API_KEY", "test-fake-azure-credential");
+    setEnv("AZURE_OPENAI_ENDPOINT", mockOrigin);
+    setEnv("AZURE_API_VERSION", undefined);
+    setEnv("AZURE_OPENAI_MODEL", undefined);
+    setEnv("AZURE_OPENAI_DEPLOYMENT", undefined);
+    setEnv("AZURE_OPENAI_DEPLOYMENT_ID", undefined);
+
+    setHandler(jsonError(401, "Request failed with status code 401"));
+    await expectGenerateError({
+      name: "azure: 401 substring -> AuthenticationError naming the endpoint (unchanged)",
+      run: () => gen({ provider: "azure", model: "gpt-4o" }),
+      expectClass: AuthenticationError,
+      messageIncludes: ["Azure OpenAI"],
+    });
+
+    setHandler(jsonError(429, "Rate limit exceeded"));
+    await expectGenerateError({
+      name: "azure: 429 body text -> RateLimitError (RULING 1 fix; previously a generic ProviderError)",
+      run: () => gen({ provider: "azure", model: "gpt-4o" }),
+      messageIncludes: ["azure rate limit exceeded"],
+    });
+
+    // -- litellm: ModelAccessDeniedError pre-classifier intercept -------------
+    setEnv("LITELLM_API_KEY", "test-fake-litellm-credential");
+    setEnv("LITELLM_BASE_URL", mockOrigin);
+    setHandler(
+      jsonError(
+        403,
+        "team not allowed to access model. This team can only access models=['glm-latest', 'kimi-latest', 'open-large']",
+      ),
+    );
+    await expectGenerateError({
+      name: "litellm: team-whitelist denial -> ModelAccessDeniedError with a parsed allow-list",
+      run: () => gen({ provider: "litellm", model: "glm-restricted" }),
+      expectClass: ModelAccessDeniedError,
+      messageIncludes: ["glm-latest", "kimi-latest", "open-large"],
+    });
+    // DEMOTED to contract suite: "duck-typed timeout (name only, not
+    // instanceof) -> NetworkError" (old Part B #13) — same buildAPIError()
+    // gap as openai-compatible's #4 above.
+
+    // -- nvidia-nim: bare-400 precision + usage-ceiling ------------------------
+    setEnv("NVIDIA_NIM_API_KEY", "test-fake-nvidia-nim-credential");
+    setEnv("NVIDIA_NIM_BASE_URL", mockOrigin);
+
+    setHandler(jsonError(400, "400 Bad Request"));
+    await expectGenerateError({
+      name: "nvidia-nim: bare malformed-request trigger -> NOT AuthenticationError (deliberate precision)",
+      run: () =>
+        gen({ provider: "nvidia-nim", model: "meta/llama-3.1-8b-instruct" }),
+      notClasses: [AuthenticationError],
+    });
+
+    // NIM answers most of its roster with a 404 whose text names no model and
+    // does not contain "404". Its own rule keys on the status for exactly this,
+    // so the stale-model fallback keeps working for it.
+    setHandler(
+      jsonError(404, "Function 'ghost-id': Not found for account 'acct-id'"),
+    );
+    await expectGenerateError({
+      name: "nvidia-nim: a 404 naming no model (not found for account) -> InvalidModelError",
+      run: () =>
+        gen({ provider: "nvidia-nim", model: "meta/llama-3.1-8b-instruct" }),
+      expectClass: InvalidModelError,
+    });
+
+    setHandler(jsonError(403, "403 account has hit its usage ceiling"));
+    await expectGenerateError({
+      name: "nvidia-nim: usage-ceiling trigger -> generic ProviderError",
+      run: () =>
+        gen({ provider: "nvidia-nim", model: "meta/llama-3.1-8b-instruct" }),
+      notClasses: [AuthenticationError, RateLimitError, InvalidModelError],
+    });
+
+    // -- openrouter: multi-branch quirks ---------------------------------------
+    setEnv("OPENROUTER_API_KEY", "test-fake-openrouter-credential");
+    setEnv("OPENROUTER_BASE_URL", mockOrigin);
+
+    setHandler(jsonError(400, "Timeout while awaiting upstream provider"));
+    await expectGenerateError({
+      name: "openrouter: case-sensitive duck-typed timeout ('Timeout' substring) -> NetworkError",
+      run: () => gen({ provider: "openrouter", model: "openai/gpt-4o-mini" }),
+      expectClass: NetworkError,
+    });
+
+    setHandler(jsonError(400, "insufficient_credits: balance exhausted"));
+    await expectGenerateError({
+      name: "openrouter: credit-exhaustion trigger -> generic ProviderError with a top-up URL",
+      run: () => gen({ provider: "openrouter", model: "openai/gpt-4o-mini" }),
+      notClasses: [AuthenticationError, RateLimitError, InvalidModelError],
+      messageIncludes: ["openrouter.ai/credits"],
+    });
+
+    setHandler(jsonError(400, "No endpoints found for this request"));
+    await expectGenerateError({
+      name: "openrouter: no-capacity-model trigger -> InvalidModelError echoing the model",
+      run: () => gen({ provider: "openrouter", model: "some/ghost-model" }),
+      expectClass: InvalidModelError,
+      messageIncludes: ["some/ghost-model"],
+    });
+
+    setHandler(jsonError(400, "tools are not supported for this model"));
+    await expectGenerateError({
+      name: "openrouter: tool-support trigger -> ProviderError with capable-model suggestions",
+      run: () => gen({ provider: "openrouter", model: "openai/gpt-4o-mini" }),
+      notClasses: [AuthenticationError, RateLimitError, InvalidModelError],
+      messageIncludes: ["openrouter.ai/models?supported_parameters=tools"],
+    });
+
+    // -- ollama: local-runtime quirks -------------------------------------------
+    setEnv("OLLAMA_BASE_URL", CLOSED_PORT_ORIGIN);
+    await expectGenerateError({
+      name: "ollama: real ECONNREFUSED (closed port) -> NetworkError naming the base URL",
+      run: () => gen({ provider: "ollama", model: "llama3.1" }),
+      messageIncludes: ["Cannot connect to Ollama"],
+    });
+    // DEMOTED to contract suite: "TimeoutError -> NetworkError with its own
+    // wording (not the classifier default)" (old Part B #20) — client-side
+    // timeout, not cheaply reproducible via real HTTP within budget.
+
+    setEnv("OLLAMA_BASE_URL", mockOrigin);
+    setHandler(
+      jsonError(400, "the requested MODEL was Not Found on this host"),
+    );
+    await expectGenerateError({
+      name: "ollama: missing-model haystack (message text) -> InvalidModelError",
+      run: () => gen({ provider: "ollama", model: "llama3.1" }),
+      expectClass: InvalidModelError,
+    });
+
+    setHandler(jsonError(404, "upstream returned status 404"));
+    await expectGenerateError({
+      name: "ollama: bare endpoint-mismatch 404 -> generic ProviderError distinct from missing-model",
+      run: () => gen({ provider: "ollama", model: "llama3.1" }),
+      notClasses: [AuthenticationError, RateLimitError, InvalidModelError],
+    });
+
+    // -- huggingface: real auth trigger + tool-calling -------------------------
+    setEnv("HUGGINGFACE_API_KEY", "test-fake-huggingface-credential");
+    setEnv("HUGGINGFACE_BASE_URL", mockOrigin);
+
+    setHandler(jsonError(401, "Invalid token"));
+    await expectGenerateError({
+      name: "huggingface: credential-token trigger -> AuthenticationError naming its env var",
+      run: () =>
+        gen({
+          provider: "huggingface",
+          model: "meta-llama/Llama-3.1-8B-Instruct",
+        }),
+      expectClass: AuthenticationError,
+      messageIncludes: ["HUGGINGFACE_API_KEY"],
+    });
+
+    setHandler(
+      jsonError(400, "this function/tool call could not be processed"),
+    );
+    await expectGenerateError({
+      name: "huggingface: tool-calling trigger -> ProviderError with capable-model suggestions",
+      run: () =>
+        gen({
+          provider: "huggingface",
+          model: "meta-llama/Llama-3.1-8B-Instruct",
+        }),
+      notClasses: [AuthenticationError, RateLimitError, InvalidModelError],
+      messageIncludes: ["meta-llama/Llama-3.3-70B-Instruct"],
+    });
+
+    setHandler(jsonError(400, "tool_choice is not supported for this model"));
+    await expectGenerateError({
+      name: "huggingface: a tool_choice rejection -> the same tool-calling advice",
+      run: () =>
+        gen({
+          provider: "huggingface",
+          model: "meta-llama/Llama-3.1-8B-Instruct",
+        }),
+      notClasses: [AuthenticationError, RateLimitError, InvalidModelError],
+      messageIncludes: ["meta-llama/Llama-3.3-70B-Instruct"],
+    });
+
+    setHandler(jsonError(401, "Unauthorized: see the tools documentation"));
+    await expectGenerateError({
+      name: "huggingface: a 401 that merely mentions tools stays an AuthenticationError",
+      run: () =>
+        gen({
+          provider: "huggingface",
+          model: "meta-llama/Llama-3.1-8B-Instruct",
+          disableInternalFallback: true,
+        }),
+      expectClass: AuthenticationError,
+      messageExcludes: ["tool calling error"],
+    });
+
+    setHandler(jsonError(401, "tool_choice requires authentication"));
+    await expectGenerateError({
+      name: "huggingface: status 401 wins over a tool-call phrase",
+      run: () =>
+        gen({
+          provider: "huggingface",
+          model: "meta-llama/Llama-3.1-8B-Instruct",
+          disableInternalFallback: true,
+        }),
+      expectClass: AuthenticationError,
+      messageExcludes: ["tool calling error"],
+    });
+
+    setHandler(jsonError(429, "too many function_call requests"));
+    await expectGenerateError({
+      name: "huggingface: status 429 wins over a tool-call phrase",
+      run: () =>
+        gen({
+          provider: "huggingface",
+          model: "meta-llama/Llama-3.1-8B-Instruct",
+          disableInternalFallback: true,
+        }),
+      messageIncludes: ["rate limit exceeded"],
+      messageExcludes: ["tool calling error"],
+    });
+
+    setHandler(jsonError(404, "tool_calls endpoint unavailable"));
+    await expectGenerateError({
+      name: "huggingface: a 404 that mentions tool_calls is not tool-calling advice",
+      run: () =>
+        gen({
+          provider: "huggingface",
+          model: "meta-llama/Llama-3.1-8B-Instruct",
+          disableInternalFallback: true,
+        }),
+      messageExcludes: ["tool calling error"],
+    });
+
+    setHandler(jsonError(400, "malfunction in toolkit"));
+    await expectGenerateError({
+      name: "huggingface: unrelated substrings keep the original error",
+      run: () =>
+        gen({
+          provider: "huggingface",
+          model: "meta-llama/Llama-3.1-8B-Instruct",
+        }),
+      messageIncludes: ["malfunction in toolkit"],
+      messageExcludes: ["tool calling error"],
+    });
+
+    // -- llamacpp: local-runtime quirks ------------------------------------------
+    setEnv("LLAMACPP_BASE_URL", CLOSED_PORT_ORIGIN);
+    await expectGenerateError({
+      name: "llamacpp: real ECONNREFUSED (closed port) -> NetworkError with a launch hint",
+      run: () => gen({ provider: "llamacpp", model: "local-model" }),
+      messageIncludes: ["llama-server"],
+    });
+
+    setEnv("LLAMACPP_BASE_URL", mockOrigin);
+    setHandler(jsonError(400, "400 rejected"));
+    await expectGenerateError({
+      name: "llamacpp: bare malformed-request trigger -> ProviderError with a tool-support hint",
+      run: () => gen({ provider: "llamacpp", model: "local-model" }),
+      notClasses: [AuthenticationError, RateLimitError, InvalidModelError],
+      messageIncludes: ["--jinja"],
+    });
+
+    // The 400 rule used to test the bare digits "400" in the message, so any
+    // error whose text happened to contain them (a token count, a request id)
+    // was reported as the --jinja tool-support hint and lost its real class.
+    setHandler(jsonError(401, "unauthorized: request 14000 rejected"));
+    await expectGenerateError({
+      name: "llamacpp: a 401 whose text contains 400 stays an AuthenticationError",
+      run: () => gen({ provider: "llamacpp", model: "local-model" }),
+      expectClass: AuthenticationError,
+      messageExcludes: ["--jinja"],
+    });
+
+    setHandler(jsonError(500, "slot crashed after 14000 tokens"));
+    await expectGenerateError({
+      name: "llamacpp: a 500 whose text contains 400 is a server error, not the --jinja hint",
+      run: () => gen({ provider: "llamacpp", model: "local-model" }),
+      messageIncludes: ["server error"],
+      messageExcludes: ["--jinja"],
+    });
+
+    // -- lm-studio: local-runtime quirks -----------------------------------------
+    setEnv("LM_STUDIO_BASE_URL", CLOSED_PORT_ORIGIN);
+    await expectGenerateError({
+      name: "lm-studio: real ECONNREFUSED (closed port) -> NetworkError with a launch hint",
+      run: () => gen({ provider: "lm-studio", model: "local-model" }),
+      messageIncludes: ["Start Server"],
+    });
+
+    setEnv("LM_STUDIO_BASE_URL", mockOrigin);
+    setHandler(jsonError(404, "model_not_found: no such model loaded"));
+    await expectGenerateError({
+      name: "lm-studio: missing-model trigger -> InvalidModelError with a load hint",
+      run: () => gen({ provider: "lm-studio", model: "local-model" }),
+      expectClass: InvalidModelError,
+      messageIncludes: ["is not loaded"],
+    });
+
+    // -- cohere: real lowercase auth trigger + trial-limit ----------------------
+    setEnv("COHERE_API_KEY", "test-fake-cohere-credential");
+    setEnv("COHERE_BASE_URL", mockOrigin);
+
+    setHandler(jsonError(401, "invalid api token"));
+    await expectGenerateError({
+      name: "cohere: lowercase credential trigger -> AuthenticationError (case-sensitive, not normalized)",
+      run: () => gen({ provider: "cohere", model: "command-r-plus" }),
+      expectClass: AuthenticationError,
+      messageIncludes: ["COHERE_API_KEY"],
+    });
+
+    setHandler(jsonError(400, "trial limit exceeded for this key"));
+    await expectGenerateError({
+      name: "cohere: trial-usage trigger -> generic ProviderError with an upgrade URL",
+      run: () => gen({ provider: "cohere", model: "command-r-plus" }),
+      notClasses: [AuthenticationError, RateLimitError, InvalidModelError],
+      messageIncludes: ["dashboard.cohere.com/billing"],
+    });
+
+    // =========================================================================
+    // SECTION: Anthropic (old File3 anthropic tests #2-7; #1 TimeoutError
+    // demoted to contract — client-side timeout, not cheaply e2e-reproducible)
+    // =========================================================================
+    setEnv("ANTHROPIC_API_KEY", "test-fake-anthropic-credential");
+    setEnv("ANTHROPIC_BASE_URL", mockOrigin);
+
+    setHandler(jsonError(401, "API_KEY_INVALID"));
+    await expectGenerateError({
+      name: "anthropic: API_KEY_INVALID -> AuthenticationError",
+      run: () =>
+        gen({ provider: "anthropic", model: "claude-3-5-sonnet-20241022" }),
+      expectClass: AuthenticationError,
+    });
+
+    setHandler(
+      jsonError(
+        401,
+        '{"type":"authentication_error","message":"invalid x-api-key"}',
+      ),
+    );
+    await expectGenerateError({
+      name: "anthropic: SDK-style 401 body (no API_KEY_INVALID text) -> AuthenticationError via statusCode",
+      run: () =>
+        gen({ provider: "anthropic", model: "claude-3-5-sonnet-20241022" }),
+      expectClass: AuthenticationError,
+    });
+
+    // 429/5xx/network-transport failures are retryable by status, so
+    // directProviderGeneration()'s single-provider fallback loop always
+    // wraps them in a plain Error (see the DEFAULT_ERROR_RULES mistral 429
+    // case above) — asserted via message content, not instanceof.
+    setHandler(jsonError(429, "too_many_requests"));
+    await expectGenerateError({
+      name: "anthropic: 429/too_many_requests -> RateLimitError",
+      run: () =>
+        gen({ provider: "anthropic", model: "claude-3-5-sonnet-20241022" }),
+      messageIncludes: ["Anthropic rate limit exceeded"],
+    });
+
+    setHandler(jsonError(429, "too many requests"));
+    await expectGenerateError({
+      name: "anthropic: SDK-style statusCode 429 (no rate-limit text) -> RateLimitError",
+      run: () =>
+        gen({ provider: "anthropic", model: "claude-3-5-sonnet-20241022" }),
+      messageIncludes: ["Anthropic rate limit exceeded"],
+    });
+
+    // Real socket death (not a synthetic message string) via
+    // req.socket.destroy(). Node's native fetch (undici) surfaces this as
+    // `TypeError: fetch failed` wrapping a `SocketError` with message
+    // "other side closed" and code `UND_ERR_SOCKET` on `.cause` — NOT the
+    // literal "ECONNRESET" text or code, matching the mistral case above.
+    // Assertion is correct (buildErrorContext walks `.cause` and the
+    // NetworkError rule matches the transient errorCode set), only the old
+    // name lied about the mechanism.
+    setSocketDestroyHandler();
+    await expectGenerateError({
+      name: "anthropic: real socket death (UND_ERR_SOCKET) -> NetworkError",
+      run: () =>
+        gen({ provider: "anthropic", model: "claude-3-5-sonnet-20241022" }),
+      messageIncludes: ["Connection error"],
+    });
+
+    setHandler(jsonError(502, "bad gateway"));
+    await expectGenerateError({
+      name: "anthropic: 5xx -> generic ProviderError, not NetworkError",
+      run: () =>
+        gen({ provider: "anthropic", model: "claude-3-5-sonnet-20241022" }),
+      messageIncludes: ["Server error: 502"],
+    });
+
+    // The 5xx rule used to match the bare substrings 500/502/503/504 anywhere in
+    // the message, so a 4xx whose text carried one of those digit runs (a token
+    // count, an id) was reported as an upstream server failure.
+    setHandler(jsonError(400, "metadata.user_id 250000 is malformed"));
+    await expectGenerateError({
+      name: "anthropic: a 400 whose text contains 500 is not a server error",
+      run: () =>
+        gen({ provider: "anthropic", model: "claude-3-5-sonnet-20241022" }),
+      messageIncludes: ["Anthropic error:"],
+      messageExcludes: ["Server error:"],
+    });
+
+    // The other direction of the same fix: a 5xx the old substring list did
+    // not name (Anthropic's 529 "overloaded") is still a server error.
+    setHandler(jsonError(529, "Overloaded"));
+    await expectGenerateError({
+      name: "anthropic: a 529 with no 5xx digits in the text is still a server error",
+      run: () =>
+        gen({ provider: "anthropic", model: "claude-3-5-sonnet-20241022" }),
+      messageIncludes: ["Server error:"],
+    });
+
+    // =========================================================================
+    // SECTION: a status number in the message text (NIM, Anthropic, Azure)
+    // -------------------------------------------------------------------------
+    // These providers' own rules once tested the bare digits ("429", "401",
+    // "404", "403") against the message, so an unrelated number in a vendor
+    // text ("(429)" in a validation message, an id, a count) classified a 400
+    // as a rate limit, an auth failure, a missing model or a quota stop. The
+    // rules now accept a number only in a status-shaped position, so:
+    //   - every "unrelated number" case below answers a 400 and must fall
+    //     through to the generic error, not to the provider's own override;
+    //   - every "named status" case answers a 400 whose TEXT names the
+    //     status (a relay wrapping an upstream reply: "HTTP 429", "status code
+    //     401", a leading "403 ..."), which the override still has to catch.
+    //     The structured status is 400 there, so only the text rule can
+    //     produce the override message these cases look for.
+    // Every case here answers 400, which is not retried, so each is one
+    // request and the classified message is the thrown one. Google Vertex has
+    // the same rule change; its cases are in the next section, which reaches
+    // it through Express Mode.
+    // =========================================================================
+    {
+      setEnv("NVIDIA_NIM_API_KEY", "test-fake-nvidia-nim-credential");
+      setEnv("NVIDIA_NIM_BASE_URL", mockOrigin);
+      setEnv("ANTHROPIC_API_KEY", "test-fake-anthropic-credential");
+      setEnv("ANTHROPIC_BASE_URL", mockOrigin);
+      setEnv("AZURE_OPENAI_API_KEY", "test-fake-azure-credential");
+      setEnv("AZURE_OPENAI_ENDPOINT", mockOrigin);
+      setEnv("AZURE_API_VERSION", undefined);
+      setEnv("AZURE_OPENAI_MODEL", undefined);
+      setEnv("AZURE_OPENAI_DEPLOYMENT", undefined);
+      setEnv("AZURE_OPENAI_DEPLOYMENT_ID", undefined);
+
+      const nimModel = "meta/llama-3.1-8b-instruct";
+      const nimCases = [
+        {
+          code: 429,
+          label: "rate limit",
+          override: "NVIDIA NIM rate limit exceeded",
+          named: "relay failed with status code 429",
+        },
+        {
+          code: 401,
+          label: "invalid key",
+          override: "build.nvidia.com/settings/api-keys",
+          named: "401 key rejected by the model host",
+        },
+        {
+          code: 404,
+          label: "model not available",
+          override: "build.nvidia.com/models",
+          named: "upstream returned error 404",
+        },
+        {
+          code: 403,
+          label: "quota",
+          override: "NVIDIA NIM quota exceeded",
+          named: "upstream HTTP 403 relayed",
+        },
+      ];
+      for (const c of nimCases) {
+        setHandler(
+          jsonError(400, `the offset value (${c.code}) is not accepted here`),
+        );
+        await expectGenerateError({
+          name: `nvidia-nim: an unrelated ${c.code} in a 400's text is not read as ${c.label}`,
+          run: () => gen({ provider: "nvidia-nim", model: nimModel }),
+          messageIncludes: ["nvidia-nim error:"],
+          messageExcludes: [c.override],
+        });
+        setHandler(jsonError(400, c.named));
+        await expectGenerateError({
+          name: `nvidia-nim: a 400 whose text names status ${c.code} is still read as ${c.label}`,
+          run: () => gen({ provider: "nvidia-nim", model: nimModel }),
+          messageIncludes: [c.override],
+        });
+      }
+
+      const anthropicModel = "claude-3-5-sonnet-20241022";
+      setHandler(jsonError(400, "the offset value (429) is not accepted here"));
+      await expectGenerateError({
+        name: "anthropic: an unrelated 429 in a 400's text is not read as a rate limit",
+        run: () => gen({ provider: "anthropic", model: anthropicModel }),
+        messageIncludes: ["Anthropic error:"],
+        messageExcludes: ["Anthropic rate limit exceeded"],
+      });
+      setHandler(jsonError(400, "upstream HTTP 429 relayed by the gateway"));
+      await expectGenerateError({
+        name: "anthropic: a 400 whose text names HTTP 429 is still read as a rate limit",
+        run: () => gen({ provider: "anthropic", model: anthropicModel }),
+        messageIncludes: ["Anthropic rate limit exceeded"],
+      });
+
+      setHandler(jsonError(400, "the offset value (401) is not accepted here"));
+      await expectGenerateError({
+        name: "azure: an unrelated 401 in a 400's text is not read as an auth failure",
+        run: () => gen({ provider: "azure", model: "gpt-4o" }),
+        messageIncludes: ["azure error:"],
+        messageExcludes: ["Invalid Azure OpenAI API key or endpoint."],
+      });
+      setHandler(jsonError(400, "401 key rejected by the gateway"));
+      await expectGenerateError({
+        name: "azure: a 400 whose text starts with 401 is still read as an auth failure",
+        run: () => gen({ provider: "azure", model: "gpt-4o" }),
+        expectClass: AuthenticationError,
+        messageIncludes: ["Invalid Azure OpenAI API key or endpoint."],
+      });
+      setHandler(jsonError(400, "gateway answered HTTP 401 for this call"));
+      await expectGenerateError({
+        name: "azure: a 400 whose text names HTTP 401 is still read as an auth failure",
+        run: () => gen({ provider: "azure", model: "gpt-4o" }),
+        expectClass: AuthenticationError,
+        messageIncludes: ["Invalid Azure OpenAI API key or endpoint."],
+      });
+    }
+
+    // =========================================================================
+    // SECTION: a status number in the message text (Google Vertex, Express Mode)
+    // -------------------------------------------------------------------------
+    // The same rule change as the section above, on the two Vertex rules that
+    // read a status out of the text: the rate limit (429) and the server error
+    // (500, 502, 503, 504). Vertex in project/location mode authenticates
+    // through ADC, which cannot be pointed at a local server (the next section
+    // has the details), but Express Mode, an API key with no project or
+    // location, makes no token exchange, so the real @google/genai client
+    // reaches the mock through the per-call `credentials.vertex.{apiKey,baseURL}`:
+    // the hook that test:vertex-loop-characterization and
+    // test:native-failure-events use.
+    //
+    // @google/genai raises an ApiError whose message is the JSON text of the
+    // whole reply body and whose `status` is the HTTP status, so:
+    //   - every "unrelated" case answers a 400 whose text holds the digits of
+    //     a status where no status is written (a limit in parentheses, a
+    //     request id, a count that merely contains them). It must fall through
+    //     to the invalid-request answer, not to the rate-limit or server-error
+    //     override;
+    //   - every "names" case answers a 400 whose TEXT names the status (a
+    //     relay wrapping an upstream reply). The structured status is 400
+    //     there, so only the text rule can produce the override;
+    //   - the "saying" and "real" cases are controls that classified before
+    //     the change and must still: wording with no number at all, and a real
+    //     429 or 5xx. They pass with the bare-digit rules too, which is what
+    //     shows the "unrelated" cases fail for the digits and nothing else.
+    // Every 400 here is not retried, so each is one request and the thrown
+    // error is the classified one. A real 429 or 5xx is retried, and the error
+    // from @google/genai carries no Retry-After, so each such case would wait
+    // out the provider's 10 s no-hint floor twice and end as the retry
+    // wrapper's plain Error (only its text is asserted). They run side by side,
+    // each against a stand-in of its own, so the suite pays that wait once.
+    // The Vertex constructor copies a per-call apiKey into GOOGLE_API_KEY, so
+    // that variable is snapshotted first and cleared again afterwards. Every
+    // case passes disableInternalFallback: a failed turn must not be rescued by
+    // another provider that holds a placeholder credential from the sections
+    // above.
+    // =========================================================================
+    {
+      setEnv("GOOGLE_API_KEY", undefined);
+
+      const rateLimited = "Google Vertex AI rate limit";
+      const serverError = "Google Vertex AI server error";
+      const invalidRequest = "Google Vertex AI Invalid Request";
+
+      const genVertex = (origin: string) =>
+        gen({
+          provider: "vertex",
+          model: "gemini-2.5-flash",
+          credentials: {
+            vertex: {
+              apiKey: "test-fake-vertex-express-credential",
+              baseURL: origin,
+            },
+          },
+          disableInternalFallback: true,
+        });
+      const vertexCase = async (
+        name: string,
+        handler: MockHandler,
+        expected: {
+          expectClass?: ErrorCtor;
+          notClasses?: ErrorCtor[];
+          messageIncludes?: string[];
+          messageExcludes?: string[];
+        },
+      ): Promise<void> => {
+        setHandler(handler);
+        await expectGenerateError({
+          name: `vertex (express): ${name}`,
+          run: () => genVertex(mockOrigin),
+          ...expected,
+        });
+      };
+      const badRequest = (message: string) =>
+        googleError(400, { code: 400, message, status: "INVALID_ARGUMENT" });
+
+      // --- the rate-limit rule (429) --------------------------------------
+      for (const { label, text } of [
+        {
+          label: "a limit in parentheses",
+          text: "max_tokens (429) exceeds the model limit",
+        },
+        {
+          label: "inside a longer number",
+          text: "request 14290 failed validation",
+        },
+      ]) {
+        await vertexCase(
+          `an unrelated 429 (${label}) in a 400's text is not read as a rate limit`,
+          badRequest(text),
+          {
+            notClasses: [RateLimitError],
+            messageIncludes: [invalidRequest],
+            messageExcludes: [rateLimited],
+          },
+        );
+      }
+      for (const { shape, text } of [
+        { shape: "HTTP", text: "upstream HTTP 429 relayed by the gateway" },
+        { shape: "status code", text: "relay failed with status code 429" },
+        { shape: "error", text: "upstream returned error 429" },
+        {
+          shape: "trailing error",
+          text: "429 error from the upstream gateway",
+        },
+      ]) {
+        await vertexCase(
+          `a 400 whose text names ${shape} 429 is still read as a rate limit`,
+          badRequest(text),
+          { expectClass: RateLimitError, messageIncludes: [rateLimited] },
+        );
+      }
+      // The body of every Google error spells its code the same way, so a
+      // relay that answers 400 around an upstream 429 body still names it.
+      await vertexCase(
+        "a 400 whose body names code 429 is still read as a rate limit",
+        googleError(400, {
+          code: 429,
+          message: "relayed by the gateway",
+          status: "RESOURCE_EXHAUSTED",
+        }),
+        { expectClass: RateLimitError, messageIncludes: [rateLimited] },
+      );
+      for (const { word, text } of [
+        { word: "QUOTA_EXCEEDED", text: "QUOTA_EXCEEDED for this project" },
+        {
+          word: "RATE_LIMIT_EXCEEDED",
+          text: "RATE_LIMIT_EXCEEDED for this project",
+        },
+        { word: "rate limit", text: "rate limit exceeded, slow down" },
+      ]) {
+        await vertexCase(
+          `a 400 saying ${word} is read as a rate limit without a status number`,
+          badRequest(text),
+          { expectClass: RateLimitError, messageIncludes: [rateLimited] },
+        );
+      }
+
+      // --- the server-error rule (500, 502, 503, 504) ---------------------
+      for (const { code, label, text } of [
+        {
+          code: 500,
+          label: "a request id",
+          text: "request id 500 could not be validated",
+        },
+        {
+          code: 502,
+          label: "a request id",
+          text: "request id 502 could not be validated",
+        },
+        {
+          code: 503,
+          label: "a request id",
+          text: "request id 503 could not be validated",
+        },
+        {
+          code: 504,
+          label: "a request id",
+          text: "request id 504 could not be validated",
+        },
+        {
+          code: 500,
+          label: "inside a longer number",
+          text: "the prompt holds 1500 tokens, more than this model accepts",
+        },
+      ]) {
+        await vertexCase(
+          `an unrelated ${code} (${label}) in a 400's text is not read as a server error`,
+          badRequest(text),
+          { messageIncludes: [invalidRequest], messageExcludes: [serverError] },
+        );
+      }
+      for (const { code, shape, text } of [
+        {
+          code: 500,
+          shape: "status code",
+          text: "relay failed with status code 500",
+        },
+        { code: 502, shape: "error", text: "upstream returned error 502" },
+        {
+          code: 503,
+          shape: "HTTP",
+          text: "upstream HTTP 503 relayed by the gateway",
+        },
+        {
+          code: 504,
+          shape: "trailing error",
+          text: "504 error from the upstream gateway",
+        },
+      ]) {
+        await vertexCase(
+          `a 400 whose text names ${shape} ${code} is still read as a server error`,
+          badRequest(text),
+          { messageIncludes: [serverError] },
+        );
+      }
+      for (const { word, text } of [
+        { word: "server error", text: "the backend reported a server error" },
+        {
+          word: "Internal Server Error",
+          text: "Internal Server Error from the backend",
+        },
+        { word: "INTERNAL", text: "INTERNAL: the backend failed" },
+        {
+          word: "UNAVAILABLE",
+          text: "UNAVAILABLE: the backend is not answering",
+        },
+      ]) {
+        await vertexCase(
+          `a 400 saying ${word} is read as a server error without a status number`,
+          badRequest(text),
+          { messageIncludes: [serverError] },
+        );
+      }
+
+      // --- real statuses --------------------------------------------------
+      // A reply with no code in its body can only be classified by the
+      // structured status; the Google-shaped replies also spell the code in
+      // their text, as a real Vertex reply does.
+      await Promise.all(
+        [
+          {
+            name: "a real 429 with no number in its text is a rate limit",
+            reply: jsonError(429, "slow down"),
+            includes: rateLimited,
+          },
+          {
+            name: "a real 429 RESOURCE_EXHAUSTED reply is a rate limit",
+            reply: googleError(429, {
+              code: 429,
+              message: "Resource has been exhausted (e.g. check quota).",
+              status: "RESOURCE_EXHAUSTED",
+            }),
+            includes: rateLimited,
+          },
+          {
+            name: "a real 502 with no number in its text is a server error",
+            reply: jsonError(502, "the backend is down"),
+            includes: serverError,
+          },
+          {
+            name: "a real 503 UNAVAILABLE reply is a server error",
+            reply: googleError(503, {
+              code: 503,
+              message: "The service is currently unavailable.",
+              status: "UNAVAILABLE",
+            }),
+            includes: serverError,
+          },
+        ].map(async ({ name, reply, includes }) => {
+          const standIn = await startReplyServer(reply);
+          try {
+            await expectGenerateError({
+              name: `vertex (express): ${name}`,
+              run: () => genVertex(standIn.origin),
+              messageIncludes: [includes],
+            });
+          } finally {
+            await standIn.close();
+          }
+        }),
+      );
+
+      setEnv("GOOGLE_API_KEY", undefined);
+    }
+
+    // =========================================================================
+    // SECTION: Google Vertex (old File3 #8-11) — VERTEX EXCEPTION
+    // -------------------------------------------------------------------------
+    // Real ADC OAuth makes true e2e impossible for Vertex in project/location
+    // mode (scout-2 #21): a fake service-account key fails signature
+    // verification at Google's real token endpoint before any request reaches
+    // a local mock — no env var or config hook in NeuroLink or the underlying
+    // google-auth-library lets this be redirected. Ported as direct
+    // formatProviderError() calls on a GoogleVertexProvider instance imported
+    // from dist instead (same pattern providers-mocked.ts already uses for
+    // this exact reason). Express Mode, which has no token exchange, is driven
+    // end to end in the section above; the four cases below stay direct calls.
+    // =========================================================================
+    {
+      // Constructing the provider validates that SOME credential is present.
+      // Without these the constructor throws where none exists, aborting the
+      // whole suite before a single case runs — which is what happened the
+      // first time this suite was wired into CI.
+      //
+      // It is invisible locally, and NOT for the reason it first appears.
+      // `src/lib/neurolink.ts` calls `dotenvConfig({ quiet: true })` with no
+      // path, so importing the SDK loads `./.env` from the working directory
+      // — and a developer's .env has GOOGLE_APPLICATION_CREDENTIALS in it.
+      // `DOTENV_CONFIG_PATH=/dev/null` does not prevent this: that variable
+      // is read by `dotenv/config`, not by a direct `config()` call. So the
+      // "run it with the environment stripped" check documented on the
+      // extended-suites job does not actually isolate a suite that
+      // constructs a provider; only running from a directory with no .env
+      // does. Verified both ways: passes in-repo with the environment
+      // stripped, reproduces the CI abort from a cwd without .env.
+      //
+      // These cases only call formatProviderError(), which performs no
+      // network I/O, so placeholders are enough.
+      setEnv("GOOGLE_SERVICE_ACCOUNT_KEY", "e2e-placeholder-not-a-real-key");
+      setEnv("GOOGLE_VERTEX_PROJECT", "e2e-placeholder-project");
+      setEnv("GOOGLE_VERTEX_LOCATION", "us-central1");
+      const vertex = new GoogleVertexProvider() as unknown as {
+        formatProviderError(error: unknown): Error;
+      };
+
+      const permissionDenied = vertex.formatProviderError(
+        new Error("PERMISSION_DENIED: no access"),
+      );
+      record(
+        "vertex: PERMISSION_DENIED -> AuthenticationError",
+        permissionDenied instanceof AuthenticationError,
+        permissionDenied instanceof AuthenticationError
+          ? undefined
+          : `got ${permissionDenied.constructor.name}`,
+      );
+
+      const notFound = vertex.formatProviderError(
+        new Error("NOT_FOUND: model not found"),
+      );
+      record(
+        "vertex: NOT_FOUND -> InvalidModelError with model suggestions",
+        notFound instanceof InvalidModelError,
+        notFound instanceof InvalidModelError
+          ? undefined
+          : `got ${notFound.constructor.name}`,
+      );
+
+      const resourceExhausted = vertex.formatProviderError(
+        new Error('429 RESOURCE_EXHAUSTED {"retryDelay":"12s"}'),
+      );
+      const resourceExhaustedOk =
+        resourceExhausted instanceof RateLimitError &&
+        resourceExhausted.message.includes("12s");
+      record(
+        "vertex: 429 RESOURCE_EXHAUSTED with retryDelay -> RateLimitError mentioning the delay",
+        resourceExhaustedOk,
+        resourceExhaustedOk
+          ? undefined
+          : `got ${resourceExhausted.constructor.name}: ${resourceExhausted.message}`,
+      );
+
+      const overloaded = vertex.formatProviderError(
+        new Error("model is overloaded, try again"),
+      );
+      record(
+        "vertex: overloaded -> RateLimitError (regex-detected, not substring)",
+        overloaded instanceof RateLimitError,
+        overloaded instanceof RateLimitError
+          ? undefined
+          : `got ${overloaded.constructor.name}`,
+      );
+    }
+
+    // =========================================================================
+    // SECTION: Amazon Bedrock (old File3 #12-14; #15 by-.code and #16
+    // ordering demoted to contract — see reasons below)
+    // -------------------------------------------------------------------------
+    // SigV4 is pure local HMAC, no real AWS round-trip needed to validate
+    // credentials (scout-2 #22) — redirect via AWS_ENDPOINT_URL_BEDROCK_RUNTIME,
+    // which @smithy/middleware-endpoint reads automatically.
+    // =========================================================================
+    setEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", bedrockMockOrigin);
+    setEnv("AWS_ACCESS_KEY_ID", "test-fake-bedrock-access-key");
+    setEnv("AWS_SECRET_ACCESS_KEY", "test-fake-bedrock-secret-key");
+    setEnv("AWS_REGION", "us-east-1");
+
+    setHandler(
+      bedrockError(
+        403,
+        "AccessDeniedException",
+        "AccessDeniedException: denied",
+      ),
+    );
+    await expectGenerateError({
+      name: "bedrock: AccessDeniedException -> AuthenticationError",
+      run: () =>
+        gen({
+          provider: "bedrock",
+          model: "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        }),
+      expectClass: AuthenticationError,
+    });
+
+    // Unlike the OpenAI-compat family (buildAPIError stamps `.statusCode =
+    // res.status` on the raw error), the AWS SDK's ServiceException base
+    // class (@smithy/smithy-client) never sets a flat `.status`/`.statusCode`
+    // — only `$metadata.httpStatusCode`, which nothing in the classification
+    // path duck-types onto the thrown error. So `isNonRetryableProviderError`'s
+    // numeric-status bypass never fires for Bedrock, regardless of the
+    // original HTTP status: wrapping is governed solely by the class-bypass
+    // check (AuthenticationError et al.) and message-pattern matching, and
+    // neither "Validation error: ValidationException: bad input" nor "Bedrock
+    // rate limit (throttled): throttled" matches any non-retryable message
+    // pattern — both get wrapped by directProviderGeneration()'s fallback
+    // exhaustion, same as every other non-bypassed classified error in this
+    // suite. Asserted via message content instead of instanceof.
+    setHandler(
+      bedrockError(
+        400,
+        "ValidationException",
+        "ValidationException: bad input",
+      ),
+    );
+    await expectGenerateError({
+      name: "bedrock: ValidationException -> generic ProviderError, not RateLimitError",
+      run: () =>
+        gen({
+          provider: "bedrock",
+          model: "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        }),
+      messageIncludes: ["Validation error: ValidationException: bad input"],
+    });
+
+    setHandler(bedrockError(429, "ThrottlingException", "throttled"));
+    await expectGenerateError({
+      name: "bedrock: ThrottlingException by .name -> RateLimitError",
+      run: () =>
+        gen({
+          provider: "bedrock",
+          model: "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        }),
+      messageIncludes: ["Bedrock rate limit (throttled): throttled"],
+    });
+    // DEMOTED to contract suite: "ThrottlingException by .code (not just
+    // .name) -> RateLimitError" (old File3 #15). Verified against the
+    // installed @aws-sdk/client-bedrock-runtime's generated exception
+    // classes (dist-cjs/index.js): every recognized exception (including
+    // ThrottlingException) sets only `name` as an own field in its
+    // constructor — never `code`. A real Bedrock error response deserialized
+    // by this SDK version can therefore never populate `ctx.errorCode`; this
+    // rule branch is a defensive duck-typed fallback no live/mocked AWS
+    // response produces with the currently installed SDK.
+    // DEMOTED to contract suite: "ThrottlingException checked BEFORE the
+    // ValidationException generic path" (old File3 #16, already flagged by
+    // the task brief as a "self-contradictory bedrock name-vs-message" rule-
+    // ordering pin — kept as a determinism-exception case as directed).
+
+    // =========================================================================
+    // SECTION: public dist surface — TimeoutError/ServerTimeoutError identity
+    // (old File1 #14 — Task-5 public-surface test, moved here per the brief)
+    // =========================================================================
+    {
+      const publicModule = await import("../dist/index.js");
+      const hasServerTimeoutError = "ServerTimeoutError" in publicModule;
+      const hasTimeoutError = "TimeoutError" in publicModule;
+      const sameIdentity =
+        hasServerTimeoutError &&
+        hasTimeoutError &&
+        (publicModule as { TimeoutError: unknown }).TimeoutError ===
+          (publicModule as { ServerTimeoutError: unknown }).ServerTimeoutError;
+      record(
+        "dist public surface: exports both TimeoutError and ServerTimeoutError with === identity",
+        sameIdentity,
+        sameIdentity
+          ? undefined
+          : `hasServerTimeoutError=${hasServerTimeoutError} hasTimeoutError=${hasTimeoutError}`,
+      );
+    }
+
+    // =========================================================================
+    // SECTION: public dist surface — AuthenticationError/AuthorizationError/
+    // RateLimitError identity. Same shadowing bug as TimeoutError above, just
+    // fixed later: `dist/index.js` does `export * from "./types/index.js"`
+    // and then a LATER explicit named re-export block from `./server/index.js`
+    // whose same-named AuthenticationError/AuthorizationError/RateLimitError
+    // classes (extending ServerAdapterError) used to silently win over the
+    // provider-error classes of the same name (extending ProviderError) — an
+    // explicit named export placed after an earlier `export *` always wins
+    // per ESM semantics. Fixed by Server*-prefixing the three server-side
+    // exports at both barrels (src/lib/server/index.ts, src/lib/index.ts),
+    // mirroring the ValidationError/RateLimitError ->
+    // ServerValidationError/ServerRateLimitError pattern already in place and
+    // the TimeoutError -> ServerTimeoutError fix pinned just above. The
+    // `dist/types/index.js` import this suite's `main()` uses throughout
+    // (see the comment at its top) sidesteps the bug entirely by never going
+    // through `dist/index.js` for these classes — this section is what
+    // actually exercises the public surface itself.
+    // =========================================================================
+    {
+      const publicModule = (await import("../dist/index.js")) as Record<
+        string,
+        unknown
+      >;
+      const typesModule = (await import("../dist/types/index.js")) as Record<
+        string,
+        unknown
+      >;
+      const pairs: [bare: string, serverAliased: string][] = [
+        ["AuthenticationError", "ServerAuthenticationError"],
+        ["AuthorizationError", "ServerAuthorizationError"],
+        ["RateLimitError", "ServerRateLimitError"],
+      ];
+      for (const [bare, serverAliased] of pairs) {
+        const publicClass = publicModule[bare];
+        const typesClass = typesModule[bare];
+        const serverClass = publicModule[serverAliased];
+
+        const wonByProviderClass =
+          typeof publicClass === "function" &&
+          typeof typesClass === "function" &&
+          publicClass === typesClass;
+        record(
+          `dist public surface: ${bare} === types/index.js's ${bare} (provider class won, not the server class)`,
+          wonByProviderClass,
+          wonByProviderClass
+            ? undefined
+            : `hasPublic=${typeof publicClass === "function"} hasTypes=${typeof typesClass === "function"} identical=${publicClass === typesClass}`,
+        );
+
+        const distinctFromServerClass =
+          typeof serverClass === "function" && publicClass !== serverClass;
+        record(
+          `dist public surface: ${serverAliased} is exported and distinct from ${bare}`,
+          distinctFromServerClass,
+          distinctFromServerClass
+            ? undefined
+            : `hasServerClass=${typeof serverClass === "function"} identicalToBare=${publicClass === serverClass}`,
+        );
+      }
+    }
+
+    // =========================================================================
+    // SECTION: public dist surface — end-to-end regression for the
+    // AuthenticationError shadowing fix. Drives a real 401 through
+    // NeuroLink().generate() (reusing the mistral DEFAULT_ERROR_RULES 401
+    // case above) and asserts the caught error is `instanceof` an
+    // AuthenticationError imported from `../dist/index.js` — the public
+    // `@juspay/neurolink` entry point, deliberately NOT `../dist/types/
+    // index.js` like every other test in this suite. Before the fix,
+    // `dist/index.js`'s `AuthenticationError` was the server-adapter class
+    // (extends ServerAdapterError), so this `instanceof` check failed even
+    // though `generate()` legitimately threw a provider AuthenticationError;
+    // after the fix the two classes are identical (see the identity section
+    // above) so this passes.
+    // =========================================================================
+    {
+      const { AuthenticationError: PublicAuthenticationError } =
+        (await import("../dist/index.js")) as {
+          AuthenticationError: ErrorCtor;
+        };
+      setEnv("MISTRAL_API_KEY", "test-fake-mistral-credential");
+      setEnv("MISTRAL_BASE_URL", mockOrigin);
+      setHandler(jsonError(401, "denied"));
+      await expectGenerateError({
+        name: "public surface regression: real 401 (mistral) is instanceof AuthenticationError imported from dist/index.js",
+        run: () => gen({ provider: "mistral", model: "mistral-large-latest" }),
+        expectClass: PublicAuthenticationError,
+      });
+    }
+
+    // =========================================================================
+    // SECTION: Google AI Studio — Gemini tools-vs-schema mutual exclusion,
+    // end-to-end (rework batch I, task 1b). Supersedes the two source-grep
+    // tests formerly in continuous-test-suite-gemini-tools-schema-policy.ts
+    // (deleted; that file's other two tests were predicate-level checks of
+    // isToolsSchemaExclusionInForce() already ported verbatim into
+    // continuous-test-suite-error-classifier-contract.ts by batch G — NOT
+    // re-ported here).
+    //
+    // Both generate() and stream() on GoogleAIStudioProvider route through
+    // @google/genai's `client.models.generateContentStream()` under the hood
+    // (confirmed by reading googleAiStudio/client.ts directly — generate()
+    // collects the stream via collectStreamChunks, stream() consumes it
+    // incrementally), so a single mock response shape serves both. Both
+    // paths are pointed at a mock server via GOOGLE_AI_BASE_URL (wired in
+    // this same commit — see getBaseURL() in googleAiStudio/client.ts) and
+    // asked for BOTH tools and a JSON schema simultaneously. This asserts on
+    // the CAPTURED OUTBOUND REQUEST BODY (module-level `lastRequestBody`,
+    // populated by handleMockRequest on every hit) — not just that the call
+    // completes — that the shared isToolsSchemaExclusionInForce predicate
+    // actually fired over the wire: no `tools` key in the JSON body, and
+    // `generationConfig.responseSchema` present (schema wins, tools
+    // dropped). Verified against the installed @google/genai SDK source
+    // (generateContentParametersToMldev / generateContentConfigToMldev)
+    // that `tools` sits at the top level of the body while
+    // responseSchema/responseMimeType live under `generationConfig`.
+    // =========================================================================
+    {
+      setEnv("GOOGLE_AI_API_KEY", "test-fake-google-ai-credential");
+      setEnv("GOOGLE_AI_BASE_URL", mockOrigin);
+
+      // Harmless — never actually invoked, since the mock's SSE response
+      // never contains a functionCall part. Its only job is to make
+      // Object.keys(tools).length > 0 so the exclusion predicate sees an
+      // active tool set, mirroring continuous-test-suite-json-e2e.ts's
+      // pingTool.
+      const pingTool = {
+        ping: tool({
+          description:
+            "Health check. Returns 'pong'. Do not call unless explicitly asked.",
+          inputSchema: z.object({ value: z.string().describe("anything") }),
+          execute: async () => "pong",
+        }),
+      };
+      const schema = z.object({ answer: z.string() });
+
+      type OutboundBody = {
+        tools?: unknown;
+        generationConfig?: {
+          responseSchema?: unknown;
+          responseMimeType?: unknown;
+        };
+      };
+
+      // --- generate() ---------------------------------------------------
+      setHandler(geminiSSEHandler('{"answer":"ok"}'));
+      try {
+        await nl().generate({
+          provider: "google-ai",
+          model: "gemini-2.5-flash",
+          input: { text: "What is the weather in Paris?" },
+          tools: pingTool,
+          schema,
+        } as Parameters<InstanceType<typeof NeuroLink>["generate"]>[0]);
+        const body = JSON.parse(lastRequestBody) as OutboundBody;
+        const toolsAbsent =
+          body.tools === undefined ||
+          (Array.isArray(body.tools) && body.tools.length === 0);
+        const schemaPresent =
+          body.generationConfig?.responseSchema !== undefined;
+        record(
+          "Gemini tools-vs-schema e2e (generate): outbound body has no tools and a responseSchema",
+          toolsAbsent && schemaPresent,
+          toolsAbsent && schemaPresent
+            ? undefined
+            : `toolsAbsent=${toolsAbsent} schemaPresent=${schemaPresent} tools=${JSON.stringify(body.tools)} generationConfig=${JSON.stringify(body.generationConfig)}`,
+        );
+      } catch (err) {
+        record(
+          "Gemini tools-vs-schema e2e (generate): outbound body has no tools and a responseSchema",
+          false,
+          `generate() threw unexpectedly: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
+      // --- stream() -------------------------------------------------------
+      setHandler(geminiSSEHandler('{"answer":"ok"}'));
+      try {
+        const streamResult = await nl().stream({
+          provider: "google-ai",
+          model: "gemini-2.5-flash",
+          input: { text: "What is the weather in Paris?" },
+          tools: pingTool,
+          schema,
+        } as Parameters<InstanceType<typeof NeuroLink>["stream"]>[0]);
+        for await (const _chunk of streamResult.stream) {
+          // Drain to completion — the assertion is on the captured request
+          // body, not the streamed content.
+        }
+        const body = JSON.parse(lastRequestBody) as OutboundBody;
+        const toolsAbsent =
+          body.tools === undefined ||
+          (Array.isArray(body.tools) && body.tools.length === 0);
+        const schemaPresent =
+          body.generationConfig?.responseSchema !== undefined;
+        record(
+          "Gemini tools-vs-schema e2e (stream): outbound body has no tools and a responseSchema",
+          toolsAbsent && schemaPresent,
+          toolsAbsent && schemaPresent
+            ? undefined
+            : `toolsAbsent=${toolsAbsent} schemaPresent=${schemaPresent} tools=${JSON.stringify(body.tools)} generationConfig=${JSON.stringify(body.generationConfig)}`,
+        );
+      } catch (err) {
+        record(
+          "Gemini tools-vs-schema e2e (stream): outbound body has no tools and a responseSchema",
+          false,
+          `stream() threw unexpectedly: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    // =========================================================================
+    // SECTION: structured-output recovery over the wire (openai-compatible)
+    // -------------------------------------------------------------------------
+    // Two vendor behaviours met live while onboarding the catalog providers,
+    // reproduced against the mock server and asserted on the CAPTURED
+    // OUTBOUND BODIES, not just the final result:
+    //   1. A vendor that ignores `response_format` (GMI Cloud's MiniMax
+    //      endpoint) answers a strict json_schema request in prose. The
+    //      structured-output fallback must re-ask with the schema spelled out
+    //      in the prompt, and the coercion path must recover the object.
+    //   2. A vendor whose tool-call parser swallows a JSON-shaped answer
+    //      (io.net's Llama endpoint) ends the step after a tool result with
+    //      `finish_reason: tool_calls`, no tool_calls and null content. The
+    //      loop must re-ask exactly once with `tool_choice: "none"`, carrying
+    //      the tool result, and keep the executed tool in the result.
+    // Handlers key on request CONTENT, never on hit count, so provider-side
+    // retries can replay any request and get the same answer.
+    // =========================================================================
+    {
+      setEnv(
+        "OPENAI_COMPATIBLE_API_KEY",
+        "test-fake-openai-compatible-credential",
+      );
+      setEnv("OPENAI_COMPATIBLE_BASE_URL", mockOrigin);
+      type ChatRequestBody = {
+        messages?: Array<{ role: string; content?: unknown }>;
+        response_format?: unknown;
+        tool_choice?: unknown;
+        tools?: unknown[];
+      };
+      const completion = (
+        message: Record<string, unknown>,
+        finishReason: string,
+      ): MockResponseSpec => ({
+        status: 200,
+        body: JSON.stringify({
+          id: "chatcmpl-mock",
+          object: "chat.completion",
+          created: 0,
+          model: "gpt-4o-mini",
+          choices: [{ index: 0, message, finish_reason: finishReason }],
+          usage: { prompt_tokens: 5, completion_tokens: 5, total_tokens: 10 },
+        }),
+      });
+      const parseBody = (raw: string): ChatRequestBody => {
+        try {
+          return JSON.parse(raw) as ChatRequestBody;
+        } catch {
+          return {};
+        }
+      };
+      const carriesJsonInstruction = (body: ChatRequestBody): boolean =>
+        JSON.stringify(body.messages ?? []).includes("JSON Schema");
+
+      // --- 1. response_format ignored -> prompt-side JSON instruction -------
+      {
+        const seen: ChatRequestBody[] = [];
+        setHandler(() => {
+          const body = parseBody(lastRequestBody);
+          seen.push(body);
+          return completion(
+            {
+              role: "assistant",
+              content: carriesJsonInstruction(body)
+                ? '{"city":"Tokyo","country":"Japan","population_millions":14}'
+                : "Tokyo is the capital of Japan, home to roughly 14 million people in the city proper.",
+            },
+            "stop",
+          );
+        });
+        const citySchema = z.object({
+          city: z.string(),
+          country: z.string(),
+          population_millions: z.number(),
+        });
+        const name =
+          "openai-compatible: vendor ignores response_format -> fallback re-asks with the schema in the prompt and recovers structuredData";
+        try {
+          const r = await nl().generate({
+            provider: "openai-compatible",
+            model: "gpt-4o-mini",
+            input: {
+              text: "Return the city Tokyo, its country, and its approximate population in millions.",
+            },
+            systemPrompt: "You are a terse geography assistant.",
+            schema: citySchema,
+            disableTools: true,
+          } as Parameters<InstanceType<typeof NeuroLink>["generate"]>[0]);
+          const parsed = citySchema.safeParse(r.structuredData);
+          const first = seen[0];
+          const last = seen[seen.length - 1];
+          const lastSystem = (last?.messages ?? []).filter(
+            (m) => m.role === "system",
+          );
+          const singleMergedSystem =
+            lastSystem.length === 1 &&
+            typeof lastSystem[0]?.content === "string" &&
+            lastSystem[0].content.includes("terse geography assistant") &&
+            lastSystem[0].content.includes("JSON Schema");
+          const firstNative =
+            first !== undefined &&
+            first.response_format !== undefined &&
+            !carriesJsonInstruction(first);
+          const lastPromptSide =
+            last !== undefined &&
+            last.response_format === undefined &&
+            carriesJsonInstruction(last);
+          const problems: string[] = [];
+          if (!parsed.success) {
+            problems.push("structuredData did not satisfy the schema");
+          }
+          if (seen.length < 2) {
+            problems.push(
+              `expected a fallback request, saw ${seen.length} request(s)`,
+            );
+          }
+          if (!firstNative) {
+            problems.push(
+              "first request did not carry response_format without a prompt instruction",
+            );
+          }
+          if (!lastPromptSide) {
+            problems.push(
+              "fallback request did not carry the JSON instruction with response_format removed",
+            );
+          }
+          if (!singleMergedSystem) {
+            problems.push(
+              "fallback request did not merge the instruction into the caller's single system message",
+            );
+          }
+          record(name, problems.length === 0, problems.join("; ") || undefined);
+        } catch (err) {
+          record(
+            name,
+            false,
+            `generate() threw unexpectedly: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+
+      // --- 2. empty tool_calls finish -> one tool_choice:none re-ask --------
+      {
+        const seen: ChatRequestBody[] = [];
+        setHandler(() => {
+          const body = parseBody(lastRequestBody);
+          seen.push(body);
+          const hasToolResult = (body.messages ?? []).some(
+            (m) => m.role === "tool",
+          );
+          if (body.tool_choice === "none") {
+            return completion(
+              {
+                role: "assistant",
+                content: '{"code":"ZQ-TEST","source":"tool"}',
+              },
+              "stop",
+            );
+          }
+          if (hasToolResult) {
+            return completion(
+              { role: "assistant", content: null, refusal: null },
+              "tool_calls",
+            );
+          }
+          return completion(
+            {
+              role: "assistant",
+              content: null,
+              tool_calls: [
+                {
+                  id: "call_1",
+                  type: "function",
+                  function: { name: "getSecretCode", arguments: "{}" },
+                },
+              ],
+            },
+            "tool_calls",
+          );
+        });
+        const codeTool = {
+          getSecretCode: tool({
+            description: "Returns the secret code. Takes no arguments.",
+            inputSchema: z.object({}),
+            execute: async () => ({ code: "ZQ-TEST" }),
+          }),
+        };
+        const codeSchema = z.object({ code: z.string(), source: z.string() });
+        const name =
+          "openai-compatible: empty tool_calls finish after a tool result -> one tool_choice:none re-ask recovers the answer";
+        try {
+          const r = (await nl().generate({
+            provider: "openai-compatible",
+            model: "gpt-4o-mini",
+            input: {
+              text: "Call getSecretCode, then answer as JSON with the code and source.",
+            },
+            tools: codeTool,
+            schema: codeSchema,
+            maxSteps: 4,
+          } as Parameters<InstanceType<typeof NeuroLink>["generate"]>[0])) as {
+            structuredData?: unknown;
+            toolsUsed?: string[];
+            toolExecutions?: unknown[];
+          };
+          const parsed = codeSchema.safeParse(r.structuredData);
+          const reasks = seen.filter((b) => b.tool_choice === "none");
+          const reaskCarriesToolResult =
+            reasks.length === 1 &&
+            (reasks[0]?.messages ?? []).some((m) => m.role === "tool");
+          const toolKept =
+            (Array.isArray(r.toolsUsed) &&
+              r.toolsUsed.includes("getSecretCode")) ||
+            (Array.isArray(r.toolExecutions) && r.toolExecutions.length > 0);
+          const problems: string[] = [];
+          if (!parsed.success || parsed.data.code !== "ZQ-TEST") {
+            problems.push("structuredData did not carry the tool's code");
+          }
+          if (reasks.length !== 1) {
+            problems.push(
+              `expected exactly one tool_choice none request, saw ${reasks.length}`,
+            );
+          }
+          if (!reaskCarriesToolResult) {
+            problems.push("re-ask did not carry the tool result message");
+          }
+          if (!toolKept) {
+            problems.push(
+              "executed tool missing from toolsUsed/toolExecutions",
+            );
+          }
+          record(name, problems.length === 0, problems.join("; ") || undefined);
+        } catch (err) {
+          record(
+            name,
+            false,
+            `generate() threw unexpectedly: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+
+      // --- 3. re-ask fails -> original result is kept, never thrown -------
+      {
+        setHandler(() => {
+          const body = parseBody(lastRequestBody);
+          const hasToolResult = (body.messages ?? []).some(
+            (m) => m.role === "tool",
+          );
+          if (body.tool_choice === "none") {
+            return {
+              status: 500,
+              headers: { "retry-after": "0" },
+              body: JSON.stringify({ error: { message: "upstream hiccup" } }),
+            };
+          }
+          if (hasToolResult) {
+            return completion(
+              { role: "assistant", content: null, refusal: null },
+              "tool_calls",
+            );
+          }
+          return completion(
+            {
+              role: "assistant",
+              content: null,
+              tool_calls: [
+                {
+                  id: "call_1",
+                  type: "function",
+                  function: { name: "getSecretCode", arguments: "{}" },
+                },
+              ],
+            },
+            "tool_calls",
+          );
+        });
+        const codeTool = {
+          getSecretCode: tool({
+            description: "Returns the secret code. Takes no arguments.",
+            inputSchema: z.object({}),
+            execute: async () => ({ code: "ZQ-TEST" }),
+          }),
+        };
+        const name =
+          "openai-compatible: a failing tool_choice:none re-ask degrades to the original result instead of throwing";
+        try {
+          const r = (await nl().generate({
+            provider: "openai-compatible",
+            model: "gpt-4o-mini",
+            input: { text: "Call getSecretCode, then answer." },
+            tools: codeTool,
+            maxSteps: 4,
+          } as Parameters<InstanceType<typeof NeuroLink>["generate"]>[0])) as {
+            content?: string;
+            toolsUsed?: string[];
+            toolExecutions?: unknown[];
+          };
+          const toolKept =
+            (Array.isArray(r.toolsUsed) &&
+              r.toolsUsed.includes("getSecretCode")) ||
+            (Array.isArray(r.toolExecutions) && r.toolExecutions.length > 0);
+          const problems: string[] = [];
+          if (!toolKept) {
+            problems.push("executed tool missing from the degraded result");
+          }
+          if ((r.content ?? "").trim().length !== 0) {
+            problems.push("degraded result unexpectedly carried text");
+          }
+          record(name, problems.length === 0, problems.join("; ") || undefined);
+        } catch (err) {
+          record(
+            name,
+            false,
+            `generate() threw instead of degrading: ${err instanceof Error ? err.constructor.name : "non-Error"}`,
+          );
+        }
+      }
+
+      // --- 4. no step budget left -> no re-ask, honest step-cap ------------
+      {
+        const seen: ChatRequestBody[] = [];
+        setHandler(() => {
+          const body = parseBody(lastRequestBody);
+          seen.push(body);
+          const hasToolResult = (body.messages ?? []).some(
+            (m) => m.role === "tool",
+          );
+          if (body.tool_choice === "none") {
+            return completion(
+              {
+                role: "assistant",
+                content: '{"code":"ZQ-TEST","source":"tool"}',
+              },
+              "stop",
+            );
+          }
+          if (hasToolResult) {
+            return completion(
+              { role: "assistant", content: null, refusal: null },
+              "tool_calls",
+            );
+          }
+          return completion(
+            {
+              role: "assistant",
+              content: null,
+              tool_calls: [
+                {
+                  id: "call_1",
+                  type: "function",
+                  function: { name: "getSecretCode", arguments: "{}" },
+                },
+              ],
+            },
+            "tool_calls",
+          );
+        });
+        const codeTool = {
+          getSecretCode: tool({
+            description: "Returns the secret code. Takes no arguments.",
+            inputSchema: z.object({}),
+            execute: async () => ({ code: "ZQ-TEST" }),
+          }),
+        };
+        const name =
+          "openai-compatible: empty tool_calls finish on the last budgeted step -> no re-ask, stopReason step-cap, stepsUsed within maxSteps";
+        try {
+          const r = (await nl().generate({
+            provider: "openai-compatible",
+            model: "gpt-4o-mini",
+            input: { text: "Call getSecretCode, then answer." },
+            tools: codeTool,
+            maxSteps: 2,
+          } as Parameters<InstanceType<typeof NeuroLink>["generate"]>[0])) as {
+            stopReason?: string;
+            stepsUsed?: number;
+          };
+          const reasks = seen.filter((b) => b.tool_choice === "none").length;
+          const problems: string[] = [];
+          if (reasks !== 0) {
+            problems.push(
+              `expected no re-ask with the budget spent, saw ${reasks}`,
+            );
+          }
+          if (r.stopReason !== "step-cap") {
+            problems.push("stopReason was not step-cap");
+          }
+          if (typeof r.stepsUsed !== "number" || r.stepsUsed > 2) {
+            problems.push("stepsUsed exceeded maxSteps");
+          }
+          record(name, problems.length === 0, problems.join("; ") || undefined);
+        } catch (err) {
+          record(
+            name,
+            false,
+            `generate() threw unexpectedly: ${err instanceof Error ? err.constructor.name : "non-Error"}`,
+          );
+        }
+      }
+
+      // --- 4b. tools suppress response_format -> tool-free re-ask ---------
+      // The ordinary shape of a `generate({ schema })` call: tools are attached,
+      // so response_format is dropped from the wire and NOTHING asks the model
+      // for JSON. The turn then re-asks once with the tools removed. These
+      // three cases pin the property the recovery is built on — it can improve
+      // an outcome but must never degrade one — by scripting the re-ask to
+      // succeed, to fail outright, and to come back unusable.
+      {
+        const skySchema = z.object({ colour: z.string(), reason: z.string() });
+        const pingTool = {
+          ping: tool({
+            description: "Health check. Returns pong.",
+            inputSchema: z.object({}),
+            execute: async () => "pong",
+          }),
+        };
+        const PROSE = "A clear daytime sky looks blue because of scattering.";
+        // The re-ask is identifiable on the wire without guessing: the tool turn
+        // carries `tools` and no `response_format`, the re-ask is the inverse.
+        const isReask = (b: ChatRequestBody): boolean =>
+          b.response_format !== undefined &&
+          (b.tools === undefined || (b.tools as unknown[]).length === 0);
+
+        const driveReask = async (
+          label: string,
+          reaskResponse: () => MockResponseSpec,
+        ): Promise<{
+          seen: ChatRequestBody[];
+          result?: { content?: string; structuredData?: unknown };
+          threw?: unknown;
+        }> => {
+          const seen: ChatRequestBody[] = [];
+          setHandler(() => {
+            const body = parseBody(lastRequestBody);
+            seen.push(body);
+            return isReask(body)
+              ? reaskResponse()
+              : completion({ role: "assistant", content: PROSE }, "stop");
+          });
+          try {
+            const result = (await nl().generate({
+              provider: "openai-compatible",
+              model: "gpt-4o-mini",
+              input: { text: "What colour is a clear daytime sky, and why?" },
+              schema: skySchema,
+              tools: pingTool,
+              disableTools: false,
+            } as Parameters<
+              InstanceType<typeof NeuroLink>["generate"]
+            >[0])) as { content?: string; structuredData?: unknown };
+            return { seen, result };
+          } catch (threw) {
+            return { seen, threw };
+          }
+        };
+
+        // (a) The re-ask works: structuredData is recovered even though the
+        //     tool turn answered in prose.
+        {
+          const name =
+            "openai-compatible: tools suppress response_format -> a tool-free re-ask recovers structuredData";
+          const { seen, result, threw } = await driveReask("ok", () =>
+            completion(
+              {
+                role: "assistant",
+                content: '{"colour":"blue","reason":"scattering"}',
+              },
+              "stop",
+            ),
+          );
+          const problems: string[] = [];
+          if (threw) {
+            problems.push("generate() threw instead of recovering");
+          }
+          if (seen.length !== 2) {
+            problems.push(`expected exactly 2 requests, saw ${seen.length}`);
+          }
+          if (seen[0]?.response_format !== undefined) {
+            problems.push("the tool turn carried response_format");
+          }
+          if (seen[1] && !isReask(seen[1])) {
+            problems.push("the re-ask kept its tools or dropped the schema");
+          }
+          if (!skySchema.safeParse(result?.structuredData).success) {
+            problems.push("structuredData was not recovered");
+          }
+          record(name, problems.length === 0, problems.join("; ") || undefined);
+        }
+
+        // (b) The re-ask FAILS outright. The turn must still succeed with the
+        //     answer the tool phase already produced.
+        {
+          const name =
+            "openai-compatible: a re-ask that fails keeps the original answer instead of failing the turn";
+          const { seen, result, threw } = await driveReask("boom", () => ({
+            status: 500,
+            headers: { "retry-after": "0" },
+            body: JSON.stringify({ error: { message: "upstream exploded" } }),
+          }));
+          const problems: string[] = [];
+          if (threw) {
+            problems.push("a failed re-ask was allowed to fail the whole turn");
+          }
+          // NOT an exact count: a 5xx is retryable, so withProviderRetry's
+          // ladder legitimately issues the re-ask more than once before giving
+          // up. What matters is that a re-ask was attempted at all and that
+          // exhausting it did not fail the turn.
+          if (seen.length < 2) {
+            problems.push(`expected a re-ask, saw ${seen.length} request(s)`);
+          }
+          if (result?.content !== PROSE) {
+            problems.push("the tool phase's answer was not preserved");
+          }
+          if (result?.structuredData !== undefined) {
+            problems.push("structuredData was published despite no valid JSON");
+          }
+          record(name, problems.length === 0, problems.join("; ") || undefined);
+        }
+
+        // (c) The re-ask returns 200 but ignores the schema. Sending
+        //     response_format is not the same as being obeyed, so the unusable
+        //     answer must be discarded rather than replace a good one.
+        //
+        //     An unobeyed response_format is also how a vendor that supports
+        //     only `json_object` behaves — it accepts the request and answers
+        //     with a shape it invented, because the schema never reached the
+        //     model — so the outcome earns one more tools-free pass with the
+        //     schema spelled into the prompt before the answer is written off.
+        //     Hence three requests, not two, and the third must carry the
+        //     schema in the prompt with no tools and no response_format: put
+        //     the schema beside a tool list and groq reads it as another tool
+        //     and answers by calling one named "JSON", turning a recoverable
+        //     miss into a hard error.
+        {
+          const name =
+            "openai-compatible: a re-ask that ignores the schema is discarded, not published";
+          const { seen, result, threw } = await driveReask("prose", () =>
+            completion(
+              { role: "assistant", content: "Still just prose, sorry." },
+              "stop",
+            ),
+          );
+          const problems: string[] = [];
+          if (threw) {
+            problems.push("generate() threw instead of keeping the answer");
+          }
+          if (seen.length !== 3) {
+            problems.push(`expected exactly 3 requests, saw ${seen.length}`);
+          }
+          const spelledOut = seen[2];
+          if (
+            spelledOut !== undefined &&
+            !(
+              carriesJsonInstruction(spelledOut) &&
+              spelledOut.response_format === undefined &&
+              (spelledOut.tools === undefined ||
+                (spelledOut.tools as unknown[]).length === 0)
+            )
+          ) {
+            problems.push(
+              "the retry after the ignored re-ask did not spell the schema into a tools-free prompt",
+            );
+          }
+          if (result?.content !== PROSE) {
+            problems.push(
+              "a non-schema-valid re-ask replaced the tool phase's answer",
+            );
+          }
+          if (result?.structuredData !== undefined) {
+            problems.push(
+              "structuredData was published from an unusable re-ask",
+            );
+          }
+          record(name, problems.length === 0, problems.join("; ") || undefined);
+        }
+      }
+
+      // --- 4b-2. review follow-ups: non-object roots, and tool bookkeeping --
+      {
+        const pingTool2 = {
+          ping: tool({
+            description: "Health check. Returns pong.",
+            inputSchema: z.object({}),
+            execute: async () => "pong",
+          }),
+        };
+        const PROSE2 = "Blue, green and red are the ones I would pick.";
+
+        // (d) An ARRAY-root schema. The re-ask prompt used to demand "a single
+        //     JSON object", which an array root can never satisfy — so the
+        //     recovery was silently dead for every non-object schema. Guards the
+        //     "object" -> "value" wording.
+        {
+          const arraySchema = z.array(z.string());
+          const seen: ChatRequestBody[] = [];
+          setHandler(() => {
+            const body = parseBody(lastRequestBody);
+            seen.push(body);
+            const isReask =
+              body.response_format !== undefined &&
+              (body.tools === undefined ||
+                (body.tools as unknown[]).length === 0);
+            return completion(
+              {
+                role: "assistant",
+                content: isReask ? '["blue","green","red"]' : PROSE2,
+              },
+              "stop",
+            );
+          });
+          const name =
+            "openai-compatible: an ARRAY-root schema is recovered by the tool-free re-ask";
+          try {
+            const r = (await nl().generate({
+              provider: "openai-compatible",
+              model: "gpt-4o-mini",
+              input: { text: "Name three colours." },
+              schema: arraySchema,
+              tools: pingTool2,
+              disableTools: false,
+            } as Parameters<
+              InstanceType<typeof NeuroLink>["generate"]
+            >[0])) as { structuredData?: unknown };
+            const problems: string[] = [];
+            if (seen.length < 2) {
+              problems.push(`expected a re-ask, saw ${seen.length} request(s)`);
+            }
+            if (!arraySchema.safeParse(r.structuredData).success) {
+              problems.push("the array root was not recovered");
+            }
+            // Assert the INSTRUCTION, not just the outcome. A scripted mock
+            // returns its array whatever the prompt says, so recovery alone
+            // would pass with the old "a single JSON object" wording too — the
+            // very wording that misdirects a real model away from an array
+            // root. Checking the wire text is what actually pins the fix.
+            const reaskText = JSON.stringify(
+              seen[seen.length - 1]?.messages ?? [],
+            );
+            if (!reaskText.includes("single JSON value")) {
+              problems.push("the re-ask did not ask for a JSON value");
+            }
+            if (reaskText.includes("single JSON object")) {
+              problems.push(
+                "the re-ask still demands an object, which an array root cannot satisfy",
+              );
+            }
+            record(
+              name,
+              problems.length === 0,
+              problems.join("; ") || undefined,
+            );
+          } catch (err) {
+            record(
+              name,
+              false,
+              `generate() threw: ${err instanceof Error ? err.constructor.name : "non-Error"}`,
+            );
+          }
+        }
+
+        // (e) A tool really runs, the tool phase then answers in PROSE, and the
+        //     re-ask (which declares no tools) succeeds. Review claimed the
+        //     merge drops the tool phase's toolExecutions. It does not:
+        //     toolExecutions is built from the shared toolExecutionSummaries
+        //     array, not from the loop result — which carries no such field.
+        //     This pins that, so the claim cannot be re-litigated from reading
+        //     the merge alone.
+        {
+          const timeSchema = z.object({ city: z.string() });
+          const seen: ChatRequestBody[] = [];
+          setHandler(() => {
+            const body = parseBody(lastRequestBody);
+            seen.push(body);
+            const isReask =
+              body.response_format !== undefined &&
+              (body.tools === undefined ||
+                (body.tools as unknown[]).length === 0);
+            if (isReask) {
+              return completion(
+                { role: "assistant", content: '{"city":"Tokyo"}' },
+                "stop",
+              );
+            }
+            // First turn: ask for the tool. Second: answer in prose.
+            // Detect the tool RESULT by role, the way the section above does —
+            // a substring search for "tool" matches the first request too,
+            // because the tool descriptions are already in its messages.
+            const hasToolResult = (body.messages ?? []).some(
+              (m) => m.role === "tool",
+            );
+            if (!hasToolResult) {
+              return completion(
+                {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: [
+                    {
+                      id: "call_1",
+                      type: "function",
+                      function: {
+                        name: "get_city",
+                        arguments: JSON.stringify({ tz: "Asia/Tokyo" }),
+                      },
+                    },
+                  ],
+                },
+                "tool_calls",
+              );
+            }
+            return completion(
+              { role: "assistant", content: "It is Tokyo over there." },
+              "stop",
+            );
+          });
+          let executed = 0;
+          const cityTool = {
+            get_city: tool({
+              description: "Get the city for a timezone.",
+              inputSchema: z.object({ tz: z.string() }),
+              execute: async () => {
+                executed += 1;
+                return JSON.stringify({ city: "Tokyo" });
+              },
+            }),
+          };
+          const name =
+            "openai-compatible: a tool-free re-ask keeps the tool phase's toolExecutions and toolsUsed";
+          try {
+            const r = (await nl().generate({
+              provider: "openai-compatible",
+              model: "gpt-4o-mini",
+              input: { text: "Which city is Asia/Tokyo?" },
+              schema: timeSchema,
+              tools: cityTool,
+              disableTools: false,
+            } as Parameters<
+              InstanceType<typeof NeuroLink>["generate"]
+            >[0])) as {
+              structuredData?: unknown;
+              toolsUsed?: string[];
+              toolExecutions?: unknown[];
+            };
+            const problems: string[] = [];
+            if (executed !== 1) {
+              problems.push(`the tool ran ${executed} time(s), expected 1`);
+            }
+            if (!(r.toolsUsed ?? []).includes("get_city")) {
+              problems.push("toolsUsed lost the tool phase's entry");
+            }
+            if ((r.toolExecutions ?? []).length < 1) {
+              problems.push(
+                "toolExecutions lost the tool phase's execution record",
+              );
+            }
+            if (!timeSchema.safeParse(r.structuredData).success) {
+              problems.push("structuredData was not recovered");
+            }
+            record(
+              name,
+              problems.length === 0,
+              problems.join("; ") || undefined,
+            );
+          } catch (err) {
+            record(
+              name,
+              false,
+              `generate() threw: ${err instanceof Error ? err.constructor.name : "non-Error"}`,
+            );
+          }
+        }
+      }
+
+      // (f) A tool phase that ends on `length` (truncated) then recovers. The
+      //     unified reason must survive the merge AND its raw partner must move
+      //     with it — reporting unified "length" beside the reformat's raw
+      //     "stop" hands a consumer a contradictory pair. `steps` must also stay
+      //     the loop's own count: the reformat is not a tool step, so counting
+      //     it can push stepsUsed past the maxSteps it is measured against and
+      //     manufacture a step-cap that never happened.
+      {
+        const sSchema = z.object({ colour: z.string() });
+        const pingTool3 = {
+          ping: tool({
+            description: "Health check. Returns pong.",
+            inputSchema: z.object({}),
+            execute: async () => "pong",
+          }),
+        };
+        setHandler(() => {
+          const body = parseBody(lastRequestBody);
+          const isReask =
+            body.response_format !== undefined &&
+            (body.tools === undefined ||
+              (body.tools as unknown[]).length === 0);
+          // The tool phase ends on `tool_calls` WITHOUT any tool_calls array
+          // and with prose text, so the loop breaks after ONE step carrying
+          // finishReason "tool-calls". With maxSteps 2 that is one step short
+          // of the cap — which is exactly what makes a summed reformat step
+          // cross the threshold and manufacture a step-cap.
+          return isReask
+            ? completion(
+                { role: "assistant", content: '{"colour":"blue"}' },
+                "stop",
+              )
+            : completion(
+                { role: "assistant", content: "The sky is blue because" },
+                "tool_calls",
+              );
+        });
+        const name =
+          "openai-compatible: the tool-free reformat is not counted as a loop step and does not fake a step-cap";
+        try {
+          const r = (await nl().generate({
+            provider: "openai-compatible",
+            model: "gpt-4o-mini",
+            input: { text: "What colour is the sky?" },
+            schema: sSchema,
+            tools: pingTool3,
+            disableTools: false,
+            maxSteps: 2,
+          } as Parameters<InstanceType<typeof NeuroLink>["generate"]>[0])) as {
+            finishReason?: string;
+            rawFinishReason?: string;
+            stopReason?: string;
+            stepsUsed?: number;
+            structuredData?: unknown;
+          };
+          const problems: string[] = [];
+          if (r.finishReason !== "tool-calls") {
+            problems.push("the tool phase's finishReason was lost");
+          }
+          // The discriminator: the loop ran ONE step. Summing the reformat's
+          // step makes stepsUsed 2, which is >= maxSteps 2, and with
+          // finishReason "tool-calls" that reports a step-cap the tool loop
+          // never hit.
+          if (r.stepsUsed !== 1) {
+            problems.push(
+              `stepsUsed counted the tool-free reformat as a loop step (${r.stepsUsed})`,
+            );
+          }
+          if (r.stopReason === "step-cap") {
+            problems.push("a step-cap was reported that never happened");
+          }
+          // Exact match, not just "isn't the reformat's stop": the tool
+          // phase's own doGenerate call always carries a raw finish reason
+          // (openaiChatCompletionsBase defaults it to "stop" when the wire
+          // value is falsy), so a tolerant "undefined-or-tool_calls" check
+          // would silently accept a merge that dropped the raw pairing.
+          if (r.rawFinishReason !== "tool_calls") {
+            problems.push(
+              "rawFinishReason did not stay paired with the tool phase's finishReason",
+            );
+          }
+          if (!sSchema.safeParse(r.structuredData).success) {
+            problems.push("structuredData was not recovered");
+          }
+          record(name, problems.length === 0, problems.join("; ") || undefined);
+        } catch (err) {
+          record(
+            name,
+            false,
+            `generate() threw: ${err instanceof Error ? err.constructor.name : "non-Error"}`,
+          );
+        }
+      }
+
+      // (g) The vendor rejects the SCHEMA ITSELF on the re-ask. Groq answers a
+      //     non-object root with "invalid JSON schema for response_format:
+      //     schema must have type 'object'", so array and scalar roots fail
+      //     there even though the request shape is fine. Found live; no mock
+      //     that always accepts response_format can surface it. The re-ask must
+      //     degrade to spelling the schema into the prompt, exactly as the
+      //     non-suppressed path already does.
+      {
+        const arrSchema2 = z.array(z.string()).min(2);
+        const pingTool4 = {
+          ping: tool({
+            description: "Health check. Returns pong.",
+            inputSchema: z.object({}),
+            execute: async () => "pong",
+          }),
+        };
+        const seen: ChatRequestBody[] = [];
+        setHandler(() => {
+          const body = parseBody(lastRequestBody);
+          seen.push(body);
+          const wantsNativeFormat = body.response_format !== undefined;
+          if (wantsNativeFormat) {
+            // Reject the schema the way Groq does for a non-object root.
+            return {
+              status: 400,
+              body: JSON.stringify({
+                error: {
+                  message:
+                    "invalid JSON schema for response_format: schema must have type 'object'",
+                },
+              }),
+            };
+          }
+          // The prompt-instruction degradation carries the schema in a system
+          // turn instead; only then do we answer with the array.
+          const carriesInstruction = JSON.stringify(
+            body.messages ?? [],
+          ).includes("JSON Schema");
+          return completion(
+            {
+              role: "assistant",
+              content: carriesInstruction
+                ? '["red","blue","yellow"]'
+                : "The primary colours are red, blue and yellow.",
+            },
+            "stop",
+          );
+        });
+        const name =
+          "openai-compatible: a re-ask whose response_format the vendor rejects degrades to the schema-in-prompt path";
+        try {
+          const r = (await nl().generate({
+            provider: "openai-compatible",
+            model: "gpt-4o-mini",
+            input: { text: "Name three primary colours." },
+            schema: arrSchema2,
+            tools: pingTool4,
+            disableTools: false,
+          } as Parameters<InstanceType<typeof NeuroLink>["generate"]>[0])) as {
+            structuredData?: unknown;
+          };
+          const problems: string[] = [];
+          if (!arrSchema2.safeParse(r.structuredData).success) {
+            problems.push(
+              "the array root was not recovered after the schema was rejected",
+            );
+          }
+          if (!seen.some((b) => b.response_format !== undefined)) {
+            problems.push("the native response_format re-ask was never tried");
+          }
+          if (
+            !seen.some(
+              (b) =>
+                b.response_format === undefined &&
+                JSON.stringify(b.messages ?? []).includes("JSON Schema"),
+            )
+          ) {
+            problems.push("the schema-in-prompt degradation never ran");
+          }
+          record(name, problems.length === 0, problems.join("; ") || undefined);
+        } catch (err) {
+          record(
+            name,
+            false,
+            `generate() threw: ${err instanceof Error ? err.constructor.name : "non-Error"}`,
+          );
+        }
+      }
+
+      // --- 4c. catalog structuredOutputWithTools drives the wire shape -----
+      // The generic OpenAI-compatible path conservatively drops
+      // response_format whenever a request carries tools. A catalog entry may
+      // opt out only when a combined wire probe proved the vendor accepts both.
+      // Assert on the real outbound request for generate() and stream(): the
+      // answer alone cannot distinguish native constrained decoding from the
+      // tool-free recovery path.
+      {
+        const skySchema = z.object({
+          colour: z.string(),
+          reason: z.string(),
+        });
+        const pingTool = {
+          ping: tool({
+            description: "Health check. Returns pong.",
+            inputSchema: z.object({}),
+            execute: async () => "pong",
+          }),
+        };
+        const responseContent =
+          '{"colour":"blue","reason":"atmospheric scattering"}';
+        const streamedCompletion = (): MockResponseSpec => {
+          const base = {
+            id: "chatcmpl-catalog-capability",
+            object: "chat.completion.chunk",
+            created: 0,
+            model: "catalog-test-model",
+          };
+          return {
+            status: 200,
+            headers: { "content-type": "text/event-stream" },
+            body: [
+              `data: ${JSON.stringify({
+                ...base,
+                choices: [
+                  {
+                    index: 0,
+                    delta: { content: responseContent },
+                    finish_reason: null,
+                  },
+                ],
+              })}\n\n`,
+              `data: ${JSON.stringify({
+                ...base,
+                choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+                usage: {
+                  prompt_tokens: 5,
+                  completion_tokens: 5,
+                  total_tokens: 10,
+                },
+              })}\n\n`,
+              "data: [DONE]\n\n",
+            ].join(""),
+          };
+        };
+        type CatalogWireMode = "generate" | "stream";
+        const firstBodyFor = async (
+          provider: string,
+          baseUrlEnv: string,
+          apiKeyEnv: string,
+          model: string,
+          mode: CatalogWireMode,
+        ): Promise<ChatRequestBody | undefined> => {
+          setEnv(apiKeyEnv, "sk-testfakecredential000000");
+          setEnv(baseUrlEnv, mockOrigin);
+          const seen: ChatRequestBody[] = [];
+          setHandler(() => {
+            seen.push(parseBody(lastRequestBody));
+            return mode === "stream"
+              ? streamedCompletion()
+              : completion(
+                  { role: "assistant", content: responseContent },
+                  "stop",
+                );
+          });
+          const request = {
+            provider,
+            model,
+            input: {
+              text: "What colour is a clear daytime sky, and why?",
+            },
+            schema: skySchema,
+            tools: pingTool,
+            disableTools: false,
+          };
+          if (mode === "generate") {
+            await nl().generate(
+              request as Parameters<
+                InstanceType<typeof NeuroLink>["generate"]
+              >[0],
+            );
+          } else {
+            const result = await nl().stream(
+              request as Parameters<
+                InstanceType<typeof NeuroLink>["stream"]
+              >[0],
+            );
+            for await (const _chunk of result.stream) {
+              // Drain the real SSE response before examining the captured body.
+            }
+          }
+          return seen[0];
+        };
+        const assertWireShape = async (opts: {
+          provider: string;
+          baseUrlEnv: string;
+          apiKeyEnv: string;
+          model: string;
+          mode: CatalogWireMode;
+          expectResponseFormat: boolean;
+        }): Promise<void> => {
+          const capability = opts.expectResponseFormat ? "true" : "false";
+          const name = `${opts.provider} (catalog structuredOutputWithTools:${capability}, ${opts.mode}): tools and response_format follow the catalog capability`;
+          try {
+            const body = await firstBodyFor(
+              opts.provider,
+              opts.baseUrlEnv,
+              opts.apiKeyEnv,
+              opts.model,
+              opts.mode,
+            );
+            const problems: string[] = [];
+            if (!body) {
+              problems.push("no request reached the mock");
+            } else {
+              if (!Array.isArray(body.tools) || body.tools.length === 0) {
+                problems.push("the request carried no tools");
+              }
+              const responseFormatPresent = body.response_format !== undefined;
+              if (responseFormatPresent !== opts.expectResponseFormat) {
+                problems.push(
+                  opts.expectResponseFormat
+                    ? "response_format was suppressed despite the proven opt-in"
+                    : "response_format was sent without a proven opt-in",
+                );
+              }
+            }
+            record(
+              name,
+              problems.length === 0,
+              problems.join("; ") || undefined,
+            );
+          } catch (err) {
+            record(
+              name,
+              false,
+              `${opts.mode}() threw: ${err instanceof Error ? err.constructor.name : "non-Error"}`,
+            );
+          }
+        };
+
+        for (const mode of ["generate", "stream"] as const) {
+          // xAI returned HTTP 200 when tools and json_schema were sent together.
+          await assertWireShape({
+            provider: "xai",
+            baseUrlEnv: "XAI_BASE_URL",
+            apiKeyEnv: "XAI_API_KEY",
+            model: "grok-4.6",
+            mode,
+            expectResponseFormat: true,
+          });
+          // Groq rejects the combination, so conservative suppression remains.
+          await assertWireShape({
+            provider: "groq",
+            baseUrlEnv: "GROQ_BASE_URL",
+            apiKeyEnv: "GROQ_API_KEY",
+            model: "openai/gpt-oss-120b",
+            mode,
+            expectResponseFormat: false,
+          });
+        }
+      }
+
+      // --- 5. catalog tools:false keeps native tools off the wire ----------
+      // Mancer declares capabilities.tools: false (its free model answers 400
+      // BAD_PARAMETERS to any tool list). buildCatalogEntries() surfaces that
+      // as OpenAICompatCatalogEntry.supportsTools, and the provider's
+      // supportsTools() override honours it, so a caller who registers a tool
+      // still gets an answer and the outbound body carries no `tools` key.
+      {
+        setEnv("MANCER_API_KEY", "mcr_testfakecredential00");
+        setEnv("MANCER_BASE_URL", mockOrigin);
+        const seen: ChatRequestBody[] = [];
+        setHandler(() => {
+          seen.push(parseBody(lastRequestBody));
+          return completion(
+            { role: "assistant", content: "Yes, I am ready." },
+            "stop",
+          );
+        });
+        const codeTool = {
+          getSecretCode: tool({
+            description: "Returns the secret code. Takes no arguments.",
+            inputSchema: z.object({}),
+            execute: async () => ({ code: "ZQ-TEST" }),
+          }),
+        };
+        const name =
+          "mancer (catalog tools:false): a registered tool never reaches the wire and generate() still answers";
+        try {
+          const r = (await nl().generate({
+            provider: "mancer",
+            model: "mytholite",
+            input: { text: "Use the tool if you can, then say ready." },
+            tools: codeTool,
+            maxSteps: 3,
+          } as Parameters<InstanceType<typeof NeuroLink>["generate"]>[0])) as {
+            content?: string;
+          };
+          const bodiesWithTools = seen.filter(
+            (b) =>
+              (b as { tools?: unknown }).tools !== undefined ||
+              b.tool_choice !== undefined,
+          );
+          const problems: string[] = [];
+          if (seen.length === 0) {
+            problems.push("no request reached the mock");
+          }
+          if (bodiesWithTools.length !== 0) {
+            problems.push(
+              `${bodiesWithTools.length} request(s) carried tools or tool_choice`,
+            );
+          }
+          if (!/ready/i.test(r.content ?? "")) {
+            problems.push("answer did not come back");
+          }
+          record(name, problems.length === 0, problems.join("; ") || undefined);
+        } catch (err) {
+          record(
+            name,
+            false,
+            `generate() threw: ${err instanceof Error ? err.constructor.name : "non-Error"}`,
+          );
+        }
+      }
+
+      // --- 6. catalog model fallback is generate()'s default --------------
+      // A model the vendor rejects as invalid is retried on the catalog's
+      // fallback list (BaseProvider.runGenerateWithModelFallback). Case 7
+      // turns that off, so the default is pinned first: the retry carries
+      // the catalog's first fallback id and the call resolves.
+      {
+        type ModelBody = ChatRequestBody & { model?: string };
+        const bodies: ModelBody[] = [];
+        setHandler(() => {
+          const body = parseBody(lastRequestBody) as ModelBody;
+          bodies.push(body);
+          if (body.model === "mancer-ghost") {
+            return {
+              status: 400,
+              body: JSON.stringify({ error: { message: "Unknown Model" } }),
+            };
+          }
+          return completion({ role: "assistant", content: "ready" }, "stop");
+        });
+        const name =
+          "mancer: an invalid model is retried on the catalog fallback by default";
+        try {
+          const r = (await nl().generate({
+            provider: "mancer",
+            model: "mancer-ghost",
+            input: { text: "Say ready." },
+            disableTools: true,
+          } as Parameters<InstanceType<typeof NeuroLink>["generate"]>[0])) as {
+            content?: string;
+          };
+          const problems: string[] = [];
+          if (bodies.length < 2) {
+            problems.push(
+              `expected a fallback request, saw ${bodies.length} request(s)`,
+            );
+          }
+          if (bodies[0]?.model !== "mancer-ghost") {
+            problems.push("first request did not carry the requested model");
+          }
+          if (bodies.length >= 2 && bodies[1]?.model !== "deepseek-v4-flash") {
+            problems.push(
+              "fallback request did not carry the catalog's first fallback model",
+            );
+          }
+          if (!/ready/i.test(r.content ?? "")) {
+            problems.push("answer did not come back");
+          }
+          record(name, problems.length === 0, problems.join("; ") || undefined);
+        } catch (err) {
+          record(
+            name,
+            false,
+            `generate() threw: ${err instanceof Error ? err.constructor.name : "non-Error"}`,
+          );
+        }
+      }
+
+      // --- 7. disableInternalFallback reaches the provider on generate() --
+      // GenerateOptions declares the flag and buildGenerateTextOptions maps
+      // it through. Before that, the explicit field list dropped it and
+      // generate() fell back regardless of what the caller asked (stream()
+      // spreads its options, so it always honoured the flag). With the flag
+      // the vendor's rejection surfaces as the classified InvalidModelError
+      // after exactly one request.
+      {
+        type ModelBody = ChatRequestBody & { model?: string };
+        const bodies: ModelBody[] = [];
+        setHandler(() => {
+          bodies.push(parseBody(lastRequestBody) as ModelBody);
+          return {
+            status: 400,
+            body: JSON.stringify({ error: { message: "Unknown Model" } }),
+          };
+        });
+        await expectGenerateError({
+          name: "mancer: disableInternalFallback on generate() surfaces the invalid model instead of falling back",
+          run: () =>
+            nl().generate({
+              provider: "mancer",
+              model: "mancer-ghost",
+              input: { text: "Say ready." },
+              disableTools: true,
+              disableInternalFallback: true,
+            } as Parameters<InstanceType<typeof NeuroLink>["generate"]>[0]),
+          expectClass: InvalidModelError,
+          messageIncludes: ["mancer-ghost"],
+        });
+        record(
+          "mancer: disableInternalFallback on generate() sends exactly one request",
+          bodies.length === 1,
+          bodies.length === 1 ? undefined : `saw ${bodies.length} request(s)`,
+        );
+      }
+    }
+  } finally {
+    restoreEnv();
+    await new Promise<void>((resolve) => mockServer.close(() => resolve()));
+    await new Promise<void>((resolve) =>
+      bedrockMockServer.close(() => resolve()),
+    );
+  }
+
+  const failed = results.filter((r) => !r.ok);
+  console.log("\n" + "=".repeat(70));
+  console.log(
+    `Error classification e2e suite: ${results.length - failed.length}/${results.length} passed`,
+  );
+  if (failed.length > 0) {
+    console.log(`\nFailed (${failed.length}):`);
+    for (const f of failed) {
+      console.log(`  ✗ ${f.name}${f.reason ? ` — ${f.reason}` : ""}`);
+    }
+  }
+  console.log("=".repeat(70));
+  process.exit(failed.length > 0 ? 1 : 0);
+}
+
+main().catch((err) => {
+  console.error("Fatal error running error-classification-e2e suite:", err);
+  process.exit(1);
+});

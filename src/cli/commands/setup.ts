@@ -22,31 +22,40 @@ import { handleBedrockSetup } from "./setup-bedrock.js";
 import { handleGCPSetup } from "./setup-gcp.js";
 import { handleHuggingFaceSetup } from "./setup-huggingface.js";
 import { handleMistralSetup } from "./setup-mistral.js";
-
-interface SetupArgs {
-  provider?: string;
-  list?: boolean;
-  status?: boolean;
-  interactive?: boolean;
-  help?: boolean;
-}
-
-interface ProviderInfo {
-  id: string;
-  name: string;
-  emoji: string;
-  description: string;
-  setupTime: string;
-  cost: string;
-  bestFor: string;
-  models: string;
-  strengths: string;
-  pricing: string;
-  setupCommand: string;
-}
+import type {
+  ProviderConfigOptions,
+  SetupArgs,
+  SetupProviderInfo,
+} from "../../lib/types/index.js";
+import {
+  type AIProviderName,
+  OpenRouterModels,
+} from "../../lib/constants/enums.js";
+import { PROVIDER_DESCRIPTORS_BY_NAME } from "../../lib/factories/providerDescriptors.js";
+import {
+  createCohereConfig,
+  createDeepSeekConfig,
+  createIdeogramConfig,
+  createJinaConfig,
+  createNvidiaNimConfig,
+  createOpenAICompatibleConfig,
+  createRecraftConfig,
+  createReplicateConfig,
+  createStabilityConfig,
+  createVoyageConfig,
+  createTypeSafeConfig,
+  createPerplexityDeciderConfig,
+  createCloudflareClefConfig,
+  satisfiesFallbacks,
+} from "../../lib/utils/providerConfig.js";
+import {
+  getCatalogJsonEntries,
+  getDecideCatalogEntries,
+  buildCatalogConfigOptions,
+} from "../../lib/providers/catalog/loader.js";
 
 // Provider information database
-const PROVIDERS: ProviderInfo[] = [
+const PROVIDERS: SetupProviderInfo[] = [
   {
     id: "google-ai",
     name: "Google AI Studio",
@@ -167,21 +176,188 @@ const PROVIDERS: ProviderInfo[] = [
 ];
 
 /**
+ * ProviderConfigOptions for the canonical AIProviderName values the
+ * interactive wizard above doesn't have a bespoke handleXSetup() for. 8 are
+ * the JSON-catalog providers (cerebras, cloudflare, fireworks, groq,
+ * perplexity, sambanova, together-ai, xai — mistral is the 9th catalog
+ * provider but keeps its own handleMistralSetup() flow above, so it's
+ * excluded here), spread directly from the catalog JSON via
+ * buildCatalogConfigOptions(); decide-kind catalog entries (laya, xor, subq, openai-decisions, scaledown) are
+ * spread the same way from getDecideCatalogEntries(). The hand rows listed
+ * first reuse the existing createXConfig() factories in providerConfig.ts; the
+ * remaining 5 (ollama, litellm, sagemaker, lm-studio, llamacpp) don't have a
+ * factory and are defined inline using their real env var names. lm-studio
+ * and llamacpp previously
+ * had createLmStudioConfig()/createLlamaCppConfig() factories, but those
+ * were removed as dead code in a later cleanup — this mirrors that removal
+ * rather than re-adding them.
+ */
+export const EXTRA_PROVIDER_CONFIGS: Record<string, ProviderConfigOptions> = {
+  "openai-compatible": createOpenAICompatibleConfig(),
+  deepseek: createDeepSeekConfig(),
+  "nvidia-nim": createNvidiaNimConfig(),
+  cohere: createCohereConfig(),
+  replicate: createReplicateConfig(),
+  voyage: createVoyageConfig(),
+  jina: createJinaConfig(),
+  stability: createStabilityConfig(),
+  ideogram: createIdeogramConfig(),
+  recraft: createRecraftConfig(),
+  typesafe: createTypeSafeConfig(),
+  "perplexity-decider": createPerplexityDeciderConfig(),
+  "cloudflare-clef": createCloudflareClefConfig(),
+  ...Object.fromEntries(
+    getDecideCatalogEntries().map((e) => [e.id, buildCatalogConfigOptions(e)]),
+  ),
+  ...Object.fromEntries(
+    getCatalogJsonEntries()
+      .filter((e) => e.id !== "mistral")
+      .map((e) => [e.id, buildCatalogConfigOptions(e)]),
+  ),
+  ollama: {
+    providerName: "Ollama",
+    envVarName: "OLLAMA_BASE_URL",
+    setupUrl: "https://ollama.com/download",
+    description:
+      "Run open-source models locally via Ollama's OpenAI-compatible API.",
+    instructions: [
+      "Install Ollama from https://ollama.com/download",
+      "Pull a model: ollama pull llama3.1",
+      "Ollama serves its API at http://localhost:11434 by default — set OLLAMA_BASE_URL only to override.",
+      "Optionally set OLLAMA_MODEL to choose the default model.",
+    ],
+    optional: true,
+  },
+  litellm: {
+    providerName: "LiteLLM",
+    envVarName: "LITELLM_API_KEY",
+    setupUrl: "https://docs.litellm.ai/docs/simple_proxy",
+    description:
+      "Route through a LiteLLM proxy server for unified access to 100+ upstream providers.",
+    instructions: [
+      "Start a LiteLLM proxy server (see https://docs.litellm.ai/docs/simple_proxy).",
+      "Set LITELLM_BASE_URL to the proxy's URL (defaults to http://localhost:4000).",
+      "Set LITELLM_API_KEY to the proxy's virtual key (defaults to a permissive placeholder for local proxies without auth).",
+    ],
+    fallbackEnvVars: ["LITELLM_BASE_URL"],
+    optional: true,
+  },
+  sagemaker: {
+    providerName: "Amazon SageMaker",
+    envVarName: "SAGEMAKER_ENDPOINT_NAME",
+    setupUrl:
+      "https://docs.aws.amazon.com/sagemaker/latest/dg/realtime-endpoints.html",
+    description:
+      "Invoke a self-hosted model on an Amazon SageMaker real-time inference endpoint.",
+    instructions: [
+      "Deploy a model to a SageMaker real-time endpoint (see AWS docs above).",
+      "Set SAGEMAKER_ENDPOINT_NAME to the deployed endpoint's name.",
+      "Set SAGEMAKER_REGION to the AWS region hosting the endpoint.",
+      "Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (or use an AWS credential provider chain) for authentication.",
+    ],
+    fallbackEnvVars: [
+      "SAGEMAKER_REGION",
+      "AWS_ACCESS_KEY_ID",
+      "AWS_SECRET_ACCESS_KEY",
+    ],
+    optional: false,
+  },
+  "lm-studio": {
+    providerName: "LM Studio",
+    envVarName: "LM_STUDIO_BASE_URL",
+    setupUrl: "https://lmstudio.ai/",
+    description:
+      "Run open-source models locally via LM Studio's OpenAI-compatible API.",
+    instructions: [
+      "Install LM Studio from https://lmstudio.ai/",
+      'Load a model in the LM Studio app and click "Start Server".',
+      "LM Studio serves its API at http://localhost:1234/v1 by default — set LM_STUDIO_BASE_URL only to override.",
+      "Optionally set LM_STUDIO_API_KEY if running behind an auth-proxying reverse proxy.",
+      "Optionally set LM_STUDIO_MODEL to choose the default model.",
+    ],
+    fallbackEnvVars: ["LM_STUDIO_API_KEY", "LM_STUDIO_MODEL"],
+    optional: true,
+  },
+  llamacpp: {
+    providerName: "llama.cpp",
+    envVarName: "LLAMACPP_BASE_URL",
+    setupUrl: "https://github.com/ggerganov/llama.cpp",
+    description:
+      "Run a self-hosted GGUF model locally via llama.cpp's OpenAI-compatible llama-server.",
+    instructions: [
+      "Build or install llama.cpp from https://github.com/ggerganov/llama.cpp",
+      "Start the server: ./llama-server -m model.gguf --port 8080",
+      "llama-server serves its API at http://localhost:8080/v1 by default — set LLAMACPP_BASE_URL only to override.",
+      "Optionally set LLAMACPP_API_KEY if running behind an auth-proxying reverse proxy.",
+      "Optionally set LLAMACPP_MODEL to choose the default model.",
+    ],
+    fallbackEnvVars: ["LLAMACPP_API_KEY", "LLAMACPP_MODEL"],
+    optional: true,
+  },
+};
+
+/**
+ * Generic, data-driven setup printout for providers without a bespoke
+ * interactive handler — reads directly from a ProviderConfigOptions entry.
+ */
+function printGenericProviderSetup(
+  providerId: string,
+  config: ProviderConfigOptions,
+): void {
+  logger.always("");
+  logger.always(chalk.blue(`🔧 ${config.providerName} Setup`));
+  logger.always("");
+  logger.always(config.description);
+  logger.always("");
+  logger.always(chalk.yellow("Setup steps:"));
+  config.instructions.forEach((step, index) => {
+    logger.always(`  ${index + 1}. ${step}`);
+  });
+  logger.always("");
+  logger.always(chalk.yellow("Environment variable:"));
+  const optionalNote = config.optional
+    ? " (optional — has a working local default)"
+    : "";
+  logger.always(
+    chalk.cyan(`  export ${config.envVarName}=your_value_here${optionalNote}`),
+  );
+  if (config.fallbackEnvVars?.length) {
+    logger.always(
+      chalk.cyan(`  Also relevant: ${config.fallbackEnvVars.join(", ")}`),
+    );
+  }
+  logger.always("");
+  logger.always(chalk.yellow("Test the configuration:"));
+  logger.always(
+    chalk.cyan(`  neurolink generate "Hello!" --provider ${providerId}`),
+  );
+  logger.always("");
+  logger.always(chalk.gray(`Docs: ${config.setupUrl}`));
+}
+
+/**
  * Main setup command handler
  */
 export async function handleSetup(argv: SetupArgs): Promise<void> {
   try {
-    // Handle specific flags
+    // Handle specific flags. `--list`/`--status` are documented as one-shot,
+    // non-interactive informational commands (see the `setup --list` /
+    // `setup --status` examples in setupCommandFactory.ts) — pass
+    // interactive: false so they print and return instead of chaining into
+    // the wizard's follow-up inquirer prompt below.
     if (argv.list) {
-      return await showProviderList();
+      return await showProviderList(false);
     }
 
     if (argv.status) {
-      return await showProviderStatus();
+      return await showProviderStatus(false);
     }
 
     if (argv.provider && argv.provider !== "auto") {
-      return await delegateToProviderSetup(argv.provider);
+      return await delegateToProviderSetup(argv.provider, {
+        check: argv.check,
+        nonInteractive: argv.nonInteractive,
+      });
     }
 
     // Main setup wizard
@@ -225,7 +401,7 @@ async function showWelcomeScreen(): Promise<void> {
   );
   logger.always(
     chalk.blue("│  ") +
-      chalk.gray("Universal interface for 8+ AI providers") +
+      chalk.gray("Unified interface for many AI providers") +
       chalk.blue("                   │"),
   );
   logger.always(
@@ -281,7 +457,7 @@ async function runSetupWizard(): Promise<void> {
   // Main menu
   const { action } = await inquirer.prompt([
     {
-      type: "list",
+      type: "select",
       name: "action",
       message: "What would you like to do?",
       choices: [
@@ -324,49 +500,29 @@ async function runSetupWizard(): Promise<void> {
 /**
  * Check which providers are already configured
  */
-async function checkExistingConfigurations(): Promise<string[]> {
+export async function checkExistingConfigurations(): Promise<string[]> {
   const configured: string[] = [];
-
-  // Check for environment variables that indicate configured providers
-  if (
-    process.env.GOOGLE_AI_API_KEY ||
-    process.env.GOOGLE_GENERATIVE_AI_API_KEY
-  ) {
-    configured.push("google-ai");
+  for (const p of PROVIDERS) {
+    const descriptor = PROVIDER_DESCRIPTORS_BY_NAME.get(p.id as AIProviderName);
+    if (!descriptor) {
+      continue;
+    }
+    const { apiKey, fallbacks, extraRequired, extraRequiredFallbacks } =
+      descriptor.envVars;
+    const hasPrimary =
+      !!apiKey &&
+      (!!process.env[apiKey] ||
+        (fallbacks ?? []).some((v) => !!process.env[v]));
+    if (!hasPrimary) {
+      continue;
+    }
+    const requiredOk =
+      (extraRequired ?? []).every((v) => !!process.env[v]) ||
+      satisfiesFallbacks(extraRequiredFallbacks, process.env);
+    if (requiredOk) {
+      configured.push(p.id);
+    }
   }
-  if (process.env.OPENAI_API_KEY) {
-    configured.push("openai");
-  }
-  if (process.env.ANTHROPIC_API_KEY) {
-    configured.push("anthropic");
-  }
-  if (process.env.AZURE_OPENAI_API_KEY && process.env.AZURE_OPENAI_ENDPOINT) {
-    configured.push("azure");
-  }
-  if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
-    configured.push("bedrock");
-  }
-  if (
-    process.env.GOOGLE_APPLICATION_CREDENTIALS ||
-    process.env.GOOGLE_SERVICE_ACCOUNT_KEY
-  ) {
-    configured.push("vertex");
-  }
-  if (
-    process.env.HUGGINGFACE_API_KEY ||
-    process.env.HUGGINGFACE_API_TOKEN ||
-    process.env.HF_TOKEN ||
-    process.env.HF_API_TOKEN
-  ) {
-    configured.push("huggingface");
-  }
-  if (process.env.MISTRAL_API_KEY) {
-    configured.push("mistral");
-  }
-  if (process.env.OPENROUTER_API_KEY) {
-    configured.push("openrouter");
-  }
-
   return configured;
 }
 
@@ -441,11 +597,12 @@ async function runProviderSelection(): Promise<void> {
   logger.always(chalk.blue("🎯 Perfect! Let's get you connected."));
   logger.always("");
 
-  const choices: Array<{ name: string; value: string } | inquirer.Separator> =
-    PROVIDERS.map((provider) => ({
-      name: `${provider.emoji} ${provider.name.padEnd(18)} - ${provider.description}`,
-      value: provider.id,
-    }));
+  const choices: Array<
+    { name: string; value: string } | InstanceType<typeof inquirer.Separator>
+  > = PROVIDERS.map((provider) => ({
+    name: `${provider.emoji} ${provider.name.padEnd(18)} - ${provider.description}`,
+    value: provider.id,
+  }));
 
   // Add a non-selectable separator row
   choices.push(new inquirer.Separator("─".repeat(60)));
@@ -458,7 +615,7 @@ async function runProviderSelection(): Promise<void> {
 
   const { selectedProvider } = await inquirer.prompt([
     {
-      type: "list",
+      type: "select",
       name: "selectedProvider",
       message: "Which AI provider would you like to configure?",
       choices,
@@ -477,11 +634,19 @@ async function runProviderSelection(): Promise<void> {
 /**
  * Delegate to existing provider setup commands
  */
-async function delegateToProviderSetup(providerId: string): Promise<void> {
-  const setupArgs = {
-    nonInteractive: false,
-    "non-interactive": false,
+export async function delegateToProviderSetup(
+  providerId: string,
+  flags: { check?: boolean; nonInteractive?: boolean } = {
     check: false,
+    nonInteractive: false,
+  },
+): Promise<void> {
+  const nonInteractive = flags.nonInteractive ?? false;
+  const check = flags.check ?? false;
+  const setupArgs = {
+    nonInteractive,
+    "non-interactive": nonInteractive,
+    check,
     _: [] as (string | number)[],
     $0: "neurolink",
   };
@@ -514,8 +679,14 @@ async function delegateToProviderSetup(providerId: string): Promise<void> {
     case "openrouter":
       await handleOpenRouterSetup();
       break;
-    default:
-      throw new Error(`Unknown provider: ${providerId}`);
+    default: {
+      const genericConfig = EXTRA_PROVIDER_CONFIGS[providerId];
+      if (!genericConfig) {
+        throw new Error(`Unknown provider: ${providerId}`);
+      }
+      printGenericProviderSetup(providerId, genericConfig);
+      break;
+    }
   }
 
   // After successful setup, show completion message
@@ -549,15 +720,19 @@ async function handleOpenRouterSetup(): Promise<void> {
   logger.always(chalk.yellow("Step 3: Test the configuration"));
   logger.always(
     chalk.cyan(
-      '  neurolink generate "Hello!" --provider openrouter --model google/gemini-2.0-flash-exp:free',
+      `  neurolink generate "Hello!" --provider openrouter --model ${OpenRouterModels.GEMINI_2_5_FLASH}`,
     ),
   );
   logger.always("");
   logger.always(chalk.green("Available models include:"));
-  logger.always("  • anthropic/claude-3.5-sonnet - Best for analysis");
-  logger.always("  • openai/gpt-4o - Industry standard");
-  logger.always("  • google/gemini-2.0-flash-exp:free - Free tier");
-  logger.always("  • meta-llama/llama-3.1-70b-instruct - Open source");
+  logger.always(
+    `  • ${OpenRouterModels.CLAUDE_SONNET_4_6} - Best for analysis`,
+  );
+  logger.always(`  • ${OpenRouterModels.GPT_4O} - Industry standard`);
+  logger.always(
+    `  • ${OpenRouterModels.GEMINI_2_5_FLASH} - Fast and efficient`,
+  );
+  logger.always(`  • ${OpenRouterModels.LLAMA_3_1_70B} - Open source`);
   logger.always("");
   logger.always(chalk.gray("See all models at: https://openrouter.ai/models"));
 }
@@ -589,9 +764,15 @@ async function showSetupCompletion(providerId: string): Promise<void> {
 }
 
 /**
- * Show detailed provider information
+ * Show detailed provider information.
+ *
+ * @param interactive - When true (the default, used by the interactive
+ * wizard's "learn more" menu choice), follows up with a prompt offering to
+ * launch the setup wizard. When false (used by the direct `setup --list`
+ * flag), returns immediately after printing so the command exits cleanly
+ * without waiting on stdin.
  */
-async function showProviderList(): Promise<void> {
+async function showProviderList(interactive = true): Promise<void> {
   logger.always(chalk.blue("📚 NeuroLink Supported AI Providers"));
   logger.always("");
 
@@ -632,9 +813,13 @@ async function showProviderList(): Promise<void> {
   logger.always("• neurolink setup --provider bedrock");
   logger.always("");
 
+  if (!interactive) {
+    return;
+  }
+
   const { action } = await inquirer.prompt([
     {
-      type: "list",
+      type: "select",
       name: "action",
       message: "Ready to set up a provider?",
       choices: [
@@ -650,9 +835,15 @@ async function showProviderList(): Promise<void> {
 }
 
 /**
- * Show provider status with detailed information
+ * Show provider status with detailed information.
+ *
+ * @param interactive - When true (the default, used by the interactive
+ * wizard's "check status" menu choice), follows up with a prompt offering to
+ * set up another provider. When false (used by the direct `setup --status`
+ * flag), returns immediately after printing so the command exits cleanly
+ * without waiting on stdin.
  */
-async function showProviderStatus(): Promise<void> {
+async function showProviderStatus(interactive = true): Promise<void> {
   const spinner = ora("🔍 Checking all AI provider configurations...").start();
 
   try {
@@ -758,6 +949,10 @@ async function showProviderStatus(): Promise<void> {
       }
       logger.always("• Check performance: neurolink provider status");
       logger.always("");
+    }
+
+    if (!interactive) {
+      return;
     }
 
     const { setupAnother } = await inquirer.prompt([

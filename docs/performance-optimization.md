@@ -754,13 +754,13 @@ async function robustVideoGeneration(prompt: string, image: Buffer) {
 ### Monitoring Video Generation Performance
 
 ```typescript
-interface VideoMetrics {
+type VideoMetrics = {
   totalGenerated: number;
   avgGenerationTime: number;
   cacheHitRate: number;
   failureRate: number;
   costEstimate: number;
-}
+};
 
 class VideoPerformanceMonitor {
   private metrics: VideoMetrics = {
@@ -810,3 +810,4 @@ This comprehensive performance optimization guide provides the tools and strateg
 - [Troubleshooting](reference/troubleshooting.md) - Common performance issues
 - [Enterprise Setup](getting-started/provider-setup.md) - Production configuration
 - [Video Generation Guide](features/video-generation.md) - Complete video generation documentation
+- [PPT Generation Guide](features/ppt-generation.md) - PowerPoint presentation generation

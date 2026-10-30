@@ -1,0 +1,400 @@
+import { AIProviderName, NvidiaNimModels } from "../../constants/enums.js";
+import type {
+  NeurolinkCredentials,
+  NvidiaNimExtraBody,
+  OpenAICompatBuildBodyArgs,
+  OpenAICompatChatRequest,
+  ProviderErrorRule,
+} from "../../types/index.js";
+import {
+  AuthenticationError,
+  InvalidModelError,
+  ProviderError,
+  RateLimitError,
+} from "../../types/index.js";
+import {
+  classifyProviderError,
+  DEFAULT_ERROR_RULES,
+  messageNamesStatus,
+} from "../../utils/errorClassifier.js";
+import { logger } from "../../utils/logger.js";
+import { redactUrlCredentials } from "../../utils/logSanitize.js";
+import {
+  createNvidiaNimConfig,
+  getProviderModel,
+  validateApiKey,
+} from "../../utils/providerConfig.js";
+import { OpenAIChatCompletionsProvider } from "../openaiChatCompletionsBase.js";
+import { PROVIDER_DESCRIPTORS_BY_NAME } from "../../factories/providerDescriptors.js";
+
+/**
+ * Decide whether a NIM 400 response body is a rejection of the named
+ * field (as opposed to an unrelated 400 that happens to mention the
+ * field name — e.g. when the user's prompt is echoed back inside the
+ * error envelope).
+ *
+ * A rejection requires both:
+ *   - the field name appears in the body, and
+ *   - a rejection keyword (`unsupported`, `not supported`, `unknown`,
+ *     `invalid`, `unrecognized`, `does not support`) appears within
+ *     80 characters of any occurrence.
+ *
+ * The 80-character window is loose enough to absorb NIM's "Unsupported
+ * argument: `chat_template`" framing and tight enough that a 1KB error
+ * body mentioning the field once in a code sample plus an unrelated
+ * "invalid" elsewhere won't trigger a strip.
+ */
+const NIM_REJECTION_KEYWORDS = [
+  "unsupported",
+  "not supported",
+  "does not support",
+  "unrecognized",
+  "unknown field",
+  "unknown parameter",
+  "unknown argument",
+  "invalid field",
+  "invalid parameter",
+  "invalid argument",
+];
+
+const isNimFieldRejection = (body: string, field: string): boolean => {
+  if (!body) {
+    return false;
+  }
+  const lower = body.toLowerCase();
+  const fieldLower = field.toLowerCase();
+  let idx = lower.indexOf(fieldLower);
+  while (idx !== -1) {
+    const windowStart = Math.max(0, idx - 80);
+    const windowEnd = Math.min(lower.length, idx + fieldLower.length + 80);
+    const slice = lower.slice(windowStart, windowEnd);
+    if (NIM_REJECTION_KEYWORDS.some((kw) => slice.includes(kw))) {
+      return true;
+    }
+    idx = lower.indexOf(fieldLower, idx + fieldLower.length);
+  }
+  return false;
+};
+
+/**
+ * Strip an offending field from a JSON request body and return the rebuilt
+ * stringified body. Returns `null` if the body isn't JSON-parseable or the
+ * field isn't present (signal: nothing to retry).
+ */
+const stripFieldFromJsonBody = (
+  body: string,
+  field: "reasoning_budget" | "chat_template",
+): string | null => {
+  try {
+    const parsed = JSON.parse(body) as Record<string, unknown>;
+    let mutated = false;
+    if (field === "chat_template" && "chat_template" in parsed) {
+      delete parsed.chat_template;
+      mutated = true;
+    }
+    if (field === "reasoning_budget") {
+      const kw = parsed.chat_template_kwargs as
+        | Record<string, unknown>
+        | undefined;
+      if (kw && "reasoning_budget" in kw) {
+        delete kw.reasoning_budget;
+        mutated = true;
+        if (Object.keys(kw).length === 0) {
+          delete parsed.chat_template_kwargs;
+        }
+      }
+    }
+    if (!mutated) {
+      return null;
+    }
+    return JSON.stringify(parsed);
+  } catch {
+    return null;
+  }
+};
+
+const NVIDIA_NIM_DEFAULT_BASE_URL = "https://integrate.api.nvidia.com/v1";
+
+const envInt = (k: string): number | undefined => {
+  const v = process.env[k];
+  if (!v) {
+    return undefined;
+  }
+  const parsed = Number.parseInt(v, 10);
+  return Number.isFinite(parsed) ? parsed : undefined;
+};
+const envFloat = (k: string): number | undefined => {
+  const v = process.env[k];
+  if (!v) {
+    return undefined;
+  }
+  const parsed = Number.parseFloat(v);
+  return Number.isFinite(parsed) ? parsed : undefined;
+};
+
+const buildNvidiaNimExtraBody = (
+  thinkingEnabled: boolean,
+  maxTokens: number | undefined,
+): NvidiaNimExtraBody => {
+  const extra: NvidiaNimExtraBody = {};
+
+  const topK = envInt("NVIDIA_NIM_TOP_K");
+  if (topK !== undefined && topK !== -1) {
+    extra.top_k = topK;
+  }
+
+  const minP = envFloat("NVIDIA_NIM_MIN_P");
+  if (minP !== undefined && minP !== 0) {
+    extra.min_p = minP;
+  }
+
+  const repPenalty = envFloat("NVIDIA_NIM_REPETITION_PENALTY");
+  if (repPenalty !== undefined && repPenalty !== 1) {
+    extra.repetition_penalty = repPenalty;
+  }
+
+  const minTokens = envInt("NVIDIA_NIM_MIN_TOKENS");
+  if (minTokens !== undefined && minTokens !== 0) {
+    extra.min_tokens = minTokens;
+  }
+
+  const chatTemplate = process.env.NVIDIA_NIM_CHAT_TEMPLATE;
+  if (chatTemplate) {
+    extra.chat_template = chatTemplate;
+  }
+
+  if (thinkingEnabled) {
+    extra.chat_template_kwargs = {
+      thinking: true,
+      enable_thinking: true,
+      ...(maxTokens ? { reasoning_budget: maxTokens } : {}),
+    };
+  }
+
+  return extra;
+};
+
+const getNimApiKey = (): string => {
+  return validateApiKey(createNvidiaNimConfig());
+};
+
+const getDefaultNimModel = (): string => {
+  // NVIDIA retired meta/llama-3.3-70b-instruct upstream on 2026-08-26, so this
+  // fallback answered "no longer available" for anyone who selected nvidia-nim
+  // without naming a model. gpt-oss-20b is on the current roster and was
+  // probed for text, streaming, tool calling and structured output.
+  // Read the descriptor rather than repeating the literal. Review on this PR
+  // pointed out the default lived in four places and that changing only some
+  // of them is a no-op — which happened twice while tracking this down. The
+  // descriptor is the Factory+Registry convention's source of truth.
+  return getProviderModel(
+    "NVIDIA_NIM_MODEL",
+    PROVIDER_DESCRIPTORS_BY_NAME.get(AIProviderName.NVIDIA_NIM)?.defaultModel ??
+      NvidiaNimModels.GPT_OSS_20B,
+  );
+};
+
+/**
+ * NVIDIA NIM Provider — native HTTP+SSE, no AI SDK.
+ *
+ * Wraps NVIDIA's hosted (or self-hosted) inference endpoints.
+ * Passes NIM-specific extras (top_k, min_p, repetition_penalty, min_tokens,
+ * chat_template, chat_template_kwargs.reasoning_budget) to the wire via the
+ * `extraBody` channel of adjustBuildBodyOptions, and retries once without
+ * `chat_template`/`reasoning_budget` when a model server rejects them with a
+ * 400 (adjustBodyAfter400 — applies on both generate and stream paths).
+ * reasoning_content is surfaced automatically by the native base client
+ * (streamed as `{ content: "", reasoning }` chunks; `result.reasoning` on
+ * the non-streaming path); all other behavior is preserved.
+ *
+ * @see https://docs.api.nvidia.com/nim/reference/
+ */
+export class NvidiaNimProvider extends OpenAIChatCompletionsProvider {
+  constructor(
+    modelName?: string,
+    sdk?: unknown,
+    _region?: string,
+    credentials?: NeurolinkCredentials["nvidiaNim"],
+  ) {
+    // Trim the override before applying precedence. A blank/whitespace
+    // `credentials.apiKey` should NOT bypass `getNimApiKey()` — that would
+    // build a client with an unusable bearer token and fail at request time
+    // with a confusing 401 instead of at construction time.
+    const overrideApiKey = credentials?.apiKey?.trim();
+    const apiKey =
+      overrideApiKey && overrideApiKey.length > 0
+        ? overrideApiKey
+        : getNimApiKey();
+    const baseURL =
+      credentials?.baseURL ??
+      process.env.NVIDIA_NIM_BASE_URL ??
+      NVIDIA_NIM_DEFAULT_BASE_URL;
+
+    super(AIProviderName.NVIDIA_NIM, modelName, sdk, { baseURL, apiKey });
+
+    logger.debug("NVIDIA NIM Provider initialized", {
+      modelName: this.modelName,
+      providerName: this.providerName,
+      baseURL: redactUrlCredentials(this.config.baseURL),
+    });
+  }
+
+  protected getProviderName(): AIProviderName {
+    return AIProviderName.NVIDIA_NIM;
+  }
+
+  protected getDefaultModel(): string {
+    return getDefaultNimModel();
+  }
+
+  /**
+   * Inject NIM-specific body fields (top_k, min_p, repetition_penalty,
+   * min_tokens, chat_template, chat_template_kwargs) into the wire body.
+   *
+   * The base passes the full StreamOptions as `opts` at runtime (typed
+   * narrowly as OpenAICompatBuildBodyArgs["options"] for standard fields).
+   * We access thinkingLevel via an indexed-access cast since the runtime
+   * value is the full StreamOptions object.
+   */
+  protected adjustBuildBodyOptions(
+    _modelId: string,
+    opts: OpenAICompatBuildBodyArgs["options"],
+  ): OpenAICompatBuildBodyArgs["options"] & Record<string, unknown> {
+    // The runtime value of opts is the full StreamOptions; TypeScript types
+    // it narrowly so we cast to access NIM-specific thinking fields.
+    const fullOpts = opts as OpenAICompatBuildBodyArgs["options"] &
+      Record<string, unknown>;
+    const thinkingConfigRaw = fullOpts.thinkingConfig as
+      | { thinkingLevel?: string }
+      | undefined;
+    const tl =
+      (fullOpts.thinkingLevel as string | undefined) ??
+      thinkingConfigRaw?.thinkingLevel;
+    const thinkingEnabled = tl !== undefined && tl !== "minimal";
+    const maxTokens =
+      typeof fullOpts.maxTokens === "number" ? fullOpts.maxTokens : undefined;
+
+    const extra = buildNvidiaNimExtraBody(thinkingEnabled, maxTokens);
+
+    // Attach via the explicit extraBody channel — buildBody spreads it onto
+    // the wire body. (Loose unknown keys on the returned options object are
+    // dropped by buildBody, which is why the extras previously never reached
+    // the wire.)
+    return Object.keys(extra).length > 0
+      ? { ...opts, extraBody: extra as Record<string, unknown> }
+      : opts;
+  }
+
+  /**
+   * One-shot 400 retry (base hook): some NIM model servers reject
+   * `chat_template` or `chat_template_kwargs.reasoning_budget` with a 400
+   * naming the field. Strip the rejected field(s) and let the base retry
+   * once, restoring the pre-migration fetch-level behavior. Returns
+   * undefined for unrelated 400s so they propagate unchanged.
+   */
+  protected adjustBodyAfter400(
+    body: OpenAICompatChatRequest,
+    error: Error & { statusCode?: number; responseBody?: string },
+  ): OpenAICompatChatRequest | undefined {
+    const responseBody = error.responseBody ?? "";
+    let serialized = JSON.stringify(body);
+    const strippedFields: string[] = [];
+
+    for (const field of ["chat_template", "reasoning_budget"] as const) {
+      if (isNimFieldRejection(responseBody, field)) {
+        const next = stripFieldFromJsonBody(serialized, field);
+        if (next !== null) {
+          serialized = next;
+          strippedFields.push(field);
+        }
+      }
+    }
+
+    if (strippedFields.length === 0) {
+      return undefined;
+    }
+    logger.debug(
+      "NVIDIA NIM: 400 rejected request field(s) — retrying once without them",
+      {
+        strippedFields,
+        model: body.model,
+        rejection: responseBody.slice(0, 200),
+      },
+    );
+    return JSON.parse(serialized) as OpenAICompatChatRequest;
+  }
+
+  protected formatProviderError(error: unknown): Error {
+    const rules: ProviderErrorRule[] = [
+      // NIM canonically returns HTTP 401/Unauthorized for invalid API keys,
+      // but its OpenAI-compatible gateway sometimes surfaces a bare 400 +
+      // "Bad Request" with no body details for both malformed-credentials
+      // and bad-parameter cases. Because the two are indistinguishable from
+      // the message alone, bare 400/"Bad Request" is deliberately NOT
+      // promoted to "invalid key" here — that would mis-classify legitimate
+      // parameter errors (e.g. unsupported `reasoning_budget`, unsupported
+      // `chat_template`) as auth failures. Tests that probe the auth path
+      // (K1) detect "bad request" / "400" themselves; tests that probe
+      // parameter retry (K5) need the original "Bad Request" message to
+      // surface.
+      {
+        match: (ctx) =>
+          /Invalid API key|Unauthorized/.test(ctx.message) ||
+          messageNamesStatus(ctx.message, 401),
+        errorClass: AuthenticationError,
+        message:
+          "Invalid NVIDIA NIM API key. Get one at https://build.nvidia.com/settings/api-keys",
+      },
+      {
+        match: (ctx) =>
+          /rate limit/.test(ctx.message) ||
+          messageNamesStatus(ctx.message, 429),
+        errorClass: RateLimitError,
+        message: "NVIDIA NIM rate limit exceeded",
+      },
+      {
+        // NIM answers most of its roster with a 404 whose text ("Function …
+        // not found for account …") names no model, so the status decides.
+        match: (ctx) =>
+          ctx.statusCode === 404 ||
+          /model_not_found/.test(ctx.message) ||
+          messageNamesStatus(ctx.message, 404),
+        errorClass: InvalidModelError,
+        message: () =>
+          `NVIDIA NIM model '${this.modelName}' not available. Browse the catalog at https://build.nvidia.com/models`,
+      },
+      {
+        match: (ctx) =>
+          /quota/.test(ctx.message) || messageNamesStatus(ctx.message, 403),
+        errorClass: ProviderError,
+        message: "NVIDIA NIM quota exceeded for your account",
+      },
+      ...DEFAULT_ERROR_RULES,
+    ];
+    return classifyProviderError(
+      error,
+      rules,
+      this.providerName,
+      this.modelName,
+    );
+  }
+
+  async validateConfiguration(): Promise<boolean> {
+    return (
+      typeof this.config.apiKey === "string" &&
+      this.config.apiKey.trim().length > 0
+    );
+  }
+
+  getConfiguration() {
+    return {
+      provider: this.providerName,
+      model: this.modelName,
+      defaultModel: getDefaultNimModel(),
+      baseURL: this.config.baseURL,
+    };
+  }
+}
+
+// Exported for test suites that probe NIM's 400-retry behaviour directly.
+export { isNimFieldRejection, stripFieldFromJsonBody };

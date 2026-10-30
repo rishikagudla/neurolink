@@ -1,0 +1,672 @@
+import { createStreamChannel } from "./streamChannel.js";
+import { observeGeneration } from "../telemetry/observation.js";
+import { StepSpans, withGeneration } from "../telemetry/withSpan.js";
+import type {
+  AgenticLoopAdapter,
+  AgenticLoopChunk,
+  AgenticLoopOptions,
+  AgenticLoopResult,
+  AgenticLoopStepRequest,
+  AgenticLoopStepResult,
+  AgenticLoopToolCall,
+  AgenticLoopToolCallResult,
+  AgenticLoopUsage,
+} from "../types/index.js";
+import { logger } from "../utils/logger.js";
+import { withProviderRetry } from "../utils/providerRetry.js";
+import { resolveToolTimeoutMs } from "./constants.js";
+
+/**
+ * Marks a step error that occurred AFTER at least one chunk had already
+ * been streamed to the consumer for this step. Retrying at that point
+ * would duplicate or interleave already-emitted output, so this wrapper
+ * deliberately carries none of the original error's status/retry
+ * metadata (`.statusCode`/`.status`, no APICallError/NeuroLinkError
+ * branding) — that makes `withProviderRetry`'s internal
+ * `isRetryableProviderError()` check return false via its duck-typed
+ * fallback, which ends the retry loop on the very next classification
+ * instead of sleeping and re-invoking `adapter.executeStep`. The engine
+ * unwraps back to the original `cause` before it ever reaches the
+ * caller — see the try/catch around the `withProviderRetry` call below.
+ */
+class PostEmissionStepError extends Error {
+  constructor(public readonly cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause));
+  }
+}
+
+function sumUsage(a: AgenticLoopUsage, b: AgenticLoopUsage): AgenticLoopUsage {
+  return {
+    inputTokens: a.inputTokens + b.inputTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    cacheReadTokens:
+      (a.cacheReadTokens ?? 0) + (b.cacheReadTokens ?? 0) || undefined,
+    cacheWriteTokens:
+      (a.cacheWriteTokens ?? 0) + (b.cacheWriteTokens ?? 0) || undefined,
+    reasoningTokens:
+      (a.reasoningTokens ?? 0) + (b.reasoningTokens ?? 0) || undefined,
+    cacheWrite5mTokens:
+      (a.cacheWrite5mTokens ?? 0) + (b.cacheWrite5mTokens ?? 0) || undefined,
+    cacheWrite1hTokens:
+      (a.cacheWrite1hTokens ?? 0) + (b.cacheWrite1hTokens ?? 0) || undefined,
+  };
+}
+
+/**
+ * Run one tool call under its deadline, cancelling it rather than abandoning it.
+ *
+ * The signal handed to `execute` is a controller owned by THIS call, not the
+ * turn's — the deadline aborts it. A tool that honours its signal is therefore
+ * told to stop when its time is up, instead of being left running while the
+ * loop records that it failed: a terminal outcome reported for something that
+ * has not terminated, still holding its resources and, for a side-effecting
+ * tool, still applying its effect after the model was told it did not. A retry
+ * would then start a second copy alongside the first.
+ *
+ * What this cannot do is stop a tool that ignores its signal. Nothing in this
+ * process can; the loop stops waiting and the call runs on. That limit is
+ * stated in `toolTimeoutMs`'s own documentation rather than left implied.
+ *
+ * The turn's abort is forwarded into the same controller, so cancelling a turn
+ * reaches an in-flight tool exactly as it did before. Only the deadline is
+ * raced — a turn-level abort still lets the call settle on its own terms.
+ *
+ * `null` means the caller opted out of the bound: the call is awaited
+ * unguarded, with the turn's own signal, which is what the loops that never
+ * had a per-tool timer did.
+ */
+async function executeToolCall(params: {
+  name: string;
+  execute: (
+    args: Record<string, unknown>,
+    opts: unknown,
+  ) => Promise<unknown> | unknown;
+  args: Record<string, unknown>;
+  toolCallId: string;
+  turnSignal: AbortSignal;
+  toolTimeoutMs: number | null;
+}): Promise<unknown> {
+  const { name, execute, args, toolCallId, turnSignal, toolTimeoutMs } = params;
+
+  if (toolTimeoutMs === null) {
+    return execute(args, { toolCallId, abortSignal: turnSignal });
+  }
+
+  const toolAbort = new AbortController();
+  const onTurnAbort = () => toolAbort.abort(turnSignal.reason);
+  if (turnSignal.aborted) {
+    toolAbort.abort(turnSignal.reason);
+  } else {
+    turnSignal.addEventListener("abort", onTurnAbort, { once: true });
+  }
+
+  // One timer does both jobs — abort the tool, then stop waiting for it — so
+  // the two can never drift apart. That is why this is not `withTimeout`,
+  // which would need a second timer to reach the controller. It is
+  // deliberately NOT unref'd: while a tool is in flight this timer is the only
+  // thing that will ever end a wedged one, so it must be able to hold the
+  // event loop open long enough to fire. `finally` clears it the instant the
+  // call settles, so it never outlives its tool.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error(
+        `Tool "${name}" execution timed out after ${toolTimeoutMs}ms`,
+      );
+      toolAbort.abort(error);
+      reject(error);
+    }, toolTimeoutMs);
+  });
+
+  try {
+    // `Promise.race` subscribes to both, so a tool that eventually rejects
+    // after its deadline has already been reported cannot resurface as an
+    // unhandled rejection and kill the consumer's process.
+    return await Promise.race([
+      Promise.resolve(
+        execute(args, { toolCallId, abortSignal: toolAbort.signal }),
+      ),
+      deadline,
+    ]);
+  } finally {
+    clearTimeout(timer);
+    turnSignal.removeEventListener("abort", onTurnAbort);
+  }
+}
+
+/**
+ * Dispatch one step's tool calls.
+ *
+ * Split out of `runAgenticLoop` because it is the one part of the turn with
+ * its own decision tree — breaker, hydration, execution, failure
+ * classification — and reading the loop should not mean reading all of it.
+ * It owns no state: everything it needs arrives as arguments, and it reports
+ * what happened by returning it, so the turn's accumulators stay in one place.
+ */
+async function dispatchStepTools(params: {
+  calls: AgenticLoopToolCall[];
+  adapter: Pick<
+    AgenticLoopAdapter<unknown>,
+    "toolFailureBreaker" | "resolveToolOnMiss"
+  >;
+  tools: AgenticLoopOptions["tools"];
+  failedTools: Map<string, { count: number; lastError: string }>;
+  abortSignal: AbortSignal;
+  /**
+   * Resolved per-tool deadline (ms), or `null` for no bound. Never `undefined`
+   * by the time it lands here — the default is applied by the caller.
+   */
+  toolTimeoutMs: number | null;
+}): Promise<{
+  toolResults: AgenticLoopToolCallResult[];
+  executions: AgenticLoopResult<unknown>["toolExecutions"];
+  dispatched: AgenticLoopToolCall[];
+  /** True when an abort cut the batch short, so the caller must NOT append a
+   *  partial tool-result turn. */
+  abortedMidBatch: boolean;
+}> {
+  const { calls, adapter, tools, failedTools, abortSignal, toolTimeoutMs } =
+    params;
+  const toolResults: AgenticLoopToolCallResult[] = [];
+  const executions: AgenticLoopResult<unknown>["toolExecutions"] = [];
+  const dispatched: AgenticLoopToolCall[] = [];
+  let abortedMidBatch = false;
+  for (const call of calls) {
+    // Honour an abort BETWEEN tool executions. A step can carry several calls,
+    // and each one costs up to a full tool timeout, so without this a wide
+    // batch keeps running long past the moment the turn was cancelled — the
+    // step-top check only fires once the whole batch has drained. Passing the
+    // signal into execute() is not enough on its own: a tool that ignores it
+    // runs to completion, and every remaining call still gets STARTED.
+    if (abortSignal.aborted) {
+      abortedMidBatch = true;
+      break;
+    }
+    dispatched.push(call);
+    const breaker = adapter.toolFailureBreaker;
+    const failInfo = breaker ? failedTools.get(call.name) : undefined;
+    if (breaker && failInfo && failInfo.count >= breaker.maxRetries) {
+      const output = {
+        error: `TOOL_PERMANENTLY_FAILED: "${call.name}" has failed ${failInfo.count} times. Last error: ${failInfo.lastError}.`,
+        status: "permanently_failed",
+        do_not_retry: true,
+      };
+      toolResults.push({
+        ...call,
+        output,
+        error: output.error,
+        permanentlyFailed: true,
+      });
+      executions.push({
+        id: call.id,
+        name: call.name,
+        input: call.args,
+        output,
+        error: output.error,
+      });
+      continue;
+    }
+    // Second lookup path for adapters that discover tools mid-turn.
+    // The miss is defined as "nothing executable under this name"
+    // rather than "no key under this name", because the guard directly
+    // below already treats a present-but-unexecutable entry as absent —
+    // a deferred-catalog placeholder is exactly that shape, and it is
+    // precisely what hydration exists to resolve.
+    const declaredTool = tools?.[call.name];
+    let tool = declaredTool;
+    if (!declaredTool?.execute) {
+      const hydrated = adapter.resolveToolOnMiss?.(call.name);
+      if (hydrated) {
+        tool = hydrated;
+        // It resolves NOW, so any strikes standing against this name were
+        // recorded while it genuinely did not resolve — snapshot artifacts of
+        // a deferred catalog, not failures of a tool that exists. Leaving them
+        // in place would disable the tool at the exact moment it became
+        // usable.
+        failedTools.delete(call.name);
+      }
+    }
+    if (!tool?.execute) {
+      const output = breaker
+        ? {
+            error: `TOOL_NOT_FOUND: "${call.name}" does not exist.`,
+            status: "permanently_failed",
+            do_not_retry: true,
+          }
+        : { error: `Tool not found: ${call.name}` };
+      toolResults.push({
+        ...call,
+        output,
+        error: output.error,
+        permanentlyFailed: !!breaker,
+      });
+      executions.push({
+        id: call.id,
+        name: call.name,
+        input: call.args,
+        output,
+        error: output.error,
+      });
+      continue;
+    }
+    try {
+      // Bounded unless the caller opted out. `abortSignal` alone only ends a
+      // tool that honours it, and between two steps there is no other timer
+      // running: the step's request deadline was disposed when the step
+      // settled and the next one is not armed yet. A tool that neither returns
+      // nor watches its signal would otherwise hang the whole turn with
+      // nothing to end it — the case a turn that removed its lifetime ceiling
+      // has no defence against.
+      //
+      // A breach lands in the catch below and is recorded as an ordinary tool
+      // failure, so the turn spends one step and carries on, matching what
+      // `toolTimeoutMs` already means on the native generate path.
+      const output = await executeToolCall({
+        name: call.name,
+        execute: tool.execute,
+        args: call.args,
+        toolCallId: call.id,
+        turnSignal: abortSignal,
+        toolTimeoutMs,
+      });
+      // A result can report failure without throwing — an MCP isError
+      // payload, a proxy-blocked call resolving with `{ error }`. When
+      // the breaker is told how to recognise those, they strike it
+      // exactly as a throw does; otherwise the model can grind on a
+      // blocked tool for the whole step budget.
+      const resultFailure = breaker?.classifyResultFailure?.(output);
+      if (breaker) {
+        if (resultFailure) {
+          const current = failedTools.get(call.name) ?? {
+            count: 0,
+            lastError: "",
+          };
+          current.count++;
+          current.lastError = resultFailure;
+          failedTools.set(call.name, current);
+        } else if (breaker.consecutive) {
+          // Genuinely consecutive: a clean result clears the count, so
+          // an argument-dependent soft error cannot accumulate its way
+          // to disabling a tool that works.
+          failedTools.delete(call.name);
+        }
+      }
+      toolResults.push({ ...call, output });
+      executions.push({
+        id: call.id,
+        name: call.name,
+        input: call.args,
+        output,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (breaker) {
+        const current = failedTools.get(call.name) ?? {
+          count: 0,
+          lastError: "",
+        };
+        current.count++;
+        current.lastError = message;
+        failedTools.set(call.name, current);
+      }
+      const output = { error: message, status: "failed" };
+      toolResults.push({ ...call, output, error: message });
+      executions.push({
+        id: call.id,
+        name: call.name,
+        input: call.args,
+        output,
+        error: message,
+      });
+    }
+  }
+  return { toolResults, executions, dispatched, abortedMidBatch };
+}
+
+async function executeObservedStep<TConversation>(
+  adapter: AgenticLoopAdapter<TConversation>,
+  request: AgenticLoopStepRequest,
+  channel: { push(chunk: AgenticLoopChunk): void },
+  signal: AbortSignal,
+  span: AgenticLoopOptions["span"],
+): Promise<AgenticLoopStepResult> {
+  // Pre-first-chunk 429/5xx retry: watch whether THIS attempt of
+  // THIS step pushes anything to the shared channel before it
+  // throws. `hasEmitted` resets at the top of every attempt
+  // withProviderRetry makes; the instant an attempt emits and then
+  // throws, the thrown error is rewrapped as a PostEmissionStepError
+  // (no status/branding info survives the rewrap), which
+  // isRetryableProviderError() duck-types as non-retryable — so
+  // withProviderRetry gives up immediately instead of sleeping and
+  // re-invoking executeStep, which would duplicate/interleave
+  // output already sent to the consumer. The original error (not
+  // the wrapper) is what the caller of runAgenticLoop ultimately
+  // sees, via the unwrap in the catch below.
+  let hasEmitted = false;
+  let firstChunkAt: Date | undefined;
+  const watchedChannel = {
+    push: (chunk: AgenticLoopChunk) => {
+      hasEmitted = true;
+      firstChunkAt ??= new Date();
+      channel.push(chunk);
+    },
+  };
+  return withGeneration(request.generation ?? {}, async (generationSpan) => {
+    let result: AgenticLoopStepResult;
+    try {
+      result = await withProviderRetry(
+        async () => {
+          hasEmitted = false;
+          try {
+            return await adapter.executeStep(request, watchedChannel, signal);
+          } catch (err) {
+            throw hasEmitted ? new PostEmissionStepError(err) : err;
+          }
+        },
+        span,
+        `${adapter.providerLabel}.step`,
+        undefined,
+        signal,
+      );
+    } catch (err) {
+      throw err instanceof PostEmissionStepError ? err.cause : err;
+    }
+    const observed = adapter.observedUsage?.(result.usage) ?? result.usage;
+    observeGeneration(generationSpan, {
+      provider: request.generation?.provider,
+      model: request.generation?.model,
+      responseModel: result.model,
+      output: {
+        text: result.text,
+        ...(result.reasoning ? { reasoning: result.reasoning } : {}),
+        ...(result.toolCalls.length > 0 ? { toolCalls: result.toolCalls } : {}),
+      },
+      usage: {
+        inputTokens: observed.inputTokens,
+        outputTokens: observed.outputTokens,
+        cacheReadTokens: observed.cacheReadTokens,
+        cacheCreationTokens: observed.cacheWriteTokens,
+        reasoningTokens: observed.reasoningTokens,
+      },
+      // A step cut short before the provider's terminal event has no stop
+      // reason; record "other", as the turn's own finishReason does.
+      finishReason:
+        result.rawStopReason ?? (signal.aborted ? "other" : undefined),
+      aborted: signal.aborted,
+      completionStartTime: firstChunkAt,
+    });
+    return result;
+  });
+}
+
+/**
+ * Run one adapter-parameterized agentic tool-calling turn. Owns the
+ * maxSteps-bounded loop, generic tool dispatch (with an opt-in
+ * TOOL_NOT_FOUND/failure-strike breaker — see AgenticLoopAdapter.toolFailureBreaker),
+ * per-step usage accumulation, a single optional malformed-call retry,
+ * chunk emission through streamChannel, and a pre-first-chunk 429/5xx
+ * retry (via withProviderRetry) around every adapter.executeStep() call.
+ * The retry wrap is unconditional and adapter-agnostic — every migrated
+ * provider gets it for free, not just the ones that had a hand-rolled
+ * version before migration (see Verified Fact 4-adjacent note in Task 4
+ * Step 1 and the Risks & Rollback "Deliberate behavior changes" list for
+ * which families are gaining this for the first time). Everything
+ * wire-format-specific (building the request, parsing the SDK response,
+ * serializing tool results back into the conversation, mapping the raw
+ * stop reason) is delegated to `adapter`.
+ */
+export function runAgenticLoop<TConversation>(
+  adapter: AgenticLoopAdapter<TConversation>,
+  initialConversation: TConversation,
+  options: AgenticLoopOptions,
+): {
+  stream: AsyncIterable<AgenticLoopChunk>;
+  resultPromise: Promise<AgenticLoopResult<TConversation>>;
+} {
+  const channel = createStreamChannel<AgenticLoopChunk>();
+  const internalAbort = new AbortController();
+  const onCallerAbort = () => internalAbort.abort();
+  options.abortSignal?.addEventListener("abort", onCallerAbort);
+  if (options.abortSignal?.aborted) {
+    internalAbort.abort();
+  }
+
+  const failedTools = new Map<string, { count: number; lastError: string }>();
+  let malformedRetryUsed = false;
+
+  const resultPromise = (async (): Promise<
+    AgenticLoopResult<TConversation>
+  > => {
+    let conversation = initialConversation;
+    let usage: AgenticLoopUsage = { inputTokens: 0, outputTokens: 0 };
+    let finalText = "";
+    // The most recent step's text, kept only for the step-cap case below.
+    let lastStepText = "";
+    let rawStopReason: string | undefined;
+    const allToolCalls: AgenticLoopResult<TConversation>["toolCalls"] = [];
+    const allToolExecutions: AgenticLoopResult<TConversation>["toolExecutions"] =
+      [];
+    let hadToolCallsAtCap = false;
+    // The cap is a variable, not `adapter.maxSteps` read in place, because a
+    // step-boundary callback may renew it mid-turn. With no callback nothing
+    // ever writes to it, so the loop is the same loop it was.
+    let stepCap = adapter.maxSteps;
+    const turnStartedAt = Date.now();
+    const stepSpans = new StepSpans(options.operation);
+
+    try {
+      for (let step = 0; step < stepCap; step++) {
+        if (internalAbort.signal.aborted) {
+          break;
+        }
+        stepSpans.begin(step + 1);
+
+        if (adapter.planReclaim) {
+          const reclaimed = adapter.planReclaim(conversation, step);
+          if (reclaimed?.conversation !== undefined) {
+            conversation = reclaimed.conversation;
+          }
+          // A guard that could not reclaim enough room ends the turn HERE,
+          // before the request goes out — stepping into a provider rejection
+          // would lose every completed step of the turn.
+          if (reclaimed?.stop) {
+            break;
+          }
+        }
+
+        const request = await adapter.buildStepRequest(conversation, step);
+
+        // A tool that just became callable starts clean. Its TOOL_NOT_FOUND
+        // strikes were recorded against a name that genuinely did not resolve
+        // yet, and the breaker is consulted before the lookup, so without this
+        // a deferred tool the model named twice is refused for the rest of the
+        // turn at the exact moment it becomes usable.
+        for (const name of request.hydratedToolNames ?? []) {
+          failedTools.delete(name);
+        }
+
+        const stepResult = await stepSpans.run(() =>
+          executeObservedStep(
+            adapter,
+            request,
+            channel,
+            internalAbort.signal,
+            options.span,
+          ),
+        );
+
+        usage = sumUsage(usage, stepResult.usage);
+        rawStopReason = stepResult.rawStopReason;
+        lastStepText = stepResult.text || lastStepText;
+
+        if (
+          adapter.isMalformedStep?.(stepResult) &&
+          !malformedRetryUsed &&
+          !internalAbort.signal.aborted
+        ) {
+          malformedRetryUsed = true;
+          logger.warn(
+            `[${adapter.providerLabel}] Malformed function call at step ${step + 1}/${stepCap}; retrying once.`,
+          );
+          conversation =
+            adapter.buildMalformedRetryNote?.(conversation, step) ??
+            conversation;
+          continue;
+        }
+
+        if (stepResult.toolCalls.length === 0) {
+          finalText = stepResult.text || finalText;
+          break;
+        }
+
+        if (step === stepCap - 1) {
+          hadToolCallsAtCap = true;
+        }
+
+        const dispatch = await stepSpans.run(() =>
+          dispatchStepTools({
+            calls: stepResult.toolCalls,
+            adapter,
+            tools: options.tools,
+            failedTools,
+            abortSignal: internalAbort.signal,
+            toolTimeoutMs: resolveToolTimeoutMs(options.toolTimeoutMs),
+          }),
+        );
+        const toolResults = dispatch.toolResults;
+        allToolCalls.push(...dispatch.dispatched);
+        allToolExecutions.push(...dispatch.executions);
+        const abortedMidBatch = dispatch.abortedMidBatch;
+
+        // A batch cut short leaves some calls without results, and the
+        // tool-result turn is appended as one message: writing it here would
+        // put an unanswered tool call into history. Anthropic rejects exactly
+        // that on the next request, and Gemini carries a dangling call
+        // forward. Break instead, leaving history ending on the model turn —
+        // which is a valid place to stop.
+        if (abortedMidBatch) {
+          break;
+        }
+
+        conversation = adapter.buildToolResultMessages(
+          conversation,
+          stepResult,
+          toolResults,
+          step,
+        );
+
+        // THE step boundary. Everything this step did has settled — tools ran,
+        // their results are in the conversation — and the cap has not yet been
+        // re-checked, so this is the only point where raising it changes what
+        // happens next without replaying anything. Deliberately not reached
+        // when the step asked for no tools (the turn ended on its own; renewing
+        // there would be a restart) or when the turn is already cancelled.
+        if (options.beforeStep && !internalAbort.signal.aborted) {
+          const decision = await options.beforeStep({
+            stepIndex: step,
+            stepsCompleted: step + 1,
+            maxSteps: stepCap,
+            elapsedMs: Date.now() - turnStartedAt,
+            toolNames: dispatch.dispatched.map((call) => call.name),
+            signal: internalAbort.signal,
+          });
+          // Strictly larger and finite. A smaller number would end a turn the
+          // engine has already committed steps to, and Infinity would remove
+          // the bound entirely — the callback's job is to extend a budget, not
+          // to delete it.
+          //
+          // Floored BEFORE the comparison, not after. A cap is a whole number
+          // of steps, so `stepCap + 0.5` is not a renewal at all — it floors
+          // back to the cap already in force. Comparing the raw value first
+          // let it pass the guard, leave the cap where it was, and still clear
+          // `hadToolCallsAtCap` below, which drops the turn's last-step-text
+          // fallback and reports a capped turn as an uncapped one.
+          const renewed =
+            typeof decision?.maxSteps === "number" &&
+            Number.isFinite(decision.maxSteps)
+              ? Math.floor(decision.maxSteps)
+              : undefined;
+          if (renewed !== undefined && renewed > stepCap) {
+            stepCap = renewed;
+            // The step that just ran is no longer the last one, so the turn is
+            // no longer capped. Left set, a renewed turn would report itself
+            // as having run out of steps.
+            hadToolCallsAtCap = false;
+          }
+          if (decision?.nudge && adapter.appendPlanningNudge) {
+            conversation = adapter.appendPlanningNudge(
+              conversation,
+              decision.nudge,
+            );
+          }
+        }
+      }
+
+      // Read AFTER the loop, so it covers every way an abort can end a turn:
+      // the step-top check, a tool batch cut short, and an adapter whose
+      // provider SDK swallows the cancellation and returns what it had. The
+      // Anthropic SDK does exactly that last one — its stream iterator treats
+      // an aborted read as a clean end — so an interrupted turn arrives here
+      // indistinguishable from a completed one unless the signal is consulted.
+      const aborted = internalAbort.signal.aborted;
+      const finishReason = adapter.mapFinishReason(
+        rawStopReason,
+        hadToolCallsAtCap,
+      );
+      return {
+        // `finalText` is only set by a step that asked for no tools, so a turn
+        // that runs out of steps mid-tool-call would otherwise return "" and
+        // throw away everything the model actually said. An empty result also
+        // reads as a failed generation to callers that retry on empty content,
+        // turning one capped turn into several. Fall back to the last step's
+        // text in that case only — when the loop ended normally, an empty
+        // final step genuinely means the model said nothing.
+        text: finalText || (hadToolCallsAtCap ? lastStepText : ""),
+        toolCalls: allToolCalls,
+        toolExecutions: allToolExecutions,
+        usage,
+        // A turn that was cut short before any terminal event reached it has
+        // no provider stop reason to map, and `mapFinishReason`'s default
+        // branch reports "stop" for that absence — the same value a model
+        // that finished normally produces. "other" is the AI-SDK-shaped value
+        // for "ended for a reason outside this enum", which is the truth.
+        // When the provider DID report a stop reason before the abort, that
+        // reason is real and is kept.
+        finishReason:
+          aborted && rawStopReason === undefined ? "other" : finishReason,
+        rawStopReason,
+        // The engine owns the actual cap (including mid-turn renewal), so a
+        // provider must not infer this from raw "tool_use" or a step count.
+        // Cancellation takes priority when it interrupts the last tool batch.
+        stopReason: aborted
+          ? "aborted"
+          : hadToolCallsAtCap
+            ? "step-cap"
+            : undefined,
+        conversation,
+        aborted,
+      };
+    } catch (err) {
+      // Must run before the finally block's channel.close(): a consumer
+      // parked in the channel's iterable is woken by whichever of
+      // error()/close() runs first, and close() alone would let a
+      // stream-only consumer observe a clean end of stream for a turn that
+      // actually failed. Calling error() here — synchronously, inside this
+      // catch — guarantees it lands before close(), with no dependence on
+      // microtask scheduling (unlike an outer promise-chained catch handler
+      // on this IIFE, which would run in a later microtask after `finally`
+      // already closed the channel).
+      channel.error(err);
+      throw err;
+    } finally {
+      stepSpans.end();
+      // close() after error() is harmless: it only flips `done`, and
+      // streamChannel.error() keeps its error state intact regardless of a
+      // later close() call.
+      channel.close();
+      options.abortSignal?.removeEventListener("abort", onCallerAbort);
+    }
+  })();
+
+  return { stream: channel.iterable, resultPromise };
+}

@@ -4,17 +4,16 @@
  * Hono is chosen for its performance, TypeScript-first design, and edge compatibility
  */
 
-import type { Context as HonoContext, Next } from "hono";
-import { Hono } from "hono";
-import { cors } from "hono/cors";
-import { HTTPException } from "hono/http-exception";
-import { logger as honoLogger } from "hono/logger";
-import { secureHeaders } from "hono/secure-headers";
-import { streamSSE } from "hono/streaming";
-import { timeout } from "hono/timeout";
+import type { Context as HonoContext, Hono, Next } from "hono";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { NeuroLink } from "../../neurolink.js";
 import { logger } from "../../utils/logger.js";
-import { AlreadyRunningError, ServerStopError, wrapError } from "../errors.js";
+import {
+  AlreadyRunningError,
+  ServerAdapterError,
+  ServerStopError,
+  wrapError,
+} from "../errors.js";
 import { BaseServerAdapter } from "../abstract/baseServerAdapter.js";
 import type {
   MiddlewareDefinition,
@@ -22,16 +21,20 @@ import type {
   ServerAdapterConfig,
   ServerAdapterEvents,
   ServerContext,
-} from "../types.js";
+  HonoRateLimitEntry,
+} from "../../types/index.js";
+import { markContextCarried } from "../utils/carriedContextMark.js";
+import { resolveClientAddress } from "../utils/clientAddress.js";
+import { shapeRouteError } from "../utils/clientError.js";
+import { pathMatchesAny } from "../utils/pathMatch.js";
 import { isErrorResponse } from "../utils/validation.js";
-
-/**
- * Rate limit store entry
- */
-type RateLimitEntry = {
-  count: number;
-  resetAt: number;
-};
+import {
+  isRawBodyContentType,
+  isWebResponse,
+  parseByteLimit,
+  RawBodyTooLargeError,
+  readBoundedRequestBody,
+} from "../utils/rawBody.js";
 
 // Declare global for runtime detection
 declare const Bun: { serve: (options: unknown) => unknown } | undefined;
@@ -43,13 +46,33 @@ declare const Deno:
  * Hono-specific server adapter
  * Supports multiple runtimes: Bun, Deno, Node.js
  */
+
 export class HonoServerAdapter extends BaseServerAdapter {
   private app!: Hono;
   private server?: unknown;
-  private rateLimitStore = new Map<string, RateLimitEntry>();
+  private rateLimitStore = new Map<string, HonoRateLimitEntry>();
   private rateLimitCleanupInterval?: ReturnType<typeof setInterval>;
-  // Store context by request ID for sharing between middleware and route handlers
-  private requestContextStore = new Map<string, ServerContext>();
+  // Context shared between middleware and the route handler. Keyed by the request
+  // object, never by the request id: the id can be the
+  // caller's own X-Request-ID, so two overlapping requests that send the same one
+  // would share a context, and the second would run with the first one's
+  // identity, headers and body. A WeakMap also frees an entry whose handler
+  // never ran.
+  private requestContextStore = new WeakMap<Request, ServerContext>();
+  // One id per request, for logs and events: the caller's X-Request-ID when sent,
+  // otherwise generated once, so every step reports the same id. With no header
+  // every step used to invent its own.
+  private requestIds = new WeakMap<Request, string>();
+  // Populated by initializeFramework's dynamic imports; used by methods that
+  // run after initialization (route registration, streaming) and so cannot
+  // rely on initializeFramework's own local closure variables.
+  private streamSSEFn!: typeof import("hono/streaming").streamSSE;
+  private parseFormBody!: typeof import("hono/utils/body").parseBody;
+  // The runtime's view of the TCP peer (Node, Bun or Deno); undefined where the
+  // runtime offers none, and then requests carry no address.
+  private getConnInfoFn?: typeof import("@hono/node-server/conninfo").getConnInfo;
+  // The rate limiter counts nothing it cannot attribute, and says so once.
+  private warnedNoClientAddress = false;
 
   constructor(neurolink: NeuroLink, config: ServerAdapterConfig = {}) {
     super(neurolink, config);
@@ -64,16 +87,12 @@ export class HonoServerAdapter extends BaseServerAdapter {
   ) => Promise<Response | void> {
     return async (c: HonoContext, next: Next): Promise<Response | void> => {
       // Skip rate limiting for excluded paths
-      if (this.config.rateLimit.skipPaths) {
-        for (const skipPath of this.config.rateLimit.skipPaths) {
-          if (c.req.path.startsWith(skipPath)) {
-            return next();
-          }
-        }
+      if (pathMatchesAny(c.req.path, this.config.rateLimit.skipPaths)) {
+        return next();
       }
 
       // Use custom keyGenerator if provided, otherwise default to IP-based key
-      let key: string;
+      let key: string | undefined;
       if (this.config.rateLimit.keyGenerator) {
         // Build minimal context for keyGenerator
         const headers: Record<string, string> = {};
@@ -81,7 +100,7 @@ export class HonoServerAdapter extends BaseServerAdapter {
           headers[name] = value;
         });
         const minCtx = {
-          requestId: c.req.header("X-Request-ID") || this.generateRequestId(),
+          requestId: this.requestIdFor(c),
           method: c.req.method,
           path: c.req.path,
           headers,
@@ -92,13 +111,30 @@ export class HonoServerAdapter extends BaseServerAdapter {
           externalServerManager: this.externalServerManager,
           timestamp: Date.now(),
           metadata: {},
+          remoteAddress: this.remoteAddressFor(c),
         };
         key = this.config.rateLimit.keyGenerator(minCtx as ServerContext);
       } else {
-        key =
-          c.req.header("x-forwarded-for") ||
-          c.req.header("x-real-ip") ||
-          "unknown";
+        // The TCP peer, or behind a declared proxy the client it reports. A
+        // header alone used to be the key, so one shared "unknown" bucket
+        // served every direct client and a rotating X-Forwarded-For escaped
+        // the limit; a request with no attributable address is now let
+        // through rather than pooled with every other such request.
+        key = resolveClientAddress({
+          remoteAddress: this.remoteAddressFor(c),
+          forwardedFor: c.req.header("x-forwarded-for"),
+          trustProxy: this.config.rateLimit.trustProxy,
+          trustedProxies: this.config.rateLimit.trustedProxies,
+        });
+        if (key === undefined) {
+          if (!this.warnedNoClientAddress) {
+            this.warnedNoClientAddress = true;
+            logger.alwaysStderr(
+              "[HonoAdapter] The runtime reports no peer address for requests, so the rate limiter cannot count them; configure rateLimit.keyGenerator to limit by another key.",
+            );
+          }
+          return next();
+        }
       }
       const now = Date.now();
       const windowMs = this.config.rateLimit.windowMs;
@@ -156,8 +192,55 @@ export class HonoServerAdapter extends BaseServerAdapter {
 
   /**
    * Initialize Hono framework
+   * Dynamically imports Hono and its middleware so requiring only another
+   * adapter (Express/Fastify/Koa) never pulls Hono's import graph in.
    */
-  protected initializeFramework(): void {
+  protected async initializeFramework(): Promise<void> {
+    const [
+      { Hono },
+      { cors },
+      { HTTPException },
+      { logger: honoLogger },
+      { secureHeaders },
+      { streamSSE },
+      { timeout },
+      { parseBody },
+    ] = await Promise.all([
+      this.importFrameworkDependency<typeof import("hono")>("hono", "hono"),
+      this.importFrameworkDependency<typeof import("hono/cors")>(
+        "hono/cors",
+        "hono",
+      ),
+      this.importFrameworkDependency<typeof import("hono/http-exception")>(
+        "hono/http-exception",
+        "hono",
+      ),
+      this.importFrameworkDependency<typeof import("hono/logger")>(
+        "hono/logger",
+        "hono",
+      ),
+      this.importFrameworkDependency<typeof import("hono/secure-headers")>(
+        "hono/secure-headers",
+        "hono",
+      ),
+      this.importFrameworkDependency<typeof import("hono/streaming")>(
+        "hono/streaming",
+        "hono",
+      ),
+      this.importFrameworkDependency<typeof import("hono/timeout")>(
+        "hono/timeout",
+        "hono",
+      ),
+      this.importFrameworkDependency<typeof import("hono/utils/body")>(
+        "hono/utils/body",
+        "hono",
+      ),
+    ]);
+
+    this.streamSSEFn = streamSSE;
+    this.parseFormBody = parseBody;
+    this.getConnInfoFn = await this.loadConnInfo();
+
     this.app = new Hono();
 
     // Add secure headers
@@ -168,7 +251,12 @@ export class HonoServerAdapter extends BaseServerAdapter {
       this.app.use(
         "*",
         cors({
-          origin: this.config.cors.origins,
+          // Hono matches a list of origins literally, so `["*"]` (the default)
+          // matches nothing and no CORS header is sent; the string "*" is the
+          // wildcard. Pass it as such when the list contains it.
+          origin: this.config.cors.origins.includes("*")
+            ? "*"
+            : this.config.cors.origins,
           allowMethods: this.config.cors.methods,
           allowHeaders: this.config.cors.headers,
           credentials: this.config.cors.credentials,
@@ -198,20 +286,28 @@ export class HonoServerAdapter extends BaseServerAdapter {
 
     // Global error handler
     this.app.onError((error, c) => {
-      const requestId =
-        c.req.header("X-Request-ID") || this.generateRequestId();
+      const requestId = this.requestIdFor(c);
 
-      logger.error("[HonoAdapter] Request error", {
-        requestId,
-        error: error.message,
-        stack: error.stack,
-      });
+      this.logRequestError("HonoAdapter", requestId, error);
 
-      this.emit("error", {
+      this.emitRequestError({
         requestId,
         error,
         timestamp: new Date(),
-      } satisfies ServerAdapterEvents["error"]);
+      });
+
+      if (error instanceof ServerAdapterError) {
+        return c.json(
+          {
+            error: { code: error.code, message: error.message },
+            metadata: {
+              requestId,
+              timestamp: new Date().toISOString(),
+            },
+          },
+          error.getHttpStatus() as ContentfulStatusCode,
+        );
+      }
 
       if (error instanceof HTTPException) {
         return c.json(
@@ -271,31 +367,57 @@ export class HonoServerAdapter extends BaseServerAdapter {
       | "options";
 
     this.app[method](route.path, async (c: HonoContext) => {
-      const requestId =
-        c.req.header("X-Request-ID") || this.generateRequestId();
-      const connectionId = `conn-${requestId}`;
+      const requestId = this.requestIdFor(c);
+      // Not derived from the request id, which a caller may repeat: two
+      // overlapping requests would then share one record and the first to
+      // finish would untrack the other.
+      const connectionId = `conn-${this.generateRequestId()}`;
       const startTime = Date.now();
 
       // Track connection for graceful shutdown
       this.trackConnection(connectionId, undefined, requestId);
 
+      let abort: ReturnType<typeof this.attachRequestAbort> | undefined;
       try {
         // Extract path parameters
         const params = c.req.param() as Record<string, string>;
 
         // Reuse existing context from middleware if available, otherwise create new one
-        const existingCtx = this.requestContextStore.get(requestId);
-        const ctx =
-          existingCtx ||
-          this.createContext({
-            requestId,
-            method: c.req.method,
-            path: c.req.path,
-            headers: this.extractHeaders(c),
-            query: this.extractQuery(c),
-            params,
-            body: await this.extractBody(c),
-          });
+        const existingCtx = this.requestContextStore.get(c.req.raw);
+        // Middleware ran before the router matched this route, so the shared
+        // context carries no path parameters yet.
+        if (existingCtx) {
+          existingCtx.params = params;
+          // The one request the handler already got the middleware's context
+          // for before this adapter carried it on every request: the caller
+          // sent its own X-Request-ID, which the old store was keyed by. That
+          // context stays unmarked, so the agent routes keep trusting its
+          // ctx.user there. A context found for any other request exists only
+          // because the server carries middleware state, is new to the
+          // handler, and is marked.
+          if (!c.req.header("X-Request-ID")) {
+            markContextCarried(existingCtx);
+          }
+        }
+        let ctx = existingCtx;
+        if (!ctx) {
+          const created = await this.createRequestContext(c, requestId, params);
+          if (isWebResponse(created)) {
+            return created;
+          }
+          ctx = created;
+        }
+
+        // The handler learns of a client that went away through the request's
+        // own signal, and of the request timeout through the same controller
+        // (Hono's timeout middleware answers 504; this stops the work).
+        abort = this.attachRequestAbort(ctx, {
+          onClientClose: (listener) =>
+            c.req.raw.signal.addEventListener("abort", listener, {
+              once: true,
+            }),
+          applyTimeout: !route.streaming?.enabled,
+        });
 
         // Emit request event
         this.emit("request", {
@@ -313,6 +435,24 @@ export class HonoServerAdapter extends BaseServerAdapter {
         // Execute handler
         const result = await route.handler(ctx);
         const duration = Date.now() - startTime;
+
+        // A route that answers in its own wire format returns a web Response.
+        if (isWebResponse(result)) {
+          this.emit("response", {
+            requestId,
+            statusCode: result.status,
+            duration,
+            timestamp: new Date(),
+          } satisfies ServerAdapterEvents["response"]);
+          for (const [key, value] of Object.entries(
+            ctx.responseHeaders ?? {},
+          )) {
+            if (!result.headers.has(key)) {
+              result.headers.set(key, value);
+            }
+          }
+          return result;
+        }
 
         // Check if result is an error response
         if (isErrorResponse(result)) {
@@ -374,21 +514,29 @@ export class HonoServerAdapter extends BaseServerAdapter {
           },
         });
       } catch (error) {
-        const errorMessage =
-          error instanceof Error ? error.message : String(error);
-
-        logger.error("[HonoAdapter] Handler error", {
+        // The exception's text stays in the log under this request id; the
+        // client gets a fixed message for its category. It used to get the
+        // text itself, environment variable names and upstream bodies included.
+        const shaped = shapeRouteError("HonoAdapter", requestId, error);
+        this.emit("response", {
           requestId,
-          route: route.path,
-          error: errorMessage,
-        });
-
-        throw new HTTPException(500, { message: errorMessage });
+          statusCode: shaped.status,
+          duration: Date.now() - startTime,
+          timestamp: new Date(),
+        } satisfies ServerAdapterEvents["response"]);
+        return c.json(
+          {
+            error: { code: shaped.code, message: shaped.message },
+            metadata: { requestId, timestamp: new Date().toISOString() },
+          },
+          shaped.status as ContentfulStatusCode,
+        );
       } finally {
+        abort?.release();
         // Untrack connection when request completes
         this.untrackConnection(connectionId);
         // Clean up context store to prevent memory leaks
-        this.requestContextStore.delete(requestId);
+        this.requestContextStore.delete(c.req.raw);
       }
     });
   }
@@ -408,7 +556,7 @@ export class HonoServerAdapter extends BaseServerAdapter {
       }
     }
 
-    return streamSSE(c, async (stream) => {
+    return this.streamSSEFn(c, async (stream) => {
       try {
         // Get streaming result from handler
         const result = await route.handler(ctx);
@@ -420,33 +568,108 @@ export class HonoServerAdapter extends BaseServerAdapter {
           Symbol.asyncIterator in result
         ) {
           for await (const chunk of result as AsyncIterable<unknown>) {
+            // Transform raw provider chunks into StreamEvent format
+            // The client SDK expects { type, content, timestamp, ... } objects
+            const streamEvent = this.toStreamEvent(chunk);
             await stream.writeSSE({
-              data: JSON.stringify(chunk),
-              event: "message",
+              data: JSON.stringify(streamEvent),
             });
           }
-        } else {
-          // Single result, send as complete event
+        } else if (result && isErrorResponse(result)) {
+          // Error result, send as error event
+          const errorResult = result as {
+            error?: { message?: string; code?: string };
+            httpStatus?: number;
+          };
+          const statusCode = errorResult.httpStatus ?? 500;
           await stream.writeSSE({
-            data: JSON.stringify(result),
-            event: "complete",
+            data: JSON.stringify({
+              type: "error",
+              error: {
+                code: errorResult.error?.code ?? "STREAM_ERROR",
+                message: errorResult.error?.message ?? "Stream error",
+                status: statusCode,
+              },
+              timestamp: Date.now(),
+            }),
+          });
+        } else {
+          // Single result, normalize into a StreamEvent so the client can
+          // match on the `type` field via handleEvent()
+          const streamEvent = this.toStreamEvent(result);
+          await stream.writeSSE({
+            data: JSON.stringify(streamEvent),
           });
         }
 
-        // Send done event
+        // Send [DONE] signal that the client SDK expects
         await stream.writeSSE({
-          data: "",
-          event: "done",
+          data: "[DONE]",
         });
       } catch (error) {
+        const shaped = shapeRouteError("HonoAdapter", ctx.requestId, error);
         await stream.writeSSE({
           data: JSON.stringify({
-            error: error instanceof Error ? error.message : "Stream error",
+            type: "error",
+            error: {
+              code: shaped.code,
+              message: shaped.message,
+              status: shaped.status,
+            },
+            timestamp: Date.now(),
           }),
-          event: "error",
+        });
+        // Still send [DONE] after error so the client terminates cleanly
+        await stream.writeSSE({
+          data: "[DONE]",
         });
       }
     });
+  }
+
+  /**
+   * Transform a raw provider chunk into a StreamEvent
+   * Provider chunks are typically { content: string } objects;
+   * the client SDK expects { type: "text", content: string, timestamp: number }
+   */
+  private toStreamEvent(chunk: unknown): Record<string, unknown> {
+    // Already a StreamEvent (has a type field)
+    if (
+      chunk &&
+      typeof chunk === "object" &&
+      "type" in chunk &&
+      typeof (chunk as Record<string, unknown>).type === "string"
+    ) {
+      return {
+        ...(chunk as Record<string, unknown>),
+        timestamp: (chunk as Record<string, unknown>).timestamp ?? Date.now(),
+      };
+    }
+
+    // Raw text chunk from provider: { content: string }
+    if (chunk && typeof chunk === "object" && "content" in chunk) {
+      return {
+        type: "text",
+        content: String((chunk as Record<string, unknown>).content),
+        timestamp: Date.now(),
+      };
+    }
+
+    // String chunk
+    if (typeof chunk === "string") {
+      return {
+        type: "text",
+        content: chunk,
+        timestamp: Date.now(),
+      };
+    }
+
+    // Unknown shape — wrap as metadata event (StreamEventType has no "data" variant)
+    return {
+      type: "metadata",
+      metadata: chunk,
+      timestamp: Date.now(),
+    };
   }
 
   /**
@@ -460,7 +683,7 @@ export class HonoServerAdapter extends BaseServerAdapter {
     for (const path of paths) {
       this.app.use(path, async (c, next) => {
         // Skip excluded paths
-        if (middleware.excludePaths?.some((p) => c.req.path.startsWith(p))) {
+        if (pathMatchesAny(c.req.path, middleware.excludePaths)) {
           return next();
         }
 
@@ -468,30 +691,46 @@ export class HonoServerAdapter extends BaseServerAdapter {
         const params = c.req.param() as Record<string, string>;
 
         // Get or generate request ID for context lookup
-        const requestId =
-          c.req.header("X-Request-ID") || this.generateRequestId();
+        const requestId = this.requestIdFor(c);
 
         // Reuse existing context from previous middleware if available
-        let ctx = this.requestContextStore.get(requestId);
+        let ctx = this.requestContextStore.get(c.req.raw);
         if (!ctx) {
           // Create new context for the first middleware
-          ctx = this.createContext({
-            requestId,
-            method: c.req.method,
-            path: c.req.path,
-            headers: this.extractHeaders(c),
-            query: this.extractQuery(c),
-            params,
-            body: await this.extractBody(c),
-          });
-          // Store context for sharing between middleware and route handlers
-          this.requestContextStore.set(requestId, ctx);
+          const created = await this.createRequestContext(c, requestId, params);
+          if (isWebResponse(created)) {
+            return created;
+          }
+          ctx = created;
+          // Share the context between the middleware steps and the route
+          // handler when the server carries middleware state, or when the
+          // caller sent its own X-Request-ID: the one case the old store, keyed
+          // by that header, ever found a context again. Otherwise every step
+          // and the handler build their own, and storing this one would only
+          // leave it behind.
+          if (this.carriesMiddlewareState() || c.req.header("X-Request-ID")) {
+            this.requestContextStore.set(c.req.raw, ctx);
+          }
         }
 
         // Execute middleware
         return middleware.handler(ctx, next);
       });
     }
+  }
+
+  /**
+   * The id of this request: the caller's `X-Request-ID` when sent, otherwise
+   * one generated on first use, and the same one on every later use.
+   */
+  private requestIdFor(c: HonoContext): string {
+    const known = this.requestIds.get(c.req.raw);
+    if (known) {
+      return known;
+    }
+    const id = c.req.header("X-Request-ID") || this.generateRequestId();
+    this.requestIds.set(c.req.raw, id);
+    return id;
   }
 
   /**
@@ -540,6 +779,7 @@ export class HonoServerAdapter extends BaseServerAdapter {
       this.lifecycleState = "running";
 
       logger.info(`[HonoAdapter] Server started on ${host}:${port}`);
+      this.warnIfSensitiveRoutesUnauthenticated();
 
       this.emit("started", {
         port,
@@ -661,8 +901,13 @@ export class HonoServerAdapter extends BaseServerAdapter {
   /**
    * Get the Hono app instance
    */
-  public getFrameworkInstance(): Hono {
+  public getFrameworkInstance(): unknown {
     return this.app;
+  }
+
+  public override getNativeServer(): unknown {
+    // @hono/node-server's serve() returns the http.Server; Bun/Deno do not.
+    return this.server;
   }
 
   // ============================================
@@ -677,6 +922,47 @@ export class HonoServerAdapter extends BaseServerAdapter {
     return headers;
   }
 
+  /**
+   * The runtime's connection-info helper: `@hono/node-server`'s on Node, the
+   * Bun or Deno adapter's there. Absent on a runtime that offers none.
+   */
+  private async loadConnInfo(): Promise<
+    typeof import("@hono/node-server/conninfo").getConnInfo | undefined
+  > {
+    try {
+      if (typeof Bun !== "undefined") {
+        const bun = await import("hono/bun");
+        return bun.getConnInfo;
+      }
+      if (typeof Deno !== "undefined") {
+        const deno = await import("hono/deno");
+        return deno.getConnInfo;
+      }
+      const node = await import("@hono/node-server/conninfo");
+      return node.getConnInfo;
+    } catch (error) {
+      logger.debug("[HonoAdapter] No connection-info helper for this runtime", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return undefined;
+    }
+  }
+
+  /** The TCP peer of this request, when the runtime reports one. */
+  private remoteAddressFor(c: HonoContext): string | undefined {
+    if (!this.getConnInfoFn) {
+      return undefined;
+    }
+    try {
+      const address = this.getConnInfoFn(c).remote.address;
+      return typeof address === "string" && address.length > 0
+        ? address
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   private extractQuery(c: HonoContext): Record<string, string> {
     const query: Record<string, string> = {};
     const url = new URL(c.req.url);
@@ -686,6 +972,53 @@ export class HonoServerAdapter extends BaseServerAdapter {
     return query;
   }
 
+  /**
+   * A request's context, or the 413 that answers a JSON or form body over its
+   * limit. That answer is built here, before the context exists, so no
+   * middleware (an auth check included) and no route runs for the request.
+   * An upload over the limit still reaches its route as the error itself,
+   * which answers in its own wire format.
+   */
+  private async createRequestContext(
+    c: HonoContext,
+    requestId: string,
+    params: Record<string, string>,
+  ): Promise<ServerContext | Response> {
+    const body = await this.extractBody(c);
+    if (
+      body instanceof RawBodyTooLargeError &&
+      !isRawBodyContentType(c.req.header("Content-Type"))
+    ) {
+      logger.warn("[HonoAdapter] Request rejected", {
+        requestId,
+        code: "PAYLOAD_TOO_LARGE",
+        error: body.message,
+      });
+      this.emitRequestError({
+        requestId,
+        error: body,
+        timestamp: new Date(),
+      });
+      return c.json(
+        {
+          error: { code: "PAYLOAD_TOO_LARGE", message: body.message },
+          metadata: { requestId, timestamp: new Date().toISOString() },
+        },
+        413,
+      );
+    }
+    return this.createContext({
+      requestId,
+      method: c.req.method,
+      path: c.req.path,
+      headers: this.extractHeaders(c),
+      query: this.extractQuery(c),
+      params,
+      body,
+      remoteAddress: this.remoteAddressFor(c),
+    });
+  }
+
   private async extractBody(c: HonoContext): Promise<unknown> {
     if (!this.config.bodyParser.enabled) {
       return undefined;
@@ -693,20 +1026,48 @@ export class HonoServerAdapter extends BaseServerAdapter {
 
     const contentType = c.req.header("Content-Type") || "";
 
-    if (contentType.includes("application/json")) {
+    // JSON and url-encoded forms are read through the same bounded read as
+    // uploads, with the limits the other adapters apply: `jsonLimit` for JSON,
+    // `maxSize` for forms. The bytes are then parsed the way Hono parses a
+    // body it has already buffered. A body that cannot be read or parsed is
+    // `undefined`, as it was when Hono did the reading.
+    const isJson = contentType.includes("application/json");
+    if (isJson || contentType.includes("application/x-www-form-urlencoded")) {
       try {
-        return await c.req.json();
+        const bytes = await readBoundedRequestBody(
+          c.req.raw,
+          parseByteLimit(
+            isJson
+              ? this.config.bodyParser.jsonLimit
+              : this.config.bodyParser.maxSize,
+          ),
+        );
+        if (bytes instanceof RawBodyTooLargeError) {
+          return bytes;
+        }
+        return isJson
+          ? JSON.parse(new TextDecoder().decode(bytes))
+          : await this.parseFormBody(
+              new Request(c.req.url, {
+                method: "POST",
+                headers: { "Content-Type": contentType },
+                body: new Uint8Array(bytes),
+              }),
+            );
       } catch {
         return undefined;
       }
     }
 
-    if (contentType.includes("application/x-www-form-urlencoded")) {
-      try {
-        return await c.req.parseBody();
-      } catch {
-        return undefined;
-      }
+    // Uploads (multipart, octet-stream, audio/*) reach the route as bytes.
+    // Over the size limit the body is the error itself rather than a throw:
+    // a throw from the middleware path would land in onError, which answers
+    // 500. The route answers 413 (or a validation error) from it.
+    if (isRawBodyContentType(contentType)) {
+      return readBoundedRequestBody(
+        c.req.raw,
+        parseByteLimit(this.config.bodyParser.rawMaxSize),
+      );
     }
 
     return undefined;

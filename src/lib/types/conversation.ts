@@ -33,7 +33,115 @@
  * - Current time (ISO): `new Date().toISOString()`
  */
 
-import type { Mem0Config } from "../memory/mem0Initializer.js";
+import type { HippocampusMemory, HippocampusStorageConfig } from "./memory.js";
+import type { ObservabilityConfig } from "./observability.js";
+
+// Message and content primitives. Today these resolve through the upstream
+// generation library; the layout is stable enough for consumers to import
+// from the package barrel without caring about the source module.
+export type {
+  ModelMessage,
+  SystemModelMessage,
+  UserModelMessage,
+  AssistantModelMessage,
+  ToolModelMessage,
+  TextPart,
+  ImagePart,
+  FilePart,
+  ToolCallPart,
+  ToolResultPart,
+  AssistantContent,
+  UserContent,
+  ToolContent,
+  DataContent,
+} from "./aiCompat.js";
+
+/**
+ * Legacy public alias for the Hippocampus storage configuration.
+ * The structural definition lives in `./memory.ts`; this re-export keeps
+ * the SDK surface stable for callers who imported `StorageConfig` from
+ * the package barrel. Defined as a `type` alias rather than a re-export
+ * so the canonical `HippocampusStorageConfig` name is the one ESLint
+ * uniqueness checks see.
+ */
+export type StorageConfig = HippocampusStorageConfig;
+
+/**
+ * How stored `tool_call` / `tool_result` rows are replayed into the prompt
+ * on later turns of a session (see `ConversationMemoryConfig.replayToolSteps`).
+ *
+ * - `"full"`: replayed as real tool-call / tool-result turns, so the model
+ *   sees the exact call and its output.
+ * - `"marker"`: a compact text line per tool call
+ *   (`[called <tool> → ok]` / `[called <tool> → error]`) folded into the
+ *   assistant turn, so the model knows what it did without the payload.
+ * - `"off"`: tool rows are dropped from the prompt, as before this option.
+ */
+export type ToolReplayMode = "full" | "marker" | "off";
+
+/**
+ * The fields the tool-step replay reads off a stored history row. Structural
+ * rather than `ChatMessage` because the multimodal builder's history is typed
+ * as `{ role: string; content: string }` while carrying the same rows.
+ */
+export type ToolHistoryRow = {
+  /** Row id; a `repair-*` prefix marks a placeholder `repairToolPairs` invented. */
+  id?: string;
+  role: string;
+  content?: unknown;
+  tool?: string;
+  toolCallId?: string;
+  args?: Record<string, unknown>;
+  result?: { success?: boolean; error?: string };
+  metadata?: { stepIndex?: number; isSummary?: boolean; isSkill?: boolean };
+};
+
+/**
+ * What a replayed step tells the model about the call's outcome: `"ok"`,
+ * `"error"` (the result was a failure — thrown, rejected, or an `isError`
+ * payload), or `"unknown"` when the real result was lost to compaction and
+ * `repairToolPairs` filled the gap with a placeholder.
+ */
+export type ToolReplayOutcome = "ok" | "error" | "unknown";
+
+/** One paired call/result from a session's history, ready to replay. */
+export type ToolReplayStep = {
+  callId: string;
+  toolName: string;
+  args: Record<string, unknown>;
+  output: string;
+  outcome: ToolReplayOutcome;
+};
+
+/**
+ * One tool call as handed to conversation-memory storage after a loop step.
+ * The stores read `args` (Redis also `arguments` / `parameters`), so the
+ * field is named for what they read — an `input` key here is silently
+ * persisted as `{}`, which is exactly the bug this type exists to prevent.
+ */
+export type MemoryToolCallRecord = {
+  toolCallId?: string;
+  toolName?: string;
+  args?: Record<string, unknown>;
+  /** Zero-based loop step, persisted as `metadata.stepIndex` by stores that keep it. */
+  stepIndex?: number;
+  /** Gemini 3 thought signature riding on the step's first call. */
+  thoughtSignature?: string;
+  timestamp?: Date;
+};
+
+/** One tool result as handed to conversation-memory storage after a loop step. */
+export type MemoryToolResultRecord = {
+  toolCallId?: string;
+  toolName?: string;
+  output?: unknown;
+  /** Legacy alias of `output`; stores read whichever is present. */
+  result?: unknown;
+  /** Set when the execution failed; persisted as `result.error` and `success: false`. */
+  error?: string;
+  stepIndex?: number;
+  timestamp?: Date;
+};
 
 /**
  * Configuration for conversation memory feature
@@ -41,6 +149,16 @@ import type { Mem0Config } from "../memory/mem0Initializer.js";
 export type ConversationMemoryConfig = {
   /** Enable conversation memory feature */
   enabled: boolean;
+
+  /**
+   * How a session's stored tool steps are replayed into later prompts.
+   * Default `"marker"`. `"full"` replays real tool-call / tool-result turns
+   * (costs tokens per replayed step and, on Anthropic, changes the prompt
+   * prefix ahead of the cached system breakpoint); `"off"` restores the
+   * previous behaviour of dropping them. Overridable per request via
+   * `replayToolSteps` on the generate / stream options.
+   */
+  replayToolSteps?: ToolReplayMode;
 
   /** Maximum number of sessions to keep in memory (default: 50) */
   maxSessions?: number;
@@ -57,14 +175,59 @@ export type ConversationMemoryConfig = {
   /** Model to use for summarization */
   summarizationModel?: string;
 
-  /** Enable mem0 integration for conversation memory */
-  mem0Enabled?: boolean;
+  /**
+   * Wall-clock cap for one summarization generate call, in milliseconds
+   * (default: 60000). A summary that overruns is dropped, not fatal — the
+   * turn continues without it — so size this for the slowest summary a real
+   * conversation produces rather than losing compaction summaries silently.
+   */
+  summarizationTimeoutMs?: number;
 
-  /** Configuration for mem0 cloud API integration */
-  mem0Config?: Mem0Config;
+  /** Memory SDK config (condensed key-value memory per user). Set enabled: true to activate. */
+  memory?: HippocampusMemory;
 
   /** Redis configuration (optional) - overrides environment variables */
   redisConfig?: RedisStorageConfig;
+
+  /** Context compaction configuration */
+  contextCompaction?: {
+    /** Enable auto-compaction (default: true when summarization enabled) */
+    enabled?: boolean;
+    /** Compaction trigger threshold (0.0-1.0, default: 0.80) */
+    threshold?: number;
+    /** Enable tool output pruning (default: true) */
+    enablePruning?: boolean;
+    /** Enable file read deduplication (default: true) */
+    enableDeduplication?: boolean;
+    /** Enable sliding window fallback (default: true) */
+    enableSlidingWindow?: boolean;
+    /** Tool output max size in bytes (default: 50KB) */
+    maxToolOutputBytes?: number;
+    /** Tool output max lines (default: 2000) */
+    maxToolOutputLines?: number;
+
+    /**
+     * When true, buildContextMessages() returns the head/tail preview instead of
+     * the full tool output for tool_result messages. Default: false (full output sent to LLM).
+     * When false (default), the AI receives the complete tool output in content.
+     * When true, the AI receives the truncated preview and can use the retrieve_context
+     * tool to access full output if needed.
+     */
+    sendToolPreview?: boolean;
+
+    /** File read budget as fraction of remaining context (default: 0.60) */
+    fileReadBudgetPercent?: number;
+  };
+
+  /** Configuration for automatic file content summarization when files exceed context budget */
+  fileSummarization?: {
+    enabled?: boolean;
+    provider?: string;
+    model?: string;
+    threshold?: number;
+    minTokensPerFile?: number;
+    maxTokensPerFile?: number;
+  };
 
   /** @deprecated Use tokenThreshold instead - Maximum number of conversation turns to keep per session (default: 20) */
   maxTurnsPerSession?: number;
@@ -121,6 +284,15 @@ export type SessionMemory = {
   /** When token count was last calculated (NEW - for token-based memory) */
   lastCountedAt?: number;
 
+  /** API-reported token count from last request (most accurate) */
+  lastApiTokenCount?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+  };
+
   /** Optional session metadata */
   metadata?: {
     /** User role or permissions */
@@ -161,6 +333,117 @@ export type StreamEventSequence = {
   [key: string]: unknown;
 };
 
+/** Structured metadata for tool_result messages. */
+export type ToolResultData = {
+  /** Whether the tool execution succeeded */
+  success?: boolean;
+  /** Expression that was evaluated (for calculation tools) */
+  expression?: string;
+  /**
+   * The tool execution result.
+   * @deprecated Read from ChatMessage.content instead. This field is dynamically
+   * populated from content for backward compatibility and will be removed in a future version.
+   */
+  result?: unknown;
+  /** Result type hint */
+  type?: string;
+  /** Error message if execution failed */
+  error?: string;
+};
+
+/** How a conversation turn was entered. */
+export type ConversationModality = "text" | "voice";
+
+/** Metadata associated with a ChatMessage. */
+export type ChatMessageMetadata = {
+  /** Is this a summary message? */
+  isSummary?: boolean;
+  /** First message ID that this summary covers */
+  summarizesFrom?: string;
+  /** Last message ID that this summary covers */
+  summarizesTo?: string;
+  /** Was this message truncated due to token limits? */
+  truncated?: boolean;
+  /** Source of the message (e.g., provider name, user input) */
+  source?: string;
+  /** Language of the message content */
+  language?: string;
+  /** Confidence score for AI-generated content */
+  confidence?: number;
+  /**
+   * Numeric timestamp for internal tracking and efficient comparisons.
+   * Format: Unix epoch milliseconds (number).
+   * Complements the ISO string `ChatMessage.timestamp` field.
+   * Use this for sorting, filtering, and performance-critical operations.
+   */
+  timestamp?: number;
+  /** Model used to generate this message */
+  modelUsed?: string;
+  /** Unique signature identifying thought/reasoning patterns */
+  thoughtSignature?: string;
+  /** Hash of the thinking/reasoning content for deduplication */
+  thoughtHash?: string;
+  /** Whether extended thinking was used for this message */
+  thinkingExpanded?: boolean;
+  /** Step index for reconstructing parallel vs sequential tool calls */
+  stepIndex?: number;
+
+  // --- Modality (voice persistence) ---
+
+  /**
+   * How the message was entered: typed (`"text"`) or spoken (`"voice"`).
+   * Absent on every message stored before this field existed, and on typed
+   * turns that did not set it; readers treat absence as `"text"`.
+   */
+  modality?: ConversationModality;
+  /**
+   * Stable id of the voice turn this message belongs to. The stored message
+   * ids are `${turnId}:user` and `${turnId}:assistant`, which is what makes
+   * recording the same turn twice a no-op.
+   */
+  turnId?: string;
+  /** True when the message was cut off (barge-in, or the call ended) before it finished. */
+  interrupted?: boolean;
+  /** True when the call ended while this turn was still open. */
+  callEnded?: boolean;
+
+  // --- Tool output management (SDK-2) ---
+
+  /**
+   * Head/tail preview of a large tool output.
+   * Only present on tool_result messages where the output exceeded truncation limits.
+   * When `sendToolPreview` is enabled in config, `buildContextMessages()` returns
+   * this value as the message content instead of the full output.
+   */
+  toolOutputPreview?: string;
+  /** Original byte size of the full tool output before any truncation */
+  originalSize?: number;
+  /**
+   * Artifact store ID for an externalized MCP tool output.
+   * Set when `mcp.outputLimits.strategy = "externalize"` and the tool output
+   * exceeded `maxBytes`. Use retrieve_context with this ID to fetch the full
+   * payload from the local artifact store.
+   */
+  artifactId?: string;
+
+  // --- Skill activation pinning (skills v2) ---
+
+  /**
+   * Marks a pinned skill-activation message: the full instructions of a
+   * skill loaded via use_skill, persisted into session history so later
+   * turns replay it verbatim instead of re-fetching the skill. Pinned
+   * skill messages are protected from sliding-window truncation and are
+   * re-included after memory summarization.
+   */
+  isSkill?: boolean;
+  /** Skill id of a pinned skill-activation message. */
+  skillId?: string;
+  /** Skill name of a pinned skill-activation message. */
+  skillName?: string;
+  /** Skill version captured at activation (sessions pin the activated version). */
+  skillVersion?: number;
+};
+
 /**
  * Chat message format for conversation history
  */
@@ -185,17 +468,23 @@ export type ChatMessage = {
   /** Tool name (optional) - for tool_call/tool_result messages */
   tool?: string;
 
+  /**
+   * Provider tool-call correlation ID, carried on BOTH the `tool_call` and its
+   * matching `tool_result`. This is the only reliable way to pair the two:
+   * a step with parallel tool calls is persisted as every `tool_call` followed
+   * by every `tool_result` (see flushPendingToolData), so adjacency does
+   * NOT imply pairing and position-based matching corrupts the batch.
+   *
+   * Optional for backward compatibility — sessions written before this field
+   * existed pair positionally within a batch (see repairToolPairs legacy mode).
+   */
+  toolCallId?: string;
+
   /** Tool arguments (optional) - for tool_call messages */
   args?: Record<string, unknown>;
 
-  /** Tool result (optional) - for tool_result messages */
-  result?: {
-    success?: boolean;
-    expression?: string;
-    result?: unknown;
-    type?: string;
-    error?: string;
-  };
+  /** Tool result metadata (optional) - for tool_result messages */
+  result?: ToolResultData;
 
   /**
    * Event sequence for rich history reconstruction
@@ -205,38 +494,19 @@ export type ChatMessage = {
    */
   events?: StreamEventSequence[];
 
-  /** Message metadata (NEW - for token-based memory) */
-  metadata?: {
-    /** Is this a summary message? */
-    isSummary?: boolean;
-    /** First message ID that this summary covers */
-    summarizesFrom?: string;
-    /** Last message ID that this summary covers */
-    summarizesTo?: string;
-    /** Was this message truncated due to token limits? */
-    truncated?: boolean;
-    /** Source of the message (e.g., provider name, user input) */
-    source?: string;
-    /** Language of the message content */
-    language?: string;
-    /** Confidence score for AI-generated content */
-    confidence?: number;
-    /**
-     * Numeric timestamp for internal tracking and efficient comparisons.
-     * Format: Unix epoch milliseconds (number).
-     * Complements the ISO string `ChatMessage.timestamp` field.
-     * Use this for sorting, filtering, and performance-critical operations.
-     */
-    timestamp?: number;
-    /** Model used to generate this message */
-    modelUsed?: string;
-    /** Unique signature identifying thought/reasoning patterns */
-    thoughtSignature?: string;
-    /** Hash of the thinking/reasoning content for deduplication */
-    thoughtHash?: string;
-    /** Whether extended thinking was used for this message */
-    thinkingExpanded?: boolean;
-  };
+  /** Message metadata */
+  metadata?: ChatMessageMetadata;
+
+  /** UUID identifying this condensation group */
+  condenseId?: string;
+  /** Points to summary that replaces this message */
+  condenseParent?: string;
+  /** UUID identifying this truncation group */
+  truncationId?: string;
+  /** Points to truncation marker that hides this message */
+  truncationParent?: string;
+  /** Marks this message as a truncation boundary marker */
+  isTruncationMarker?: boolean;
 };
 
 /**
@@ -312,7 +582,7 @@ export type NeurolinkOptions = {
   sessionId?: string;
 
   /** Observability configuration */
-  observability?: import("./observability.js").ObservabilityConfig;
+  observability?: ObservabilityConfig;
 };
 
 /**
@@ -335,6 +605,124 @@ export type StoreConversationTurnOptions = {
   providerDetails?: ProviderDetails;
   enableSummarization?: boolean;
   events?: StreamEventSequence[];
+  /** Observability request identifier for log correlation */
+  requestId?: string;
+  /** API-reported token usage from provider response */
+  tokenUsage?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+  };
+  /** Gemini 3 thought signature for reasoning continuity across turns */
+  thoughtSignature?: string;
+  /**
+   * Pinned skill-activation messages (skills v2) recorded during this turn.
+   * Inserted between the user and assistant messages so replayed history
+   * mirrors the actual order: ask → skill loaded → answer. Stored verbatim —
+   * skill instructions are never truncated.
+   *
+   * Invariant for history consumers: a skill-bearing turn is a
+   * user → skill(user-role, metadata.isSkill) → assistant triplet, so
+   * stored history is NOT strictly pair-wise alternating. Pair-based
+   * logic must filter `metadata.isSkill` first (see slidingWindowTruncator
+   * for the canonical partition-and-reanchor pattern).
+   */
+  skillMessages?: ChatMessage[];
+  /**
+   * How the turn was entered. Stamped on both stored messages' metadata when
+   * set; a typed turn that leaves it unset is stored exactly as before.
+   */
+  modality?: ConversationModality;
+  /**
+   * Idempotency key for the turn. When set, the user and assistant messages
+   * are stored with the ids `${turnId}:user` and `${turnId}:assistant`, and a
+   * turn whose assistant id is already in the session's recent messages is
+   * skipped, so a retry after an ambiguous failure cannot duplicate it.
+   */
+  turnId?: string;
+  /** The assistant message was cut off before it finished. */
+  interrupted?: boolean;
+  /** The call ended while this turn was open. */
+  callEnded?: boolean;
+};
+
+/** Id and metadata a memory manager gives one stored message of a turn. */
+export type TurnMessageIdentity = {
+  /** Stable id for the message, or undefined to let the manager mint a random one. */
+  id: string | undefined;
+  /** Metadata to set on the message, or undefined when there is none to add. */
+  metadata: ChatMessageMetadata | undefined;
+};
+
+/**
+ * Input to `NeuroLink.recordConversationTurn`: one finished turn from a
+ * transport that does not go through generate()/stream() (a voice call),
+ * written to the same conversation memory typed chat uses.
+ */
+export type RecordConversationTurnOptions = {
+  /** Conversation to append to. Must not contain ":" (it is part of the stored key). */
+  sessionId: string;
+  /**
+   * Owner of the conversation. Required: typed chat falls back to a shared
+   * placeholder user when it is missing, and a spoken turn must never land
+   * there.
+   */
+  userId: string;
+  /** What the person said. Must be non-blank. */
+  userMessage: string;
+  /** What the assistant said (or the closing note for a cut-off turn). Must be non-blank unless `events` carries tool activity. */
+  aiResponse: string;
+  /** How the turn was entered. Stamped on both stored messages. */
+  modality?: ConversationModality;
+  /** Idempotency key. Recording the same `turnId` again is a no-op. */
+  turnId?: string;
+  /** The assistant message was cut off before it finished. */
+  interrupted?: boolean;
+  /** The call ended while this turn was open. */
+  callEnded?: boolean;
+  /** Tool and UI events of the turn, in the shape typed chat stores. */
+  events?: StreamEventSequence[];
+  /** When the turn started. */
+  startTime?: Date;
+  /** Provider and model that answered, for token-threshold selection. */
+  provider?: string;
+  model?: string;
+  /** Observability request identifier. */
+  requestId?: string;
+  /** Per-call override of summarization, as on generate()/stream(). */
+  enableSummarization?: boolean;
+  /** Per-call long-term memory switches, as on generate()/stream(). */
+  memory?: { enabled?: boolean; write?: boolean };
+};
+
+/** Outcome of `NeuroLink.recordConversationTurn`. */
+export type RecordConversationTurnResult = {
+  /** False when the turn was deliberately not stored; see `reason`. */
+  recorded: boolean;
+  /** Why nothing was stored. Only set when `recorded` is false. */
+  reason?: "empty-user-message" | "empty-response";
+  sessionId: string;
+  userId: string;
+  turnId?: string;
+};
+
+/** Options for `NeuroLink.getConversationSeed`. */
+export type ConversationSeedOptions = {
+  sessionId: string;
+  userId: string;
+  /** Most recent user/assistant exchanges to return (default 10). */
+  maxTurns?: number;
+  /** Cap on the total characters returned; the oldest messages are dropped first (default 6000). */
+  maxChars?: number;
+};
+
+/** One message of a conversation seed. */
+export type ConversationSeedMessage = {
+  role: "user" | "assistant";
+  content: string;
+  modality?: ConversationModality;
 };
 
 /**
@@ -346,6 +734,87 @@ export type SessionMetadata = {
   title: string;
   createdAt: string;
   updatedAt: string;
+  /** Additional metadata including agentic loop reports */
+  metadata?: {
+    agenticLoopReports?: AgenticLoopReportMetadata[];
+  };
+};
+
+/**
+ * Report type for agentic loop reports
+ * Identifies the platform or category of the report
+ */
+export type AgenticLoopReportType =
+  | "META"
+  | "GOOGLEADS"
+  | "GOOGLEGA4"
+  | "SHOPIFY"
+  | "BREEZE"
+  | "OTHER";
+
+/**
+ * Status of an agentic loop report
+ */
+export type AgenticLoopReportStatus =
+  | "INPROGRESS"
+  | "COMPLETED"
+  | "CANCELLED"
+  | "FAILED";
+
+/**
+ * Metadata for an individual agentic loop report
+ * A conversation session can have multiple reports tracked via this type
+ */
+export type AgenticLoopReportMetadata = {
+  /** Unique identifier for this report */
+  reportId: string;
+  /** Platform/category of the report */
+  reportType: AgenticLoopReportType;
+  /** Current status of the report */
+  reportStatus: AgenticLoopReportStatus;
+  /** Optional audit period date range for the report */
+  auditPeriod?: {
+    startDate: string;
+    endDate: string;
+  };
+};
+
+/**
+ * Session list item for CLI/API listing
+ * Extends SessionMetadata with additional display information
+ */
+export type SessionListItem = SessionMetadata & {
+  /** User identifier associated with this session */
+  userId?: string;
+  /** Total number of messages in this session */
+  messageCount: number;
+  /** Human-readable time since last activity (e.g., "2 hours ago") */
+  lastActive?: string;
+};
+
+/**
+ * Complete session export format for backup/analytics
+ * Contains full session data including all messages
+ */
+export type SessionExport = {
+  /** Session identifier */
+  sessionId: string;
+  /** Session title/description */
+  title?: string;
+  /** User identifier */
+  userId?: string;
+  /** When session was created (ISO 8601) */
+  createdAt: string;
+  /** When session was last updated (ISO 8601) */
+  updatedAt: string;
+  /** Complete message history */
+  messages: ChatMessage[];
+  /** Export metadata */
+  exportMetadata?: {
+    exportedAt: string;
+    exportFormat: "json" | "csv";
+    neuroLinkVersion?: string;
+  };
 };
 
 /**
@@ -385,6 +854,23 @@ export type ConversationBase = {
 
   /** Timestamp of last token count */
   lastCountedAt?: number;
+
+  /** API-reported token count from last request */
+  lastApiTokenCount?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+  };
+
+  /** Additional metadata for extensible conversation-level data */
+  additionalMetadata?: {
+    /** Agentic loop reports associated with this conversation */
+    agenticLoopReports?: AgenticLoopReportMetadata[];
+    /** Allow future extensibility */
+    [key: string]: unknown;
+  };
 };
 
 /**
@@ -394,6 +880,19 @@ export type ConversationBase = {
 export type RedisConversationObject = ConversationBase & {
   /** Array of conversation messages */
   messages: ChatMessage[];
+};
+
+/**
+ * Payload of the `conversation:titleGenerated` event, emitted once the title
+ * of a new Redis-backed conversation has been stored.
+ */
+export type ConversationTitleGeneratedEvent = {
+  sessionId: string;
+  userId: string;
+  /** The title that was stored, which is what `listSessions()` reports. */
+  title: string;
+  /** Unix epoch milliseconds when the title was stored. */
+  timestamp: number;
 };
 
 /**
@@ -440,6 +939,12 @@ export type ConversationSummary = ConversationBase & {
  * Redis storage configuration
  */
 export type RedisStorageConfig = {
+  /** Redis connection URL (e.g., 'rediss://host:6379' for TLS) */
+  url?: string;
+
+  /** Redis username for ACL authentication (optional) */
+  username?: string;
+
   /** Redis host (default: 'localhost') */
   host?: string;
 
@@ -474,4 +979,21 @@ export type RedisStorageConfig = {
 export type ProviderDetails = {
   provider: string;
   model: string;
+};
+
+/**
+ * Reduced ChatMessage shape used by callers (typically tests and history
+ * reconstructors) that pass synthetic entries into the Gemini history
+ * reconstructor without filling every `ChatMessage` field. Mirrors the
+ * fields actually read by `prependConversationMessages`.
+ */
+export type MinimalChatMessage = {
+  role: ChatMessage["role"];
+  content: string;
+  tool?: string;
+  args?: Record<string, unknown>;
+  metadata?: {
+    stepIndex?: number;
+    thoughtSignature?: string;
+  };
 };

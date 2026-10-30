@@ -24,7 +24,7 @@ export function getProviderSetupMessage(
         'OPENAI_API_KEY="sk-proj-your-openai-api-key"',
         "# Optional:",
         `OPENAI_MODEL="${OpenAIModels.GPT_4O}"`,
-        'OPENAI_BASE_URL="https://api.openai.com"',
+        'OPENAI_BASE_URL="https://api.openai.com/v1"',
       ],
     },
     anthropic: {
@@ -32,7 +32,7 @@ export function getProviderSetupMessage(
       envVars: [
         'ANTHROPIC_API_KEY="sk-ant-api03-your-anthropic-key"',
         "# Optional:",
-        `ANTHROPIC_MODEL="${AnthropicModels.CLAUDE_3_5_SONNET}"`,
+        `ANTHROPIC_MODEL="${AnthropicModels.CLAUDE_SONNET_4_6}"`,
       ],
     },
     "google-ai": {
@@ -82,8 +82,8 @@ export function getProviderSetupMessage(
       envVars: [
         'HUGGINGFACE_API_KEY="hf_your_huggingface_token"',
         "# Optional:",
-        'HUGGINGFACE_MODEL="microsoft/DialoGPT-medium"',
-        'HUGGINGFACE_ENDPOINT="https://api-inference.huggingface.co"',
+        'HUGGINGFACE_MODEL="Qwen/Qwen2.5-72B-Instruct"',
+        'HUGGINGFACE_BASE_URL="https://router.huggingface.co/v1"',
       ],
     },
     mistral: {

@@ -9,82 +9,13 @@
 import { TypedEventEmitter } from "../../core/infrastructure/index.js";
 import { logger } from "../../utils/logger.js";
 import { RAGCircuitBreakerError, RAGErrorCodes } from "../errors/RAGError.js";
-
-/**
- * Circuit breaker states
- */
-export type CircuitState = "closed" | "open" | "half-open";
-
-/**
- * Circuit breaker configuration
- */
-export interface RAGCircuitBreakerConfig {
-  /** Number of failures before opening circuit (default: 5) */
-  failureThreshold: number;
-  /** Time in ms before attempting reset (default: 60000) */
-  resetTimeout: number;
-  /** Max calls allowed in half-open state (default: 3) */
-  halfOpenMaxCalls: number;
-  /** Operation timeout in ms (default: 30000) */
-  operationTimeout: number;
-  /** Minimum calls before calculating failure rate (default: 10) */
-  minimumCallsBeforeCalculation: number;
-  /** Time window for statistics in ms (default: 300000 - 5 minutes) */
-  statisticsWindowSize: number;
-}
-
-/**
- * Call record for statistics
- */
-interface CallRecord {
-  timestamp: number;
-  success: boolean;
-  duration: number;
-  operationType?: string;
-}
-
-/**
- * Circuit breaker statistics
- */
-export interface RAGCircuitBreakerStats {
-  state: CircuitState;
-  totalCalls: number;
-  successfulCalls: number;
-  failedCalls: number;
-  failureRate: number;
-  windowCalls: number;
-  lastStateChange: Date;
-  nextRetryTime?: Date;
-  halfOpenCalls: number;
-  averageLatency: number;
-  p95Latency: number;
-}
-
-/**
- * Circuit breaker events
- */
-export type RAGCircuitBreakerEvents = {
-  stateChange: [
-    {
-      oldState: CircuitState;
-      newState: CircuitState;
-      reason: string;
-      timestamp: Date;
-    },
-  ];
-  callSuccess: [{ duration: number; timestamp: Date; operationType?: string }];
-  callFailure: [
-    {
-      error: string;
-      duration: number;
-      timestamp: Date;
-      operationType?: string;
-    },
-  ];
-  circuitOpen: [{ failureRate: number; totalCalls: number; timestamp: Date }];
-  circuitHalfOpen: [{ timestamp: Date }];
-  circuitClosed: [{ timestamp: Date }];
-};
+import type {
+  CallRecord,
+  CircuitState,
+  RAGCircuitBreakerConfig,
+  RAGCircuitBreakerEvents,
+  RAGCircuitBreakerStats,
+} from "../../types/index.js";
 
 /**
  * Default configuration

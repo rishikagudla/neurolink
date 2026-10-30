@@ -1,3 +1,5 @@
+import { bedrockModelIdForLookup } from "./bedrockIdentifiers.js";
+
 /**
  * Token Limit Constants for NeuroLink
  *
@@ -92,6 +94,13 @@ export const PROVIDER_TOKEN_LIMITS = {
 
   /** OpenAI model limits */
   OPENAI: {
+    "gpt-6-astra": 128_000,
+    "gpt-6-sol": 128_000,
+    "gpt-6-luna": 128_000,
+    "gpt-5.4": 128_000,
+    "gpt-5.4-mini": 128_000,
+    "gpt-5.4-nano": 128_000,
+    "gpt-5.4-pro": 128_000,
     "gpt-4o": 16384,
     "gpt-4o-mini": 16384,
     "gpt-3.5-turbo": 4096,
@@ -104,18 +113,20 @@ export const PROVIDER_TOKEN_LIMITS = {
 
   /** Google AI model limits */
   GOOGLE_AI: {
-    // Gemini 3 Series (Preview - November 2025)
-    "gemini-3-pro-preview": 8192,
-    "gemini-3-pro-preview-11-2025": 8192,
-    "gemini-3-pro-latest": 8192,
-    // Gemini 3 Flash Series
-    "gemini-3-flash": 65536,
+    // Gemini 3.1 Series (all require -preview suffix)
+    "gemini-3.1-pro-preview": 8192,
+    "gemini-3.1-flash-lite-preview": 65536,
+    "gemini-3.1-flash-image-preview": 8192,
+    "gemini-3.1-pro-preview-customtools": 8192,
+    // Gemini 3 Series
     "gemini-3-flash-preview": 65536,
-    "gemini-3-flash-latest": 65536,
+    "gemini-3-pro-image-preview": 8192,
+    /** @deprecated SHUT DOWN March 9, 2026. Migrate to gemini-3.1-pro-preview. */
+    "gemini-3-pro-preview": 8192,
     // Gemini 2.5 Series
-    "gemini-2.5-pro": 8192,
-    "gemini-2.5-flash": 8192,
-    "gemini-2.5-flash-lite": 8192,
+    "gemini-2.5-pro": 65536,
+    "gemini-2.5-flash": 65536,
+    "gemini-2.5-flash-lite": 65536,
     // Gemini 2.0 Series
     "gemini-2.0-flash-001": 8192,
     "gemini-2.0-flash-lite": 8192,
@@ -128,18 +139,20 @@ export const PROVIDER_TOKEN_LIMITS = {
 
   /** Google Vertex AI model limits */
   VERTEX: {
-    // Gemini 3 Series (Preview - November 2025)
-    "gemini-3-pro-preview": 8192,
-    "gemini-3-pro-preview-11-2025": 8192,
-    "gemini-3-pro-latest": 8192,
-    // Gemini 3 Flash Series
-    "gemini-3-flash": 65536,
+    // Gemini 3.1 Series (all require -preview suffix)
+    "gemini-3.1-pro-preview": 8192,
+    "gemini-3.1-flash-lite-preview": 65536,
+    "gemini-3.1-flash-image-preview": 8192,
+    "gemini-3.1-pro-preview-customtools": 8192,
+    // Gemini 3 Series
     "gemini-3-flash-preview": 65536,
-    "gemini-3-flash-latest": 65536,
+    "gemini-3-pro-image-preview": 8192,
+    /** @deprecated SHUT DOWN March 9, 2026. Migrate to gemini-3.1-pro-preview. */
+    "gemini-3-pro-preview": 8192,
     // Gemini 2.5 Series
-    "gemini-2.5-pro": 8192,
-    "gemini-2.5-flash": 8192,
-    "gemini-2.5-flash-lite": 8192,
+    "gemini-2.5-pro": 65536,
+    "gemini-2.5-flash": 65536,
+    "gemini-2.5-flash-lite": 65536,
     // Gemini 2.0 Series
     "gemini-2.0-flash-001": 8192,
     "gemini-2.0-flash-lite": 8192,
@@ -148,7 +161,7 @@ export const PROVIDER_TOKEN_LIMITS = {
     "gemini-1.5-flash": 8192,
     // Claude 4.5 Series (September-November 2025)
     "claude-sonnet-4-5@20250929": 8192,
-    "claude-opus-4-5@20251124": 8192,
+    "claude-opus-4-5@20251101": 8192,
     "claude-haiku-4-5@20251001": 8192,
     // Claude 4 Series (May 2025)
     "claude-sonnet-4@20250514": 4096,
@@ -247,10 +260,13 @@ export const CONTEXT_WINDOWS = {
  * For models that require explicit input and output token limits
  */
 export const MODEL_TOKEN_LIMITS = {
+  /** Gemini 3.1 Series */
+  "gemini-3.1-pro-preview": { input: 1048576, output: 65536 },
+  "gemini-3.1-flash-lite-preview": { input: 1048576, output: 65536 },
+  "gemini-3.1-flash-image-preview": { input: 1048576, output: 8192 },
+  "gemini-3.1-pro-preview-customtools": { input: 1048576, output: 65536 },
   /** Gemini 3 Flash Series */
-  "gemini-3-flash": { input: 1000000, output: 65536 },
   "gemini-3-flash-preview": { input: 1000000, output: 65536 },
-  "gemini-3-flash-latest": { input: 1000000, output: 65536 },
 } as const;
 
 /**
@@ -299,6 +315,7 @@ export const TokenUtils = {
       case "vertex":
         providerLimits = PROVIDER_TOKEN_LIMITS.VERTEX;
         break;
+      case "aws":
       case "bedrock":
         providerLimits = PROVIDER_TOKEN_LIMITS.BEDROCK;
         break;
@@ -323,6 +340,16 @@ export const TokenUtils = {
 
     if (model && providerLimits[model]) {
       return providerLimits[model];
+    }
+
+    if (
+      model &&
+      (normalizedProvider === "bedrock" || normalizedProvider === "aws")
+    ) {
+      const lookupModel = bedrockModelIdForLookup(model);
+      if (lookupModel !== undefined) {
+        return TokenUtils.getProviderTokenLimit("bedrock", lookupModel);
+      }
     }
 
     return providerLimits.default || PROVIDER_TOKEN_LIMITS.DEFAULT;

@@ -7,11 +7,7 @@ import path from "path";
 import { logger } from "../../lib/utils/logger.js";
 import { getTopModelChoices } from "../../lib/utils/modelChoices.js";
 import { AIProviderName } from "../../lib/types/index.js";
-
-interface SetupMistralArgs {
-  check?: boolean;
-  "non-interactive"?: boolean;
-}
+import type { SetupMistralArgs } from "../../lib/types/index.js";
 
 /**
  * Validates Mistral API key format
@@ -187,7 +183,7 @@ export const handleMistralSetup = async (
     // Step 2: Model Selection
     const { modelChoice } = await inquirer.prompt([
       {
-        type: "list",
+        type: "select",
         name: "modelChoice",
         message: "Select a Mistral model:",
         choices: getTopModelChoices(AIProviderName.MISTRAL, 5),

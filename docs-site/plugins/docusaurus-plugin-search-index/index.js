@@ -1,0 +1,378 @@
+/**
+ * Docusaurus Plugin: Search Index Generator
+ *
+ * Generates a search-index.json at build time from all docs content.
+ * The index is loaded client-side for local search when Algolia is not configured.
+ */
+
+const fs = require("fs");
+const path = require("path");
+const matter = require("gray-matter");
+const { createHash } = require("node:crypto");
+const { parseHeadingId } = require("./headingId");
+const { truncateAtBoundary } = require("./truncate");
+const { stripMarkdown } = require("./stripMarkdown");
+
+/** Simple glob matching for exclude patterns */
+function matchGlob(glob, filePath) {
+  // Convert glob to regex:
+  // ** matches any number of path segments (including zero)
+  // * matches anything except /
+  const regexStr = glob
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&") // escape regex chars except * and ?
+    .replace(/\*\*\//g, "(.+/)?") // **/ matches zero or more path segments
+    .replace(/\/\*\*/g, "(/.+)?") // /** matches zero or more trailing segments
+    .replace(/\*\*/g, ".*") // ** alone matches anything
+    .replace(/\*/g, "[^/]*"); // * matches within single segment
+  return new RegExp("^" + regexStr + "$").test(filePath);
+}
+
+/**
+ * A section's searchable text. A section whose body is only fenced code, such
+ * as a heading over a single command, strips to nothing and would drop out of
+ * the index, so its heading stands in. The code itself stays out: code blocks
+ * hold placeholder keys and tokens that do not belong in a served index.
+ */
+function sectionText(lines, heading) {
+  const text = stripMarkdown(lines.join("\n"));
+  if (text) {
+    return text;
+  }
+  return lines.some((line) => /^ {0,3}(`{3,}|~{3,})/.test(line)) ? heading : "";
+}
+
+/** Extract sections from markdown content */
+function extractSections(content) {
+  const sections = [];
+  const lines = content.split("\n");
+  let currentHeading = "";
+  let currentId = "";
+  let currentContent = [];
+  let currentLevel = 0;
+
+  // Every heading is recorded here, even one immediately followed by another
+  // heading (empty body) — anchor disambiguation must see every heading a
+  // real Markdown slugger would, not just the ones with indexable content.
+  // Whether a section has enough body to actually be indexed is decided by
+  // the caller, which reads `section.content`.
+  // A `#` line inside a fenced code block (a shell comment, say) is code, not
+  // a heading: Docusaurus gives it no anchor, so treating it as one would
+  // split the fence across two records and invent a link the page lacks.
+  let fence = null;
+  for (const line of lines) {
+    const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (fence) {
+      if (
+        fenceMatch &&
+        fenceMatch[1][0] === fence[0] &&
+        fenceMatch[1].length >= fence.length &&
+        fenceMatch[2].trim() === ""
+      ) {
+        fence = null;
+      }
+      currentContent.push(line);
+      continue;
+    }
+    if (
+      fenceMatch &&
+      !(fenceMatch[1][0] === "`" && fenceMatch[2].includes("`"))
+    ) {
+      fence = fenceMatch[1];
+      currentContent.push(line);
+      continue;
+    }
+    const headingMatch = line.match(/^(#{1,6})\s+(.+)/);
+    if (headingMatch) {
+      // Save previous section (skip the pre-first-heading preamble, which
+      // has no heading at all)
+      if (currentHeading || currentContent.length > 0) {
+        sections.push({
+          heading: currentHeading,
+          id: currentId,
+          level: currentLevel,
+          content: truncateAtBoundary(
+            sectionText(currentContent, currentHeading),
+          ),
+        });
+      }
+      currentLevel = headingMatch[1].length;
+      // A trailing `{#id}` is Docusaurus's explicit heading id: the page's
+      // anchor is that id, and it is not part of the heading's text.
+      const parsed = parseHeadingId(headingMatch[2]);
+      currentId = parsed.id ?? "";
+      currentHeading = parsed.text
+        .replace(/\*\*/g, "")
+        .replace(/`/g, "")
+        .trim();
+      currentContent = [];
+    } else {
+      currentContent.push(line);
+    }
+  }
+
+  // Save last section
+  if (currentHeading || currentContent.length > 0) {
+    sections.push({
+      heading: currentHeading,
+      id: currentId,
+      level: currentLevel,
+      content: truncateAtBoundary(sectionText(currentContent, currentHeading)),
+    });
+  }
+
+  return sections;
+}
+
+/**
+ * Codepoint total order; locale collation differs across Node/ICU builds.
+ * Plain `<`/`>` on strings compares UTF-16 code units, which diverges from
+ * code point order for astral characters (surrogate pairs, U+10000+) vs BMP
+ * characters above the surrogate range (U+E000-U+FFFF): a surrogate pair's
+ * leading unit (U+D800-U+DBFF) always sorts below those BMP units even when
+ * its actual code point is numerically larger. Step through code points
+ * explicitly instead.
+ */
+function byCodepoint(a, b) {
+  let i = 0;
+  let j = 0;
+  while (i < a.length && j < b.length) {
+    const ca = a.codePointAt(i);
+    const cb = b.codePointAt(j);
+    if (ca !== cb) {
+      return ca < cb ? -1 : 1;
+    }
+    i += ca > 0xffff ? 2 : 1;
+    j += cb > 0xffff ? 2 : 1;
+  }
+  if (i < a.length) {
+    return 1;
+  }
+  if (j < b.length) {
+    return -1;
+  }
+  return 0;
+}
+
+/** Stable Algolia/MiniSearch object id for one URL. */
+function objectIdForUrl(url) {
+  return createHash("sha256").update(url).digest("hex");
+}
+
+/** Recursively find all markdown files */
+function findMarkdownFiles(dir) {
+  const files = [];
+  if (!fs.existsSync(dir)) {
+    return files;
+  }
+
+  const entries = fs
+    .readdirSync(dir, { withFileTypes: true })
+    .sort((a, b) => byCodepoint(a.name, b.name));
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...findMarkdownFiles(fullPath));
+    } else if (/\.(md|mdx)$/.test(entry.name)) {
+      files.push(fullPath);
+    }
+  }
+  return files;
+}
+
+module.exports = function searchIndexPlugin(context, options = {}) {
+  const docsDir = options.docsDir || path.resolve(context.siteDir, "docs");
+
+  // Exclude patterns matching docusaurus.config.ts docs.exclude
+  const excludeGlobs = options.exclude || [
+    "**/api/**",
+    "**/cli-guide.md",
+    "**/package-overrides.md",
+    "**/mcp/concurrency.md",
+    "**/features/interactive-cli.md",
+    "**/404.md",
+    "**/404.mdx",
+  ];
+
+  function isExcluded(relativePath) {
+    const normalized = relativePath.replace(/\\/g, "/");
+    return excludeGlobs.some((glob) => matchGlob(glob, normalized));
+  }
+
+  return {
+    name: "docusaurus-plugin-search-index",
+
+    async postBuild({ outDir }) {
+      await generateIndex(docsDir, outDir, isExcluded);
+    },
+
+    // Also generate during dev via configureWebpack
+    configureWebpack() {
+      return {
+        plugins: [
+          {
+            apply(compiler) {
+              compiler.hooks.afterEmit.tapAsync(
+                "SearchIndexPlugin",
+                (compilation, callback) => {
+                  const staticDir = path.resolve(context.siteDir, "static");
+                  generateIndex(docsDir, staticDir, isExcluded).then(() =>
+                    callback(),
+                  );
+                },
+              );
+            },
+          },
+        ],
+      };
+    },
+  };
+};
+
+async function generateIndex(docsDir, outDir, isExcluded) {
+  const files = findMarkdownFiles(docsDir);
+  const documents = [];
+  let skipped = 0;
+
+  // URL is derived from file path only (frontmatter `slug:` overrides are
+  // not consulted), so two files can legitimately compute the same URL —
+  // e.g. `tutorials.md` and `tutorials/index.md` both landing on
+  // `/docs/tutorials`. That predates this file and is not fixed here; what
+  // must hold regardless is that every entry still gets a distinct,
+  // order-independent objectID, so a repeat occurrence is disambiguated the
+  // same way a repeated heading anchor is below.
+  const urlOccurrences = new Map();
+
+  for (const filePath of files) {
+    try {
+      const relativePath = path.relative(docsDir, filePath).replace(/\\/g, "/");
+
+      // Skip excluded files (matches docusaurus.config.ts docs.exclude)
+      if (isExcluded(relativePath)) {
+        skipped++;
+        continue;
+      }
+
+      const raw = fs.readFileSync(filePath, "utf-8");
+      const { data: frontmatter, content } = matter(raw);
+
+      // Skip drafts
+      if (frontmatter.draft === true) {
+        continue;
+      }
+
+      // Build URL path from file path
+      const urlPath = relativePath
+        .replace(/(index)?\.(md|mdx)$/, "")
+        .replace(/\/$/, "");
+
+      const url = `/docs/${urlPath}`;
+      const title = frontmatter.title || path.basename(urlPath) || "Untitled";
+
+      const urlOccurrence = urlOccurrences.get(url) ?? 0;
+      urlOccurrences.set(url, urlOccurrence + 1);
+      // Only the objectID input is suffixed on a repeat — the visible `url`
+      // field is untouched, so this changes nothing about what's indexed or
+      // where a result links, only how its id is derived.
+      const idSource = (forUrl) =>
+        urlOccurrence === 0 ? forUrl : `${forUrl}::dup${urlOccurrence}`;
+
+      // Extract hierarchy from path
+      const pathParts = urlPath.split("/");
+      const lvl0 =
+        pathParts[0]
+          ?.replace(/-/g, " ")
+          .replace(/\b\w/g, (c) => c.toUpperCase()) || "Docs";
+
+      // Add main document entry — index full content for better search recall
+      const plainContent = stripMarkdown(content);
+      documents.push({
+        objectID: objectIdForUrl(idSource(url)),
+        title,
+        url,
+        content: plainContent.slice(0, 5000),
+        hierarchy: {
+          lvl0,
+          lvl1: title,
+          lvl2: "",
+          lvl3: "",
+        },
+      });
+
+      // Add section entries
+      const sections = extractSections(content);
+      const anchorCounts = new Map();
+      const sectionUrlOccurrences = new Map();
+      for (const section of sections) {
+        if (!section.heading) {
+          continue;
+        }
+        // An explicit id is used as written and never goes through the slugger,
+        // so it neither gets a numeric suffix nor shifts the suffixes of the
+        // auto-slugged headings around it.
+        let anchor = section.id;
+        if (!anchor) {
+          const baseAnchor = section.heading
+            .toLowerCase()
+            .replace(/[^\w\s-]/g, "")
+            .replace(/\s+/g, "-");
+          const occurrence = anchorCounts.get(baseAnchor) ?? 0;
+          anchorCounts.set(baseAnchor, occurrence + 1);
+          anchor =
+            occurrence === 0 ? baseAnchor : `${baseAnchor}-${occurrence}`;
+        }
+
+        // Every heading counts toward anchor disambiguation above (matching
+        // Docusaurus's own slugger), but a heading with no body text isn't
+        // worth indexing as a search result.
+        if (!section.content) {
+          continue;
+        }
+
+        const sectionUrl = `${url}#${anchor}`;
+        // Two records on one page can now share an anchor: an explicit `{#id}`
+        // is used as written, so it can equal the auto-slug of another heading. The
+        // search hook loads records with MiniSearch.addAll, which throws on a
+        // repeated id and would leave the whole index unloaded, so a repeat is
+        // given its own id. As with `idSource`, only the id input is suffixed;
+        // the record's `url` is untouched.
+        const sectionOccurrence = sectionUrlOccurrences.get(sectionUrl) ?? 0;
+        sectionUrlOccurrences.set(sectionUrl, sectionOccurrence + 1);
+        const sectionIdSource =
+          sectionOccurrence === 0
+            ? idSource(sectionUrl)
+            : `${idSource(sectionUrl)}::section${sectionOccurrence}`;
+        documents.push({
+          objectID: objectIdForUrl(sectionIdSource),
+          title: section.heading,
+          url: sectionUrl,
+          content: section.content,
+          hierarchy: {
+            lvl0,
+            lvl1: title,
+            lvl2: section.heading,
+            lvl3: "",
+          },
+        });
+      }
+    } catch (err) {
+      // Skip files that can't be parsed
+      console.warn(`[search-index] Skipping ${filePath}: ${err.message}`);
+    }
+  }
+
+  // Write index
+  const indexPath = path.join(outDir, "search-index.json");
+  fs.mkdirSync(path.dirname(indexPath), { recursive: true });
+  // One entry per line. The file is committed and every docs change
+  // regenerates it; as a single line, any two such PRs conflicted on the
+  // whole 8 MB file. With per-URL ids and a sorted traversal, two PRs that
+  // touch different pages now change different lines and git merges them.
+  // Readers JSON.parse the file, so the layout is invisible to them.
+  fs.writeFileSync(
+    indexPath,
+    `[\n${documents.map((doc) => JSON.stringify(doc)).join(",\n")}\n]\n`,
+  );
+  console.log(
+    `[search-index] Generated ${documents.length} entries from ${files.length} files (${skipped} excluded)`,
+  );
+}

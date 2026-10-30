@@ -1,0 +1,626 @@
+import type { AIProviderName } from "../../constants/enums.js";
+import { AIProviderName as AIProviderNameEnum } from "../../constants/enums.js";
+import { createProxyFetch } from "../../proxy/proxyFetch.js";
+import type {
+  EmbedInput,
+  EnhancedGenerateResult,
+  NeurolinkCredentials,
+  ProviderErrorRule,
+  TextGenerationOptions,
+  UnknownRecord,
+} from "../../types/index.js";
+import {
+  AuthenticationError,
+  InvalidModelError,
+  ProviderError,
+  RateLimitError,
+} from "../../types/index.js";
+import { logger } from "../../utils/logger.js";
+import { redactUrlCredentials } from "../../utils/logSanitize.js";
+import {
+  classifyProviderError,
+  DEFAULT_ERROR_RULES,
+} from "../../utils/errorClassifier.js";
+import {
+  createOpenAIConfig,
+  getProviderModel,
+  validateApiKey,
+} from "../../utils/providerConfig.js";
+import { safeDownload } from "../../utils/safeFetch.js";
+import { MAX_IMAGE_BYTES } from "../../utils/sizeGuard.js";
+import { createTimeoutController } from "../../utils/timeout.js";
+import { stripTrailingSlash } from "../openaiChatCompletionsClient.js";
+import { OpenAIChatCompletionsProvider } from "../openaiChatCompletionsBase.js";
+import {
+  isOpenAIQuotaExhaustedError,
+  readOpenAIBodyErrorType,
+} from "../../utils/providerRetry.js";
+
+const OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1";
+
+/**
+ * Resolve the effective OpenAI base URL from optional credential / env
+ * overrides, falling back to the official API host.
+ *
+ * - Blank or whitespace-only overrides are treated as unset, so a bare
+ *   `OPENAI_BASE_URL=` cannot silently override the default with "".
+ * - The official OpenAI REST API lives under `/v1`. Setup guidance has long
+ *   shown `OPENAI_BASE_URL="https://api.openai.com"` (no path); consumed
+ *   verbatim that builds `https://api.openai.com/chat/completions` and 404s.
+ *   When the canonical host is supplied without a path, append `/v1`. Custom
+ *   proxy hosts (LiteLLM, gateways, …) are left exactly as provided.
+ */
+const resolveOpenAIBaseURL = (
+  credentialBaseURL?: string,
+  envBaseURL?: string,
+): string => {
+  const resolved =
+    [credentialBaseURL, envBaseURL]
+      .map((v) => v?.trim())
+      .find((v): v is string => !!v && v.length > 0) ?? OPENAI_DEFAULT_BASE_URL;
+
+  try {
+    const url = new URL(resolved);
+    const hasPath = url.pathname && url.pathname !== "/";
+    if (url.hostname === "api.openai.com" && !hasPath) {
+      url.pathname = "/v1";
+      return stripTrailingSlash(url.toString());
+    }
+  } catch {
+    // Not a parseable absolute URL — return the override verbatim.
+  }
+  return resolved;
+};
+
+const getOpenAIApiKey = (): string => validateApiKey(createOpenAIConfig());
+
+const getOpenAIModel = (): string =>
+  getProviderModel("OPENAI_MODEL", "gpt-5.4");
+
+/**
+ * OpenAI Provider — direct HTTP, no AI SDK.
+ *
+ * OpenAI chat completions at api.openai.com/v1. All request / stream /
+ * tool-loop orchestration lives in `OpenAIChatCompletionsProvider`; this
+ * class adds:
+ *   - Native `/v1/embeddings` (`embed` / `embedMany`)
+ *   - Image generation via `/v1/images/generations` (`executeImageGeneration`)
+ *   - OpenAI-specific error mapping (`formatProviderError`)
+ *
+ * @see https://platform.openai.com/docs/api-reference
+ */
+export class OpenAIProvider extends OpenAIChatCompletionsProvider {
+  constructor(
+    modelName?: string,
+    sdk?: unknown,
+    _region?: string,
+    credentials?: NeurolinkCredentials["openai"],
+  ) {
+    const overrideApiKey = credentials?.apiKey?.trim();
+    const apiKey =
+      overrideApiKey && overrideApiKey.length > 0
+        ? overrideApiKey
+        : getOpenAIApiKey();
+    const baseURL = resolveOpenAIBaseURL(
+      credentials?.baseURL,
+      process.env.OPENAI_BASE_URL,
+    );
+
+    super(AIProviderNameEnum.OPENAI, modelName, sdk, { baseURL, apiKey });
+
+    logger.debug("OpenAIProvider initialized", {
+      model: this.modelName,
+      providerName: this.providerName,
+      baseURL: redactUrlCredentials(this.config.baseURL),
+    });
+  }
+
+  // ===========================================================================
+  // Abstract hook implementations
+  // ===========================================================================
+
+  /**
+   * OpenAI natively supports `response_format: json_schema` together with
+   * tool calling in one request, so structured output stays wire-enforced
+   * mid-loop instead of deferring to post-hoc coercion.
+   */
+  protected override suppressResponseFormatWithTools(): boolean {
+    return false;
+  }
+
+  protected getProviderName(): AIProviderName {
+    return AIProviderNameEnum.OPENAI;
+  }
+
+  protected getDefaultModel(): string {
+    return getOpenAIModel();
+  }
+
+  public formatProviderError(error: unknown): Error {
+    // Chat errors retain the JSON in responseBody; embedding errors stamp
+    // type onto the raw error. Keep both paths available to the rule closures.
+    const errorObj = error as UnknownRecord;
+    const errorType =
+      errorObj?.type && typeof errorObj.type === "string"
+        ? errorObj.type
+        : readOpenAIBodyErrorType(errorObj?.responseBody);
+
+    const rules: ProviderErrorRule[] = [
+      // Curator P1-1 / Reviewer Finding #4: only the explicit auth markers
+      // map to AuthenticationError. Earlier we treated every
+      // `invalid_request_error` as an auth failure — that's OpenAI's
+      // catch-all for any bad request (unsupported parameter, malformed
+      // JSON, etc.) and mislabelled them as "invalid API key". Use
+      // credential-specific signals only.
+      {
+        match: (ctx) =>
+          ctx.statusCode === 401 ||
+          errorType === "invalid_api_key" ||
+          /API_KEY_INVALID|Invalid API key|Incorrect API key|invalid_api_key/i.test(
+            ctx.message,
+          ),
+        errorClass: AuthenticationError,
+        message: (ctx) =>
+          /Incorrect API key|Invalid API key/i.test(ctx.message)
+            ? ctx.message
+            : "Invalid OpenAI API key. Please check your OPENAI_API_KEY environment variable.",
+      },
+      // MUST precede the 429 rule below. OpenAI returns 429 for two
+      // unrelated conditions: transient throttling, and a permanently
+      // exhausted quota (out of credit, or a spend cap reached). Matching on
+      // the status code alone collapses them, and the resulting advice —
+      // "try again later" — is the one thing that can never resolve the
+      // second. The signal is the error TYPE, not the wording.
+      {
+        // One definition of "permanent billing state", in the helper. The
+        // earlier cut also tested `errorType === "insufficient_quota"` here,
+        // which is precisely the helper's own first branch — two places to
+        // keep in step for no benefit.
+        match: (ctx) => isOpenAIQuotaExhaustedError(ctx.error),
+        errorClass: ProviderError,
+        message:
+          "OpenAI quota exhausted — this will not resolve by retrying. " +
+          "Check your plan and billing details at " +
+          "https://platform.openai.com/account/billing",
+      },
+      {
+        match: (ctx) =>
+          ctx.statusCode === 429 ||
+          errorType === "rate_limit_error" ||
+          /rate limit/i.test(ctx.message),
+        errorClass: RateLimitError,
+        message: "OpenAI rate limit exceeded. Please try again later.",
+      },
+      {
+        match: (ctx) => /model_not_found/i.test(ctx.message),
+        errorClass: InvalidModelError,
+        message: (ctx) => `Model not found: ${ctx.modelName}`,
+      },
+      ...DEFAULT_ERROR_RULES,
+    ];
+    return classifyProviderError(
+      error,
+      rules,
+      this.providerName,
+      this.modelName,
+    );
+  }
+
+  // ===========================================================================
+  // Embeddings — native POST /v1/embeddings
+  // ===========================================================================
+
+  /**
+   * Default embedding model, overridable via OPENAI_EMBEDDING_MODEL env var.
+   */
+  protected getDefaultEmbeddingModel(): string {
+    return process.env.OPENAI_EMBEDDING_MODEL || "text-embedding-3-small";
+  }
+
+  /**
+   * Generate an embedding for a single text input via native /v1/embeddings.
+   *
+   * @param input - The text to embed (string or EmbedInput)
+   * @param modelName - The embedding model to use (default: text-embedding-3-small)
+   * @returns Promise resolving to the embedding vector
+   */
+  async embed(
+    input: string | EmbedInput,
+    modelName?: string,
+  ): Promise<number[]> {
+    if (typeof input !== "string" && input.image) {
+      throw new ProviderError(
+        `${this.providerName} does not support image embeddings; provide text input`,
+        this.providerName,
+      );
+    }
+
+    const text = typeof input === "string" ? input : (input.text ?? "");
+    const embeddingModelName = modelName || this.getDefaultEmbeddingModel();
+
+    logger.debug("Generating embedding", {
+      provider: this.providerName,
+      model: embeddingModelName,
+      textLength: text.length,
+    });
+
+    let rows: Array<number[] | undefined>;
+    try {
+      rows = await this.callEmbeddings(embeddingModelName, [text], "embed");
+    } catch (error) {
+      logger.error("Embedding generation failed", {
+        error: error instanceof Error ? error.message : String(error),
+        model: embeddingModelName,
+        textLength: text.length,
+      });
+      throw this.handleProviderError(error);
+    }
+
+    const [embedding] = this.requireEmbeddings(rows, 1, embeddingModelName);
+    logger.debug("Embedding generated successfully", {
+      provider: this.providerName,
+      model: embeddingModelName,
+      embeddingDimension: embedding.length,
+    });
+    return embedding;
+  }
+
+  /**
+   * Generate embeddings for multiple texts in a single batch via native /v1/embeddings.
+   *
+   * @param texts - The texts to embed
+   * @param modelName - The embedding model to use (default: text-embedding-3-small)
+   * @returns Promise resolving to an array of embedding vectors
+   */
+  async embedMany(texts: string[], modelName?: string): Promise<number[][]> {
+    const embeddingModelName = modelName || this.getDefaultEmbeddingModel();
+
+    logger.debug("Generating batch embeddings", {
+      provider: this.providerName,
+      model: embeddingModelName,
+      count: texts.length,
+    });
+
+    let rows: Array<number[] | undefined>;
+    try {
+      rows = await this.callEmbeddings(embeddingModelName, texts, "embedMany");
+    } catch (error) {
+      logger.error("Batch embedding generation failed", {
+        error: error instanceof Error ? error.message : String(error),
+        model: embeddingModelName,
+        count: texts.length,
+      });
+      throw this.handleProviderError(error);
+    }
+
+    const embeddings = this.requireEmbeddings(
+      rows,
+      texts.length,
+      embeddingModelName,
+    );
+    logger.debug("Batch embeddings generated successfully", {
+      provider: this.providerName,
+      model: embeddingModelName,
+      count: embeddings.length,
+      embeddingDimension: embeddings[0]?.length,
+    });
+    return embeddings;
+  }
+
+  /**
+   * One non-empty vector per input, or fail: a dropped or empty row would
+   * pair later texts with the wrong vectors, or score 0 downstream.
+   *
+   * Called after the request's try on purpose: inside it, handleProviderError
+   * would wrap this message in a second provider error and run it through its
+   * keyword rules.
+   */
+  private requireEmbeddings(
+    rows: Array<number[] | undefined>,
+    inputCount: number,
+    modelName: string,
+  ): number[][] {
+    if (rows.length !== inputCount) {
+      logger.error("Embedding response held the wrong number of vectors", {
+        model: modelName,
+        expected: inputCount,
+        received: rows.length,
+      });
+      throw new ProviderError(
+        `Embedding response held ${rows.length} vectors for ${inputCount} texts`,
+        this.providerName,
+      );
+    }
+    return rows.map((values, index) => {
+      if (!values || values.length === 0) {
+        logger.error("Embedding returned no values", {
+          model: modelName,
+          index,
+        });
+        throw new ProviderError(
+          `Embedding for the text at index ${index} came back without values`,
+          this.providerName,
+        );
+      }
+      return values;
+    });
+  }
+
+  private async callEmbeddings(
+    modelName: string,
+    input: string[],
+    operation: "embed" | "embedMany",
+  ): Promise<Array<number[] | undefined>> {
+    const url = `${stripTrailingSlash(this.config.baseURL)}/embeddings`;
+    const fetchImpl = createProxyFetch();
+    const timeoutController = createTimeoutController(
+      30_000,
+      this.providerName,
+      "generate",
+    );
+    try {
+      const res = await fetchImpl(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.config.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: modelName,
+          input: input.length === 1 ? input[0] : input,
+        }),
+        ...(timeoutController?.controller.signal
+          ? { signal: timeoutController.controller.signal }
+          : {}),
+      });
+      if (!res.ok) {
+        const bodyText = await res.text().catch(() => "");
+        let message = `OpenAI ${operation} failed with status ${res.status}`;
+        let errorType: string | undefined;
+        if (bodyText) {
+          try {
+            const parsed = JSON.parse(bodyText) as {
+              error?: { message?: string; type?: string };
+            };
+            if (parsed.error?.message) {
+              message = parsed.error.message;
+            }
+            errorType = parsed.error?.type;
+          } catch {
+            // Non-JSON error body — keep the status-based message.
+          }
+        }
+        // Throw a raw, annotated error so the public embed/embedMany catch
+        // formats it exactly once via handleProviderError(), preserving
+        // status-based classification (401 -> auth, 429 -> rate limit, …).
+        throw Object.assign(new Error(message), {
+          status: res.status,
+          type: errorType,
+        });
+      }
+      const json = (await res.json()) as {
+        data?: Array<{ embedding?: number[] }>;
+      };
+      const rows = (json.data ?? []).map((row) =>
+        Array.isArray(row.embedding) ? row.embedding : undefined,
+      );
+      if (rows.length === 0) {
+        throw new ProviderError(
+          `OpenAI ${operation} returned no embeddings`,
+          this.providerName,
+        );
+      }
+      return rows;
+    } finally {
+      timeoutController?.cleanup();
+    }
+  }
+
+  // ===========================================================================
+  // Image generation — native POST /v1/images/generations
+  // ===========================================================================
+
+  /**
+   * Image generation via the OpenAI Images API (`/v1/images/generations`).
+   *
+   * Supports `gpt-image-1`, `dall-e-3`, and `dall-e-2`. The three models
+   * differ in which body params they accept:
+   *
+   * - `gpt-image-1` returns base64 by default; does NOT accept `response_format`.
+   * - `dall-e-3` / `dall-e-2` accept `response_format: "b64_json"` to get base64.
+   * - `dall-e-2` does NOT accept `quality` / `style`.
+   *
+   * The model is taken from `options.model || this.modelName`.
+   *
+   * @see https://platform.openai.com/docs/api-reference/images/create
+   */
+  protected override async executeImageGeneration(
+    options: TextGenerationOptions,
+  ): Promise<EnhancedGenerateResult> {
+    const startTime = Date.now();
+    const prompt = options.prompt ?? options.input?.text ?? "";
+    if (!prompt.trim()) {
+      throw new Error(
+        "OpenAI image generation requires a prompt (input.text or prompt)",
+      );
+    }
+
+    const model = options.model ?? this.modelName;
+    const baseURL = stripTrailingSlash(
+      this.config.baseURL ?? OPENAI_DEFAULT_BASE_URL,
+    );
+
+    // Image-gen extras live on `options` but are not part of the strict
+    // TextGenerationOptions shape — cast to a permissive type to read them.
+    const extras = options as TextGenerationOptions & {
+      aspectRatio?: string;
+      numberOfImages?: number;
+      quality?: string;
+      style?: string;
+      size?: string;
+    };
+
+    // Map aspect ratio to OpenAI's `size` parameter. gpt-image-1 supports
+    // 1024x1024 / 1024x1536 / 1536x1024 / auto; dall-e-3 supports
+    // 1024x1024 / 1792x1024 / 1024x1792; dall-e-2 supports 256x256 /
+    // 512x512 / 1024x1024. We pick safe defaults and let users override
+    // via `extras.size` directly.
+    const size =
+      extras.size ?? this.aspectRatioToOpenAISize(extras.aspectRatio, model);
+
+    // Clamp n per-model: gpt-image-1 and dall-e-3 only support n=1;
+    // dall-e-2 supports n=1..10; default to 1 for any future models.
+    const rawN = extras.numberOfImages ?? 1;
+    let clampedN: number;
+    if (model === "gpt-image-1" || model.startsWith("dall-e-3")) {
+      clampedN = 1;
+    } else if (model.startsWith("dall-e-2")) {
+      clampedN = Math.min(Math.max(rawN, 1), 10);
+    } else {
+      clampedN = 1;
+    }
+    const n = clampedN;
+
+    const body: Record<string, unknown> = {
+      model,
+      prompt,
+      n,
+      size,
+    };
+
+    if (model === "gpt-image-1") {
+      // gpt-image-1 always returns base64; rejects `response_format`.
+      if (extras.quality) {
+        body.quality = extras.quality;
+      }
+    } else if (model.startsWith("dall-e-3")) {
+      body.response_format = "b64_json";
+      if (extras.quality) {
+        body.quality = extras.quality;
+      }
+      if (extras.style) {
+        body.style = extras.style;
+      }
+    } else {
+      // dall-e-2 (and forward-compat default).
+      body.response_format = "b64_json";
+    }
+
+    const REQUEST_TIMEOUT_MS = 120_000;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+    let response: Response;
+    try {
+      const proxyFetch = createProxyFetch();
+      response = await proxyFetch(`${baseURL}/images/generations`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.config.apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } catch (err: unknown) {
+      if (err instanceof Error && err.name === "AbortError") {
+        throw new Error(
+          `OpenAI image generation timed out after ${REQUEST_TIMEOUT_MS / 1000}s`,
+          { cause: err },
+        );
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(
+        `OpenAI image generation failed: ${response.status} — ${text}`,
+      );
+    }
+
+    const data = (await response.json()) as {
+      created?: number;
+      data?: Array<{
+        b64_json?: string;
+        url?: string;
+        revised_prompt?: string;
+      }>;
+    };
+
+    const first = data.data?.[0];
+    if (!first) {
+      throw new Error("OpenAI image generation returned no images");
+    }
+
+    let base64: string | undefined = first.b64_json;
+    // dall-e-2 with `response_format: "b64_json"` should always include
+    // b64_json. If a hosted URL came back instead (e.g. older keys, or
+    // url-mode), download it inline so callers always get base64.
+    if (!base64 && first.url) {
+      // The API-returned URL carries the same SSRF risk as a caller-supplied
+      // one, so it is fetched through `safeDownload`: vetted and pinned (or,
+      // when the environment configures a proxy, sent through it), no
+      // redirects, size-capped. Vetting and fetching in two separate steps
+      // left a DNS-rebinding window between them.
+      const buf = await safeDownload(first.url, {
+        maxBytes: MAX_IMAGE_BYTES,
+        label: "OpenAI image fallback",
+        timeoutMs: 60_000,
+      });
+      base64 = buf.toString("base64");
+    }
+
+    if (!base64) {
+      throw new Error(
+        "OpenAI image generation returned neither b64_json nor a URL",
+      );
+    }
+
+    const generationTimeMs = Date.now() - startTime;
+    logger.info(
+      `[OpenAIProvider] Generated image (${base64.length} base64 chars) in ${generationTimeMs}ms — model ${model}`,
+    );
+
+    return {
+      content: first.revised_prompt ?? prompt,
+      provider: this.providerName,
+      model,
+      usage: { input: 0, output: 0, total: 0 },
+      imageOutput: { base64 },
+    };
+  }
+
+  /**
+   * Map a NeuroLink-style aspect ratio (e.g. "16:9") to the OpenAI
+   * `size` parameter accepted by the active image model. Falls back to
+   * the per-model square default when the ratio is unknown.
+   */
+  private aspectRatioToOpenAISize(
+    aspectRatio: string | undefined,
+    model: string,
+  ): string {
+    if (model === "gpt-image-1") {
+      if (aspectRatio === "16:9" || aspectRatio === "3:2") {
+        return "1536x1024";
+      }
+      if (aspectRatio === "9:16" || aspectRatio === "2:3") {
+        return "1024x1536";
+      }
+      return "1024x1024";
+    }
+    if (model.startsWith("dall-e-3")) {
+      if (aspectRatio === "16:9" || aspectRatio === "3:2") {
+        return "1792x1024";
+      }
+      if (aspectRatio === "9:16" || aspectRatio === "2:3") {
+        return "1024x1792";
+      }
+      return "1024x1024";
+    }
+    // dall-e-2 — only square sizes supported.
+    return "1024x1024";
+  }
+}

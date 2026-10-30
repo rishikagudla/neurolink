@@ -6,12 +6,12 @@ While Vercel AI SDK is excellent for Next.js applications, NeuroLink offers broa
 
 | Benefit                 | Vercel AI SDK                  | NeuroLink                                |
 | ----------------------- | ------------------------------ | ---------------------------------------- |
-| **Multi-Provider**      | Separate packages per provider | 13 providers in single package           |
+| **Multi-Provider**      | Separate packages per provider | Supported providers in a single package  |
 | **Framework Support**   | Optimized for Next.js          | Next.js, SvelteKit, Express, any Node.js |
 | **Tool Integration**    | Function calling only          | MCP (58+ servers) + function calling     |
 | **Enterprise Features** | Basic                          | HITL, Redis memory, middleware, failover |
 | **Memory/State**        | useChat hook (client-side)     | Redis-backed server-side memory          |
-| **Production Ready**    | Good for prototypes            | Battle-tested at enterprise scale        |
+| **Production Ready**    | Good for prototypes            | In production use at Juspay              |
 | **Bundle Size**         | Moderate                       | Optimized, tree-shakeable                |
 | **Streaming**           | Excellent                      | Excellent (same quality)                 |
 
@@ -21,16 +21,16 @@ While Vercel AI SDK is excellent for Next.js applications, NeuroLink offers broa
 
 ## Concept Mapping
 
-| Vercel AI SDK                        | NeuroLink                        | Notes                                 |
-| ------------------------------------ | -------------------------------- | ------------------------------------- |
-| `generateText()`                     | `generate()`                     | Similar API, unified across providers |
-| `streamText()`                       | `generate({ stream: true })`     | Built-in streaming                    |
-| `useChat()`                          | Custom hook + API route          | Server-side memory more robust        |
-| `CoreMessage`                        | `ChatMessage`                    | Type compatible                       |
-| `tool()` function                    | MCP Tools                        | More powerful, 58+ servers            |
-| Provider packages (`@ai-sdk/openai`) | `provider` parameter             | Single package                        |
-| `generateObject()`                   | `generate({ structuredOutput })` | Zod schema validation                 |
-| Edge Runtime                         | Node.js runtime                  | Compatible with Edge via adapters     |
+| Vercel AI SDK                        | NeuroLink               | Notes                                 |
+| ------------------------------------ | ----------------------- | ------------------------------------- |
+| `generateText()`                     | `generate()`            | Similar API, unified across providers |
+| `streamText()`                       | `stream()`              | Built-in streaming                    |
+| `useChat()`                          | Custom hook + API route | Server-side memory more robust        |
+| `CoreMessage`                        | `ChatMessage`           | Type compatible                       |
+| `tool()` function                    | MCP Tools               | More powerful, 58+ servers            |
+| Provider packages (`@ai-sdk/openai`) | `provider` parameter    | Single package                        |
+| `generateObject()`                   | `generate({ schema })`  | Zod schema validation                 |
+| Edge Runtime                         | Node.js runtime         | Compatible with Edge via adapters     |
 
 ---
 
@@ -142,24 +142,21 @@ import { NeuroLink } from "@juspay/neurolink";
 
 const neurolink = new NeuroLink({ provider: "openai" });
 
-const result = await neurolink.generate({
+const result = await neurolink.stream({
   input: { text: "Tell me a story" },
   model: "gpt-4",
-  stream: true,
 });
 
-for await (const chunk of result.stream!) {
-  process.stdout.write(chunk.delta);
+for await (const chunk of result.stream) {
+  process.stdout.write(chunk.content);
 }
 ```
 
 **Full chunk data:**
 
 ```typescript
-for await (const chunk of result.stream!) {
-  console.log(chunk.delta); // Text delta
-  console.log(chunk.contentType); // 'text' | 'tool_call'
-  console.log(chunk.toolCalls); // Tool calls if any
+for await (const chunk of result.stream) {
+  console.log(chunk.content); // Text content
 }
 ```
 
@@ -236,7 +233,7 @@ const result2 = await neurolink.generate({
 
 - MCP servers provide 58+ pre-built integrations
 - No manual tool registration needed
-- Tools work across all providers
+- Tools work with providers that support tool-calling
 
 ---
 
@@ -279,13 +276,10 @@ const schema = z.object({
 const result = await neurolink.generate({
   input: { text: "Generate a user profile for John Doe, age 30" },
   model: "gpt-4",
-  structuredOutput: {
-    format: "json",
-    schema,
-  },
+  schema,
 });
 
-console.log(result.structuredOutput); // { name: "John Doe", age: 30, email: "..." }
+console.log(result.content); // JSON string with { name: "John Doe", age: 30, email: "..." }
 // Automatically validated against Zod schema
 ```
 
@@ -293,7 +287,7 @@ console.log(result.structuredOutput); // { name: "John Doe", age: 30, email: "..
 
 - Type-safe results
 - Automatic validation
-- Works across all providers
+- Works across providers that support structured output
 
 ---
 
@@ -360,7 +354,7 @@ const result = await neurolink.generate({
 
 **Benefits:**
 
-- Single package for all 13 providers
+- Single package for supported providers
 - Runtime provider switching
 - Automatic failover
 - No need to install separate packages
@@ -408,24 +402,23 @@ const neurolink = new NeuroLink({
 export async function POST(req: Request) {
   const { message } = await req.json();
 
-  const result = await neurolink.generate({
+  const result = await neurolink.stream({
     input: { text: message },
     model: "gpt-4",
-    stream: true,
   });
 
   // Convert stream to Response
   const encoder = new TextEncoder();
-  const stream = new ReadableStream({
+  const readableStream = new ReadableStream({
     async start(controller) {
-      for await (const chunk of result.stream!) {
-        controller.enqueue(encoder.encode(chunk.delta));
+      for await (const chunk of result.stream) {
+        controller.enqueue(encoder.encode(chunk.content));
       }
       controller.close();
     },
   });
 
-  return new Response(stream, {
+  return new Response(readableStream, {
     headers: { "Content-Type": "text/plain; charset=utf-8" },
   });
 }
@@ -438,16 +431,15 @@ export async function POST(req: Request) {
   try {
     const { message } = await req.json();
 
-    const result = await neurolink.generate({
+    const result = await neurolink.stream({
       input: { text: message },
-      stream: true,
     });
 
     const encoder = new TextEncoder();
     const stream = new ReadableStream({
       async start(controller) {
         try {
-          for await (const chunk of result.stream!) {
+          for await (const chunk of result.stream) {
             controller.enqueue(
               encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`),
             );
@@ -839,9 +831,8 @@ const neurolink = new NeuroLink({ provider: "openai" });
 export async function POST(req: Request) {
   const { message } = await req.json();
 
-  const result = await neurolink.generate({
+  const result = await neurolink.stream({
     input: { text: message },
-    stream: true,
   });
 
   // Convert to Response...
@@ -979,11 +970,10 @@ for await (const chunk of result.textStream) {
 **After:**
 
 ```typescript
-const result = await neurolink.generate({
+const result = await neurolink.stream({
   input: { text: "Story" },
-  stream: true,
 });
-for await (const chunk of result.stream!) {
+for await (const chunk of result.stream) {
 }
 ```
 
@@ -1004,7 +994,7 @@ const result = await generateObject({
 ```typescript
 const result = await neurolink.generate({
   input: { text: "..." },
-  structuredOutput: { format: "json", schema },
+  schema,
 });
 ```
 

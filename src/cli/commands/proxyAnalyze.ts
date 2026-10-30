@@ -1,0 +1,290 @@
+import type { Argv, CommandModule } from "yargs";
+import chalk from "chalk";
+import { analyzeProxyLogs } from "../../lib/proxy/proxyAnalysis.js";
+import type {
+  ProxyAnalyzeArgs,
+  ProxyLatencySummary,
+} from "../../lib/types/index.js";
+import { logger } from "../../lib/utils/logger.js";
+
+function formatLatency(label: string, summary: ProxyLatencySummary): string {
+  const value = (amount: number | null) =>
+    amount === null ? "-" : amount.toFixed(1);
+  return `${label.padEnd(22)} ${String(summary.count).padStart(7)} ${value(summary.p50).padStart(9)} ${value(summary.p95).padStart(9)} ${value(summary.p99).padStart(9)} ${value(summary.max).padStart(9)}`;
+}
+
+/**
+ * Render the offline evidence report without converting missing outcomes
+ * into inferred success.
+ */
+function printAnalysis(
+  report: Awaited<ReturnType<typeof analyzeProxyLogs>>,
+): void {
+  logger.always("");
+  logger.always(chalk.bold.cyan("NeuroLink Proxy Analysis"));
+  logger.always(chalk.gray("=".repeat(50)));
+  logger.always(`  Since:       ${chalk.cyan(report.since)}`);
+  logger.always(`  Until:       ${chalk.cyan(report.until)}`);
+  logger.always(`  Logs:        ${chalk.cyan(report.logsDir)}`);
+  logger.always(
+    `  Files:       ${report.files.requests} request, ${report.files.attempts} attempt, ${report.files.lifecycle} lifecycle, ${report.files.debug} debug`,
+  );
+  logger.always("");
+  logger.always(chalk.bold("  Reliability"));
+  logger.always(
+    report.coverage.finalRequests
+      ? `    Completed: ${report.requests.completed} (${chalk.green(`${report.requests.success} success`)}, ${chalk.red(`${report.requests.errors} errors`)})`
+      : chalk.yellow("    Completed: unavailable (no final request logs)"),
+  );
+  logger.always(
+    report.coverage.attempts &&
+      report.coverage.finalRequests &&
+      report.coverage.comparableRequestAttempts
+      ? `    Recovered after retry: ${report.requests.recoveredAfterRetry}`
+      : chalk.yellow(
+          "    Recovered after retry: unavailable (request/attempt windows are incomplete or non-comparable)",
+        ),
+  );
+  if (report.requests.errors > 0) {
+    logger.always(
+      `    Final error types: ${JSON.stringify(report.requests.errorTypes)}`,
+    );
+  }
+  if (report.coverage.attempts) {
+    logger.always(
+      `    Attempts: ${report.attempts.total}, ${report.attempts.errors} errors${report.attempts.errors > 0 ? ` ${JSON.stringify(report.attempts.errorTypes)}` : ""}`,
+    );
+    if (Object.keys(report.attempts.transportScopes).length > 0) {
+      logger.always(
+        `    Transport scopes: ${JSON.stringify(report.attempts.transportScopes)}`,
+      );
+    }
+  }
+  logger.always(
+    report.coverage.lifecycle
+      ? `    Lifecycle: ${report.lifecycle.accepted} accepted (${report.lifecycle.auxiliaryRequests} auxiliary), ${report.lifecycle.terminal} terminal, ${report.lifecycle.unsettled} unsettled (${report.lifecycle.unconfirmedAtWorkerExit.length} unconfirmed at worker exit)`
+      : chalk.yellow("    Lifecycle: unavailable (no lifecycle metadata)"),
+  );
+  if (report.runtime.samples > 0) {
+    logger.always(
+      `    Runtime: ${report.runtime.samples} samples, max event-loop delay ${report.runtime.maxEventLoopDelayMs ?? "unknown"}ms, max CPU ${report.runtime.maxCpuPercentOneCore?.toFixed(1) ?? "unknown"}% of one core, max host load ${report.runtime.maxHostLoad1m ?? "unknown"}`,
+    );
+  }
+  if (report.coverage.attempts) {
+    const finalRateLimits = report.coverage.finalRequests
+      ? `${report.requests.finalRateLimits} final`
+      : "final unavailable";
+    logger.always(
+      `    Rate limits: ${report.rateLimits.attemptRateLimits} attempts (${report.rateLimits.quota} quota, ${report.rateLimits.transient} transient, ${report.rateLimits.unclassified} unclassified), ${finalRateLimits}`,
+    );
+  } else if (report.coverage.finalRequests) {
+    logger.always(
+      chalk.yellow(
+        `    Rate limits: attempt classification unavailable; ${report.requests.finalRateLimits} final 429 response(s)`,
+      ),
+    );
+  } else {
+    logger.always(chalk.yellow("    Rate limits: unavailable"));
+  }
+  logger.always("");
+  logger.always(chalk.bold("  Account Routing"));
+  if (report.coverage.routingDecisions) {
+    logger.always(
+      `    Decisions: ${report.routing.totalRecords} (${report.routing.records.length} retained), modes: ${JSON.stringify(report.routing.modes)}`,
+    );
+    logger.always(
+      `    Selection reasons: ${JSON.stringify(report.routing.selectionReasons)}`,
+    );
+    const productionQuotaProbes =
+      report.routing.selectionReasons.quota_probe ?? 0;
+    if (productionQuotaProbes > 0) {
+      logger.always(
+        chalk.yellow(
+          `    WARNING: ${productionQuotaProbes} production request(s) were selected for quota discovery`,
+        ),
+      );
+    }
+    logger.always(
+      `    Initial accounts: ${JSON.stringify(report.routing.initialAccounts)}`,
+    );
+    logger.always(
+      `    Final account changed after retry: ${report.routing.finalAccountChanges}, outside candidate set: ${report.routing.finalOutsideCandidateSet}`,
+    );
+  } else {
+    logger.always(
+      chalk.yellow("    Routing decisions: unavailable (legacy or no logs)"),
+    );
+  }
+  logger.always("");
+  logger.always(chalk.bold("  Latency (ms)"));
+  const latencyHeader = `${"METRIC".padEnd(22)} ${"COUNT".padStart(7)} ${"P50".padStart(9)} ${"P95".padStart(9)} ${"P99".padStart(9)} ${"MAX".padStart(9)}`;
+  logger.always(`    ${chalk.gray(latencyHeader)}`);
+  logger.always(`    ${chalk.gray("-".repeat(latencyHeader.length))}`);
+  for (const [label, summary] of [
+    ["Response headers", report.latencyMs.headers],
+    ["First chunk", report.latencyMs.firstChunk],
+    ["First useful output", report.latencyMs.firstUsefulOutput],
+    ["Terminal", report.latencyMs.terminal],
+    ["Final request log", report.latencyMs.finalRequest],
+    ["Account attempt", report.latencyMs.attempt],
+    ["Single-attempt delta", report.latencyMs.singleAttemptDelta],
+  ] as [string, ProxyLatencySummary][]) {
+    logger.always(`    ${formatLatency(label, summary)}`);
+  }
+  logger.always("");
+  logger.always(chalk.bold("  Cache"));
+  if (report.coverage.cacheUsage) {
+    logger.always(
+      `    Usage records: ${report.cache.requestsWithUsage}, cache-read requests: ${report.cache.requestsWithCacheRead}, hit rate: ${report.cache.requestHitRate === null ? "-" : `${(report.cache.requestHitRate * 100).toFixed(1)}%`}`,
+    );
+    logger.always(
+      `    Tokens: ${report.cache.cacheReadTokens} read, ${report.cache.cacheCreationTokens} created, ${report.cache.inputTokens} input, ${report.cache.outputTokens} output`,
+    );
+    logger.always(
+      report.cache.requestsPriced > 0
+        ? `    Estimated cost: $${report.cache.estimatedCostUsd.toFixed(4)} across ${report.cache.requestsPriced} priced request(s)`
+        : "    Estimated cost: unavailable (no request carried a priceable model)",
+    );
+    if (report.cache.requestsPricedByPrefix > 0) {
+      logger.always(
+        chalk.yellow(
+          `    ⚠ ${report.cache.requestsPricedByPrefix} request(s) priced by name-prefix fallback, not an exact rate: ${report.cache.modelsPricedByPrefix.join(", ")}`,
+        ),
+      );
+    }
+    if (report.cache.requestsUnpriced > 0) {
+      logger.always(
+        chalk.yellow(
+          `    ⚠ ${report.cache.requestsUnpriced} request(s) had usage but no pricing row: ${report.cache.unpricedModels.join(", ")}`,
+        ),
+      );
+    }
+  } else {
+    logger.always(chalk.yellow("    Cache usage: unavailable"));
+  }
+  logger.always("");
+  logger.always(chalk.bold("  Data Quality"));
+  if (!report.coverage.comparableRequestAttempts) {
+    logger.always(
+      chalk.yellow(
+        "    WARNING: request and attempt totals do not cover a comparable full window; do not reconcile them as one cohort",
+      ),
+    );
+  }
+  logger.always(
+    `    ${report.dataQuality.linesRead} lines scanned, ${report.dataQuality.malformedLines} malformed, ${report.dataQuality.unsupportedLifecycleLines} unsupported lifecycle, ${report.dataQuality.lifecycleSequenceGaps} sequence gaps, ${report.dataQuality.lifecycleSequenceDuplicates} duplicates (${report.dataQuality.conflictingLifecycleDuplicates} conflicting)`,
+  );
+  logger.always(
+    `    Outcome evidence: ${report.dataQuality.finalOutcomeConflicts} conflicts reconciled, ${report.dataQuality.acceptedWithoutFinal} accepted without a final record, ${report.dataQuality.terminalWithoutFinal} transport terminals without a final record`,
+  );
+  logger.always(
+    `    Repeated attempt records merged: ${report.dataQuality.duplicateAttempts}`,
+  );
+  logger.always(
+    `    Routing decisions: ${report.dataQuality.routingDecisions.valid} valid, ${report.dataQuality.routingDecisions.invalid} invalid, ${report.dataQuality.routingDecisions.absent} absent`,
+  );
+  for (const [stream, range] of Object.entries(report.dataQuality.streams)) {
+    if (range.observedFrom) {
+      logger.always(
+        `    ${stream}: ${range.observedFrom} to ${range.observedTo}${range.completeWindow ? "" : chalk.yellow(" (partial: starts after requested window)")}`,
+      );
+    }
+  }
+  const artifacts = report.dataQuality.bodyArtifacts;
+  if (artifacts.capturesIndexed > 0) {
+    logger.always(
+      `    Body artifacts: ${artifacts.artifactsPresent}/${artifacts.artifactsReferenced} present, ${artifacts.artifactsMissing} missing, ${artifacts.writeFailures} write failures, ${artifacts.invalidPaths} invalid paths, ${artifacts.truncatedCaptures} truncated captures`,
+    );
+  }
+  if (report.accounts.length > 0) {
+    logger.always("");
+    logger.always(chalk.bold("  Accounts"));
+    const header = `${"ACCOUNT".padEnd(30)} ${"AUTH".padEnd(8)} ${"ATTEMPT".padStart(8)} ${"ATT ERR".padStart(7)} ${"FINAL".padStart(7)} ${"FIN ERR".padStart(7)} ${"QUOTA".padStart(7)} ${"TRANS".padStart(7)} ${"UNKNOWN".padStart(8)}`;
+    logger.always(`    ${chalk.gray(header)}`);
+    logger.always(`    ${chalk.gray("-".repeat(header.length))}`);
+    for (const account of report.accounts) {
+      const attempt = report.coverage.attempts ? String(account.attempts) : "-";
+      const attemptErrors = report.coverage.attempts
+        ? String(account.attemptErrors)
+        : "-";
+      const quota = report.coverage.attempts
+        ? String(account.quotaRateLimits)
+        : "-";
+      const transient = report.coverage.attempts
+        ? String(account.transientRateLimits)
+        : "-";
+      const unknown = report.coverage.attempts
+        ? String(account.unclassifiedRateLimits)
+        : "-";
+      const finalRequests = report.coverage.finalRequests
+        ? String(account.finalRequests)
+        : "-";
+      const finalErrors = report.coverage.finalRequests
+        ? String(account.finalErrors)
+        : "-";
+      logger.always(
+        `    ${account.account.slice(0, 30).padEnd(30)} ${account.accountType.slice(0, 8).padEnd(8)} ${attempt.padStart(8)} ${attemptErrors.padStart(7)} ${finalRequests.padStart(7)} ${finalErrors.padStart(7)} ${quota.padStart(7)} ${transient.padStart(7)} ${unknown.padStart(8)}`,
+      );
+    }
+  }
+  logger.always("");
+}
+
+export const proxyAnalyzeCommand: CommandModule<object, ProxyAnalyzeArgs> = {
+  command: "analyze",
+  describe: "Analyze local proxy reliability and latency logs",
+  builder: (yargs: Argv) =>
+    yargs
+      .option("logs-dir", {
+        type: "string",
+        alias: "logsDir",
+        description: "Proxy JSONL log directory",
+      })
+      .option("since", {
+        type: "string",
+        default: "24h",
+        description: "ISO timestamp or lookback such as 6h, 1d, or 1w",
+      })
+      .option("until", {
+        type: "string",
+        description:
+          "ISO timestamp or lookback such as 6h, 1d, or 1w; defaults to analysis start time",
+      })
+      .option("format", {
+        type: "string",
+        choices: ["text", "json"] as const,
+        default: "text" as const,
+        description: "Output format",
+      })
+      .option("quiet", {
+        type: "boolean",
+        alias: "q",
+        default: false,
+        description: "Suppress non-essential output",
+      })
+      .example(
+        "neurolink proxy analyze --since 24h",
+        "Analyze the last 24 hours of proxy logs",
+      ) as Argv<ProxyAnalyzeArgs>,
+  handler: async (argv) => {
+    try {
+      const report = await analyzeProxyLogs({
+        logsDir: argv.logsDir,
+        since: argv.since,
+        until: argv.until,
+      });
+      if (argv.format === "json") {
+        logger.always(JSON.stringify(report, null, 2));
+        return;
+      }
+      printAnalysis(report);
+    } catch (error) {
+      logger.error(
+        chalk.red(
+          `Error: ${error instanceof Error ? error.message : String(error)}`,
+        ),
+      );
+      process.exitCode = 1;
+    }
+  },
+};

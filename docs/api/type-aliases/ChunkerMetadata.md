@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v8.44.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,13 +8,7 @@
 
 > **ChunkerMetadata** = `object`
 
-Defined in: [lib/rag/types.ts:283](https://github.com/juspay/neurolink/blob/main/src/lib/rag/types.ts#L283)
-
-Metadata for chunker registration in the ChunkerRegistry. Provides descriptive information about chunker capabilities, supported document types, and configuration options.
-
-## Since
-
-v8.44.0
+Chunker metadata for factory registration
 
 ## Properties
 
@@ -22,45 +16,45 @@ v8.44.0
 
 > **description**: `string`
 
-Human-readable description of the chunker's purpose and behavior
+Human-readable description
 
 ---
 
 ### supportedTypes?
 
-> `optional` **supportedTypes**: [`DocumentType`](DocumentType.md)[]
+> `optional` **supportedTypes?**: [`DocumentType`](DocumentType.md)[]
 
-Document types this chunker is optimized for
+Supported document types
 
 ---
 
 ### requiresExternalDeps?
 
-> `optional` **requiresExternalDeps**: `boolean`
+> `optional` **requiresExternalDeps?**: `boolean`
 
-Whether the chunker requires external dependencies (e.g., tokenizers, LLM providers)
+Whether the chunker requires external dependencies
 
 ---
 
 ### defaultConfig?
 
-> `optional` **defaultConfig**: `Record<string, unknown>`
+> `optional` **defaultConfig?**: `Record`\<`string`, `unknown`\>
 
-Default configuration values for this chunker
+Default configuration (can be any chunker-specific config)
 
 ---
 
 ### supportedOptions?
 
-> `optional` **supportedOptions**: `string[]`
+> `optional` **supportedOptions?**: `string`[]
 
-List of supported configuration option names
+Supported configuration options
 
 ---
 
 ### useCases?
 
-> `optional` **useCases**: `string[]`
+> `optional` **useCases?**: `string`[]
 
 Use cases where this chunker excels
 
@@ -68,32 +62,6 @@ Use cases where this chunker excels
 
 ### aliases?
 
-> `optional` **aliases**: `string[]`
+> `optional` **aliases?**: `string`[]
 
-Alternative names or aliases for this chunker
-
-## Example
-
-```typescript
-import { ChunkerRegistry, type ChunkerMetadata } from "@juspay/neurolink";
-
-// Registering a custom chunker with metadata
-const metadata: ChunkerMetadata = {
-  description: "Splits documents by paragraph boundaries",
-  supportedTypes: ["text", "markdown"],
-  requiresExternalDeps: false,
-  defaultConfig: {
-    maxSize: 1000,
-    overlap: 100,
-  },
-  supportedOptions: ["maxSize", "minSize", "overlap", "trimWhitespace"],
-  useCases: ["Blog posts", "Articles", "Documentation"],
-  aliases: ["paragraph", "para"],
-};
-
-ChunkerRegistry.register("paragraph", paragraphChunker, metadata);
-
-// Querying chunker metadata
-const allChunkers = ChunkerRegistry.list();
-const markdownChunkers = ChunkerRegistry.listForType("markdown");
-```
+Alternative names/aliases for this chunker

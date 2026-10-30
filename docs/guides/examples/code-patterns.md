@@ -1,12 +1,12 @@
 ---
 title: Production Code Patterns
-description: Best practices, anti-patterns, and battle-tested patterns for production AI applications
+description: Best practices, anti-patterns, and proven patterns for production AI applications
 keywords: code patterns, best practices, anti-patterns, error handling, caching, rate limiting
 ---
 
 # Production Code Patterns
 
-**Battle-tested patterns, anti-patterns, and best practices for production AI applications**
+**Proven patterns, anti-patterns, and best practices for production AI applications**
 
 ---
 
@@ -571,10 +571,10 @@ class WindowRateLimitedService {
 ### Pattern 1: In-Memory Cache with TTL
 
 ```typescript
-interface CacheEntry<T> {
+type CacheEntry<T> = {
   value: T;
   expiry: number;
-}
+};
 
 class CachedAIService {
   private cache: Map<string, CacheEntry<string>> = new Map();
@@ -631,18 +631,19 @@ class CachedAIService {
 ### Pattern 2: Redis Cache
 
 ```typescript
-import Redis from "ioredis";
+import { createClient, type RedisClientType } from "redis";
 
 class RedisCachedAIService {
-  private redis: Redis;
+  private redis: RedisClientType;
+  private redisReady: Promise<void>;
   private ai: NeuroLink;
 
   constructor() {
-    this.redis = new Redis({
-      host: process.env.REDIS_HOST,
-      port: parseInt(process.env.REDIS_PORT),
+    this.redis = createClient({
+      url: `redis://${process.env.REDIS_HOST}:${process.env.REDIS_PORT}`,
       password: process.env.REDIS_PASSWORD,
     });
+    this.redisReady = this.redis.connect();
 
     this.ai = new NeuroLink({
       providers: [
@@ -652,6 +653,7 @@ class RedisCachedAIService {
   }
 
   async generate(prompt: string, ttlSeconds: number = 3600): Promise<string> {
+    await this.redisReady;
     const cacheKey = `ai:${this.hash(prompt)}`;
 
     const cached = await this.redis.get(cacheKey);
@@ -666,7 +668,7 @@ class RedisCachedAIService {
       provider: "openai",
     });
 
-    await this.redis.setex(cacheKey, ttlSeconds, result.content);
+    await this.redis.set(cacheKey, result.content, { EX: ttlSeconds });
 
     return result.content;
   }

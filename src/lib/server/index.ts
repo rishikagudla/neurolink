@@ -40,8 +40,10 @@ export { KoaServerAdapter } from "./adapters/koaAdapter.js";
 export {
   AlreadyRunningError,
   // Authentication/Authorization errors
-  AuthenticationError,
-  AuthorizationError,
+  // (aliased: the bare names resolve to the provider-error classes of the
+  // same name from types/ on the public @juspay/neurolink surface)
+  AuthenticationError as ServerAuthenticationError,
+  AuthorizationError as ServerAuthorizationError,
   // Configuration errors
   ConfigurationError,
   // Error recovery
@@ -65,7 +67,7 @@ export {
   // Streaming errors
   StreamingError,
   // Timeout errors
-  TimeoutError,
+  ServerTimeoutError,
   // Validation errors
   ValidationError as ServerValidationError,
   WebSocketConnectionError,
@@ -82,7 +84,6 @@ export {
   ServerAdapterFactory,
 } from "./factory/serverAdapterFactory.js";
 export {
-  type AbortSignalMiddlewareOptions,
   createAbortSignalMiddleware,
   createExpressAbortMiddleware,
 } from "./middleware/abortSignal.js";
@@ -90,16 +91,11 @@ export {
 // Middleware
 // ============================================
 export {
-  type AuthConfig,
-  type AuthResult,
   createAuthMiddleware,
   createRoleMiddleware,
 } from "./middleware/auth.js";
 
 export {
-  type CacheConfig,
-  type CacheEntry,
-  type CacheStore,
   createCacheInvalidator,
   createCacheMiddleware,
   InMemoryCacheStore,
@@ -112,10 +108,7 @@ export {
   createSecurityHeadersMiddleware,
   createTimingMiddleware,
 } from "./middleware/common.js";
-export {
-  createDeprecationMiddleware,
-  type DeprecationConfig,
-} from "./middleware/deprecation.js";
+export { createDeprecationMiddleware } from "./middleware/deprecation.js";
 export {
   createMCPBodyAttachmentMiddleware,
   fastifyMCPBodyHook,
@@ -124,18 +117,12 @@ export {
   createRateLimitMiddleware,
   createSlidingWindowRateLimitMiddleware,
   InMemoryRateLimitStore,
-  RateLimitError,
-  type RateLimitMiddlewareConfig,
-  type RateLimitStore,
 } from "./middleware/rateLimit.js";
 export {
   CommonSchemas,
   createFieldValidator,
   createRequestValidationMiddleware,
-  type PropertySchema,
-  type ValidationConfig,
   ValidationError,
-  type ValidationSchema,
 } from "./middleware/validation.js";
 // ============================================
 // OpenAPI
@@ -176,9 +163,7 @@ export {
   NeuroLinkApiInfo,
   // Generator
   OpenAPIGenerator,
-  type OpenAPIGeneratorConfig,
   OpenAPISchemas,
-  type OpenAPISpec,
   ProviderInfoSchema,
   ReadyResponseSchema,
   SessionSchema,
@@ -197,7 +182,6 @@ export {
 // Routes
 // ============================================
 export {
-  type CreateRoutesOptions,
   createAgentRoutes,
   createAllRoutes,
   createHealthRoutes,
@@ -205,7 +189,17 @@ export {
   createMemoryRoutes,
   createOpenApiRoutes,
   createToolRoutes,
+  createTranscribeRoutes,
   registerAllRoutes,
+  // The proxy doors. All were reachable only from the deep path
+  // ./routes/index.js, which is not a package export — so a consumer of
+  // "@juspay/neurolink/server" could reach them only indirectly through
+  // createAllRoutes' flags, never to mount one on its own. Codex stayed
+  // CLI-only for long enough on exactly that gap to be worth naming.
+  createClaudeProxyRoutes,
+  createOpenAIProxyRoutes,
+  createCodexProxyRoutes,
+  createGeminiProxyRoutes,
 } from "./routes/index.js";
 // ============================================
 // Streaming
@@ -216,86 +210,36 @@ export {
   createDataStreamWriter,
   createNDJSONHeaders,
   createSSEHeaders,
-  type DataEvent,
-  type DataStreamEvent,
   // Types
-  type DataStreamEventType,
   DataStreamResponse,
   // Response
-  type DataStreamResponseConfig,
   // Writer
-  type DataStreamWriterConfig,
-  type ErrorEvent,
-  type FinishEvent,
   formatSSEEvent,
   // Helpers
   pipeAsyncIterableToDataStream,
-  type SSEEventOptions,
-  type TextDeltaEvent,
-  type TextEndEvent,
-  type TextStartEvent,
-  type ToolCallEvent,
-  type ToolResultEvent,
   WebStreamWriter,
 } from "./streaming/index.js";
 // ============================================
 // Types
 // ============================================
-export type {
-  AgentExecuteRequest,
-  AgentExecuteResponse,
-  AuthConfig as WebSocketAuthConfig,
-  AuthenticatedUser,
-  AuthStrategy,
-  BodyParserConfig,
-  CORSConfig,
-  DataStreamWriter,
-  // Error Types
-  ErrorCategoryType,
-  ErrorSeverityType,
-  HealthResponse,
-  HttpMethod,
-  LoggingConfig,
-  MCPServerStatusResponse,
-  MiddlewareDefinition,
-  MiddlewareHandler,
-  RateLimitConfig,
-  ReadyResponse,
-  RequiredServerAdapterConfig,
-  RouteDefinition,
-  RouteGroup,
-  RouteHandler,
-  ServerAdapterConfig,
-  ServerAdapterErrorCodeType,
-  ServerAdapterErrorContext,
-  ServerAdapterEvents,
-  ServerAdapterFactoryOptions,
-  ServerContext,
-  ServerFramework,
-  ServerResponse,
-  ServerStatus,
-  SSEWriteOptions,
-  StreamingConfig,
-  ToolExecuteRequest,
-  ToolExecuteResponse,
-  // WebSocket Types
-  WebSocketConfig,
-  WebSocketConnection,
-  WebSocketHandler,
-  WebSocketMessage,
-  WebSocketMessageType,
-} from "./types.js";
+
 // Export error constants
 export {
   ErrorCategory,
   ErrorSeverity,
   ServerAdapterErrorCode,
-} from "./types.js";
+} from "../types/index.js";
 export { createStreamRedactor, redactStreamChunk } from "./utils/redaction.js";
+// The address a request is counted against (for a custom rate-limit
+// keyGenerator behind a reverse proxy) and the loopback test the adapters use.
+export {
+  isLoopbackAddress,
+  resolveClientAddress,
+} from "./utils/clientAddress.js";
+export { clientFacingError } from "./utils/clientError.js";
 // ============================================
 // Validation Utilities
 // ============================================
-export type { ErrorResponse, ValidationResult } from "./utils/validation.js";
 export {
   AgentExecuteRequestSchema,
   createErrorResponse,
@@ -305,6 +249,9 @@ export {
   ToolExecuteRequestSchema,
   ToolNameParamSchema,
   ToolSearchQuerySchema,
+  TranscribeConfigSchema,
+  TranscribeRequestSchema,
+  TranscribeStreamConfigSchema,
   validateParams,
   validateQuery,
   validateRequest,
@@ -317,3 +264,4 @@ export {
   WebSocketConnectionManager,
   WebSocketMessageRouter,
 } from "./websocket/index.js";
+export { attachTranscribeWebSocket } from "./websocket/transcribeWebSocket.js";

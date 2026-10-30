@@ -4,7 +4,8 @@
  * Part of Phase 4.1 - Models Command System
  */
 
-import { DEFAULT_MODEL_ALIASES } from "../types/providers.js";
+import { DEFAULT_MODEL_ALIASES } from "../types/index.js";
+import { logger } from "../utils/logger.js";
 import {
   AIProviderName,
   OpenAIModels,
@@ -15,13 +16,27 @@ import {
   MistralModels,
   OllamaModels,
 } from "../constants/enums.js";
-import type { JsonValue } from "../types/common.js";
-import type { ModelInfo } from "../types/modelTypes.js";
+import type {
+  ClaudeDisabledThinkingReplacement,
+  JsonValue,
+  ModelCapabilities,
+  ModelInfo,
+  ModelPerformance,
+  ProviderModelManifestEntry,
+} from "../types/index.js";
+import {
+  getAllManifestProviders,
+  getManifestForProvider,
+} from "./manifestRegistry.js";
 
 /**
- * Comprehensive model registry
+ * Comprehensive model registry — hand-authored base. Every id defined here
+ * that the manifest doesn't also carry a priced entry for stays exactly as
+ * authored below; see buildManifestDerivedEntries()/MODEL_REGISTRY's
+ * docblock further down for how the two are merged and why (Task 9, model
+ * metadata consolidation plan).
  */
-export const MODEL_REGISTRY: Record<string, ModelInfo> = {
+const LEGACY_MODEL_REGISTRY: Record<string, ModelInfo> = {
   // OpenAI Models
   [OpenAIModels.GPT_4O]: {
     id: OpenAIModels.GPT_4O,
@@ -765,7 +780,7 @@ export const MODEL_REGISTRY: Record<string, ModelInfo> = {
     description: "Preview version of O1 reasoning model",
     capabilities: {
       vision: false,
-      functionCalling: true,
+      functionCalling: false,
       codeGeneration: true,
       reasoning: true,
       multimodal: false,
@@ -810,7 +825,7 @@ export const MODEL_REGISTRY: Record<string, ModelInfo> = {
     description: "Cost-effective O1 variant with strong reasoning capabilities",
     capabilities: {
       vision: false,
-      functionCalling: true,
+      functionCalling: false,
       codeGeneration: true,
       reasoning: true,
       multimodal: false,
@@ -1011,8 +1026,8 @@ export const MODEL_REGISTRY: Record<string, ModelInfo> = {
       accuracy: "high",
     },
     limits: {
-      maxContextTokens: 2097152, // 2M tokens
-      maxOutputTokens: 8192,
+      maxContextTokens: 1048576, // 1M tokens
+      maxOutputTokens: 65536,
       maxRequestsPerMinute: 360,
     },
     useCases: {
@@ -1093,8 +1108,11 @@ export const MODEL_REGISTRY: Record<string, ModelInfo> = {
       jsonMode: false,
     },
     pricing: {
-      inputCostPer1K: 0.015,
-      outputCostPer1K: 0.075,
+      // $5 / $25 per MTok. Was 0.015/0.075 — Claude 3 Opus's rate, left
+      // behind when the entry was updated to 4.5, so every cost estimate
+      // for this model came out 3x high.
+      inputCostPer1K: 0.005,
+      outputCostPer1K: 0.025,
       currency: "USD",
     },
     performance: {
@@ -1118,13 +1136,267 @@ export const MODEL_REGISTRY: Record<string, ModelInfo> = {
     },
     aliases: [
       "claude-4.5-opus",
-      "claude-opus-latest",
+      // "claude-opus-latest" now belongs to CLAUDE_OPUS_5. An alias declared
+      // on two entries silently resolves to whichever appears later in this
+      // object, so a "latest" pointer must live on exactly one model.
       "opus-4.5",
       "anthropic-flagship",
     ],
     deprecated: false,
     isLocal: false,
     releaseDate: "2025-11-24",
+    category: "reasoning",
+  },
+
+  // Claude 5 and 4.7/4.8. Limits and pricing from Anthropic's models
+  // overview comparison tables. All current Claude models take image input;
+  // these use adaptive thinking rather than the older `thinking.type`
+  // extended-thinking switch, which the overview marks "No" for each.
+  [AnthropicModels.CLAUDE_OPUS_5]: {
+    id: AnthropicModels.CLAUDE_OPUS_5,
+    name: "Claude Opus 5",
+    provider: AIProviderName.ANTHROPIC,
+    description: "For complex agentic coding and enterprise work",
+    capabilities: {
+      vision: true,
+      functionCalling: true,
+      codeGeneration: true,
+      reasoning: true,
+      multimodal: true,
+      streaming: true,
+      jsonMode: false,
+    },
+    pricing: {
+      inputCostPer1K: 0.005,
+      outputCostPer1K: 0.025,
+      currency: "USD",
+    },
+    performance: { speed: "medium", quality: "high", accuracy: "high" },
+    limits: {
+      maxContextTokens: 1000000,
+      maxOutputTokens: 128000,
+      maxRequestsPerMinute: 50,
+    },
+    useCases: {
+      coding: 10,
+      creative: 10,
+      analysis: 10,
+      conversation: 9,
+      reasoning: 10,
+      translation: 9,
+      summarization: 9,
+    },
+    aliases: ["opus-5", "claude-opus-latest"],
+    deprecated: false,
+    isLocal: false,
+    releaseDate: "2026-07-24",
+    category: "reasoning",
+  },
+
+  [AnthropicModels.CLAUDE_SONNET_5]: {
+    id: AnthropicModels.CLAUDE_SONNET_5,
+    name: "Claude Sonnet 5",
+    provider: AIProviderName.ANTHROPIC,
+    description: "The best combination of speed and intelligence",
+    capabilities: {
+      vision: true,
+      functionCalling: true,
+      codeGeneration: true,
+      reasoning: true,
+      multimodal: true,
+      streaming: true,
+      jsonMode: false,
+    },
+    pricing: {
+      inputCostPer1K: 0.002,
+      outputCostPer1K: 0.01,
+      currency: "USD",
+    },
+    performance: { speed: "fast", quality: "high", accuracy: "high" },
+    limits: {
+      maxContextTokens: 1000000,
+      maxOutputTokens: 128000,
+      maxRequestsPerMinute: 50,
+    },
+    useCases: {
+      coding: 9,
+      creative: 9,
+      analysis: 9,
+      conversation: 9,
+      reasoning: 9,
+      translation: 9,
+      summarization: 9,
+    },
+    aliases: ["sonnet-5"],
+    deprecated: false,
+    isLocal: false,
+    releaseDate: "2026-06-30",
+    category: "general",
+  },
+
+  // Owns "claude-sonnet-latest", but sits after CLAUDE_SONNET_5 so resolver
+  // score ties still go to Sonnet 5.
+  [AnthropicModels.CLAUDE_SONNET_5_5]: {
+    id: AnthropicModels.CLAUDE_SONNET_5_5,
+    name: "Claude Sonnet 5.5",
+    provider: AIProviderName.ANTHROPIC,
+    description: "The best combination of speed and intelligence",
+    capabilities: {
+      vision: true,
+      functionCalling: true,
+      codeGeneration: true,
+      reasoning: true,
+      multimodal: true,
+      streaming: true,
+      jsonMode: false,
+    },
+    pricing: {
+      inputCostPer1K: 0.002,
+      outputCostPer1K: 0.01,
+      currency: "USD",
+    },
+    performance: { speed: "fast", quality: "high", accuracy: "high" },
+    limits: {
+      maxContextTokens: 1000000,
+      maxOutputTokens: 128000,
+      maxRequestsPerMinute: 50,
+    },
+    useCases: {
+      coding: 9,
+      creative: 9,
+      analysis: 9,
+      conversation: 9,
+      reasoning: 9,
+      translation: 9,
+      summarization: 9,
+    },
+    aliases: ["sonnet-5.5", "claude-sonnet-latest"],
+    deprecated: false,
+    isLocal: false,
+    releaseDate: "2026-09-28",
+    category: "general",
+  },
+
+  [AnthropicModels.CLAUDE_FABLE_5]: {
+    id: AnthropicModels.CLAUDE_FABLE_5,
+    name: "Claude Fable 5",
+    provider: AIProviderName.ANTHROPIC,
+    description: "Next-generation intelligence for long-running agents",
+    capabilities: {
+      vision: true,
+      functionCalling: true,
+      codeGeneration: true,
+      reasoning: true,
+      multimodal: true,
+      streaming: true,
+      jsonMode: false,
+    },
+    pricing: {
+      inputCostPer1K: 0.01,
+      outputCostPer1K: 0.05,
+      currency: "USD",
+    },
+    performance: { speed: "slow", quality: "high", accuracy: "high" },
+    limits: {
+      maxContextTokens: 1000000,
+      maxOutputTokens: 128000,
+      maxRequestsPerMinute: 50,
+    },
+    useCases: {
+      coding: 10,
+      creative: 10,
+      analysis: 10,
+      conversation: 9,
+      reasoning: 10,
+      translation: 9,
+      summarization: 9,
+    },
+    aliases: ["fable-5"],
+    deprecated: false,
+    isLocal: false,
+    releaseDate: "2026-06-09",
+    category: "reasoning",
+  },
+
+  [AnthropicModels.CLAUDE_OPUS_4_8]: {
+    id: AnthropicModels.CLAUDE_OPUS_4_8,
+    name: "Claude Opus 4.8",
+    provider: AIProviderName.ANTHROPIC,
+    description: "Anthropic Opus 4.8, superseded by Claude Opus 5",
+    capabilities: {
+      vision: true,
+      functionCalling: true,
+      codeGeneration: true,
+      reasoning: true,
+      multimodal: true,
+      streaming: true,
+      jsonMode: false,
+    },
+    pricing: {
+      inputCostPer1K: 0.005,
+      outputCostPer1K: 0.025,
+      currency: "USD",
+    },
+    performance: { speed: "medium", quality: "high", accuracy: "high" },
+    limits: {
+      maxContextTokens: 1000000,
+      maxOutputTokens: 128000,
+      maxRequestsPerMinute: 50,
+    },
+    useCases: {
+      coding: 10,
+      creative: 9,
+      analysis: 10,
+      conversation: 9,
+      reasoning: 10,
+      translation: 9,
+      summarization: 9,
+    },
+    aliases: ["opus-4.8"],
+    deprecated: false,
+    isLocal: false,
+    releaseDate: "2026-05-28",
+    category: "reasoning",
+  },
+
+  [AnthropicModels.CLAUDE_OPUS_4_7]: {
+    id: AnthropicModels.CLAUDE_OPUS_4_7,
+    name: "Claude Opus 4.7",
+    provider: AIProviderName.ANTHROPIC,
+    description: "Anthropic Opus 4.7, superseded by Claude Opus 4.8",
+    capabilities: {
+      vision: true,
+      functionCalling: true,
+      codeGeneration: true,
+      reasoning: true,
+      multimodal: true,
+      streaming: true,
+      jsonMode: false,
+    },
+    pricing: {
+      inputCostPer1K: 0.005,
+      outputCostPer1K: 0.025,
+      currency: "USD",
+    },
+    performance: { speed: "medium", quality: "high", accuracy: "high" },
+    limits: {
+      maxContextTokens: 1000000,
+      maxOutputTokens: 128000,
+      maxRequestsPerMinute: 50,
+    },
+    useCases: {
+      coding: 10,
+      creative: 9,
+      analysis: 10,
+      conversation: 9,
+      reasoning: 10,
+      translation: 9,
+      summarization: 9,
+    },
+    aliases: ["opus-4.7"],
+    deprecated: false,
+    isLocal: false,
+    releaseDate: "2026-04-16",
     category: "reasoning",
   },
 
@@ -1167,7 +1439,9 @@ export const MODEL_REGISTRY: Record<string, ModelInfo> = {
       translation: 8,
       summarization: 8,
     },
-    aliases: ["claude-4.5-sonnet", "claude-sonnet-latest", "sonnet-4.5"],
+    // "claude-sonnet-latest" now belongs to CLAUDE_SONNET_5_5 — see the note
+    // on CLAUDE_OPUS_4_5's aliases.
+    aliases: ["claude-4.5-sonnet", "sonnet-4.5"],
     deprecated: false,
     isLocal: false,
     releaseDate: "2025-09-29",
@@ -1493,7 +1767,10 @@ export const MODEL_REGISTRY: Record<string, ModelInfo> = {
       summarization: 8,
     },
     aliases: ["pixtral", "mistral-vision"],
-    deprecated: false,
+    // Retired by Mistral on 2026-05-31. Kept so exact-id and alias lookups
+    // still resolve for existing callers; `deprecated` removes it from
+    // `models list` and the recommendation paths.
+    deprecated: true,
     isLocal: false,
     releaseDate: "2024-09-01",
     category: "vision",
@@ -2314,12 +2591,147 @@ export const MODEL_REGISTRY: Record<string, ModelInfo> = {
       summarization: 9,
     },
     aliases: ["azure-gpt-5-turbo", "gpt5-turbo-azure"],
-    deprecated: false,
+    // Azure OpenAI has never published a "gpt-5-turbo"; the id cannot be
+    // deployed. Flagged so it stops being offered as a live choice.
+    deprecated: true,
     isLocal: false,
     releaseDate: "2025-08-07",
     category: "general",
   },
   // Note: Azure models like O3, O4-mini, GPT-4o share IDs with OpenAI and use the OpenAI registry entries
+};
+
+function deriveSpeed(id: string): ModelPerformance["speed"] {
+  if (/mini|nano|haiku|flash|lite/i.test(id)) {
+    return "fast";
+  }
+  if (/opus|^o1|^o3|-pro$/i.test(id)) {
+    return "slow";
+  }
+  return "medium";
+}
+
+function deriveQuality(
+  entry: ProviderModelManifestEntry,
+): ModelPerformance["quality"] {
+  return entry.reasoning ? "high" : "medium";
+}
+
+/**
+ * Builds the manifest-derived slice of MODEL_REGISTRY: every manifest model
+ * that carries pricingPerMTok (ModelInfo.pricing is a required field, and
+ * the manifest's pricingPerMTok is deliberately optional for un-priced
+ * models like claude-sonnet-5 — see ProviderModelManifestEntry's docblock),
+ * excluding each provider's synthetic "_default" entry.
+ *
+ * performance/useCases/category use entry.curated verbatim when present —
+ * the ids that already had a hand-tuned LEGACY_MODEL_REGISTRY row before
+ * this migration (5 Anthropic, 20 OpenAI) carry that exact triple forward
+ * unchanged. Every other entry has no curated block and falls back to
+ * mechanical derivation from the tracked capability flags.
+ */
+function buildManifestDerivedEntries(): Record<string, ModelInfo> {
+  const entries: Record<string, ModelInfo> = {};
+  for (const provider of getAllManifestProviders()) {
+    const manifest = getManifestForProvider(provider);
+    if (!manifest) {
+      continue;
+    }
+    for (const [id, entry] of Object.entries(manifest.models)) {
+      if (id === "_default" || !entry.pricingPerMTok) {
+        continue;
+      }
+      // Keep-first on cross-manifest id collisions (Azure/OpenAI share ids):
+      // getAllManifestProviders() order is deterministic, and silently
+      // overwriting an earlier provider's row would make "which provider owns
+      // this id" depend on iteration order.
+      if (entries[id]) {
+        logger.debug(
+          `[modelRegistry] Manifest id collision: "${id}" already derived from ${entries[id].provider}; keeping first, skipping ${provider}`,
+        );
+        continue;
+      }
+      const reasoningScore = entry.reasoning ? 9 : 6;
+      const legacyRow = LEGACY_MODEL_REGISTRY[id];
+      entries[id] = {
+        id,
+        name: entry.displayName ?? id,
+        provider: provider as AIProviderName,
+        description: entry.displayName ?? id,
+        capabilities: {
+          vision: entry.vision,
+          functionCalling: entry.functionCalling,
+          codeGeneration: true,
+          reasoning: entry.reasoning ?? false,
+          multimodal: entry.vision || entry.nativeAudio === true,
+          streaming: true,
+          jsonMode: entry.jsonMode ?? false,
+          samplingParams: entry.samplingParams,
+        },
+        pricing: {
+          inputCostPer1K: entry.pricingPerMTok.input / 1000,
+          outputCostPer1K: entry.pricingPerMTok.output / 1000,
+          currency: "USD",
+        },
+        performance: entry.curated?.performance ?? {
+          speed: deriveSpeed(id),
+          quality: deriveQuality(entry),
+          accuracy: deriveQuality(entry),
+        },
+        limits: {
+          maxContextTokens: entry.contextWindow,
+          maxOutputTokens: entry.maxOutputTokens,
+          // Rate limits are operational knowledge the manifests don't track;
+          // carry the hand-authored value forward rather than dropping it.
+          ...(legacyRow?.limits?.maxRequestsPerMinute !== undefined
+            ? { maxRequestsPerMinute: legacyRow.limits.maxRequestsPerMinute }
+            : {}),
+        },
+        useCases: entry.curated?.useCases ?? {
+          coding: entry.functionCalling ? 8 : 5,
+          creative: entry.vision ? 7 : 6,
+          analysis: reasoningScore,
+          conversation: 7,
+          reasoning: reasoningScore,
+          translation: 6,
+          summarization: 7,
+        },
+        aliases: entry.aliases,
+        // Deprecation and release dates are editorial facts the manifests do
+        // not track — a manifest-priced model must not silently un-deprecate
+        // a row the hand-authored registry explicitly flagged.
+        deprecated: legacyRow?.deprecated ?? false,
+        ...(legacyRow?.releaseDate !== undefined
+          ? { releaseDate: legacyRow.releaseDate }
+          : {}),
+        isLocal:
+          provider === "ollama" ||
+          provider === "lm-studio" ||
+          provider === "llamacpp",
+        category:
+          entry.curated?.category ??
+          (entry.reasoning ? "reasoning" : "general"),
+      };
+    }
+  }
+  return entries;
+}
+
+/**
+ * Public MODEL_REGISTRY: the manifest-derived entries merged over the
+ * hand-authored LEGACY_MODEL_REGISTRY base. Spread order matters — manifest
+ * entries are spread last, so a manifest-priced model wins outright
+ * (whole-entry replacement, not a per-field merge) over a legacy row with
+ * the same id. Any legacy id the manifest doesn't also price (no
+ * pricingPerMTok, or no manifest entry at all — e.g. AnthropicModels.
+ * CLAUDE_OPUS_5/CLAUDE_FABLE_5, which have no manifest counterpart yet)
+ * passes through unchanged, which is what keeps resolveSamplingParams/
+ * modelSupportsSamplingParams behaviour identical for those "non-manifest"
+ * models: their capabilities.samplingParams (or absence of it) is untouched.
+ */
+export const MODEL_REGISTRY: Record<string, ModelInfo> = {
+  ...LEGACY_MODEL_REGISTRY,
+  ...buildManifestDerivedEntries(),
 };
 
 /**
@@ -2419,7 +2831,9 @@ export const USE_CASE_RECOMMENDATIONS: Record<string, string[]> = {
     OpenAIModels.GPT_5_2_PRO,
     AnthropicModels.CLAUDE_OPUS_4_5,
     GoogleAIModels.GEMINI_2_5_PRO,
-    MistralModels.PIXTRAL_LARGE,
+    // Mistral's Pixtral Large sat here until it was retired on 2026-05-31.
+    // Left without a substitute rather than guessing at a replacement's
+    // vision support.
     BedrockModels.NOVA_PREMIER,
   ],
 };
@@ -2439,6 +2853,222 @@ export function getModelById(id: string): ModelInfo | undefined {
 }
 
 /**
+ * Resolve a registry alias to the canonical model id for a given provider.
+ *
+ * The registry has carried per-model aliases ("gpt4o" -> "gpt-4o", "gpt4" ->
+ * "gpt-4") all along, and capability lookups like {@link modelSupports}
+ * already resolve through them — but the id actually sent to the provider did
+ * not, so `generate({ model: "gpt4o" })` put the alias on the wire and the
+ * provider 404'd. This closes that gap (#337).
+ *
+ * Deliberately conservative, because a wrong rewrite is worse than no rewrite:
+ *
+ * - An id the registry already knows is returned untouched, so a canonical id
+ *   can never be displaced by an alias that happens to collide with it.
+ * - An alias is only applied when the model it names belongs to the provider
+ *   being constructed. Without that check, an aggregator or self-hosted
+ *   deployment whose model is literally named "gpt4" would be silently
+ *   rewritten to OpenAI's "gpt-4".
+ * - Anything unrecognised passes through, so custom and brand-new model ids
+ *   keep working exactly as before.
+ *
+ * @param provider - Provider being constructed (canonical name)
+ * @param model - Model id or alias as the caller supplied it
+ * @returns The canonical id when an alias resolved, otherwise null
+ */
+export function resolveProviderModelAlias(
+  provider: string,
+  model: string,
+): string | null {
+  const normalizedModel = model.toLowerCase();
+  if (MODEL_REGISTRY[model] || MODEL_REGISTRY[normalizedModel]) {
+    return null;
+  }
+
+  const aliasTarget = MODEL_ALIASES[normalizedModel];
+  if (!aliasTarget) {
+    return null;
+  }
+
+  const target = MODEL_REGISTRY[aliasTarget];
+  if (!target || target.provider !== provider.toLowerCase()) {
+    return null;
+  }
+
+  return target.id;
+}
+
+/**
+ * Check whether a model supports a registered capability.
+ *
+ * Aliases resolve to their canonical model ID before the provider is
+ * cross-checked. Unknown provider/model pairs default to supported so new or
+ * custom models retain the existing behavior until capability data is added.
+ */
+export function modelSupports(
+  capability: keyof ModelCapabilities,
+  provider: string,
+  model: string,
+): boolean {
+  const normalizedModel = model.toLowerCase();
+  const modelId = MODEL_ALIASES[normalizedModel] ?? normalizedModel;
+  const modelInfo = MODEL_REGISTRY[modelId];
+
+  if (!modelInfo || modelInfo.provider !== provider.toLowerCase()) {
+    return true;
+  }
+
+  // Optional capabilities (e.g. samplingParams) default to supported.
+  return modelInfo.capabilities[capability] ?? true;
+}
+
+/**
+ * Model families known to reject classic sampling parameters
+ * (`temperature` / `topP`) in favour of reasoning-effort controls:
+ * Claude Sonnet 5, Opus 4.7+ (including Opus 5), and the Fable/Mythos 5
+ * tier — notably as served through Vertex. Kept as patterns because gateway
+ * model ids carry arbitrary prefixes/suffixes
+ * (`vertex_ai/claude-sonnet-5@20260203`) that exact registry ids can't cover.
+ */
+const SAMPLING_PARAM_REJECTING_FAMILIES: RegExp[] = [
+  /sonnet[-_.]?5(?![0-9])/i,
+  /opus[-_.]?4[-_.]?(?:[7-9]|\d{2,})(?![0-9])/i,
+  /opus[-_.]?5(?![0-9])/i,
+  /fable/i,
+  /mythos/i,
+];
+
+/**
+ * Whether a model accepts classic sampling parameters
+ * (`temperature` / `topP`).
+ *
+ * Resolution order: an explicit `capabilities.samplingParams` on a matching
+ * registry entry wins; otherwise the known rejecting-family patterns decide.
+ * Unknown models default to supported (same fail-open contract as
+ * `modelSupports`). Providers strip the parameters — including on
+ * retry/fallback request rebuilds — when this returns false.
+ */
+export function modelSupportsSamplingParams(
+  provider: string,
+  model: string | undefined,
+): boolean {
+  const normalizedModel = (model ?? "").toLowerCase();
+  if (!normalizedModel) {
+    return true;
+  }
+  const modelId = MODEL_ALIASES[normalizedModel] ?? normalizedModel;
+  const modelInfo = MODEL_REGISTRY[modelId];
+  if (
+    modelInfo &&
+    modelInfo.provider === provider.toLowerCase() &&
+    modelInfo.capabilities.samplingParams !== undefined
+  ) {
+    return modelInfo.capabilities.samplingParams;
+  }
+  return !SAMPLING_PARAM_REJECTING_FAMILIES.some(
+    (family) => family.test(modelId) || family.test(normalizedModel),
+  );
+}
+
+/**
+ * Sampling params to actually send for a model: passthrough when supported,
+ * `{}` (with a debug log) when the model rejects them. Apply at every
+ * request-build site, including retry/fallback rebuilds.
+ */
+export function resolveSamplingParams(
+  provider: string,
+  model: string | undefined,
+  params: { temperature?: number; topP?: number },
+  site: string,
+): { temperature?: number; topP?: number } {
+  if (modelSupportsSamplingParams(provider, model)) {
+    return params;
+  }
+  if (params.temperature !== undefined || params.topP !== undefined) {
+    logger.debug(
+      `[ModelRegistry] Stripping sampling params for ${provider}/${model} at ${site} — model rejects temperature/topP`,
+      {
+        provider,
+        model,
+        site,
+        hadTemperature: params.temperature !== undefined,
+        hadTopP: params.topP !== undefined,
+      },
+    );
+  }
+  return {};
+}
+
+/**
+ * Claude models that answer a forced `tool_choice` (`any` or `tool`) with a
+ * 400: "tool_choice: type "tool" and "any" are not supported for this model."
+ * Sonnet 5.5 and Opus 5.5 were probed live on Vertex; the Fable 5.1 docs state
+ * the same, and Mythos 5.1 shares Fable 5.1's capabilities. The same families
+ * also refuse `thinking: {type: "disabled"}`.
+ */
+const FORCED_TOOL_CHOICE_REJECTING_FAMILIES: RegExp[] = [
+  /sonnet[-_.]?5[-_.]5(?![0-9])/i,
+  /opus[-_.]?5[-_.]5(?![0-9])/i,
+  /(?:fable|mythos)[-_.]?5[-_.]1(?![0-9])/i,
+];
+
+/**
+ * Of those, the ones that accept `thinking: {type: "between_tools"}` as their
+ * lowest setting. The rest think adaptively, always on, and take no
+ * `thinking` field in its place.
+ */
+const BETWEEN_TOOLS_THINKING_FAMILIES: RegExp[] = [
+  /sonnet[-_.]?5[-_.]5(?![0-9])/i,
+];
+
+function matchesClaudeFamily(
+  families: RegExp[],
+  model: string | undefined,
+): boolean {
+  const normalizedModel = (model ?? "").toLowerCase();
+  if (!normalizedModel) {
+    return false;
+  }
+  const modelId = MODEL_ALIASES[normalizedModel] ?? normalizedModel;
+  return families.some(
+    (family) => family.test(modelId) || family.test(normalizedModel),
+  );
+}
+
+/**
+ * Whether a Claude model accepts a forced `tool_choice` (`any` or a named
+ * `tool`). Unknown models default to accepting it.
+ */
+export function modelSupportsForcedToolChoice(
+  model: string | undefined,
+): boolean {
+  return !matchesClaudeFamily(FORCED_TOOL_CHOICE_REJECTING_FAMILIES, model);
+}
+
+/**
+ * What to send instead of `thinking: {type: "disabled"}` to a Claude model.
+ * `between_tools` is refused at `xhigh` and `max` effort, so those fall back
+ * to adaptive thinking (`omit`).
+ */
+export function claudeDisabledThinkingReplacement(
+  model: string | undefined,
+  effort: string | undefined,
+): ClaudeDisabledThinkingReplacement {
+  if (!matchesClaudeFamily(FORCED_TOOL_CHOICE_REJECTING_FAMILIES, model)) {
+    return "keep";
+  }
+  const level = effort?.toLowerCase();
+  if (
+    matchesClaudeFamily(BETWEEN_TOOLS_THINKING_FAMILIES, model) &&
+    level !== "xhigh" &&
+    level !== "max"
+  ) {
+    return "between_tools";
+  }
+  return "omit";
+}
+
+/**
  * Get models by provider
  */
 export function getModelsByProvider(provider: AIProviderName): ModelInfo[] {
@@ -2448,14 +3078,21 @@ export function getModelsByProvider(provider: AIProviderName): ModelInfo[] {
 }
 
 /**
- * Get available providers
+ * Get available providers.
+ *
+ * Deliberately does NOT derive from MODEL_REGISTRY membership: a registry
+ * keyed only by "real, priced, named models" under-reports providers whose
+ * manifest carries only a `_default` entry (the minimal-tier providers —
+ * e.g. voyage, jina, stability — have no priced named model and so
+ * contribute zero MODEL_REGISTRY rows). Reading getAllManifestProviders()
+ * directly gives every provider NeuroLink actually knows a manifest for,
+ * decoupled from MODEL_REGISTRY membership entirely. Manifest keys are
+ * literally the AIProviderName enum's kebab-case values by construction
+ * (see manifestRegistry.ts), so the cast is a same-value relabel, not a
+ * narrowing assumption.
  */
 export function getAvailableProviders(): AIProviderName[] {
-  const providers = new Set<AIProviderName>();
-  Object.values(MODEL_REGISTRY).forEach((model) => {
-    providers.add(model.provider);
-  });
-  return Array.from(providers);
+  return getAllManifestProviders() as AIProviderName[];
 }
 
 /**

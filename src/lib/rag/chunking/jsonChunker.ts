@@ -7,26 +7,13 @@
 
 import { randomUUID } from "crypto";
 import type {
-  Chunker,
-  Chunk,
-  ChunkerValidationResult,
-  JSONChunkerConfig,
   BaseChunkerConfig,
-} from "../types.js";
-
-/**
- * Options for extractChunks method
- */
-interface ExtractChunksOptions {
-  data: unknown;
-  path: string;
-  depth: number;
-  maxDepth: number;
-  maxSize: number;
-  splitKeys: string[];
-  preserveKeys: string[];
-  includeJsonPath: boolean;
-}
+  Chunk,
+  Chunker,
+  ChunkerValidationResult,
+  ExtractChunksOptions,
+  JSONChunkerConfig,
+} from "../../types/index.js";
 
 /**
  * JSON-aware chunker implementation

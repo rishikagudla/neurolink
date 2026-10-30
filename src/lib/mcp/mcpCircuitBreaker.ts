@@ -5,6 +5,7 @@
  */
 
 import { EventEmitter } from "events";
+import { trace } from "@opentelemetry/api";
 import { mcpLogger } from "../utils/logger.js";
 import type {
   CallRecord,
@@ -12,7 +13,23 @@ import type {
   CircuitBreakerConfig,
   CircuitBreakerStats,
   CircuitBreakerEvents,
-} from "../types/mcpTypes.js";
+} from "../types/index.js";
+
+import { CircuitBreakerOpenError } from "../types/index.js";
+
+// Re-export CircuitBreakerOpenError from shared types to preserve public API
+export { CircuitBreakerOpenError } from "../types/index.js";
+
+/**
+ * Default operation timeout for circuit breaker protected operations.
+ * Configurable via MCP_OPERATION_TIMEOUT env var (in milliseconds).
+ * Increased from 30s to 60s to accommodate MCP server startup latency,
+ * especially when multiple servers start concurrently.
+ */
+const DEFAULT_OPERATION_TIMEOUT = Math.max(
+  10000,
+  Number(process.env.MCP_OPERATION_TIMEOUT) || 60000,
+);
 
 /**
  * MCPCircuitBreaker
@@ -39,28 +56,58 @@ export class MCPCircuitBreaker extends EventEmitter {
       failureThreshold: config.failureThreshold ?? 5,
       resetTimeout: config.resetTimeout ?? 60000,
       halfOpenMaxCalls: config.halfOpenMaxCalls ?? 3,
-      operationTimeout: config.operationTimeout ?? 30000,
+      operationTimeout: config.operationTimeout ?? DEFAULT_OPERATION_TIMEOUT,
       minimumCallsBeforeCalculation: config.minimumCallsBeforeCalculation ?? 10,
       statisticsWindowSize: config.statisticsWindowSize ?? 300000, // 5 minutes
     };
 
-    // Clean up old call records periodically - now storing the timer reference
+    // Clean up old call records periodically - now storing the timer reference.
+    // Unref'd so a live breaker (the manager's Map is a module-level
+    // singleton, never torn down by a script that merely imports the SDK)
+    // doesn't block process exit on its own — destroy()/destroyAll() still
+    // clearInterval() it for callers that do explicit lifecycle management.
     this.cleanupTimer = setInterval(() => this.cleanupCallHistory(), 60000);
+    if (this.cleanupTimer.unref) {
+      this.cleanupTimer.unref();
+    }
   }
 
   /**
-   * Execute an operation with circuit breaker protection
+   * Execute an operation with circuit breaker protection.
+   *
+   * `operation` is handed a `recordResolvedFailure` callback so it can flag a
+   * *resolved* result as a logical failure without throwing. This matters for
+   * MCP tool calls: the client does not throw on a protocol error, it
+   * resolves with `{ isError: true, ... }`. Before this callback existed,
+   * such a call always fell through to the success path below — the breaker
+   * could never open for a tool that only ever "fails" by resolving an error
+   * result, and callers still need that resolved value returned as-is (not
+   * replaced by a thrown transport error). Call `recordResolvedFailure()`
+   * from inside `operation` when that resolved value represents a failure;
+   * the call is still counted as a normal, non-throwing success from the
+   * `Promise.race` below, so this callback is what tells `execute()`
+   * otherwise. Callers that never call it see no behavior change.
    */
-  async execute<T>(operation: () => Promise<T>): Promise<T> {
+  async execute<T>(
+    operation: (recordResolvedFailure: (reason?: string) => void) => Promise<T>,
+  ): Promise<T> {
     const startTime = Date.now();
 
     try {
       // Check if circuit is open
       if (this.state === "open") {
-        if (Date.now() - this.lastFailureTime < this.config.resetTimeout) {
-          throw new Error(
-            `Circuit breaker '${this.name}' is open. Next retry at ${new Date(this.lastFailureTime + this.config.resetTimeout)}`,
-          );
+        const retryAfterMs =
+          this.config.resetTimeout - (Date.now() - this.lastFailureTime);
+        if (retryAfterMs > 0) {
+          throw new CircuitBreakerOpenError({
+            breakerName: this.name,
+            retryAfter: new Date(
+              this.lastFailureTime + this.config.resetTimeout,
+            ),
+            retryAfterMs,
+            breakerState: "open",
+            failureCount: this.getStats().failedCalls,
+          });
         }
 
         // Transition to half-open
@@ -72,16 +119,62 @@ export class MCPCircuitBreaker extends EventEmitter {
         this.state === "half-open" &&
         this.halfOpenCalls >= this.config.halfOpenMaxCalls
       ) {
-        throw new Error(
-          `Circuit breaker '${this.name}' is half-open but call limit reached`,
+        // Half-open call limit exceeded — revert to open with fresh cooldown
+        this.lastFailureTime = Date.now();
+        this.changeState(
+          "open",
+          "Half-open call limit reached, reverting to open",
         );
+
+        throw new CircuitBreakerOpenError({
+          breakerName: this.name,
+          retryAfter: new Date(this.lastFailureTime + this.config.resetTimeout),
+          retryAfterMs: this.config.resetTimeout,
+          breakerState: "open",
+          failureCount: this.getStats().failedCalls,
+        });
       }
 
+      // NLK-GAP-009: Record half-open test event when executing in half-open state
+      if (this.state === "half-open") {
+        const activeSpan = trace.getActiveSpan();
+        if (activeSpan) {
+          activeSpan.addEvent("circuit.half_open_test", {
+            "circuit.name": this.name,
+            "circuit.half_open_call": this.halfOpenCalls + 1,
+            "circuit.half_open_max_calls": this.config.halfOpenMaxCalls,
+          });
+        }
+      }
+
+      // resolvedFailureReason is set (via recordResolvedFailure, passed into
+      // operation() below) when operation() resolves normally but represents
+      // a logical failure — e.g. an MCP tool call that resolved
+      // { isError: true } instead of throwing. It is call-scoped (a local,
+      // not instance state), so concurrent execute() calls on the same
+      // breaker (the same tool invoked in parallel) can't cross-contaminate
+      // each other's outcome.
+      let resolvedFailureReason: string | undefined;
+      const recordResolvedFailure = (reason?: string): void => {
+        resolvedFailureReason = reason || "Operation resolved a failure result";
+      };
+
       // Execute operation with timeout
-      const result = await Promise.race([
-        operation(),
-        this.timeoutPromise<T>(this.config.operationTimeout),
-      ]);
+      const result = await this.raceWithTimeout(
+        operation(recordResolvedFailure),
+        this.config.operationTimeout,
+      );
+
+      if (resolvedFailureReason !== undefined) {
+        // Same bookkeeping as a thrown error below, but the resolved value
+        // is still returned to the caller unchanged — no transport error is
+        // synthesized for a result the protocol itself resolved successfully.
+        this.recordFailureOutcome(
+          resolvedFailureReason,
+          Date.now() - startTime,
+        );
+        return result;
+      }
 
       // Record successful call
       this.recordCall(true, Date.now() - startTime);
@@ -100,28 +193,36 @@ export class MCPCircuitBreaker extends EventEmitter {
     } catch (error) {
       // Record failed call
       const duration = Date.now() - startTime;
-      this.recordCall(false, duration);
-
       const errorMessage =
         error instanceof Error ? error.message : String(error);
-
-      // Emit failure event
-      this.emit("callFailure", {
-        error: errorMessage,
-        duration,
-        timestamp: new Date(),
-      } satisfies CircuitBreakerEvents["callFailure"]);
-
-      // Handle state transitions on failure
-      if (this.state === "half-open") {
-        // Failure in half-open immediately opens circuit
-        this.changeState("open", `Half-open test failed: ${errorMessage}`);
-      } else if (this.state === "closed") {
-        // Check if we should open the circuit
-        this.checkFailureThreshold();
-      }
+      this.recordFailureOutcome(errorMessage, duration);
 
       throw error;
+    }
+  }
+
+  /**
+   * Shared bookkeeping for a failed outcome — a thrown error, or a resolved
+   * result the caller flagged via `recordResolvedFailure`. Records the call
+   * as a failure, emits `callFailure`, and runs the state transitions that
+   * used to live inline in the `catch` block: half-open failure immediately
+   * re-opens the circuit; closed checks the failure threshold.
+   */
+  private recordFailureOutcome(reason: string, duration: number): void {
+    this.recordCall(false, duration);
+
+    this.emit("callFailure", {
+      error: reason,
+      duration,
+      timestamp: new Date(),
+    } satisfies CircuitBreakerEvents["callFailure"]);
+
+    if (this.state === "half-open") {
+      // Failure in half-open immediately opens circuit
+      this.changeState("open", `Half-open test failed: ${reason}`);
+    } else if (this.state === "closed") {
+      // Check if we should open the circuit
+      this.checkFailureThreshold();
     }
   }
 
@@ -195,6 +296,19 @@ export class MCPCircuitBreaker extends EventEmitter {
     this.state = newState;
     this.lastStateChange = new Date();
 
+    // NLK-GAP-009: Record state transition on active OTel span
+    const activeSpan = trace.getActiveSpan();
+    if (activeSpan) {
+      activeSpan.addEvent("circuit.state_change", {
+        "circuit.name": this.name,
+        "circuit.from_state": oldState,
+        "circuit.to_state": newState,
+        "circuit.reason": reason.slice(0, 128),
+        "circuit.failure_count": this.callHistory.filter((c) => !c.success)
+          .length,
+      });
+    }
+
     // Reset counters based on state
     if (newState === "half-open") {
       this.halfOpenCalls = 0;
@@ -222,14 +336,28 @@ export class MCPCircuitBreaker extends EventEmitter {
   }
 
   /**
-   * Create a timeout promise
+   * Race an operation against a timeout, clearing the timer on either
+   * outcome. A bare `Promise.race([operation, timeoutPromise])` leaves the
+   * timeout's `setTimeout` handle ref'd and pending until it fires even
+   * after `operation` already won the race — on the (common) success path
+   * that stray timer holds the event loop open for the full timeout
+   * duration for no reason.
    */
-  private timeoutPromise<T>(timeout: number): Promise<T> {
-    return new Promise((_, reject) => {
-      setTimeout(() => {
+  private async raceWithTimeout<T>(
+    operation: Promise<T>,
+    timeout: number,
+  ): Promise<T> {
+    let timeoutId: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutId = setTimeout(() => {
         reject(new Error(`Operation timed out after ${timeout}ms`));
       }, timeout);
     });
+    try {
+      return await Promise.race([operation, timeoutPromise]);
+    } finally {
+      clearTimeout(timeoutId);
+    }
   }
 
   /**

@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v8.32.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,8 +8,6 @@
 
 > **DiscoveredMcp**\<`TTools`\> = `object`
 
-Defined in: [types/mcpTypes.ts:516](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L516)
-
 Discovered MCP server/plugin definition
 Moved from src/lib/mcp/contracts/mcpContract.ts
 
@@ -17,11 +15,11 @@ Moved from src/lib/mcp/contracts/mcpContract.ts
 
 ### TTools
 
-`TTools` = `StandardRecord`
+`TTools` = [`StandardRecord`](StandardRecord.md)
 
 ## Indexable
 
-\[`key`: `string`\]: `unknown`
+> \[`key`: `string`\]: `unknown`
 
 ## Properties
 
@@ -29,36 +27,26 @@ Moved from src/lib/mcp/contracts/mcpContract.ts
 
 > **metadata**: [`McpMetadata`](McpMetadata.md)
 
-Defined in: [types/mcpTypes.ts:517](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L517)
-
 ---
 
 ### tools?
 
-> `optional` **tools**: `TTools`
-
-Defined in: [types/mcpTypes.ts:518](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L518)
+> `optional` **tools?**: `TTools`
 
 ---
 
 ### capabilities?
 
-> `optional` **capabilities**: `string`[]
-
-Defined in: [types/mcpTypes.ts:519](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L519)
+> `optional` **capabilities?**: `string`[]
 
 ---
 
 ### version?
 
-> `optional` **version**: `string`
-
-Defined in: [types/mcpTypes.ts:520](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L520)
+> `optional` **version?**: `string`
 
 ---
 
 ### configuration?
 
-> `optional` **configuration**: `Record`\<`string`, `string` \| `number` \| `boolean`\>
-
-Defined in: [types/mcpTypes.ts:521](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L521)
+> `optional` **configuration?**: `Record`\<`string`, `string` \| `number` \| `boolean`\>

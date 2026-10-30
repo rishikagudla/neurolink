@@ -3,8 +3,11 @@
  * Provides structured error management for tool execution and system operations
  */
 import { ErrorCategory, ErrorSeverity } from "../constants/enums.js";
-import type { StructuredError } from "../types/utilities.js";
+import { MAX_TIMER_MS } from "../constants/timeouts.js";
+import type { StructuredError } from "../types/index.js";
 import { logger } from "./logger.js";
+import { CircuitBreakerOpenError } from "../types/index.js";
+import { HITLTimeoutError } from "../hitl/hitlErrors.js";
 
 // Error codes for different scenarios
 export const ERROR_CODES = {
@@ -22,11 +25,15 @@ export const ERROR_CODES = {
   MEMORY_EXHAUSTED: "MEMORY_EXHAUSTED",
   NETWORK_ERROR: "NETWORK_ERROR",
   PERMISSION_DENIED: "PERMISSION_DENIED",
+  PROXY_WORKER_LIFECYCLE_FAILED: "PROXY_WORKER_LIFECYCLE_FAILED",
 
   // Provider errors
   PROVIDER_NOT_AVAILABLE: "PROVIDER_NOT_AVAILABLE",
   PROVIDER_AUTH_FAILED: "PROVIDER_AUTH_FAILED",
   PROVIDER_QUOTA_EXCEEDED: "PROVIDER_QUOTA_EXCEEDED",
+
+  // Cancellation
+  OPERATION_ABORTED: "OPERATION_ABORTED",
 
   // Configuration errors
   INVALID_CONFIGURATION: "INVALID_CONFIGURATION",
@@ -48,14 +55,31 @@ export const ERROR_CODES = {
   IMAGE_TOO_LARGE: "IMAGE_TOO_LARGE",
   IMAGE_TOO_SMALL: "IMAGE_TOO_SMALL",
   INVALID_IMAGE_FORMAT: "INVALID_IMAGE_FORMAT",
+  INVALID_IMAGE_SIZE: "INVALID_IMAGE_SIZE",
+  IMAGE_BUFFER_INVALID: "IMAGE_BUFFER_INVALID",
+
+  // Generic file/CSV processing errors
+  FILE_PROCESSING_FAILED: "FILE_PROCESSING_FAILED",
+  CSV_PROCESSING_FAILED: "CSV_PROCESSING_FAILED",
 
   // PDF validation errors
   PDF_PAGE_LIMIT_EXCEEDED: "PDF_PAGE_LIMIT_EXCEEDED",
+  PDF_AGGREGATE_PAGE_LIMIT_EXCEEDED: "PDF_AGGREGATE_PAGE_LIMIT_EXCEEDED",
+  PDF_AGGREGATE_SIZE_LIMIT_EXCEEDED: "PDF_AGGREGATE_SIZE_LIMIT_EXCEEDED",
+  PDF_PAGE_COUNT_UNVERIFIABLE: "PDF_PAGE_COUNT_UNVERIFIABLE",
+  PDF_PASSWORD_REQUIRED: "PDF_PASSWORD_REQUIRED",
+  PDF_INCORRECT_PASSWORD: "PDF_INCORRECT_PASSWORD",
 
   // Rate limiter errors
   RATE_LIMITER_QUEUE_FULL: "RATE_LIMITER_QUEUE_FULL",
   RATE_LIMITER_QUEUE_TIMEOUT: "RATE_LIMITER_QUEUE_TIMEOUT",
   RATE_LIMITER_RESET: "RATE_LIMITER_RESET",
+
+  // Evaluation errors
+  SCORER_NOT_FOUND: "SCORER_NOT_FOUND",
+  EVALUATION_VALIDATION_FAILED: "EVALUATION_VALIDATION_FAILED",
+  EVALUATION_TIMEOUT: "EVALUATION_TIMEOUT",
+  EVALUATION_EXECUTION_FAILED: "EVALUATION_EXECUTION_FAILED",
 
   // PPT validation errors
   MISSING_PPT_PROPERTIES: "MISSING_PPT_PROPERTIES",
@@ -67,6 +91,12 @@ export const ERROR_CODES = {
   INVALID_PPT_LOGO_PATH: "INVALID_PPT_LOGO_PATH",
   INVALID_PPT_MODE: "INVALID_PPT_MODE",
   INVALID_PPT_PROMPT: "INVALID_PPT_PROMPT",
+
+  // CSV validation/parsing errors (#1199)
+  CSV_INVALID_INPUT: "CSV_INVALID_INPUT",
+  CSV_ROW_INVALID: "CSV_ROW_INVALID",
+  CSV_FILE_ACCESS_FAILED: "CSV_FILE_ACCESS_FAILED",
+  CSV_PARSE_FAILED: "CSV_PARSE_FAILED",
 } as const;
 
 /**
@@ -77,6 +107,7 @@ export class NeuroLinkError extends Error {
   public readonly category: ErrorCategory;
   public readonly severity: ErrorSeverity;
   public readonly retriable: boolean;
+  public readonly retryAfterMs?: number;
   public readonly context: Record<string, unknown>;
   public readonly timestamp: Date;
   public readonly toolName?: string;
@@ -88,6 +119,7 @@ export class NeuroLinkError extends Error {
     category: ErrorCategory;
     severity: ErrorSeverity;
     retriable: boolean;
+    retryAfterMs?: number;
     context?: Record<string, unknown>;
     originalError?: Error;
     toolName?: string;
@@ -99,6 +131,7 @@ export class NeuroLinkError extends Error {
     this.category = options.category;
     this.severity = options.severity;
     this.retriable = options.retriable;
+    this.retryAfterMs = options.retryAfterMs;
     this.context = options.context || {};
     this.timestamp = new Date();
     this.toolName = options.toolName;
@@ -172,20 +205,45 @@ export class ErrorFactory {
   }
 
   /**
-   * Create a tool timeout error
+   * Create a tool timeout error.
+   *
+   * `timeoutMs` is the bound that was actually exceeded. Pass `budget` when
+   * the timeout happened inside a retry loop, so the error can say which
+   * number it is reporting: a reader who sees `timeoutMs: 120000` next to an
+   * `executionTime` of 483005 will otherwise conclude the timeout was never
+   * enforced, when in fact four attempts of 120s each were.
+   *
+   * `budget.exhausted` marks the case where the whole-execution ceiling ran
+   * out rather than a single attempt overrunning; that error is NOT retriable,
+   * because there is no budget left to retry into.
    */
   static toolTimeout(
     toolName: string,
     timeoutMs: number,
     serverId?: string,
+    budget?: {
+      attempt?: number;
+      maxAttempts?: number;
+      attemptTimeoutMs?: number;
+      totalTimeoutMs?: number;
+      elapsedMs?: number;
+      exhausted?: boolean;
+    },
   ): NeuroLinkError {
+    const scope = budget?.exhausted
+      ? `exhausted its ${budget.totalTimeoutMs}ms total budget`
+      : budget?.maxAttempts && budget.maxAttempts > 1
+        ? `timed out after ${timeoutMs}ms on attempt ${budget.attempt ?? 1} of ${budget.maxAttempts}`
+        : `timed out after ${timeoutMs}ms`;
     return new NeuroLinkError({
       code: ERROR_CODES.TOOL_TIMEOUT,
-      message: `Tool '${toolName}' timed out after ${timeoutMs}ms`,
+      message: `Tool '${toolName}' ${scope}`,
       category: ErrorCategory.TIMEOUT,
       severity: ErrorSeverity.HIGH,
-      retriable: true,
-      context: { timeoutMs },
+      // A single attempt timing out is worth another try; an exhausted total
+      // budget is not — retrying it can only overshoot the caller's ceiling.
+      retriable: budget?.exhausted !== true,
+      context: { timeoutMs, ...(budget ?? {}) },
       toolName,
       serverId,
     });
@@ -249,6 +307,31 @@ export class ErrorFactory {
     });
   }
 
+  /**
+   * Create a typed abort error preserving the originating exception. Callers
+   * can switch on `error.category === ErrorCategory.ABORT` and
+   * `error.code === ERROR_CODES.OPERATION_ABORTED` instead of message-string
+   * matching DOMException / AI SDK error wrappers.
+   *
+   * `error.name` is intentionally set to "AbortError" (overriding the default
+   * "NeuroLinkError") so existing callers that branch on
+   * `err.name === "AbortError"` keep working without code changes — the new
+   * structured fields (category, code, retriable) are additive.
+   */
+  static aborted(originalError?: Error): NeuroLinkError {
+    const err = new NeuroLinkError({
+      code: ERROR_CODES.OPERATION_ABORTED,
+      message: originalError?.message || "The operation was aborted",
+      category: ErrorCategory.ABORT,
+      severity: ErrorSeverity.LOW,
+      retriable: false,
+      context: {},
+      originalError,
+    });
+    err.name = "AbortError";
+    return err;
+  }
+
   // ============================================================================
   // CONFIGURATION ERRORS
   // ============================================================================
@@ -285,6 +368,79 @@ export class ErrorFactory {
       severity: ErrorSeverity.HIGH,
       retriable: false,
       context: context || {},
+    });
+  }
+
+  // ============================================================================
+  // CSV VALIDATION/PARSING ERRORS (#1199)
+  // ============================================================================
+
+  /**
+   * Create an invalid CSV input error (e.g. an empty filePath/csvString argument).
+   */
+  static csvInvalidInput(message: string): NeuroLinkError {
+    return new NeuroLinkError({
+      code: ERROR_CODES.CSV_INVALID_INPUT,
+      message,
+      category: ErrorCategory.VALIDATION,
+      severity: ErrorSeverity.MEDIUM,
+      retriable: false,
+      context: {},
+    });
+  }
+
+  /**
+   * Create a CSV row-shape violation error (#384) — a parsed row that isn't a
+   * string-keyed object with string values.
+   */
+  static csvRowInvalid(message: string, rowNumber: number): NeuroLinkError {
+    return new NeuroLinkError({
+      code: ERROR_CODES.CSV_ROW_INVALID,
+      message,
+      category: ErrorCategory.VALIDATION,
+      severity: ErrorSeverity.MEDIUM,
+      retriable: false,
+      context: { rowNumber },
+    });
+  }
+
+  /**
+   * Create a CSV file access error (bad path, permissions, ENOENT/EACCES) (#375).
+   */
+  static csvFileAccessFailed(
+    message: string,
+    filePath: string,
+    originalError?: Error,
+  ): NeuroLinkError {
+    return new NeuroLinkError({
+      code: ERROR_CODES.CSV_FILE_ACCESS_FAILED,
+      message,
+      category: ErrorCategory.RESOURCE,
+      severity: ErrorSeverity.HIGH,
+      retriable: false,
+      context: { filePath },
+      originalError,
+    });
+  }
+
+  /**
+   * Create a CSV read/parse failure error (#375) — source stream errors and
+   * csv-parser errors both route through this, carrying the enriched
+   * `buildCsvParseErrorMessage` context in `message`.
+   */
+  static csvParseFailed(
+    message: string,
+    context: Record<string, unknown>,
+    originalError?: Error,
+  ): NeuroLinkError {
+    return new NeuroLinkError({
+      code: ERROR_CODES.CSV_PARSE_FAILED,
+      message,
+      category: ErrorCategory.EXECUTION,
+      severity: ErrorSeverity.MEDIUM,
+      retriable: false,
+      context,
+      originalError,
     });
   }
 
@@ -534,6 +690,105 @@ export class ErrorFactory {
   }
 
   /**
+   * The combined page count across every PDF in one request exceeds what the
+   * provider accepts (#309). Distinct from `pdfPageLimitExceeded`, which is
+   * per-file — here each document can be individually legal.
+   */
+  static pdfAggregatePageLimitExceeded(
+    fileCount: number,
+    totalPages: number,
+    maxPages: number,
+    provider: string,
+  ): NeuroLinkError {
+    return new NeuroLinkError({
+      code: ERROR_CODES.PDF_AGGREGATE_PAGE_LIMIT_EXCEEDED,
+      message:
+        `[PDF] Combined page count across ${fileCount} PDF(s) (${totalPages}) exceeds the ` +
+        `${maxPages}-page limit for ${provider}. ` +
+        `Split the request or reduce the number of PDFs.`,
+      category: ErrorCategory.VALIDATION,
+      severity: ErrorSeverity.MEDIUM,
+      retriable: false,
+      context: { fileCount, totalPages, maxPages, provider },
+    });
+  }
+
+  /**
+   * The combined byte size across every PDF in one request exceeds what the
+   * provider accepts (#309).
+   */
+  static pdfAggregateSizeLimitExceeded(
+    fileCount: number,
+    totalMB: number,
+    maxSizeMB: number,
+    provider: string,
+  ): NeuroLinkError {
+    return new NeuroLinkError({
+      code: ERROR_CODES.PDF_AGGREGATE_SIZE_LIMIT_EXCEEDED,
+      message:
+        `[PDF] Combined size across ${fileCount} PDF(s) (${totalMB.toFixed(2)}MB) exceeds the ` +
+        `${maxSizeMB}MB limit for ${provider}.`,
+      category: ErrorCategory.VALIDATION,
+      severity: ErrorSeverity.MEDIUM,
+      retriable: false,
+      context: { fileCount, totalMB, maxSizeMB, provider },
+    });
+  }
+
+  /**
+   * A PDF supplied through the untrusted `input.content` surface could not be
+   * parsed for a page count (#309). Caller-supplied `metadata.pages` is not
+   * authoritative there, so an unreadable document is rejected rather than
+   * admitted with an assumed count of zero.
+   */
+  static pdfPageCountUnverifiable(
+    filenames: string[],
+    provider: string,
+  ): NeuroLinkError {
+    return new NeuroLinkError({
+      code: ERROR_CODES.PDF_PAGE_COUNT_UNVERIFIABLE,
+      message:
+        `[PDF] Cannot verify the page count for ${filenames.length} PDF(s) supplied via ` +
+        `input.content (${filenames.join(", ")}). Provide readable PDFs, or submit them ` +
+        `via input.pdfFiles where page counts are derived during detection.`,
+      category: ErrorCategory.VALIDATION,
+      severity: ErrorSeverity.MEDIUM,
+      retriable: false,
+      context: { filenames, provider },
+    });
+  }
+
+  /**
+   * The PDF is encrypted and no password was supplied (#258).
+   */
+  static pdfPasswordRequired(): NeuroLinkError {
+    return new NeuroLinkError({
+      code: ERROR_CODES.PDF_PASSWORD_REQUIRED,
+      message:
+        "This PDF is password-protected. Supply the password via " +
+        "`pdfOptions: { password: '…' }` (SDK) or `--pdf-password` (CLI).",
+      category: ErrorCategory.VALIDATION,
+      severity: ErrorSeverity.MEDIUM,
+      retriable: false,
+    });
+  }
+
+  /**
+   * A password was supplied for an encrypted PDF but it was incorrect (#258).
+   */
+  static pdfIncorrectPassword(): NeuroLinkError {
+    return new NeuroLinkError({
+      code: ERROR_CODES.PDF_INCORRECT_PASSWORD,
+      message:
+        "The password supplied for this PDF is incorrect. Check the " +
+        "`pdfOptions.password` / `--pdf-password` value and try again.",
+      category: ErrorCategory.VALIDATION,
+      severity: ErrorSeverity.MEDIUM,
+      retriable: false,
+    });
+  }
+
+  /**
    * Create an image too large error
    */
   static imageTooLarge(sizeMB: string, maxMB: string): NeuroLinkError {
@@ -552,6 +807,27 @@ export class ErrorFactory {
           "Use a lower quality JPEG compression",
           "Reduce image dimensions",
         ],
+      },
+    });
+  }
+
+  /**
+   * Create an invalid image size error (NaN/Infinity/negative byte length).
+   * Distinct from `imageTooLarge` — this rejects a malformed size value
+   * before it reaches the max-size comparison, since `NaN > maxSize` and
+   * `-1 > maxSize` both evaluate to `false` and would otherwise let a
+   * corrupted stat/header value silently skip the guard.
+   */
+  static invalidImageSize(size: number): NeuroLinkError {
+    return new NeuroLinkError({
+      code: ERROR_CODES.INVALID_IMAGE_SIZE,
+      message: `Invalid image size: ${size} (must be a finite, non-negative number)`,
+      category: ErrorCategory.VALIDATION,
+      severity: ErrorSeverity.MEDIUM,
+      retriable: false,
+      context: {
+        field: "input.images",
+        size,
       },
     });
   }
@@ -591,6 +867,23 @@ export class ErrorFactory {
           "Check that the file extension matches the actual format",
         ],
       },
+    });
+  }
+
+  /**
+   * Create an image buffer validation error: empty, undersized, or a
+   * truncated buffer detected by `ImageProcessor.validateBufferNotEmpty()`.
+   * Takes the fully-formed message so call sites keep their specific
+   * byte-count detail instead of a fixed generic message.
+   */
+  static imageBufferInvalid(message: string): NeuroLinkError {
+    return new NeuroLinkError({
+      code: ERROR_CODES.IMAGE_BUFFER_INVALID,
+      message,
+      category: ErrorCategory.VALIDATION,
+      severity: ErrorSeverity.MEDIUM,
+      retriable: false,
+      context: { field: "input.images" },
     });
   }
 
@@ -839,25 +1132,184 @@ export class ErrorFactory {
       },
     });
   }
+
+  // ============================================================================
+  // EVALUATION ERRORS
+  // ============================================================================
+
+  /**
+   * Create a scorer not found error
+   */
+  static scorerNotFound(
+    scorerId: string,
+    availableScorers?: string[],
+  ): NeuroLinkError {
+    return new NeuroLinkError({
+      code: ERROR_CODES.SCORER_NOT_FOUND,
+      message: `Scorer '${scorerId}' not found. Use neurolink.getAvailableScorers() to see available scorers.`,
+      category: ErrorCategory.VALIDATION,
+      severity: ErrorSeverity.MEDIUM,
+      retriable: false,
+      context: { scorerId, availableScorers },
+    });
+  }
+
+  /**
+   * Create an evaluation validation error
+   */
+  static evaluationValidationFailed(
+    scorerId: string,
+    errors: string[],
+  ): NeuroLinkError {
+    return new NeuroLinkError({
+      code: ERROR_CODES.EVALUATION_VALIDATION_FAILED,
+      message: `Invalid input for scorer '${scorerId}': ${errors.join(", ")}`,
+      category: ErrorCategory.VALIDATION,
+      severity: ErrorSeverity.MEDIUM,
+      retriable: false,
+      context: { scorerId, validationErrors: errors },
+    });
+  }
+
+  /**
+   * Create an evaluation timeout error
+   */
+  static evaluationTimeout(
+    operation: string,
+    timeoutMs: number,
+  ): NeuroLinkError {
+    return new NeuroLinkError({
+      code: ERROR_CODES.EVALUATION_TIMEOUT,
+      message: `Evaluation ${operation} timed out after ${timeoutMs}ms`,
+      category: ErrorCategory.TIMEOUT,
+      severity: ErrorSeverity.HIGH,
+      retriable: true,
+      context: { operation, timeoutMs },
+    });
+  }
+
+  /**
+   * Create an evaluation execution failed error
+   */
+  static evaluationExecutionFailed(
+    operation: string,
+    originalError: Error,
+  ): NeuroLinkError {
+    return new NeuroLinkError({
+      code: ERROR_CODES.EVALUATION_EXECUTION_FAILED,
+      message: `Evaluation ${operation} failed: ${originalError.message}`,
+      category: ErrorCategory.EXECUTION,
+      severity: ErrorSeverity.HIGH,
+      retriable: false,
+      originalError,
+    });
+  }
+
+  // ============================================================================
+  // PROXY ROLLING-WORKER ERRORS
+  // ============================================================================
+
+  /**
+   * Create a proxy rolling-worker lifecycle error. Preserves the caller's exact
+   * message so existing substring-based assertions keep working, while giving
+   * callers a typed `code`/`category` to branch on instead of string-matching
+   * generic `Error` instances.
+   */
+  static proxyWorkerLifecycle(
+    message: string,
+    context?: Record<string, unknown>,
+  ): NeuroLinkError {
+    return new NeuroLinkError({
+      code: ERROR_CODES.PROXY_WORKER_LIFECYCLE_FAILED,
+      message,
+      category: ErrorCategory.SYSTEM,
+      severity: ErrorSeverity.HIGH,
+      retriable: false,
+      context: context || {},
+    });
+  }
+
+  // ============================================================================
+  // GENERIC FILE / CSV PROCESSING ERRORS
+  // ============================================================================
+
+  /**
+   * Create a generic file-processing-failed error (e.g. an unrecognized or
+   * corrupt file in `processUnifiedFilesArray`). Preserves the original error
+   * as `originalError` (stack + message copied onto the new error's context).
+   */
+  static fileProcessingFailed(
+    filename: string,
+    originalError: Error,
+  ): NeuroLinkError {
+    return new NeuroLinkError({
+      code: ERROR_CODES.FILE_PROCESSING_FAILED,
+      message: `Failed to process file "${filename}": ${originalError.message}`,
+      category: ErrorCategory.EXECUTION,
+      severity: ErrorSeverity.HIGH,
+      retriable: false,
+      context: { filename },
+      originalError,
+    });
+  }
+
+  /**
+   * Create a generic CSV-processing-failed error (explicit `csvFiles` path,
+   * distinct from `fileProcessingFailed` so callers can classify CSV-specific
+   * failures separately). Preserves the original error as `originalError`.
+   */
+  static csvProcessingFailed(
+    filename: string,
+    originalError: Error,
+  ): NeuroLinkError {
+    return new NeuroLinkError({
+      code: ERROR_CODES.CSV_PROCESSING_FAILED,
+      message: `Failed to process CSV file "${filename}": ${originalError.message}`,
+      category: ErrorCategory.EXECUTION,
+      severity: ErrorSeverity.HIGH,
+      retriable: false,
+      context: { filename },
+      originalError,
+    });
+  }
 }
 
 /**
- * Timeout wrapper for async operations
+ * Timeout wrapper for async operations.
+ *
+ * Races an already-created promise against a deadline. It cannot cancel that
+ * promise: when the deadline wins the operation keeps running as an abandoned
+ * ghost. A caller that owns the abortable operation (an HTTP request, a
+ * provider call) must hand it an `AbortSignal` itself and abort it when this
+ * rejects.
+ *
+ * `timeoutMs` is held at `MAX_TIMER_MS`: a longer deadline would otherwise be
+ * handed to `setTimeout`, which fires after 1 ms and so rejected an operation
+ * that had asked for the longest wait available.
  */
 export async function withTimeout<T>(
   promise: Promise<T>,
   timeoutMs: number,
   timeoutError?: Error,
 ): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  // An explicit upper-bound comparison, and `>` rather than `<=`: NaN fails
+  // `>`, so NaN, zero and negative deadlines reach `setTimeout` as they always
+  // did, and only a value above the limit is replaced by it.
+  const delayMs = timeoutMs > MAX_TIMER_MS ? MAX_TIMER_MS : timeoutMs;
   const timeoutPromise = new Promise<never>((_, reject) => {
-    setTimeout(() => {
+    timer = setTimeout(() => {
       reject(
         timeoutError || new Error(`Operation timed out after ${timeoutMs}ms`),
       );
-    }, timeoutMs);
+    }, delayMs);
   });
 
-  return Promise.race([promise, timeoutPromise]);
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -909,19 +1361,30 @@ export class CircuitBreaker {
   private failures = 0;
   private lastFailureTime = 0;
   private state: "closed" | "open" | "half-open" = "closed";
+  private name: string;
 
   constructor(
     private readonly failureThreshold: number = 5,
     private readonly resetTimeoutMs: number = 60000,
-  ) {}
+    name: string = "tool-execution",
+  ) {
+    this.name = name;
+  }
 
   async execute<T>(operation: () => Promise<T>): Promise<T> {
     if (this.state === "open") {
-      if (Date.now() - this.lastFailureTime > this.resetTimeoutMs) {
-        this.state = "half-open";
-      } else {
-        throw new Error("Circuit breaker is open - operation not executed");
+      const retryAfterMs =
+        this.resetTimeoutMs - (Date.now() - this.lastFailureTime);
+      if (retryAfterMs > 0) {
+        throw new CircuitBreakerOpenError({
+          breakerName: this.name,
+          retryAfter: new Date(this.lastFailureTime + this.resetTimeoutMs),
+          retryAfterMs,
+          breakerState: "open",
+          failureCount: this.failures,
+        });
       }
+      this.state = "half-open";
     }
 
     try {
@@ -958,11 +1421,53 @@ export class CircuitBreaker {
 }
 
 /**
+ * Detect AbortError from any source (DOMException, plain Error, or message-based).
+ * Used to short-circuit retry/fallback loops when an abort signal fires.
+ *
+ * Uses `includes()` for message checks because provider error handlers
+ * (e.g., googleVertex.formatProviderError) wrap the original AbortError
+ * in a formatted error like "❌ Provider Error\n\nThis operation was aborted\n\n..."
+ * which destroys the exact message match.
+ */
+export function isAbortError(error: unknown): boolean {
+  if (error instanceof DOMException && error.name === "AbortError") {
+    return true;
+  }
+  if (error instanceof Error && error.name === "AbortError") {
+    return true;
+  }
+  // Typed NeuroLinkError abort - canonical from-now-on shape.
+  if (
+    error instanceof NeuroLinkError &&
+    error.category === ErrorCategory.ABORT
+  ) {
+    return true;
+  }
+  if (
+    error instanceof Error &&
+    (error.message?.includes("This operation was aborted") ||
+      error.message?.includes("The operation was aborted") ||
+      error.message?.includes("The user aborted a request") ||
+      // Anthropic SDK's APIUserAbortError — name is plain "Error", so only
+      // the message identifies it. Missing this classified real aborts as
+      // provider failures (ERROR log + fallback consulted on a user cancel).
+      error.message?.includes("Request was aborted"))
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * Error handler that decides whether to retry based on error type
  */
 export function isRetriableError(error: Error): boolean {
   if (error instanceof NeuroLinkError) {
     return error.retriable;
+  }
+
+  if (error instanceof HITLTimeoutError) {
+    return false;
   }
 
   // Check for common retriable error patterns
@@ -979,6 +1484,57 @@ export function isRetriableError(error: Error): boolean {
   ];
 
   return retriablePatterns.some((pattern) => pattern.test(error.message));
+}
+
+/**
+ * Determines if an error is likely recoverable (rate limit, timeout, network issues).
+ * Useful for deciding whether to retry or fail fast.
+ */
+export function isRecoverableError(error: Error): boolean {
+  // Check NeuroLinkError.retriable first
+  const errorWithRetriable = error as Error & { retriable?: boolean };
+  if (
+    "retriable" in error &&
+    typeof errorWithRetriable.retriable === "boolean"
+  ) {
+    return errorWithRetriable.retriable;
+  }
+
+  const message = error.message?.toLowerCase() || "";
+
+  // Rate limit errors
+  if (message.includes("rate limit") || message.includes("too many requests")) {
+    return true;
+  }
+  if (/\b429\b/.test(message)) {
+    return true;
+  }
+
+  // Timeout errors
+  if (
+    message.includes("timeout") ||
+    message.includes("etimedout") ||
+    message.includes("timed out")
+  ) {
+    return true;
+  }
+
+  // Network errors
+  if (
+    message.includes("econnreset") ||
+    message.includes("econnrefused") ||
+    message.includes("network") ||
+    message.includes("socket")
+  ) {
+    return true;
+  }
+
+  // Server errors (use word boundaries to avoid false matches)
+  if (/\b50[0234]\b/.test(message)) {
+    return true;
+  }
+
+  return false;
 }
 
 /**

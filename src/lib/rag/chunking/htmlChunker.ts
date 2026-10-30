@@ -6,13 +6,15 @@
  */
 
 import { randomUUID } from "crypto";
+import { decodeHtmlTextEntitiesOnce } from "../../utils/htmlEntities.js";
+import { removeHtmlMarkup } from "../../utils/htmlText.js";
 import type {
   BaseChunkerConfig,
   Chunk,
   Chunker,
   ChunkerValidationResult,
   HTMLChunkerConfig,
-} from "../types.js";
+} from "../../types/index.js";
 
 /**
  * HTML-aware chunker implementation
@@ -243,28 +245,29 @@ export class HTMLChunker implements Chunker {
    * Extract plain text from HTML
    */
   private extractText(html: string): string {
-    return (
-      html
-        // Remove script and style elements
-        .replace(/<script[\s\S]*?<\/script>/gi, "")
-        .replace(/<style[\s\S]*?<\/style>/gi, "")
-        // Remove HTML comments
-        .replace(/<!--[\s\S]*?-->/g, "")
-        // Replace block elements with newlines
-        .replace(/<\/(p|div|br|h[1-6]|li|tr)>/gi, "\n")
-        // Remove remaining tags
-        .replace(/<[^>]+>/g, "")
-        // Decode common HTML entities
-        .replace(/&nbsp;/gi, " ")
-        .replace(/&amp;/gi, "&")
-        .replace(/&lt;/gi, "<")
-        .replace(/&gt;/gi, ">")
-        .replace(/&quot;/gi, '"')
-        .replace(/&#039;/gi, "'")
-        // Normalize whitespace
-        .replace(/\s+/g, " ")
-        .trim()
-    );
+    return decodeHtmlTextEntitiesOnce(
+      removeHtmlMarkup(html, {
+        tagReplacement: "",
+        commentReplacement: "",
+        lineBreakEndTags: [
+          "p",
+          "div",
+          "br",
+          "h1",
+          "h2",
+          "h3",
+          "h4",
+          "h5",
+          "h6",
+          "li",
+          "tr",
+        ],
+        lineBreakVoidTags: [],
+      }),
+      { nbsp: " ", amp: "&", lt: "<", gt: ">", quot: '"', "#039": "'" },
+    )
+      .replace(/\s+/g, " ")
+      .trim();
   }
 
   /**

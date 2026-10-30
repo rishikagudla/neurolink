@@ -1,0 +1,1403 @@
+# Server Adapters API Reference
+
+Complete reference for `@juspay/neurolink/server` -- the HTTP server layer for NeuroLink.
+
+```typescript
+import {
+  createServer,
+  createAllRoutes,
+  HonoServerAdapter,
+  // ... ~120 exports
+} from "@juspay/neurolink/server";
+```
+
+---
+
+## Table of Contents
+
+- [Factory and Base Class](#factory-and-base-class)
+- [Framework Adapters](#framework-adapters)
+- [Middleware](#middleware)
+  - [Authentication](#authentication-middleware)
+  - [Rate Limiting](#rate-limiting-middleware)
+  - [Validation](#validation-middleware)
+  - [Caching](#caching-middleware)
+  - [Common Middleware](#common-middleware)
+  - [Abort Signal](#abort-signal-middleware)
+  - [Deprecation](#deprecation-middleware)
+  - [Stream Redaction](#stream-redaction)
+  - [MCP Body Attachment](#mcp-body-attachment-middleware)
+- [Route Groups](#route-groups)
+- [OpenAPI Generation](#openapi-generation)
+- [Streaming Utilities](#streaming-utilities)
+- [WebSocket](#websocket)
+- [Validation Utilities (Zod)](#validation-utilities-zod)
+- [Error Classes](#error-classes)
+- [Type Exports](#type-exports)
+- [Constants](#constants)
+
+---
+
+## Factory and Base Class
+
+### `createServer(neurolink, options?)`
+
+Convenience function that creates a server adapter from a NeuroLink instance.
+
+```typescript
+function createServer(
+  neurolink: NeuroLink,
+  options?: {
+    framework?: ServerFramework; // default: "hono"
+    config?: ServerAdapterConfig;
+  },
+): Promise<BaseServerAdapter>;
+```
+
+### `ServerAdapterFactory`
+
+Static factory class for creating adapters. Supports dynamic imports so unused frameworks are never bundled.
+
+| Method                    | Signature                                                              | Description                       |
+| ------------------------- | ---------------------------------------------------------------------- | --------------------------------- |
+| `create`                  | `(options: ServerAdapterFactoryOptions) => Promise<BaseServerAdapter>` | Create adapter by framework name  |
+| `createHono`              | `(neurolink, config?) => Promise<BaseServerAdapter>`                   | Shortcut for Hono                 |
+| `createExpress`           | `(neurolink, config?) => Promise<BaseServerAdapter>`                   | Shortcut for Express              |
+| `createFastify`           | `(neurolink, config?) => Promise<BaseServerAdapter>`                   | Shortcut for Fastify              |
+| `createKoa`               | `(neurolink, config?) => Promise<BaseServerAdapter>`                   | Shortcut for Koa                  |
+| `registerAdapter`         | `(framework, adapterClass) => void`                                    | Register a custom adapter class   |
+| `isSupported`             | `(framework: string) => boolean`                                       | Check if a framework is supported |
+| `getSupportedFrameworks`  | `() => Array<{framework, status, description}>`                        | List all supported frameworks     |
+| `getRecommendedFramework` | `() => ServerFramework`                                                | Returns `"hono"`                  |
+
+### `BaseServerAdapter`
+
+Abstract base class that all framework adapters extend. Extends `EventEmitter`.
+
+| Method                     | Signature                                    | Description                                   |
+| -------------------------- | -------------------------------------------- | --------------------------------------------- |
+| `initialize`               | `() => Promise<void>`                        | Initialize routes, middleware, framework      |
+| `start`                    | `() => Promise<void>`                        | Start listening (abstract)                    |
+| `stop`                     | `() => Promise<void>`                        | Stop server with graceful shutdown (abstract) |
+| `registerRoute`            | `(route: RouteDefinition) => void`           | Register a single route                       |
+| `registerRouteGroup`       | `(group: RouteGroup) => void`                | Register a route group with prefix            |
+| `registerMiddleware`       | `(middleware: MiddlewareDefinition) => void` | Register middleware                           |
+| `getStatus`                | `() => ServerStatus`                         | Get running status, uptime, route count       |
+| `listRoutes`               | `() => RouteDefinition[]`                    | List all registered routes                    |
+| `getConfig`                | `() => RequiredServerAdapterConfig`          | Get resolved configuration                    |
+| `getLifecycleState`        | `() => ServerLifecycleState`                 | Get current lifecycle state                   |
+| `getActiveConnectionCount` | `() => number`                               | Number of active connections                  |
+| `getFrameworkInstance`     | `() => unknown`                              | Get underlying framework instance (abstract)  |
+
+#### `ServerAdapterConfig`
+
+All fields are optional; defaults are applied by the base class.
+
+| Field                  | Type               | Default                  | Description                       |
+| ---------------------- | ------------------ | ------------------------ | --------------------------------- |
+| `port`                 | `number`           | `3000`                   | Server port                       |
+| `host`                 | `string`           | `"0.0.0.0"`              | Server host                       |
+| `basePath`             | `string`           | `"/api"`                 | Base path for all routes          |
+| `cors`                 | `CORSConfig`       | enabled, origins `["*"]` | CORS settings                     |
+| `rateLimit`            | `RateLimitConfig`  | enabled, 100 req/15 min  | Rate limiting                     |
+| `bodyParser`           | `BodyParserConfig` | enabled, 10 MB limit     | Body parsing                      |
+| `logging`              | `LoggingConfig`    | enabled, level `"info"`  | Request logging                   |
+| `timeout`              | `number`           | `30000`                  | Request timeout (ms)              |
+| `enableMetrics`        | `boolean`          | `true`                   | Expose `/api/metrics`             |
+| `enableSwagger`        | `boolean`          | `false`                  | Enable OpenAPI docs               |
+| `disableBuiltInHealth` | `boolean`          | `false`                  | Skip built-in `/health`, `/ready` |
+| `redaction`            | `RedactionConfig`  | disabled                 | Stream redaction settings         |
+| `shutdown`             | `ShutdownConfig`   | 30s shutdown, 15s drain  | Graceful shutdown behavior        |
+| `carryMiddlewareState` | `boolean`          | `false`                  | Carry middleware state (opt-in)   |
+
+#### `ShutdownConfig`
+
+| Field                       | Type      | Default | Description                   |
+| --------------------------- | --------- | ------- | ----------------------------- |
+| `gracefulShutdownTimeoutMs` | `number`  | `30000` | Max time for entire shutdown  |
+| `drainTimeoutMs`            | `number`  | `15000` | Max time to drain connections |
+| `forceClose`                | `boolean` | `true`  | Force-close after timeout     |
+
+#### Server Lifecycle States
+
+`"uninitialized"` | `"initializing"` | `"initialized"` | `"starting"` | `"running"` | `"draining"` | `"stopping"` | `"stopped"` | `"error"`
+
+#### Events (`ServerAdapterEvents`)
+
+| Event         | Payload                                          |
+| ------------- | ------------------------------------------------ |
+| `initialized` | `{ config, routeCount, middlewareCount }`        |
+| `started`     | `{ port, host, timestamp }`                      |
+| `stopped`     | `{ uptime, timestamp }`                          |
+| `request`     | `{ requestId, method, path, timestamp }`         |
+| `response`    | `{ requestId, statusCode, duration, timestamp }` |
+| `error`       | `{ requestId?, error, timestamp }`               |
+
+---
+
+## Framework Adapters
+
+All adapters extend `BaseServerAdapter` and share the same public API. They differ in which underlying HTTP framework they wrap.
+
+| Class                  | Framework | Multi-runtime            | Notes                                                   |
+| ---------------------- | --------- | ------------------------ | ------------------------------------------------------- |
+| `HonoServerAdapter`    | Hono      | Node.js, Bun, Deno, Edge | Recommended. Auto-detects runtime.                      |
+| `ExpressServerAdapter` | Express   | Node.js                  | Dynamic-imports `express`, `cors`, `express-rate-limit` |
+| `FastifyServerAdapter` | Fastify   | Node.js                  | Dynamic-imports `fastify`                               |
+| `KoaServerAdapter`     | Koa       | Node.js                  | Dynamic-imports `koa`, `@koa/router`, `@koa/cors`       |
+
+```typescript
+import { HonoServerAdapter } from "@juspay/neurolink/server";
+
+const adapter = new HonoServerAdapter(neurolink, { port: 8080 });
+await adapter.initialize();
+await adapter.start();
+```
+
+---
+
+## Middleware
+
+All middleware factory functions return `MiddlewareDefinition` objects. Register them with `adapter.registerMiddleware(mw)`.
+
+```typescript
+type MiddlewareDefinition = {
+  name: string;
+  order?: number; // lower = earlier (default varies)
+  handler: MiddlewareHandler;
+  paths?: string[]; // apply to these paths (default: all)
+  excludePaths?: string[]; // skip these paths
+};
+
+type MiddlewareHandler = (
+  ctx: ServerContext,
+  next: () => Promise<unknown>,
+) => Promise<unknown>;
+```
+
+### Authentication Middleware
+
+#### `createAuthMiddleware(config)`
+
+General-purpose authentication middleware supporting bearer, API key, basic, and custom strategies.
+
+```typescript
+function createAuthMiddleware(config: AuthConfig): MiddlewareDefinition;
+
+type AuthConfig = {
+  type: "bearer" | "api-key" | "basic" | "custom";
+  validate: (token: string, ctx: ServerContext) => Promise<AuthResult | null>;
+  headerName?: string; // default varies by type
+  skipPaths?: string[];
+  errorMessage?: string; // default: "Authentication required"
+  extractToken?: (ctx: ServerContext) => string | null; // for "custom" type
+  skipDevPlayground?: boolean; // default: true (honours the dev playground header only when NODE_ENV is "development")
+};
+
+type AuthResult = {
+  id: string;
+  email?: string;
+  roles?: string[];
+  /**
+   * true when this identity stands for every holder of one credential (a
+   * shared API key) rather than one person. Carried to `ctx.user.shared`; the
+   * agent routes do not warn about a body `userId` for a shared identity. See
+   * the security guide.
+   */
+  shared?: boolean;
+  metadata?: Record<string, unknown>;
+};
+```
+
+#### `createBearerAuthMiddleware(validate, options?)`
+
+Simplified bearer token authentication.
+
+```typescript
+function createBearerAuthMiddleware(
+  validate: TokenValidator,
+  options?: BearerAuthOptions,
+): MiddlewareDefinition;
+
+type TokenValidator = (
+  token: string,
+) => Promise<AuthenticatedUser | null> | AuthenticatedUser | null;
+
+type BearerAuthOptions = {
+  required?: boolean; // default: true
+  headerName?: string; // default: "authorization"
+  skipPaths?: string[];
+};
+```
+
+#### `createApiKeyAuthMiddleware(store, options?)`
+
+API key authentication using an `ApiKeyStore`.
+
+```typescript
+function createApiKeyAuthMiddleware(
+  store: ApiKeyStore,
+  options?: ApiKeyAuthOptions,
+): MiddlewareDefinition;
+
+type ApiKeyAuthOptions = {
+  headerName?: string; // default: "x-api-key"
+  skipPaths?: string[];
+};
+```
+
+#### `ApiKeyStore`
+
+In-memory API key store.
+
+| Method      | Signature                                           | Description           |
+| ----------- | --------------------------------------------------- | --------------------- |
+| `addKey`    | `(apiKey: string, user: AuthenticatedUser) => void` | Register a key        |
+| `validate`  | `(apiKey: string) => AuthenticatedUser \| null`     | Validate a key        |
+| `removeKey` | `(apiKey: string) => boolean`                       | Remove a key          |
+| `clear`     | `() => void`                                        | Remove all keys       |
+| `size`      | `number` (getter)                                   | Number of stored keys |
+
+#### `createRoleMiddleware(config)` / `createRoleAuthMiddleware(requiredRoles, options?)`
+
+Role-based access control. Place after authentication middleware.
+
+```typescript
+function createRoleMiddleware(config: {
+  requiredRoles: string[];
+  requireAll?: boolean; // default: false (any role matches)
+  errorMessage?: string;
+}): MiddlewareDefinition;
+
+// Simplified version
+function createRoleAuthMiddleware(
+  requiredRoles: string[],
+  options?: { requireAll?: boolean },
+): MiddlewareDefinition;
+```
+
+#### `createPermissionAuthMiddleware(requiredPermissions, options?)`
+
+Permission-based access control.
+
+```typescript
+function createPermissionAuthMiddleware(
+  requiredPermissions: string[],
+  options?: { requireAll?: boolean },
+): MiddlewareDefinition;
+```
+
+---
+
+### Rate Limiting Middleware
+
+#### `createRateLimitMiddleware(config)`
+
+Fixed-window rate limiter with configurable store.
+
+```typescript
+function createRateLimitMiddleware(
+  config: RateLimitMiddlewareConfig,
+): MiddlewareDefinition;
+
+type RateLimitMiddlewareConfig = {
+  maxRequests: number;
+  windowMs: number;
+  message?: string;
+  skipPaths?: string[];
+  keyGenerator?: (ctx: ServerContext) => string; // default: IP address
+  onRateLimitExceeded?: (ctx: ServerContext, retryAfter: number) => unknown;
+  store?: RateLimitStore; // default: InMemoryRateLimitStore
+};
+```
+
+Sets response headers: `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, and `Retry-After` on 429.
+
+#### `createSlidingWindowRateLimitMiddleware(config)`
+
+Sliding-window variant for smoother rate limiting.
+
+```typescript
+function createSlidingWindowRateLimitMiddleware(
+  config: RateLimitMiddlewareConfig & { subWindows?: number },
+): MiddlewareDefinition;
+```
+
+#### `createFixedWindowRateLimitMiddleware(config, store?)`
+
+Fixed-window rate limiter with store as a separate parameter.
+
+```typescript
+function createFixedWindowRateLimitMiddleware(
+  config: FixedWindowRateLimitConfig,
+  store?: RateLimitStore,
+): MiddlewareDefinition;
+```
+
+#### `InMemoryRateLimitStore`
+
+Default in-memory rate limit store implementing `RateLimitStore`.
+
+```typescript
+type RateLimitStore = {
+  get(key: string): Promise<RateLimitEntry | undefined>;
+  set(key: string, entry: RateLimitEntry): Promise<void>;
+  increment(key: string, windowMs: number): Promise<RateLimitEntry>;
+  reset(key: string): Promise<void>;
+};
+```
+
+Also exported as `MemoryRateLimitStore` (alias).
+
+---
+
+### Validation Middleware
+
+#### `createRequestValidationMiddleware(config)`
+
+Schema-based request validation for body, query, params, and headers.
+
+```typescript
+function createRequestValidationMiddleware(
+  config: ValidationConfig,
+): MiddlewareDefinition;
+
+type ValidationConfig = {
+  bodySchema?: ValidationSchema;
+  querySchema?: ValidationSchema;
+  paramsSchema?: ValidationSchema;
+  headersSchema?: ValidationSchema;
+  customValidator?: (ctx: ServerContext) => Promise<void>;
+  skipPaths?: string[];
+  errorFormatter?: (errors: ValidationError[]) => unknown;
+};
+
+type ValidationSchema = {
+  required?: string[];
+  properties?: Record<string, PropertySchema>;
+  additionalProperties?: boolean;
+};
+
+type PropertySchema = {
+  type: "string" | "number" | "boolean" | "object" | "array";
+  minimum?: number;
+  maximum?: number;
+  minLength?: number;
+  maxLength?: number;
+  minItems?: number;
+  maxItems?: number;
+  pattern?: string;
+  enum?: unknown[];
+  default?: unknown;
+  validate?: (value: unknown) => boolean | string;
+};
+```
+
+Also exported as `createValidationMiddleware` (alias).
+
+#### `createBodyValidationMiddleware(schema)` / `createQueryValidationMiddleware(schema)`
+
+Convenience wrappers for body-only or query-only validation.
+
+#### `createFieldValidator(fieldName, rules)`
+
+Returns a `(value: unknown) => void` function that throws `ValidationError` on failure.
+
+#### `CommonSchemas`
+
+Pre-built `ValidationSchema` objects: `uuid`, `email`, `pagination`, `sorting`, `idParam`, `dateRange`, `search`.
+
+#### `ValidationError` (middleware)
+
+Re-exported from `errors.ts`. Contains an `errors` array of `{ field, message, value? }`.
+
+---
+
+### Caching Middleware
+
+#### `createCacheMiddleware(config)`
+
+Response caching with LRU eviction and per-path TTL support.
+
+```typescript
+function createCacheMiddleware(config: CacheConfig): MiddlewareDefinition;
+
+type CacheConfig = {
+  ttlMs: number;
+  maxSize?: number; // default: 1000
+  keyGenerator?: (ctx: ServerContext) => string;
+  methods?: string[]; // default: ["GET"]
+  paths?: string[];
+  excludePaths?: string[];
+  store?: CacheStore; // default: InMemoryCacheStore
+  includeQuery?: boolean; // default: true
+  ttlByPath?: Record<string, number>;
+};
+```
+
+Sets response headers: `X-Cache` (`HIT` / `MISS`), `X-Cache-Age`, `Cache-Control`.
+
+#### `createCacheInvalidator(store)`
+
+Returns `{ invalidate(pattern), clear() }` for programmatic cache invalidation.
+
+#### `InMemoryCacheStore`
+
+LRU cache store implementing `CacheStore`.
+
+```typescript
+type CacheStore = {
+  get(key: string): Promise<CacheEntry | undefined>;
+  set(key: string, entry: CacheEntry): Promise<void>;
+  delete(key: string): Promise<void>;
+  clear(): Promise<void>;
+};
+
+type CacheEntry = {
+  data: unknown;
+  createdAt: number;
+  ttlMs: number;
+  headers?: Record<string, string>;
+};
+```
+
+#### `LRUCache<K, V>`
+
+Generic synchronous LRU cache. Methods: `get`, `set`, `has`, `delete`, `clear`, `size`.
+
+#### `ResponseCacheStore<T>`
+
+Synchronous response cache with TTL. Methods: `get`, `set`, `has`, `invalidate`, `invalidateByPattern`, `clear`, `size`.
+
+---
+
+### Common Middleware
+
+| Factory                                     | Order | Description                                                          |
+| ------------------------------------------- | ----- | -------------------------------------------------------------------- |
+| `createTimingMiddleware()`                  | 0     | Adds `X-Response-Time` and `Server-Timing` headers                   |
+| `createRequestIdMiddleware(options?)`       | 0     | Ensures every request has an `X-Request-ID` header                   |
+| `createErrorHandlingMiddleware(options?)`   | 1     | Catches errors and formats consistent error responses                |
+| `createSecurityHeadersMiddleware(options?)` | 2     | Adds `X-Frame-Options`, `X-Content-Type-Options`, HSTS, CSP, etc.    |
+| `createLoggingMiddleware(options?)`         | 3     | Logs request/response information; skips health endpoints by default |
+| `createCompressionMiddleware(options?)`     | 5     | Signals compression preference to adapters                           |
+
+#### `createRequestIdMiddleware` options
+
+```typescript
+{
+  headerName?: string;     // default: "x-request-id"
+  prefix?: string;         // default: "req"
+  generator?: () => string;
+}
+```
+
+#### `createErrorHandlingMiddleware` options
+
+```typescript
+{
+  includeStack?: boolean;  // default: false
+  onError?: (error: Error, ctx: ServerContext) => unknown;
+  logErrors?: boolean;     // default: true
+}
+```
+
+#### `createSecurityHeadersMiddleware` options
+
+```typescript
+{
+  contentSecurityPolicy?: string;
+  frameOptions?: "DENY" | "SAMEORIGIN" | false;       // default: "DENY"
+  contentTypeOptions?: "nosniff" | false;               // default: "nosniff"
+  hstsMaxAge?: number | false;                          // default: 31536000
+  referrerPolicy?: string | false;                      // default: "strict-origin-when-cross-origin"
+  customHeaders?: Record<string, string>;
+}
+```
+
+#### `createLoggingMiddleware` options
+
+```typescript
+{
+  logBody?: boolean;       // default: false
+  logResponse?: boolean;   // default: false
+  logger?: { info, error };
+  skipPaths?: string[];    // default: ["/health", "/ready", "/metrics"]
+}
+```
+
+#### `createCompressionMiddleware` options
+
+```typescript
+{
+  threshold?: number;      // default: 1024 bytes
+  contentTypes?: string[]; // default: text/*, application/json, etc.
+}
+```
+
+---
+
+### Abort Signal Middleware
+
+#### `createAbortSignalMiddleware(options?)`
+
+Attaches an `AbortController` to `ctx.abortSignal` and `ctx.abortController` for handling client disconnections and request timeouts.
+
+```typescript
+function createAbortSignalMiddleware(
+  options?: AbortSignalMiddlewareOptions,
+): MiddlewareDefinition;
+
+type AbortSignalMiddlewareOptions = {
+  onAbort?: (ctx: ServerContext) => void;
+  timeout?: number; // request timeout in ms
+};
+```
+
+#### `createExpressAbortMiddleware(options?)`
+
+Express-specific middleware that sets `res.locals.abortSignal` and `res.locals.abortController`.
+
+```typescript
+function createExpressAbortMiddleware(
+  options?: AbortSignalMiddlewareOptions,
+): (req, res, next) => void;
+```
+
+---
+
+### Deprecation Middleware
+
+#### `createDeprecationMiddleware(config)`
+
+Adds RFC 8594 deprecation headers (`Deprecation`, `Sunset`, `Link`, `X-Deprecation-Notice`) to responses for routes marked as deprecated.
+
+```typescript
+function createDeprecationMiddleware(
+  config: DeprecationConfig,
+): MiddlewareDefinition;
+
+type DeprecationConfig = {
+  routes: RouteDefinition[];
+  noticeHeader?: string; // default: "X-Deprecation-Notice"
+  includeLink?: boolean; // default: true
+};
+```
+
+---
+
+### Stream Redaction
+
+Redaction is **disabled by default** (opt-in security feature).
+
+#### `redactStreamChunk(chunk, config?)`
+
+Redact sensitive fields from a `DataStreamEvent` chunk. Returns the chunk unchanged when `config.enabled` is falsy.
+
+```typescript
+function redactStreamChunk(
+  chunk: DataStreamEvent,
+  config?: RedactionConfig,
+): DataStreamEvent;
+```
+
+#### `createStreamRedactor(config?)`
+
+Returns a reusable transform function `<T>(chunk: T) => T`. No-op when redaction is disabled.
+
+```typescript
+function createStreamRedactor(config?: RedactionConfig): <T>(chunk: T) => T;
+```
+
+#### `RedactionConfig`
+
+```typescript
+type RedactionConfig = {
+  enabled?: boolean; // default: false
+  additionalFields?: string[];
+  preserveFields?: string[];
+  redactToolArgs?: boolean; // default: true (when enabled)
+  redactToolResults?: boolean; // default: true (when enabled)
+  placeholder?: string; // default: "[REDACTED]"
+};
+```
+
+Default redacted fields: `request`, `args`, `result`, `apiKey`, `token`, `authorization`, `credentials`, `password`, `secret`.
+
+---
+
+### MCP Body Attachment Middleware
+
+#### `createMCPBodyAttachmentMiddleware()`
+
+Bridges Fastify's body parsing with MCP SDK expectations by attaching `request.body` to `request.raw.body`.
+
+```typescript
+function createMCPBodyAttachmentMiddleware(): MiddlewareDefinition;
+```
+
+#### `fastifyMCPBodyHook(request)`
+
+Lower-level Fastify `preHandler` hook for the same purpose.
+
+```typescript
+function fastifyMCPBodyHook(request: {
+  raw: { body?: unknown };
+  body?: unknown;
+}): Promise<void>;
+```
+
+---
+
+## Route Groups
+
+Route group factories return `RouteGroup` objects. Register them with `adapter.registerRouteGroup(group)`.
+
+### `createAllRoutes(basePath?, options?)`
+
+Creates all standard route groups in one call.
+
+```typescript
+function createAllRoutes(
+  basePath?: string, // default: "/api"
+  options?: CreateRoutesOptions,
+): RouteGroup[];
+
+type CreateRoutesOptions = {
+  enableSwagger?: boolean;
+  getRoutes?: () => RouteDefinition[];
+  /** Enables both the Claude and OpenAI-compatible proxy surfaces. */
+  proxy?: boolean;
+  /** Legacy per-format flags, still honoured. */
+  claudeProxy?: boolean;
+  openaiProxy?: boolean;
+  /** Attachment handling on /agent/execute and /agent/stream (see below). */
+  agent?: {
+    allowedInputRoots?: string[];
+    maxInputBytes?: number;
+    maxInputAttachments?: number;
+    maxInputTotalBytes?: number;
+  };
+  /**
+   * Set to true when the auth middleware identifies individual people: the
+   * agent routes then take userId and the session only from the authenticated
+   * user and ignore the request body's, on every adapter and for every request
+   * (an unauthenticated request gets neither), and the memory routes scope every
+   * session to that user. A server with per-person authentication must set this:
+   * at the default (false) the agent routes take userId and sessionId from the
+   * request body, so any authenticated caller can name another person, and the
+   * memory routes ignore who is calling. The agent routes have one exception,
+   * Hono, where a request whose client sent its own X-Request-ID header gets the
+   * authenticated user over the body, as before, and so does a context the
+   * built-in adapters did not build (your own adapter, a handler called
+   * directly). When the server carries middleware state, the routes log one
+   * warning (per server) the first time a request served from the body names a
+   * different userId than its ctx.user; with carryMiddlewareState off there is no
+   * ctx.user to compare and no warning. Leave it false for no auth or one shared
+   * API key, and mark the shared identity with `shared: true` so that warning stays quiet
+   * (`neurolink serve` does). Any truthy value turns it on. This is the one
+   * switch for `registerAllRoutes` / `createAllRoutes`; the `agent` and `memory`
+   * options do not take it. `registerAllRoutes` also turns on the server's
+   * `carryMiddlewareState`, which the routes need to see the user on every
+   * request; a caller that registers the groups itself must set that option on
+   * the server, or a perUserAuth request has a user only on Hono with the
+   * client's own X-Request-ID and every other request runs as anonymous. See
+   * the security guide.
+   */
+  perUserAuth?: boolean;
+  /**
+   * Admin roles for the memory routes; only consulted with perUserAuth. Whether
+   * the routes are scoped is decided by the top-level perUserAuth, not here. See
+   * "Memory routes and per-user authentication" below.
+   */
+  memory?: { adminRoles?: string[] };
+};
+```
+
+### `registerAllRoutes(adapter, basePath?, options?)`
+
+Registers all route groups with an adapter. If the adapter has `listRoutes()`, auto-binds it for OpenAPI spec generation.
+
+```typescript
+function registerAllRoutes(
+  adapter: { registerRouteGroup; listRoutes? },
+  basePath?: string,
+  options?: CreateRoutesOptions,
+): void;
+```
+
+### Individual Route Factories
+
+| Factory                                      | Prefix    | Endpoints                                                                                                                                                                                                                                                                                                                                                                                 |
+| -------------------------------------------- | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `createAgentRoutes(basePath?, options?)`     | `/agent`  | `POST /agent/execute` -- Execute agent<br />`POST /agent/stream` -- Stream agent response (SSE)<br />`GET /agent/providers` -- List available providers<br />`POST /agent/embed` -- Generate single embedding<br />`POST /agent/embed-many` -- Generate batch embeddings                                                                                                                  |
+| `createToolRoutes(basePath?)`                | `/tools`  | `GET /tools` -- List all tools<br />`GET /tools/search` -- Search tools by query<br />`GET /tools/:name` -- Get tool details<br />`POST /tools/:name/execute` -- Execute tool<br />`POST /tools/execute` -- Execute tool (body-based)                                                                                                                                                     |
+| `createMCPRoutes(basePath?)`                 | `/mcp`    | `GET /mcp/servers` -- List MCP servers<br />`GET /mcp/servers/:name` -- Get server status<br />`GET /mcp/servers/:name/tools` -- List server tools<br />`POST /mcp/servers/:name/tools/:toolName/execute` -- Execute server tool                                                                                                                                                          |
+| `createMemoryRoutes(basePath?, options?)`    | `/memory` | `GET /memory/sessions` -- List sessions<br />`GET /memory/sessions/:id` -- Get session details<br />`GET /memory/sessions/:id/messages` -- Get session messages<br />`DELETE /memory/sessions/:sessionId` -- Delete (clear) a session<br />`DELETE /memory/sessions` -- Clear all sessions<br />`GET /memory/stats` -- Memory statistics<br />`GET /memory/health` -- Memory health check |
+| `createHealthRoutes(basePath?)`              | `/health` | `GET /health` -- Basic health check<br />`GET /health/live` -- Liveness probe<br />`GET /health/ready` -- Readiness probe<br />`GET /health/detailed` -- Detailed health with service status                                                                                                                                                                                              |
+| `createOpenApiRoutes(basePath?, getRoutes?)` | `/docs`   | `GET /docs/openapi.json` -- OpenAPI spec (JSON)<br />`GET /docs/openapi.yaml` -- OpenAPI spec (YAML)                                                                                                                                                                                                                                                                                      |
+
+All route factories accept a `basePath` parameter (default: `"/api"`).
+
+#### Attachments on `/agent/execute` and `/agent/stream`
+
+`input.images` and `input.files` are strings that name content. The SDK resolves
+them itself, which is right for a program naming its own files and wrong for a
+network server, so the agent routes check each one before the SDK sees it. An
+`https://` URL or an allowed local path is read by the route and handed to the
+SDK as bytes; a `data:` URI already carries its content and passes through
+unchanged; anything else is refused:
+
+| Entry                          | Result                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `data:` URI                    | Passed through unchanged. Its length counts against the size limits below, and over a limit it is `413`.                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `https://` URL                 | Downloaded by the server. A redirect is refused and the size is capped. With no proxy configured the host is resolved, every address is checked against blocked ranges (loopback, private, link-local, cloud metadata) and the connection is pinned to the checked addresses. With `HTTPS_PROXY` or `ALL_PROXY` set, the proxy resolves the host: only the URL is checked (IP literals, single-label and internal host names), and what a public-looking name resolves to is the proxy's egress policy. A refused URL is `400`. |
+| `http://` URL                  | Refused with `400`. Use `https`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| Local path                     | Read only from a directory in `allowedInputRoots`, after symlinks are resolved, through a single no-follow file handle. `403` for a path outside every root (the same answer whether or not the file exists, so the route is not an oracle for which files exist) or a file the server cannot read, `404` for a missing file inside a root, `400` for something that is not a regular file, `413` for a file over a size limit.                                                                                                 |
+| Any other scheme (`file:` ...) | Refused with `400`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+
+Local paths are **off by default**: a server does not read its own disk on a
+caller's say-so unless the operator names where.
+
+A request is bounded as a whole as well as per attachment. `input.images` and
+`input.files` are counted together, and share one byte budget:
+
+| Option                | Default | Meaning                                                                                                                                                                        |
+| --------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `allowedInputRoots`   | none    | Directories local paths may be read from. Every local path is refused without one.                                                                                             |
+| `maxInputBytes`       | 50 MiB  | Largest single attachment. If `maxInputTotalBytes` is set lower, the smaller of the two is the cap.                                                                            |
+| `maxInputAttachments` | 20      | Most attachments in one request. A longer list is `413` before anything is read or downloaded.                                                                                 |
+| `maxInputTotalBytes`  | 100 MiB | Sum of all attachments in one request. A `data:` URI is charged its string length. Over the budget is `413`, and a file or download that would overflow it stops mid-transfer. |
+
+A `data:` URI that is over a limit, and a request with too many attachments, are
+refused before any other attachment is read. The remaining attachments are read
+one at a time, each allowed only what the ones before it left of the shared
+budget. An `https://` download that does not fit is refused with `400` like any
+other URL the server cannot fetch.
+
+```typescript
+registerAllRoutes(adapter, "/api", {
+  agent: {
+    allowedInputRoots: ["/srv/uploads"], // default: none, every local path is refused
+    maxInputBytes: 20 * 1024 * 1024, // per attachment, default 50 MiB
+    maxInputAttachments: 10, // per request, images and files together, default 20
+    maxInputTotalBytes: 40 * 1024 * 1024, // per request, one budget, default 100 MiB
+  },
+});
+```
+
+`/agent/stream` reports a refusal as an error frame in its event stream, as it
+does for any other error. Calling `neurolink.generate()` directly is unchanged.
+
+`neurolink serve` and `neurolink server` register the routes with these
+defaults and expose no setting for them, so a CLI-run server refuses every
+local path and uses the limits above. To change them, build the server with
+`createServer` and `registerAllRoutes` as shown.
+
+#### Memory routes and per-user authentication
+
+The memory routes ignore who is calling unless the server opts in with `perUserAuth` (any truthy value). The opt-in is the same switch the agent routes use (see the [security guide](./security.md#who-the-agent-routes-treat-as-the-user-peruserauth)); it is off by default because one shared API key (such as `neurolink serve` with `NEUROLINK_SERVER_API_KEY`) sets the same `ctx.user` for every caller and names no person to scope by. **A server with per-person authentication must set it**: without it the routes do not read `ctx.user`, so any authenticated caller can name another person with `?userId=` on Redis, read any in-memory session by id, and clear every session.
+
+**Default (`perUserAuth` unset): no authentication, or one shared API key.** The routes do not read `ctx.user`. `?userId=` chooses the user on Redis (default `"default"`), the in-memory manager keys sessions by id alone, and `GET /memory/stats` and `DELETE /memory/sessions` are open to every caller that passes your authentication, exactly as before scoping existed. A session's owner is not checked.
+
+**`perUserAuth: true`: one credential per person.**
+
+| Route                                                                  | Authenticated user                                                                                                                              | Admin role (`adminRoles`, default `["admin"]`)                                                                                       |
+| ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Any memory route except `GET /memory/health`                           | `401` (`AUTH_REQUIRED`) when the request has no user, or the user's id is empty                                                                 | Same                                                                                                                                 |
+| `GET /memory/sessions`, `GET /memory/sessions/:id`, `.../:id/messages` | Their own sessions. `?userId=` may repeat their own id; naming anyone else is `403`. Another user's session, named without `?userId=`, is `404` | May name another user with `?userId=`                                                                                                |
+| `DELETE /memory/sessions/:sessionId`                                   | Their own sessions only: `403` when `?userId=` names someone else, `404` for another user's session named without it                            | In-memory: any session. Redis: the session of the user named with `?userId=`; without it the admin's own, so another user's is `404` |
+| `GET /memory/stats`, `DELETE /memory/sessions`                         | `403`                                                                                                                                           | Allowed                                                                                                                              |
+
+Two malformed inputs are handled in scoped mode only (without `perUserAuth` they are passed on as they always were). A `?userId=` that is not a single string, which Express, Fastify and Koa produce for a repeated `?userId=a&userId=b` (and an application that configures a bracket-parsing query parser, for `?userId[]=x`), is refused with `400` (`VALIDATION_ERROR`) on the routes that take `?userId=`, for every caller, admins included, rather than read as "no user named", which would answer about a different user than the one asked for. A user whose `roles` is not an array (for example `roles: "admin"` from a faulty authentication middleware) has no roles, so it is an ordinary user rather than a `500`.
+
+The `401` matters on servers where authentication is optional or absent: without it an anonymous request would carry no identity to scope by and be treated as trusted. `GET /memory/health` stays open for probes.
+
+`registerAllRoutes` with `perUserAuth` also turns on `carryMiddlewareState` for the server, which is how `ctx.user` reaches these handlers (see [Carrying middleware state](./security.md#carrying-middleware-state-to-guards-and-handlers-carrymiddlewarestate)). A caller that registers the memory routes itself with `createMemoryRoutes("/api", { perUserAuth: true })` must create the server with `carryMiddlewareState: true`. Without it, the user the authentication middleware sets does not reach the routes, so every request whose context has no `ctx.user` is answered `401`, except `GET /memory/health`. The routes read `ctx.user` directly, so a custom adapter or a direct handler call that sets it itself is served as that user either way.
+
+What an admin reaches depends on the memory manager:
+
+- **In-memory manager.** Sessions are keyed by id alone, so an admin reads, lists and deletes any session, including one created without a `userId` (which no ordinary user can see). `GET /memory/sessions` lists every session, or one user's with `?userId=`. A manager that can only report statistics and cannot list sessions shows an ordinary user an empty list with a total of `0` (never the count of everyone's sessions); an admin gets the total.
+- **Redis manager.** Sessions are keyed per user, so a route can only look a session up once it knows the user. An admin reaches another user's session, listing and delete by naming that user in `?userId=`; without it the admin is scoped to their own sessions, and `GET /memory/sessions` does not list everyone's. The routes do not enumerate users, so there is no "list every user's sessions" call on Redis. A session created without a `userId` is stored at `<keyPrefix>session-only:<sessionId>`. `session-only` is a reserved user id: the routes refuse it with `400` as the authenticated user's id or an admin's `?userId=`, so no request reads or deletes such a session by name, and an admin's `DELETE /memory/sessions` removes it with the rest.
+
+**Under `perUserAuth` the routes refuse a `:` in any part of a session's key.** The Redis manager builds the key as `<keyPrefix><userId>:<sessionId>` without escaping either part, so two different pairs would share a key when their ids contain `:`: user `a` with session `b:c` and user `a:b` with session `c` are both `<keyPrefix>a:b:c`, and with a namespaced id scheme such as `tenant:user` the user `tenant` would reach the session `c` of user `tenant:x` by requesting session id `x:c`. The key scheme is not changed, because stored data depends on it. Instead, every memory route but `GET /memory/health` answers `400 VALIDATION_ERROR` when the authenticated user's id, an admin's `?userId=` or the session id contains `:`, on every manager, so whether a request is accepted does not depend on the backend. A deployment whose user ids contain `:` cannot use the scoped memory routes, and a session whose id contains `:` cannot be read or deleted through them. The same routes answer `400 VALIDATION_ERROR` when the authenticated user's id or an admin's `?userId=` is `session-only`, the user id a session created without a `userId` is stored under on Redis, which the Redis manager reserves; do not issue it to a user. Without `perUserAuth` nothing is refused, as before.
+
+The suite that covers these routes, `pnpm run test:memory-route-scope`, runs its Redis cases against a throwaway `redis-server` it starts on a free port. Nothing in CI installs that binary, so on a runner without it the Redis cases report as skipped and only the in-memory half gates; run the suite on a machine with `redis-server` to cover the Redis behaviour above.
+
+```typescript
+registerAllRoutes(adapter, "/api", {
+  perUserAuth: true,
+  memory: { adminRoles: ["admin", "support"] },
+});
+```
+
+### Proxy Route Factories
+
+These are only included by `createAllRoutes` when a proxy flag is set, and they
+take their own dependencies rather than just a `basePath`.
+
+| Factory                                                                                                   | Included when            | Endpoints                                                                                                                                                                                                                                                   |
+| --------------------------------------------------------------------------------------------------------- | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `createClaudeProxyRoutes(modelRouter?, basePath?, strategy?, passthrough?, primaryAccountKey?, options?)` | `proxy` or `claudeProxy` | `POST /v1/messages` — Anthropic Messages passthrough with account pooling<br />`GET /limits` — per-account quota (`?snapshot=true` for stored state)<br />`GET /accounts` — one row per account joining status, quota and per-account token totals and cost |
+| `createOpenAIProxyRoutes(modelRouter?, basePath?, loopbackPort?, runtimeConfigProvider?)`                 | `proxy` or `openaiProxy` | `POST /v1/chat/completions` — OpenAI-compatible surface; Anthropic-targeted models loop back through `/v1/messages`                                                                                                                                         |
+| `createCodexProxyRoutes(basePath?)`                                                                       | **never — CLI only**     | `POST /backend-api/codex/responses` — Codex (ChatGPT) pool engine                                                                                                                                                                                           |
+
+> **`createCodexProxyRoutes` is not wired into `createAllRoutes`.** The CLI proxy
+> assembles it by hand, so an SDK consumer embedding the proxy gets the Claude
+> and OpenAI surfaces but not Codex. Adding a new proxy surface means editing
+> both `src/cli/commands/proxy.ts` and `src/lib/server/routes/index.ts` — they
+> are separate hand-maintained lists, which is exactly why Codex is in one and
+> not the other.
+
+---
+
+## OpenAPI Generation
+
+### `OpenAPIGenerator`
+
+Class that generates OpenAPI 3.1 specifications from route definitions.
+
+```typescript
+class OpenAPIGenerator {
+  constructor(config?: OpenAPIGeneratorConfig);
+  addRoutes(routes: RouteDefinition[]): void;
+  addRoute(route: RouteDefinition): void;
+  generate(): OpenAPISpec;
+  toJSON(pretty?: boolean): string;
+  toYAML(): string;
+}
+```
+
+#### `OpenAPIGeneratorConfig`
+
+```typescript
+type OpenAPIGeneratorConfig = {
+  info?: { title?; version?; description? };
+  servers?: Array<{ url; description? }>;
+  includeSecurity?: boolean; // default: true
+  basePath?: string; // default: "/api"
+  additionalTags?: Array<{ name; description }>;
+  customSchemas?: Record<string, JsonObject>;
+  routes?: RouteDefinition[];
+};
+```
+
+#### `OpenAPISpec`
+
+```typescript
+type OpenAPISpec = {
+  openapi: "3.1.0";
+  info: JsonObject;
+  servers: JsonObject[];
+  tags: JsonObject[];
+  paths: Record<string, JsonObject>;
+  components: {
+    schemas: Record<string, JsonObject>;
+    securitySchemes?: Record<string, JsonObject>;
+    parameters?: Record<string, JsonObject>;
+  };
+  security?: JsonObject[];
+};
+```
+
+### Factory Functions
+
+| Function                    | Signature                                | Description                         |
+| --------------------------- | ---------------------------------------- | ----------------------------------- |
+| `createOpenAPIGenerator`    | `(config?) => OpenAPIGenerator`          | Create generator with defaults      |
+| `generateOpenAPISpec`       | `(routes, config?) => OpenAPISpec`       | One-shot spec from routes           |
+| `generateOpenAPIFromConfig` | `(serverConfig, routes?) => OpenAPISpec` | Generate from `ServerAdapterConfig` |
+
+### Pre-built Schemas
+
+All schemas are plain JSON Schema objects exported from `./openapi/schemas.ts`:
+
+| Schema                                | Description                                  |
+| ------------------------------------- | -------------------------------------------- |
+| `ErrorResponseSchema`                 | Standard error response                      |
+| `TokenUsageSchema`                    | Token usage breakdown                        |
+| `AgentInputSchema`                    | Agent input (string or multimodal object)    |
+| `AgentExecuteRequestSchema` (OpenAPI) | Agent execute request body                   |
+| `AgentExecuteResponseSchema`          | Agent execute response                       |
+| `ToolCallSchema`                      | Tool call object                             |
+| `ProviderInfoSchema`                  | Provider information                         |
+| `ToolParameterSchema`                 | Tool parameter definition                    |
+| `ToolDefinitionSchema`                | Full tool definition                         |
+| `ToolListResponseSchema`              | Tool list response                           |
+| `ToolExecuteRequestSchema` (OpenAPI)  | Tool execute request body                    |
+| `ToolExecuteResponseSchema`           | Tool execute response                        |
+| `MCPServerToolSchema`                 | MCP server tool                              |
+| `MCPServerStatusSchema`               | MCP server status                            |
+| `MCPServersListResponseSchema`        | MCP servers list                             |
+| `ConversationMessageSchema`           | Conversation message                         |
+| `SessionSchema`                       | Session object                               |
+| `SessionsListResponseSchema`          | Sessions list                                |
+| `HealthResponseSchema`                | Health check response                        |
+| `ReadyResponseSchema`                 | Readiness check response                     |
+| `MetricsResponseSchema`               | Metrics response                             |
+| `OpenAPISchemas`                      | Registry object containing all schemas above |
+
+### Templates
+
+| Export                                              | Description                                                                                             |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `createSuccessResponse(schemaRef)`                  | Build a 200 response object                                                                             |
+| `createOpenAPIErrorResponse(code, description)`     | Build an error response object                                                                          |
+| `createStreamingResponse(description)`              | Build a streaming (SSE) response                                                                        |
+| `StandardErrorResponses`                            | Map of 400/401/403/404/429/500 responses                                                                |
+| `createPathParameter(name, description?)`           | Build a path parameter                                                                                  |
+| `createQueryParameter(name, schema, description?)`  | Build a query parameter                                                                                 |
+| `createHeaderParameter(name, schema, description?)` | Build a header parameter                                                                                |
+| `CommonParameters`                                  | Pre-built parameters: `sessionId`, `serverName`, `toolName`, `limitQuery`, `offsetQuery`, `searchQuery` |
+| `createGetOperation(...)`                           | Build a GET operation                                                                                   |
+| `createPostOperation(...)`                          | Build a POST operation                                                                                  |
+| `createStreamingPostOperation(...)`                 | Build a streaming POST operation                                                                        |
+| `createDeleteOperation(...)`                        | Build a DELETE operation                                                                                |
+| `BearerSecurityScheme`                              | Bearer token security scheme object                                                                     |
+| `ApiKeySecurityScheme`                              | API key security scheme object                                                                          |
+| `BasicSecurityScheme`                               | HTTP basic security scheme object                                                                       |
+| `StandardTags`                                      | Default tag definitions (agent, tools, mcp, memory, health, streaming)                                  |
+| `createOpenAPIServer(url, description)`             | Build a server object                                                                                   |
+| `DefaultServers`                                    | Default server list                                                                                     |
+| `createApiInfo(title, version, description)`        | Build an info object                                                                                    |
+| `NeuroLinkApiInfo`                                  | Default NeuroLink API info object                                                                       |
+
+---
+
+## Streaming Utilities
+
+### Event Types
+
+```typescript
+type DataStreamEventType =
+  | "text-start"
+  | "text-delta"
+  | "text-end"
+  | "tool-call"
+  | "tool-result"
+  | "data"
+  | "error"
+  | "finish";
+
+type DataStreamEvent = {
+  type: DataStreamEventType;
+  id?: string;
+  timestamp: number;
+  data: unknown;
+};
+```
+
+Specialized event types: `TextStartEvent`, `TextDeltaEvent`, `TextEndEvent`, `ToolCallEvent`, `ToolResultEvent`, `DataEvent`, `ErrorEvent`, `FinishEvent`.
+
+### `createDataStreamWriter(config)`
+
+Creates a `DataStreamWriter` that writes events in SSE or NDJSON format.
+
+```typescript
+function createDataStreamWriter(
+  config: DataStreamWriterConfig,
+): DataStreamWriter;
+
+type DataStreamWriterConfig = {
+  write: (chunk: string) => void | Promise<void>;
+  close?: () => void | Promise<void>;
+  format?: "sse" | "ndjson"; // default: "sse"
+  includeTimestamps?: boolean; // default: true
+};
+```
+
+#### `DataStreamWriter` interface
+
+| Method            | Signature                                              |
+| ----------------- | ------------------------------------------------------ |
+| `writeTextStart`  | `(id: string) => Promise<void>`                        |
+| `writeTextDelta`  | `(id: string, delta: string) => Promise<void>`         |
+| `writeTextEnd`    | `(id: string) => Promise<void>`                        |
+| `writeToolCall`   | `(toolCall: { id, name, arguments }) => Promise<void>` |
+| `writeToolResult` | `(toolResult: { id, name, result }) => Promise<void>`  |
+| `writeData`       | `(data: unknown) => Promise<void>`                     |
+| `writeError`      | `(error: { message, code? }) => Promise<void>`         |
+| `close`           | `() => Promise<void>`                                  |
+
+### `DataStreamResponse`
+
+High-level class that creates a `ReadableStream<Uint8Array>` with a `DataStreamWriter` interface.
+
+```typescript
+class DataStreamResponse {
+  constructor(config?: DataStreamResponseConfig);
+  readonly stream: ReadableStream<Uint8Array>;
+  readonly headers: Record<string, string>;
+  getWriter(): DataStreamWriter;
+  writeTextStart(id: string): Promise<void>;
+  writeTextDelta(id: string, delta: string): Promise<void>;
+  writeTextEnd(id: string): Promise<void>;
+  writeToolCall(toolCall): Promise<void>;
+  writeToolResult(toolResult): Promise<void>;
+  writeData(data: unknown): Promise<void>;
+  writeError(error: { message; code? }): Promise<void>;
+  finish(options?: { reason?; usage? }): Promise<void>;
+  close(): void;
+  isClosed(): boolean;
+}
+
+type DataStreamResponseConfig = {
+  contentType?: "text/event-stream" | "application/x-ndjson";
+  headers?: Record<string, string>;
+  keepAliveInterval?: number;
+  includeTimestamps?: boolean;
+};
+```
+
+#### `createDataStreamResponse(config?)`
+
+Factory function for `DataStreamResponse`.
+
+### Helper Functions
+
+| Function                        | Signature                                         | Description                                        |
+| ------------------------------- | ------------------------------------------------- | -------------------------------------------------- |
+| `pipeAsyncIterableToDataStream` | `(iterable, response, options?) => Promise<void>` | Pipe an async iterable into a `DataStreamResponse` |
+| `createSSEHeaders`              | `(additionalHeaders?) => Record<string, string>`  | Standard SSE headers                               |
+| `createNDJSONHeaders`           | `(additionalHeaders?) => Record<string, string>`  | Standard NDJSON headers                            |
+| `formatSSEEvent`                | `(options: SSEEventOptions) => string`            | Format a single SSE message                        |
+
+#### `SSEEventOptions`
+
+```typescript
+type SSEEventOptions = {
+  event?: string;
+  data: string;
+  id?: string;
+  retry?: number;
+};
+```
+
+### `BaseDataStreamWriter`
+
+Abstract base class providing `isClosed()`, `onClose(handler)`, and `close()`.
+
+### `WebStreamWriter`
+
+Concrete class extending `BaseDataStreamWriter`. Writes SSE events to a `ReadableStream<Uint8Array>`.
+
+| Property/Method               | Type                         | Description              |
+| ----------------------------- | ---------------------------- | ------------------------ |
+| `stream`                      | `ReadableStream<Uint8Array>` | The readable stream      |
+| `writeData(data)`             | `void`                       | Write a data event       |
+| `writeError(message)`         | `void`                       | Write an error event     |
+| `writeDone()`                 | `void`                       | Write a done event       |
+| `writeEvent(eventType, data)` | `void`                       | Write a custom event     |
+| `close()`                     | `void`                       | Close the stream         |
+| `isClosed()`                  | `boolean`                    | Check if closed          |
+| `onClose(handler)`            | `void`                       | Register a close handler |
+
+---
+
+## WebSocket
+
+### `WebSocketConnectionManager`
+
+Manages WebSocket connections, ping/pong, and handler dispatch.
+
+```typescript
+class WebSocketConnectionManager {
+  constructor(config?: WebSocketConfig);
+  registerHandler(path: string, handler: WebSocketHandler): void;
+  getHandler(path: string): WebSocketHandler | undefined;
+  handleConnection(socket, path, user?): Promise<WebSocketConnection>;
+  handleMessage(connectionId, data, isBinary): Promise<void>;
+  handleClose(connectionId, code, reason): Promise<void>;
+  handleError(connectionId, error): Promise<void>;
+  getConnection(connectionId): WebSocketConnection | undefined;
+  getAllConnections(): WebSocketConnection[];
+  getConnectionsByUser(userId): WebSocketConnection[];
+  getConnectionsByPath(path): WebSocketConnection[];
+  send(connectionId, data): void;
+  broadcast(data, filter?): void;
+  close(connectionId, code?, reason?): Promise<void>;
+  closeAll(code?, reason?): Promise<void>;
+  getConnectionCount(): number;
+}
+```
+
+#### `WebSocketConfig`
+
+```typescript
+type WebSocketConfig = {
+  path?: string; // default: "/ws"
+  maxConnections?: number; // default: 1000
+  pingInterval?: number; // default: 30000
+  pongTimeout?: number; // default: 10000
+  maxMessageSize?: number; // default: 1 MB
+  auth?: AuthConfig;
+};
+```
+
+### `WebSocketMessageRouter`
+
+Routes JSON messages by `type` field to registered handlers.
+
+```typescript
+class WebSocketMessageRouter {
+  route(type: string, handler: (conn, payload) => Promise<unknown>): void;
+  handle(connection, message: WebSocketMessage): Promise<unknown>;
+  getRoutes(): string[];
+}
+```
+
+### `createAgentWebSocketHandler(neurolink)`
+
+Creates a `WebSocketHandler` with pre-registered routes for `generate`, `stream`, and `tool_call` messages.
+
+```typescript
+function createAgentWebSocketHandler(neurolink: unknown): WebSocketHandler;
+```
+
+---
+
+## Validation Utilities (Zod)
+
+Zod schemas and helpers exported from `./utils/validation.ts`. Used internally by route handlers.
+
+### Zod Schemas
+
+| Schema                      | Validates                                  |
+| --------------------------- | ------------------------------------------ |
+| `AgentExecuteRequestSchema` | Agent execute request body                 |
+| `ToolExecuteRequestSchema`  | Tool execute request body                  |
+| `ToolArgumentsSchema`       | Tool arguments (`Record<string, unknown>`) |
+| `SessionIdParamSchema`      | `{ sessionId: string }`                    |
+| `ServerNameParamSchema`     | `{ name: string }`                         |
+| `ToolNameParamSchema`       | `{ name: string }`                         |
+| `ToolSearchQuerySchema`     | `{ q?, source?, limit? }`                  |
+
+### Validation Functions
+
+| Function              | Signature                                                              | Description                         |
+| --------------------- | ---------------------------------------------------------------------- | ----------------------------------- |
+| `validateRequest`     | `<T>(schema: ZodSchema<T>, data, requestId?) => ValidationResult<T>`   | Validate request body               |
+| `validateQuery`       | `<T>(schema: ZodSchema<T>, query, requestId?) => ValidationResult<T>`  | Validate query params               |
+| `validateParams`      | `<T>(schema: ZodSchema<T>, params, requestId?) => ValidationResult<T>` | Validate path params                |
+| `createErrorResponse` | `(code, message, details?, requestId?, httpStatus?) => ErrorResponse`  | Build a standardized error response |
+
+```typescript
+type ValidationResult<T> =
+  | { success: true; data: T }
+  | { success: false; error: ErrorResponse };
+
+type ErrorResponse = {
+  error: { code: string; message: string; details?: unknown };
+  metadata?: { timestamp: string; requestId?: string };
+  httpStatus?: number;
+};
+```
+
+---
+
+## Error Classes
+
+All error classes extend `ServerAdapterError`, which extends `Error`. Every error carries `code`, `category`, `severity`, `retryable`, and optional context fields (`retryAfterMs`, `requestId`, `path`, `method`, `details`, `cause`).
+
+`ServerAdapterError` provides:
+
+- `toJSON()` -- serializes to `{ error: { code, message, category, requestId, details, retryAfter } }`
+- `getHttpStatus()` -- maps error code to HTTP status
+
+### Error Class Table
+
+| Class                        | HTTP Status | Category         | Retryable | Description                                    |
+| ---------------------------- | ----------- | ---------------- | --------- | ---------------------------------------------- |
+| `ServerAdapterError`         | varies      | `EXECUTION`      | no        | Base error class                               |
+| `ConfigurationError`         | 400         | `CONFIG`         | no        | Invalid server configuration                   |
+| `MissingDependencyError`     | 500         | `CONFIG`         | no        | Missing framework dependency (e.g., `express`) |
+| `RouteConflictError`         | 500         | `CONFIG`         | no        | Duplicate route registration                   |
+| `RouteNotFoundError`         | 404         | `VALIDATION`     | no        | Route not found                                |
+| `ServerValidationError`      | 400         | `VALIDATION`     | no        | Request validation failed; carries `errors[]`  |
+| `AuthenticationError`        | 401         | `AUTHENTICATION` | no        | Authentication required                        |
+| `InvalidAuthenticationError` | 401         | `AUTHENTICATION` | no        | Invalid credentials                            |
+| `AuthorizationError`         | 403         | `AUTHORIZATION`  | no        | Insufficient permissions                       |
+| `ServerRateLimitError`       | 429         | `RATE_LIMIT`     | yes       | Rate limit exceeded                            |
+| `HandlerError`               | 500         | `EXECUTION`      | no        | Route handler threw                            |
+| `TimeoutError`               | 408         | `EXECUTION`      | yes       | Operation timed out                            |
+| `StreamingError`             | 500         | `STREAMING`      | no        | Stream processing error                        |
+| `StreamAbortedError`         | 499         | `STREAMING`      | no        | Client disconnected                            |
+| `WebSocketError`             | 500         | `WEBSOCKET`      | yes       | WebSocket error                                |
+| `WebSocketConnectionError`   | 500         | `WEBSOCKET`      | yes       | WebSocket connection failed                    |
+| `ServerStartError`           | 500         | `CONFIG`         | yes       | Server failed to start                         |
+| `ServerStopError`            | 500         | `EXECUTION`      | no        | Server failed to stop                          |
+| `AlreadyRunningError`        | 500         | `CONFIG`         | no        | Server already running                         |
+| `NotRunningError`            | 500         | `CONFIG`         | no        | Server not running                             |
+
+Note: `ShutdownTimeoutError`, `DrainTimeoutError`, and `InvalidLifecycleStateError` are used internally by the shutdown lifecycle and are not re-exported from the public index.
+
+### `wrapError(error, requestId?, path?, method?)`
+
+Wraps any error as a `ServerAdapterError`. Returns the error as-is if it is already a `ServerAdapterError`; otherwise wraps it in a `HandlerError`.
+
+```typescript
+function wrapError(
+  error: unknown,
+  requestId?: string,
+  path?: string,
+  method?: string,
+): ServerAdapterError;
+```
+
+### `ErrorRecoveryStrategies`
+
+A `Record<ErrorCategoryType, { strategy, maxRetries, baseDelayMs }>` mapping each error category to a recommended recovery strategy (`"retry"`, `"exponentialBackoff"`, `"circuitBreak"`, or `"fail"`).
+
+---
+
+## Type Exports
+
+These are `type`-only exports (no runtime value).
+
+### Configuration Types
+
+| Type                          | Description                                |
+| ----------------------------- | ------------------------------------------ |
+| `ServerAdapterConfig`         | Server configuration (all optional)        |
+| `RequiredServerAdapterConfig` | Same, with defaults applied (all required) |
+| `CORSConfig`                  | CORS settings                              |
+| `RateLimitConfig`             | Rate limit settings                        |
+| `BodyParserConfig`            | Body parser settings                       |
+| `LoggingConfig`               | Logging settings                           |
+| `StreamingConfig`             | Streaming response configuration           |
+| `RedactionConfig`             | Stream redaction settings                  |
+| `ShutdownConfig`              | Graceful shutdown settings                 |
+
+### Request/Response Types
+
+| Type                      | Description                                           |
+| ------------------------- | ----------------------------------------------------- |
+| `ServerContext`           | Request context passed to all handlers and middleware |
+| `ServerResponse<T>`       | Generic server response envelope                      |
+| `AgentExecuteRequest`     | Agent execute request body                            |
+| `AgentExecuteResponse`    | Agent execute response                                |
+| `ToolExecuteRequest`      | Tool execute request body                             |
+| `ToolExecuteResponse`     | Tool execute response                                 |
+| `MCPServerStatusResponse` | MCP server status                                     |
+| `HealthResponse`          | Health check response                                 |
+| `ReadyResponse`           | Readiness check response                              |
+| `ErrorResponse`           | Standardized error response                           |
+| `ValidationResult<T>`     | Success/failure discriminated union                   |
+
+### Route and Middleware Types
+
+| Type                   | Description                                                                         |
+| ---------------------- | ----------------------------------------------------------------------------------- |
+| `HttpMethod`           | `"GET" \| "POST" \| "PUT" \| "DELETE" \| "PATCH" \| "OPTIONS"`                      |
+| `RouteDefinition`      | Full route definition                                                               |
+| `RouteGroup`           | Group of routes with prefix and optional middleware                                 |
+| `RouteHandler<T>`      | `(ctx: ServerContext) => Promise<T \| ServerResponse<T> \| AsyncIterable<unknown>>` |
+| `MiddlewareDefinition` | Middleware definition with name, order, handler, paths                              |
+| `MiddlewareHandler`    | `(ctx, next) => Promise<unknown>`                                                   |
+| `CreateRoutesOptions`  | Options for `createAllRoutes`                                                       |
+
+### Factory Types
+
+| Type                          | Description                                 |
+| ----------------------------- | ------------------------------------------- |
+| `ServerFramework`             | `"hono" \| "express" \| "fastify" \| "koa"` |
+| `ServerAdapterFactoryOptions` | `{ framework, neurolink, config? }`         |
+| `ServerStatus`                | Server status snapshot                      |
+
+### Streaming Types
+
+| Type                                                 | Description                       |
+| ---------------------------------------------------- | --------------------------------- |
+| `DataStreamWriter`                                   | Writer interface for data streams |
+| `DataStreamEventType`                                | Event type union                  |
+| `DataStreamEvent`                                    | Base event                        |
+| `TextStartEvent` / `TextDeltaEvent` / `TextEndEvent` | Text streaming events             |
+| `ToolCallEvent` / `ToolResultEvent`                  | Tool events                       |
+| `DataEvent` / `ErrorEvent` / `FinishEvent`           | Utility events                    |
+| `DataStreamWriterConfig`                             | Writer factory config             |
+| `DataStreamResponseConfig`                           | Response factory config           |
+| `SSEEventOptions`                                    | SSE formatting options            |
+| `SSEWriteOptions`                                    | SSE write options                 |
+
+### WebSocket Types
+
+| Type                   | Description                                                           |
+| ---------------------- | --------------------------------------------------------------------- |
+| `WebSocketConfig`      | WebSocket server settings                                             |
+| `WebSocketConnection`  | Connection object                                                     |
+| `WebSocketHandler`     | Event handler interface (`onOpen`, `onMessage`, `onClose`, `onError`) |
+| `WebSocketMessage`     | Message object                                                        |
+| `WebSocketMessageType` | `"text" \| "binary" \| "ping" \| "pong" \| "close"`                   |
+| `WebSocketAuthConfig`  | Auth config for WebSocket (same shape as `AuthConfig` from types)     |
+| `AuthenticatedUser`    | User object: id, shared, email, name, roles, permissions, metadata    |
+| `AuthStrategy`         | `"bearer" \| "apiKey" \| "basic" \| "custom" \| "none"`               |
+
+### Error Types
+
+| Type                         | Description                           |
+| ---------------------------- | ------------------------------------- |
+| `ErrorCategoryType`          | Error category union                  |
+| `ErrorSeverityType`          | Error severity union                  |
+| `ServerAdapterErrorCodeType` | Error code union                      |
+| `ServerAdapterErrorContext`  | Context object for error construction |
+
+---
+
+## Constants
+
+### `ErrorCategory`
+
+```typescript
+const ErrorCategory = {
+  CONFIG,
+  VALIDATION,
+  EXECUTION,
+  EXTERNAL,
+  RATE_LIMIT,
+  AUTHENTICATION,
+  AUTHORIZATION,
+  STREAMING,
+  WEBSOCKET,
+} as const;
+```
+
+### `ErrorSeverity`
+
+```typescript
+const ErrorSeverity = {
+  LOW,
+  MEDIUM,
+  HIGH,
+  CRITICAL,
+} as const;
+```
+
+### `ServerAdapterErrorCode`
+
+```typescript
+const ServerAdapterErrorCode = {
+  INVALID_CONFIG,
+  MISSING_DEPENDENCY,
+  FRAMEWORK_INIT_FAILED,
+  ROUTE_NOT_FOUND,
+  ROUTE_CONFLICT,
+  INVALID_ROUTE,
+  HANDLER_ERROR,
+  TIMEOUT,
+  MIDDLEWARE_ERROR,
+  RATE_LIMIT_EXCEEDED,
+  AUTH_REQUIRED,
+  AUTH_INVALID,
+  FORBIDDEN,
+  STREAM_ERROR,
+  STREAM_ABORTED,
+  WEBSOCKET_ERROR,
+  WEBSOCKET_CONNECTION_FAILED,
+  VALIDATION_ERROR,
+  SCHEMA_ERROR,
+  START_FAILED,
+  STOP_FAILED,
+  ALREADY_RUNNING,
+  NOT_RUNNING,
+} as const;
+```

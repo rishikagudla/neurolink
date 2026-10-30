@@ -48,6 +48,14 @@ import { promisify } from "util";
 import { gunzip } from "zlib";
 
 import { SIZE_LIMITS } from "../config/index.js";
+import { isAbortError } from "../../utils/errorHandling.js";
+import { downloadAttachment } from "../../utils/attachmentPolicy.js";
+import { withSpan } from "../../telemetry/withSpan.js";
+import { tracers } from "../../telemetry/tracers.js";
+// Starts tracing at the first span, as this module always did: the shared
+// tracers only start what a loaded entry registered, and this path can be
+// imported without the package entry. The client entry stays free of it.
+import "../../services/server/ai/observability/instrumentation.js";
 import {
   createFileError,
   extractHttpStatus,
@@ -56,22 +64,85 @@ import {
 } from "../errors/index.js";
 
 import type {
+  AttachmentPolicy,
   BatchProcessingSummary,
   FailedFileInfo,
   FileInfo,
   FileProcessingError,
-  FileProcessingResult,
+  ProcessorFileProcessingResult,
   FileProcessorConfig,
   FileWarning,
-  OperationResult,
+  ProcessorOperationResult,
   ProcessedFileBase,
   ProcessedFileInfo,
   ProcessOptions,
   SkippedFileInfo,
-} from "./types.js";
-import { DEFAULT_RETRY_CONFIG } from "./types.js";
+} from "../../types/index.js";
+import { DEFAULT_RETRY_CONFIG } from "../../types/index.js";
 
 const gunzipAsync = promisify(gunzip);
+
+/**
+ * Marker on the error raised when a download is refused for exceeding the
+ * processor's size limit.
+ *
+ * A code rather than a message match, for two reasons. `classifyDownloadError`
+ * can then report FILE_TOO_LARGE — the same verdict the post-download check
+ * gave, so refusing earlier does not quietly downgrade the error a caller
+ * sees to DOWNLOAD_FAILED. And `isRetryableError` decides from text; a bound
+ * that fires is not a transient fault, and re-fetching a file that will be
+ * exactly as oversized next time is the one thing worth not doing three times.
+ */
+const DOWNLOAD_TOO_LARGE_CODE = "DOWNLOAD_TOO_LARGE";
+
+function downloadTooLargeError(maxSizeMB: number, typeName: string): Error {
+  const error = new Error(
+    `Download exceeds the maximum size of ${maxSizeMB} MB for ${typeName}`,
+  ) as NodeJS.ErrnoException;
+  error.code = DOWNLOAD_TOO_LARGE_CODE;
+  return error;
+}
+
+function isDownloadTooLarge(error: unknown): boolean {
+  return (
+    (error as NodeJS.ErrnoException | null)?.code === DOWNLOAD_TOO_LARGE_CODE
+  );
+}
+
+/**
+ * Marker on the error raised when a processor refuses content for exceeding
+ * the size limit *after* the download — a ZIP entry that expands past the
+ * bound, say.
+ *
+ * Separate from DOWNLOAD_TOO_LARGE because the two fire at different stages,
+ * but it exists for the same reason. Without it a bound that fires reaches
+ * `buildProcessedResultWithResult` as a plain Error and becomes
+ * PROCESSING_FAILED, which is `retryable: true` — so a caller retries a
+ * deterministic refusal three times and gets the identical answer each time.
+ * FILE_TOO_LARGE is `retryable: false`, which is the truth about this failure.
+ */
+export const CONTENT_TOO_LARGE_CODE = "CONTENT_TOO_LARGE";
+
+/** An error that a processor's own size bound was exceeded. */
+export function contentTooLargeError(message: string): Error {
+  const error = new Error(message) as NodeJS.ErrnoException;
+  error.code = CONTENT_TOO_LARGE_CODE;
+  return error;
+}
+
+/** Whether `error` is a processor size bound firing rather than a fault. */
+export function isContentTooLarge(error: unknown): boolean {
+  return (
+    (error as NodeJS.ErrnoException | null)?.code === CONTENT_TOO_LARGE_CODE
+  );
+}
+
+/** Node's signal that a zlib output bound was reached. */
+function isBufferTooLargeError(error: unknown): boolean {
+  return (
+    (error as NodeJS.ErrnoException | null)?.code === "ERR_BUFFER_TOO_LARGE"
+  );
+}
 
 /**
  * Abstract base class for file processors.
@@ -133,91 +204,103 @@ export abstract class BaseFileProcessor<T extends ProcessedFileBase> {
   async processFile(
     fileInfo: FileInfo,
     options?: ProcessOptions,
-  ): Promise<FileProcessingResult<T>> {
-    try {
-      // Step 1: Validate file type and size
-      const validationResult = this.validateFileWithResult(fileInfo);
-      if (!validationResult.success) {
-        return {
-          success: false,
-          error: validationResult.error,
-        };
-      }
+  ): Promise<ProcessorFileProcessingResult<T>> {
+    return withSpan(
+      {
+        name: "neurolink.file.process",
+        tracer: tracers.file,
+        attributes: {
+          "file.processor": this.constructor.name,
+          "file.type": this.config.fileTypeName,
+          "file.mimetype": fileInfo.mimetype ?? "unknown",
+          "file.name": fileInfo.name ?? "unknown",
+        },
+      },
+      async (_span) => {
+        try {
+          // Step 1: Validate file type and size
+          const validationResult = this.validateFileWithResult(fileInfo);
+          if (!validationResult.success) {
+            return {
+              success: false,
+              error: validationResult.error,
+            };
+          }
 
-      // Step 2: Get file buffer (from direct buffer or download from URL)
-      let buffer: Buffer;
+          // Step 2: Get file buffer (from direct buffer or download from URL)
+          let buffer: Buffer;
 
-      if (fileInfo.buffer) {
-        // Direct buffer provided - skip download
-        buffer = fileInfo.buffer;
-      } else if (fileInfo.url) {
-        // Download from URL
-        const downloadResult = await this.downloadFileWithRetry(
-          fileInfo,
-          options,
-        );
-        if (!downloadResult.success) {
+          if (fileInfo.buffer) {
+            // Direct buffer provided - skip download
+            buffer = fileInfo.buffer;
+          } else if (fileInfo.url) {
+            // Download from URL
+            const downloadResult = await this.downloadFileWithRetry(
+              fileInfo,
+              options,
+            );
+            if (!downloadResult.success) {
+              return {
+                success: false,
+                error: downloadResult.error,
+              };
+            }
+            if (!downloadResult.data) {
+              return {
+                success: false,
+                error: this.createError(FileErrorCode.DOWNLOAD_FAILED, {
+                  reason: "Download succeeded but returned no data",
+                }),
+              };
+            }
+            buffer = downloadResult.data;
+
+            // Validate actual downloaded size against limit
+            if (!this.validateFileSize(buffer.length)) {
+              return {
+                success: false,
+                error: this.createError(FileErrorCode.FILE_TOO_LARGE, {
+                  sizeMB: (buffer.length / (1024 * 1024)).toFixed(2),
+                  maxMB: this.config.maxSizeMB,
+                  type: this.config.fileTypeName,
+                }),
+              };
+            }
+          } else {
+            // No buffer or URL provided
+            return {
+              success: false,
+              error: this.createError(FileErrorCode.DOWNLOAD_FAILED, {
+                reason: "No buffer or URL provided for file",
+              }),
+            };
+          }
+
+          // Step 3: Post-download validation (subclasses can override)
+          const postValidationResult =
+            await this.validateDownloadedFileWithResult(buffer, fileInfo);
+          if (!postValidationResult.success) {
+            return {
+              success: false,
+              error: postValidationResult.error,
+            };
+          }
+
+          // Step 4: Build processed result using template method
+          return await this.buildProcessedResultWithResult(buffer, fileInfo);
+        } catch (error) {
+          // Catch any unexpected errors
           return {
             success: false,
-            error: downloadResult.error,
+            error: this.createError(
+              FileErrorCode.UNKNOWN_ERROR,
+              { error: error instanceof Error ? error.message : String(error) },
+              error instanceof Error ? error : undefined,
+            ),
           };
         }
-        if (!downloadResult.data) {
-          return {
-            success: false,
-            error: this.createError(FileErrorCode.DOWNLOAD_FAILED, {
-              reason: "Download succeeded but returned no data",
-            }),
-          };
-        }
-        buffer = downloadResult.data;
-
-        // Validate actual downloaded size against limit
-        if (!this.validateFileSize(buffer.length)) {
-          return {
-            success: false,
-            error: this.createError(FileErrorCode.FILE_TOO_LARGE, {
-              sizeMB: (buffer.length / (1024 * 1024)).toFixed(2),
-              maxMB: this.config.maxSizeMB,
-              type: this.config.fileTypeName,
-            }),
-          };
-        }
-      } else {
-        // No buffer or URL provided
-        return {
-          success: false,
-          error: this.createError(FileErrorCode.DOWNLOAD_FAILED, {
-            reason: "No buffer or URL provided for file",
-          }),
-        };
-      }
-
-      // Step 3: Post-download validation (subclasses can override)
-      const postValidationResult = await this.validateDownloadedFileWithResult(
-        buffer,
-        fileInfo,
-      );
-      if (!postValidationResult.success) {
-        return {
-          success: false,
-          error: postValidationResult.error,
-        };
-      }
-
-      // Step 4: Build processed result using template method
-      return await this.buildProcessedResultWithResult(buffer, fileInfo);
-    } catch (error) {
-      // Catch any unexpected errors
-      return {
-        success: false,
-        error: this.createError(
-          FileErrorCode.UNKNOWN_ERROR,
-          { error: error instanceof Error ? error.message : String(error) },
-          error instanceof Error ? error : undefined,
-        ),
-      };
-    }
+      },
+    ); // end withSpan
   }
 
   /**
@@ -375,7 +458,7 @@ export abstract class BaseFileProcessor<T extends ProcessedFileBase> {
   protected async validateDownloadedFileWithResult(
     buffer: Buffer,
     fileInfo: FileInfo,
-  ): Promise<OperationResult<void>> {
+  ): Promise<ProcessorOperationResult<void>> {
     // Call the legacy validation method for backward compatibility
     const errorMessage = await this.validateDownloadedFile(buffer, fileInfo);
     if (errorMessage) {
@@ -400,11 +483,28 @@ export abstract class BaseFileProcessor<T extends ProcessedFileBase> {
   protected async buildProcessedResultWithResult(
     buffer: Buffer,
     fileInfo: FileInfo,
-  ): Promise<FileProcessingResult<T>> {
+  ): Promise<ProcessorFileProcessingResult<T>> {
     try {
       const result = await this.buildProcessedResult(buffer, fileInfo);
       return { success: true, data: result };
     } catch (error) {
+      // A size bound firing is a verdict, not a fault: PROCESSING_FAILED is
+      // retryable, and re-running a decompression that will hit the same
+      // ceiling is the one thing worth not doing three times.
+      if (isContentTooLarge(error)) {
+        return {
+          success: false,
+          // Same detail keys as the other FILE_TOO_LARGE sites, so anything
+          // reading them does not have to special-case where the verdict came
+          // from. `sizeMB` is absent on purpose: the decompressed size is the
+          // number this bound exists to never find out.
+          error: this.createError(FileErrorCode.FILE_TOO_LARGE, {
+            maxMB: this.config.maxSizeMB,
+            type: this.config.fileTypeName,
+            reason: error instanceof Error ? error.message : undefined,
+          }),
+        };
+      }
       return {
         success: false,
         error: this.createError(
@@ -433,9 +533,16 @@ export abstract class BaseFileProcessor<T extends ProcessedFileBase> {
   /**
    * Download file from URL with authentication.
    *
+   * Goes through `downloadAttachment`, which applies the attachment policy
+   * (HTTPS and public hosts unless the instance says otherwise), pins the
+   * connection to the vetted addresses, re-validates every redirect hop and
+   * bounds the body while it streams. `authHeaders` ride on the first request
+   * only — they are never replayed to a redirect target.
+   *
    * @param url - URL to download from
    * @param authHeaders - Optional authentication headers
    * @param timeout - Optional timeout override
+   * @param attachmentPolicy - Policy for the fetch; the environment default when omitted
    * @returns Downloaded file content as Buffer
    * @throws Error if download fails
    */
@@ -443,65 +550,57 @@ export abstract class BaseFileProcessor<T extends ProcessedFileBase> {
     url: string,
     authHeaders?: Record<string, string>,
     timeout?: number,
+    attachmentPolicy?: AttachmentPolicy,
   ): Promise<Buffer> {
-    // Note: We intentionally use AbortController + setTimeout here rather than the shared
-    // withTimeout utility. AbortController.signal cancels the actual HTTP request via
-    // fetch's signal option, while withTimeout only races promises and would leave
-    // the fetch running in the background, consuming network resources.
-    const controller = new AbortController();
-    const effectiveTimeout = timeout ?? this.config.timeoutMs;
-    const timeoutId = setTimeout(() => {
-      controller.abort();
-    }, effectiveTimeout);
+    const maxBytes = this.config.maxSizeMB * 1024 * 1024;
+    const downloaded = await downloadAttachment(url, {
+      policy: attachmentPolicy,
+      maxBytes,
+      label: `${this.config.fileTypeName} download`,
+      headers: authHeaders,
+      timeoutMs: timeout ?? this.config.timeoutMs,
+    });
 
-    try {
-      const headers: Record<string, string> = {
-        ...authHeaders,
-      };
+    // Reject HTML responses - likely an error page or redirect
+    const contentType = downloaded.contentType;
+    if (contentType && contentType.includes("text/html")) {
+      throw new Error(
+        `Received HTML response instead of file content (Content-Type: ${contentType}). This usually means the download URL returned an error page.`,
+      );
+    }
 
-      const response = await fetch(url, {
-        headers,
-        signal: controller.signal,
-      });
+    let buffer = downloaded.buffer;
 
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
+    // Check for gzip encoding and decompress if needed
+    // Only decompress if the data actually starts with gzip magic bytes (0x1f 0x8b)
+    const contentEncoding = downloaded.contentEncoding;
+    const isActuallyGzipped =
+      buffer.length >= 2 && buffer[0] === 0x1f && buffer[1] === 0x8b;
 
-      // Reject HTML responses - likely an error page or redirect
-      const contentType = response.headers.get("Content-Type");
-      if (contentType && contentType.includes("text/html")) {
-        throw new Error(
-          `Received HTML response instead of file content (Content-Type: ${contentType}). This usually means the download URL returned an error page.`,
+    if (contentEncoding.toLowerCase().includes("gzip") && isActuallyGzipped) {
+      try {
+        // Bounded at the decoder. The size check that runs after the download
+        // only ever sees what already fits in memory, so a few KB of gzip
+        // declaring gigabytes was inflated in full before anything objected —
+        // the response passed the "is it small" test on its way in.
+        buffer = Buffer.from(
+          await gunzipAsync(buffer, { maxOutputLength: maxBytes }),
         );
-      }
-
-      const arrayBuffer = await response.arrayBuffer();
-      let buffer = Buffer.from(arrayBuffer);
-
-      // Check for gzip encoding and decompress if needed
-      // Only decompress if the data actually starts with gzip magic bytes (0x1f 0x8b)
-      const contentEncoding = response.headers.get("Content-Encoding");
-      const isActuallyGzipped =
-        buffer.length >= 2 && buffer[0] === 0x1f && buffer[1] === 0x8b;
-
-      if (
-        contentEncoding?.toLowerCase().includes("gzip") &&
-        isActuallyGzipped
-      ) {
-        try {
-          buffer = Buffer.from(await gunzipAsync(buffer));
-        } catch (gzipError) {
-          throw new Error(
-            `Failed to decompress gzip response: ${gzipError instanceof Error ? gzipError.message : String(gzipError)}`,
+      } catch (gzipError) {
+        if (isBufferTooLargeError(gzipError)) {
+          throw downloadTooLargeError(
+            this.config.maxSizeMB,
+            this.config.fileTypeName,
           );
         }
+        throw new Error(
+          `Failed to decompress gzip response: ${gzipError instanceof Error ? gzipError.message : String(gzipError)}`,
+          { cause: gzipError },
+        );
       }
-
-      return buffer;
-    } finally {
-      clearTimeout(timeoutId);
     }
+
+    return buffer;
   }
 
   /**
@@ -514,7 +613,7 @@ export abstract class BaseFileProcessor<T extends ProcessedFileBase> {
   protected async downloadFileWithRetry(
     fileInfo: FileInfo,
     options?: ProcessOptions,
-  ): Promise<OperationResult<Buffer>> {
+  ): Promise<ProcessorOperationResult<Buffer>> {
     const url = fileInfo.url;
     if (!url) {
       return {
@@ -534,6 +633,7 @@ export abstract class BaseFileProcessor<T extends ProcessedFileBase> {
           url,
           options?.authHeaders,
           options?.timeout,
+          options?.attachmentPolicy,
         );
         return { success: true, data: buffer };
       } catch (error) {
@@ -564,7 +664,7 @@ export abstract class BaseFileProcessor<T extends ProcessedFileBase> {
     // Classify the final error
     return {
       success: false,
-      error: this.classifyDownloadError(lastError!),
+      error: this.classifyDownloadError(lastError as Error),
     };
   }
 
@@ -578,7 +678,9 @@ export abstract class BaseFileProcessor<T extends ProcessedFileBase> {
    * @param fileInfo - File information to validate
    * @returns Success result or error result
    */
-  protected validateFileWithResult(fileInfo: FileInfo): OperationResult<void> {
+  protected validateFileWithResult(
+    fileInfo: FileInfo,
+  ): ProcessorOperationResult<void> {
     // Validate file type
     if (!this.isFileSupported(fileInfo.mimetype, fileInfo.name || "")) {
       return {
@@ -688,7 +790,21 @@ export abstract class BaseFileProcessor<T extends ProcessedFileBase> {
    * @returns Structured file processing error
    */
   protected classifyDownloadError(error: Error): FileProcessingError {
-    if (error.name === "AbortError") {
+    // Refusing an oversized body mid-stream is the same verdict the old
+    // post-download check gave, so it must carry the same code — otherwise
+    // bounding the read earlier would silently reclassify a familiar error.
+    if (isDownloadTooLarge(error)) {
+      return this.createError(
+        FileErrorCode.FILE_TOO_LARGE,
+        {
+          maxMB: this.config.maxSizeMB,
+          type: this.config.fileTypeName,
+        },
+        error,
+      );
+    }
+
+    if (isAbortError(error)) {
       return this.createError(
         FileErrorCode.DOWNLOAD_TIMEOUT,
         { timeoutMs: this.config.timeoutMs },

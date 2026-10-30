@@ -3,52 +3,90 @@
  * Redis-based implementation of conversation storage with same interface as ConversationMemoryManager
  */
 
+import { context, SpanKind, SpanStatusCode } from "@opentelemetry/api";
+import { tracers } from "../telemetry/tracers.js";
 import { randomUUID } from "crypto";
+import { MESSAGES_PER_TURN } from "../config/conversationMemory.js";
+import { generateToolOutputPreview } from "../context/toolOutputLimits.js";
+import { NEUROLINK_ARTIFACT_ID_KEY } from "../mcp/mcpOutputNormalizer.js";
+import { SummarizationEngine } from "../context/summarizationEngine.js";
+import { NeuroLink } from "../neurolink.js";
 import type {
+  ChatMessage,
+  ChatMessageMetadata,
+  ToolResultData,
   ConversationMemoryConfig,
   ConversationMemoryStats,
-  ChatMessage,
-  RedisStorageConfig,
-  SessionMetadata,
   RedisConversationObject,
+  RedisStorageConfig,
+  SessionListItem,
   SessionMemory,
+  SessionMetadata,
   StoreConversationTurnOptions,
-} from "../types/conversation.js";
-import { ConversationMemoryError } from "../types/conversation.js";
-import type { PendingToolExecution } from "../types/tools.js";
-import {
-  MESSAGES_PER_TURN,
-  RECENT_MESSAGES_RATIO,
-} from "../config/conversationMemory.js";
-import { logger } from "../utils/logger.js";
-import { NeuroLink } from "../neurolink.js";
-import {
-  createRedisClient,
-  getSessionKey,
-  getUserSessionsKey,
-  getNormalizedConfig,
-  serializeConversation,
-  deserializeConversation,
-  scanKeys,
-} from "../utils/redis.js";
-import { TokenUtils } from "../constants/tokens.js";
+  AgenticLoopReportMetadata,
+  ConversationTitleGeneratedEvent,
+  IConversationMemoryManager,
+  NeuroLinkEvents,
+  PendingToolExecution,
+  TypedEventEmitter,
+} from "../types/index.js";
+import { ConversationMemoryError } from "../types/index.js";
+import { withTimeout } from "../utils/errorHandling.js";
+
 import {
   buildContextFromPointer,
   getEffectiveTokenThreshold,
-  generateSummary,
 } from "../utils/conversationMemory.js";
+import { logger } from "../utils/logger.js";
+import {
+  assistantTurnIdentity,
+  isTurnAlreadyStored,
+  turnMessageFields,
+  userTurnIdentity,
+} from "../utils/conversationTurnIdentity.js";
+import { extractIsErrorText } from "../utils/toolResultStatus.js";
+import {
+  addToSetWithTtl,
+  createRedisClient,
+  deserializeConversation,
+  encodeStoredMessages,
+  getSessionMessagesKey,
+  MESSAGES_KEY_SUFFIX,
+  isSessionMessagesKey,
+  parseStoredMessages,
+  serializeConversationMetadata,
+  usesSplitMessageStorage,
+  getNormalizedConfig,
+  getPooledRedisClient,
+  getSessionKey,
+  getUserSessionsKey,
+  releasePooledRedisClient,
+  scanKeys,
+  serializeConversation,
+  setWithTtl,
+} from "../utils/redis.js";
+
+const redisTracer = tracers.redis;
+const REDIS_TIMEOUT_MS = 5000;
 
 /**
  * Redis-based implementation of the ConversationMemoryManager
  * Uses the same interface but stores data in Redis
  */
 
-export class RedisConversationMemoryManager {
+export class RedisConversationMemoryManager implements IConversationMemoryManager {
   public config: ConversationMemoryConfig;
   private isInitialized: boolean = false;
+  private summarizationEngine: SummarizationEngine = new SummarizationEngine();
   private redisConfig: Required<RedisStorageConfig>;
   private redisClient: Awaited<ReturnType<typeof createRedisClient>> | null =
     null;
+
+  /**
+   * Receives `conversation:titleGenerated` once a new conversation's title is
+   * stored. Optional because the manager can be constructed standalone.
+   */
+  private readonly eventEmitter?: TypedEventEmitter<NeuroLinkEvents>;
 
   /**
    * Temporary storage for tool execution data to prevent race conditions
@@ -71,9 +109,11 @@ export class RedisConversationMemoryManager {
   constructor(
     config: ConversationMemoryConfig,
     redisConfig: RedisStorageConfig = {},
+    eventEmitter?: TypedEventEmitter<NeuroLinkEvents>,
   ) {
     this.config = config;
     this.redisConfig = getNormalizedConfig(redisConfig);
+    this.eventEmitter = eventEmitter;
   }
 
   /**
@@ -87,50 +127,249 @@ export class RedisConversationMemoryManager {
       return;
     }
 
+    await redisTracer.startActiveSpan(
+      "memory.initialize",
+      {
+        kind: SpanKind.CLIENT,
+        attributes: {
+          "redis.host": this.redisConfig.host,
+          "redis.port": this.redisConfig.port,
+          "redis.key_prefix": this.redisConfig.keyPrefix,
+        },
+      },
+      async (span) => {
+        try {
+          logger.debug(
+            "[RedisConversationMemoryManager] Initializing with config",
+            {
+              host: this.redisConfig.host,
+              port: this.redisConfig.port,
+              keyPrefix: this.redisConfig.keyPrefix,
+              ttl: this.redisConfig.ttl,
+            },
+          );
+
+          this.redisClient = await getPooledRedisClient(this.redisConfig);
+          this.isInitialized = true;
+
+          logger.info("RedisConversationMemoryManager initialized", {
+            storage: "redis",
+            host: this.redisConfig.host,
+            port: this.redisConfig.port,
+            maxSessions: this.config.maxSessions,
+            maxTurnsPerSession: this.config.maxTurnsPerSession,
+          });
+
+          logger.debug(
+            "[RedisConversationMemoryManager] Redis client created successfully",
+            {
+              clientType: this.redisClient?.constructor?.name || "unknown",
+              isConnected: !!this.redisClient,
+            },
+          );
+        } catch (error) {
+          span.setStatus({
+            code: SpanStatusCode.ERROR,
+            message: error instanceof Error ? error.message : String(error),
+          });
+          span.recordException(
+            error instanceof Error ? error : new Error(String(error)),
+          );
+          logger.error(
+            "[RedisConversationMemoryManager] Failed to initialize",
+            {
+              error: error instanceof Error ? error.message : String(error),
+              stack: error instanceof Error ? error.stack : undefined,
+              config: {
+                host: this.redisConfig.host,
+                port: this.redisConfig.port,
+              },
+            },
+          );
+
+          throw new ConversationMemoryError(
+            "Failed to initialize Redis conversation memory",
+            "CONFIG_ERROR",
+            {
+              error: error instanceof Error ? error.message : String(error),
+            },
+          );
+        } finally {
+          span.end();
+        }
+      },
+    );
+  }
+
+  /** Whether this memory manager can persist data (Redis connected and initialized) */
+  public get canPersist(): boolean {
+    return (
+      this.isInitialized && this.redisClient !== null && this.redisClient.isOpen
+    );
+  }
+
+  /** Whether Redis client is configured and connected */
+  public get isRedisConfigured(): boolean {
+    return this.redisClient !== null && this.redisClient.isOpen;
+  }
+
+  /** Get health status for monitoring */
+  public getHealthStatus(): {
+    initialized: boolean;
+    connected: boolean;
+    host: string;
+    keyPrefix: string;
+  } {
+    return {
+      initialized: this.isInitialized,
+      connected: this.redisClient?.isOpen ?? false,
+      host: this.redisConfig.host,
+      keyPrefix: this.redisConfig.keyPrefix,
+    };
+  }
+
+  /**
+   * Get session by ID, reconstructing a SessionMemory from Redis storage.
+   */
+  public async getSession(
+    sessionId: string,
+    userId?: string,
+    requestId?: string,
+  ): Promise<SessionMemory | undefined> {
+    await this.ensureInitialized();
+    if (!this.redisClient) {
+      return undefined;
+    }
+    const redisClient = this.redisClient;
+
+    return redisTracer.startActiveSpan(
+      "memory.getSession",
+      { kind: SpanKind.CLIENT, attributes: { "session.id": sessionId } },
+      async (span) => {
+        if (userId) {
+          span.setAttribute("user.id", userId);
+        }
+        try {
+          const redisKey = getSessionKey(this.redisConfig, sessionId, userId);
+          const conversationData = await withTimeout(
+            redisClient.get(redisKey),
+            REDIS_TIMEOUT_MS,
+          );
+          const conversation = await this.hydrateMessages(
+            deserializeConversation(conversationData || null),
+            redisKey,
+          );
+          if (!conversation) {
+            span.setAttribute("session.found", false);
+            return undefined;
+          }
+
+          span.setAttribute("session.found", true);
+
+          // Log session load metadata for observability
+          const blobSizeBytes = conversationData
+            ? Buffer.byteLength(conversationData, "utf8")
+            : 0;
+          const messageCount = conversation.messages.length;
+          const hasSummary = !!conversation.summarizedUpToMessageId;
+          const pointerIndex = hasSummary
+            ? conversation.messages.findIndex(
+                (msg) => msg.id === conversation.summarizedUpToMessageId,
+              )
+            : -1;
+          const recentMessageCount =
+            hasSummary && pointerIndex !== -1
+              ? messageCount - pointerIndex - 1
+              : messageCount;
+
+          span.setAttribute("message.count", messageCount);
+          span.setAttribute("blob.size_bytes", blobSizeBytes);
+
+          logger.info("[ConversationMemory] Session loaded", {
+            requestId,
+            sessionId,
+            blobSizeBytes,
+            messageCount,
+            hasSummary,
+            recentMessageCount,
+          });
+
+          if (blobSizeBytes > 512 * 1024) {
+            logger.warn("[ConversationMemory] Large session blob", {
+              requestId,
+              sessionId,
+              blobSizeBytes,
+              messageCount,
+            });
+          }
+
+          return {
+            sessionId: conversation.sessionId,
+            userId: conversation.userId,
+            messages: conversation.messages,
+            summarizedUpToMessageId: conversation.summarizedUpToMessageId,
+            summarizedMessage: conversation.summarizedMessage,
+            tokenThreshold: conversation.tokenThreshold,
+            lastTokenCount: conversation.lastTokenCount,
+            lastCountedAt: conversation.lastCountedAt,
+            lastApiTokenCount: conversation.lastApiTokenCount,
+            createdAt: new Date(conversation.createdAt).getTime(),
+            lastActivity: new Date(conversation.updatedAt).getTime(),
+          };
+        } catch (error) {
+          span.setStatus({
+            code: SpanStatusCode.ERROR,
+            message: error instanceof Error ? error.message : String(error),
+          });
+          span.recordException(
+            error instanceof Error ? error : new Error(String(error)),
+          );
+          logger.error(
+            "[RedisConversationMemoryManager] Failed to get session",
+            {
+              sessionId,
+              userId,
+              error: error instanceof Error ? error.message : String(error),
+            },
+          );
+          return undefined;
+        } finally {
+          span.end();
+        }
+      },
+    );
+  }
+
+  /**
+   * Get raw session data without any filtering or transformation.
+   * Used by the memory retrieval tool and internal APIs that need
+   * access to full message data including unmodified tool outputs.
+   */
+  async getSessionRaw(
+    sessionId: string,
+    userId?: string,
+  ): Promise<RedisConversationObject | null> {
     try {
-      logger.debug(
-        "[RedisConversationMemoryManager] Initializing with config",
-        {
-          host: this.redisConfig.host,
-          port: this.redisConfig.port,
-          keyPrefix: this.redisConfig.keyPrefix,
-          ttl: this.redisConfig.ttl,
-        },
-      );
-
-      this.redisClient = await createRedisClient(this.redisConfig);
-      this.isInitialized = true;
-
-      logger.info("RedisConversationMemoryManager initialized", {
-        storage: "redis",
-        host: this.redisConfig.host,
-        port: this.redisConfig.port,
-        maxSessions: this.config.maxSessions,
-        maxTurnsPerSession: this.config.maxTurnsPerSession,
-      });
-
-      logger.debug(
-        "[RedisConversationMemoryManager] Redis client created successfully",
-        {
-          clientType: this.redisClient?.constructor?.name || "unknown",
-          isConnected: !!this.redisClient,
-        },
+      await this.ensureInitialized();
+      if (!this.redisClient) {
+        return null;
+      }
+      const redisKey = getSessionKey(this.redisConfig, sessionId, userId);
+      const conversationData = await this.redisClient.get(redisKey);
+      return this.hydrateMessages(
+        deserializeConversation(conversationData || null),
+        redisKey,
       );
     } catch (error) {
-      logger.error("[RedisConversationMemoryManager] Failed to initialize", {
-        error: error instanceof Error ? error.message : String(error),
-        stack: error instanceof Error ? error.stack : undefined,
-        config: {
-          host: this.redisConfig.host,
-          port: this.redisConfig.port,
+      logger.error(
+        "[RedisConversationMemoryManager] Failed to get raw session",
+        {
+          sessionId,
+          userId,
+          error: error instanceof Error ? error.message : String(error),
         },
-      });
-
-      throw new ConversationMemoryError(
-        "Failed to initialize Redis conversation memory",
-        "CONFIG_ERROR",
-        { error: error instanceof Error ? error.message : String(error) },
       );
+      return null;
     }
   }
 
@@ -152,7 +391,7 @@ export class RedisConversationMemoryManager {
     try {
       const userSessionsKey = getUserSessionsKey(this.redisConfig, userId);
       const sessions = await this.redisClient.sMembers(userSessionsKey);
-      return sessions;
+      return Array.from(sessions).map(String);
     } catch (error) {
       logger.error(
         "[RedisConversationMemoryManager] Failed to get user sessions",
@@ -178,11 +417,12 @@ export class RedisConversationMemoryManager {
 
     try {
       const userSessionsKey = getUserSessionsKey(this.redisConfig, userId);
-      await this.redisClient.sAdd(userSessionsKey, sessionId);
-
-      if (this.redisConfig.ttl > 0) {
-        await this.redisClient.expire(userSessionsKey, this.redisConfig.ttl);
-      }
+      await addToSetWithTtl(
+        this.redisClient,
+        userSessionsKey,
+        sessionId,
+        this.redisConfig.ttl,
+      );
     } catch (error) {
       logger.error(
         "[RedisConversationMemoryManager] Failed to add session to user set",
@@ -211,7 +451,7 @@ export class RedisConversationMemoryManager {
 
       const result = await this.redisClient.sRem(userSessionsKey, sessionId);
 
-      return result > 0;
+      return Number(result) > 0;
     } catch (error) {
       logger.error(
         "[RedisConversationMemoryManager] Failed to remove session from user set",
@@ -246,6 +486,7 @@ export class RedisConversationMemoryManager {
     }>,
     toolResults: Array<{
       toolCallId?: string;
+      output?: unknown;
       result?: unknown;
       error?: string;
       [key: string]: unknown;
@@ -344,196 +585,297 @@ export class RedisConversationMemoryManager {
 
     await this.ensureInitialized();
 
-    try {
-      if (!this.redisClient) {
-        throw new Error("Redis client not initialized");
-      }
+    // NLK-GAP-012: Add span for storeTurn CRUD operation
+    return redisTracer.startActiveSpan(
+      "memory.storeTurn",
+      {
+        kind: SpanKind.CLIENT,
+        attributes: {
+          "session.id": options.sessionId,
+          ...(options.userId && { "user.id": options.userId }),
+        },
+      },
+      async (span) => {
+        try {
+          if (!this.redisClient) {
+            throw new Error("Redis client not initialized");
+          }
 
-      const redisKey = getSessionKey(
-        this.redisConfig,
-        options.sessionId,
-        options.userId,
-      );
-      const conversationData = await this.redisClient.get(redisKey);
-      let conversation = deserializeConversation(conversationData);
-
-      const currentTime = new Date().toISOString();
-      const normalizedUserId = options.userId || "randomUser";
-
-      if (!conversation) {
-        const titleGenerationKey = `${options.sessionId}:${normalizedUserId}`;
-
-        setImmediate(async () => {
-          if (this.titleGenerationInProgress.has(titleGenerationKey)) {
+          const redisKey = getSessionKey(
+            this.redisConfig,
+            options.sessionId,
+            options.userId,
+          );
+          const conversationData = await this.redisClient.get(redisKey);
+          let conversation = await this.hydrateMessages(
+            deserializeConversation(conversationData),
+            redisKey,
+          );
+          if (
+            isTurnAlreadyStored(conversation?.messages ?? [], options.turnId)
+          ) {
             return;
           }
-          this.titleGenerationInProgress.add(titleGenerationKey);
+          // Split-storage bookkeeping: whether this session already keeps its
+          // messages in the companion LIST, and how many it held before this
+          // turn — so only the new ones are appended rather than rewriting the
+          // whole conversation on every turn.
+          const wasSplitStorage = usesSplitMessageStorage(conversation);
+          const messageCountBeforeTurn = conversation?.messages.length ?? 0;
 
-          try {
-            const title = await this.generateConversationTitle(
-              options.userMessage,
-            );
+          const currentTime = new Date().toISOString();
+          const normalizedUserId = options.userId || "randomUser";
 
-            const updatedRedisKey = getSessionKey(
-              this.redisConfig,
-              options.sessionId,
-              options.userId || undefined,
-            );
-            const updatedConversationData =
-              await this.redisClient?.get(updatedRedisKey);
-            const updatedConversation = deserializeConversation(
-              updatedConversationData || null,
-            );
+          if (!conversation) {
+            const titleGenerationKey = `${options.sessionId}:${normalizedUserId}`;
 
-            if (updatedConversation) {
-              updatedConversation.title = title;
-              updatedConversation.updatedAt = new Date().toISOString();
+            const generateTitleWithContext = context.bind(
+              context.active(),
+              async () => {
+                if (this.titleGenerationInProgress.has(titleGenerationKey)) {
+                  return;
+                }
+                this.titleGenerationInProgress.add(titleGenerationKey);
 
-              const serializedData = serializeConversation(updatedConversation);
-              await this.redisClient?.set(updatedRedisKey, serializedData);
+                try {
+                  const title = await this.generateConversationTitle(
+                    options.userMessage,
+                  );
 
-              if (this.redisConfig.ttl > 0) {
-                await this.redisClient?.expire(
-                  updatedRedisKey,
-                  this.redisConfig.ttl,
-                );
-              }
-            }
-          } catch (titleError) {
-            logger.warn(
-              "[RedisConversationMemoryManager] Failed to generate conversation title in background",
-              {
-                sessionId: options.sessionId,
-                userId: normalizedUserId,
-                error:
-                  titleError instanceof Error
-                    ? titleError.message
-                    : String(titleError),
+                  const updatedRedisKey = getSessionKey(
+                    this.redisConfig,
+                    options.sessionId,
+                    options.userId || undefined,
+                  );
+                  const updatedConversationData =
+                    await this.redisClient?.get(updatedRedisKey);
+                  const updatedConversation = deserializeConversation(
+                    updatedConversationData || null,
+                  );
+
+                  if (updatedConversation) {
+                    updatedConversation.title = title;
+                    updatedConversation.updatedAt = new Date().toISOString();
+
+                    const serializedData =
+                      serializeConversation(updatedConversation);
+                    if (this.redisClient) {
+                      await setWithTtl(
+                        this.redisClient,
+                        updatedRedisKey,
+                        serializedData,
+                        this.redisConfig.ttl,
+                      );
+                      this.emitTitleGenerated({
+                        sessionId: options.sessionId,
+                        userId: normalizedUserId,
+                        title,
+                        timestamp: Date.now(),
+                      });
+                    }
+                  }
+                } catch (titleError) {
+                  logger.warn(
+                    "[RedisConversationMemoryManager] Failed to generate conversation title in background",
+                    {
+                      sessionId: options.sessionId,
+                      userId: normalizedUserId,
+                      error:
+                        titleError instanceof Error
+                          ? titleError.message
+                          : String(titleError),
+                    },
+                  );
+                } finally {
+                  this.titleGenerationInProgress.delete(titleGenerationKey);
+                }
               },
             );
-          } finally {
-            this.titleGenerationInProgress.delete(titleGenerationKey);
-          }
-        });
+            setImmediate(generateTitleWithContext);
 
-        conversation = {
-          id: randomUUID(),
-          title: "New Conversation", // Temporary title until generated
-          sessionId: options.sessionId,
-          userId: normalizedUserId,
-          createdAt: options.startTimeStamp?.toISOString() || currentTime,
-          updatedAt: options.startTimeStamp?.toISOString() || currentTime,
-          messages: [],
-        };
-      } else {
-        conversation.updatedAt = currentTime;
-      }
-
-      const tokenThreshold = options.providerDetails
-        ? getEffectiveTokenThreshold(
-            options.providerDetails.provider,
-            options.providerDetails.model,
-            this.config.tokenThreshold,
-            conversation.tokenThreshold,
-          )
-        : this.config.tokenThreshold || 50000;
-
-      const userMsg: ChatMessage = {
-        id: randomUUID(),
-        timestamp:
-          options.startTimeStamp?.toISOString() || this.generateTimestamp(),
-        role: "user",
-        content: options.userMessage,
-      };
-      conversation.messages.push(userMsg);
-
-      await this.flushPendingToolData(
-        conversation,
-        options.sessionId,
-        normalizedUserId,
-      );
-
-      const assistantMsg: ChatMessage = {
-        id: randomUUID(),
-        timestamp: this.generateTimestamp(),
-        role: "assistant",
-        content: options.aiResponse,
-        events: options.events || undefined,
-      };
-      conversation.messages.push(assistantMsg);
-
-      logger.info("[RedisConversationMemoryManager] Added new messages", {
-        sessionId: conversation.sessionId,
-        userId: conversation.userId,
-      });
-
-      // Use per-request enableSummarization with higher priority than instance config
-      const shouldSummarize =
-        options.enableSummarization !== undefined
-          ? options.enableSummarization
-          : this.config.enableSummarization;
-
-      if (shouldSummarize) {
-        const normalizedUserId = options.userId || "randomUser";
-        const summarizationKey = `${options.sessionId}:${normalizedUserId}`;
-
-        // Only trigger summarization if not already in progress for this session
-        if (!this.summarizationInProgress.has(summarizationKey)) {
-          setImmediate(async () => {
-            try {
-              await this.checkAndSummarize(
-                conversation,
-                tokenThreshold,
-                options.sessionId,
-                options.userId,
-              );
-            } catch (error) {
-              logger.error("Background summarization failed", {
-                sessionId: conversation.sessionId,
-                error: error instanceof Error ? error.message : String(error),
-              });
-            }
-          });
-        } else {
-          logger.debug(
-            "[RedisConversationMemoryManager] Summarization already in progress, skipping",
-            {
+            conversation = {
+              id: randomUUID(),
+              title: "New Conversation", // Temporary title until generated
               sessionId: options.sessionId,
               userId: normalizedUserId,
+              createdAt: options.startTimeStamp?.toISOString() || currentTime,
+              updatedAt: options.startTimeStamp?.toISOString() || currentTime,
+              messages: [],
+            };
+          } else {
+            conversation.updatedAt = currentTime;
+          }
+
+          const tokenThreshold = options.providerDetails
+            ? getEffectiveTokenThreshold(
+                options.providerDetails.provider,
+                options.providerDetails.model,
+                this.config.tokenThreshold,
+                conversation.tokenThreshold,
+              )
+            : this.config.tokenThreshold || 50000;
+
+          const userMsg: ChatMessage = {
+            ...turnMessageFields(userTurnIdentity(options)),
+            timestamp:
+              options.startTimeStamp?.toISOString() || this.generateTimestamp(),
+            role: "user",
+            content: options.userMessage,
+          };
+          conversation.messages.push(userMsg);
+
+          await this.flushPendingToolData(
+            conversation,
+            options.sessionId,
+            normalizedUserId,
+          );
+
+          // Pinned skill activations ride between ask and answer, mirroring
+          // the actual order (ask → skill loaded → answer). Stored verbatim —
+          // skill instructions are never truncated.
+          if (options.skillMessages && options.skillMessages.length > 0) {
+            conversation.messages.push(...options.skillMessages);
+          }
+
+          const assistantMsg: ChatMessage = {
+            ...turnMessageFields(
+              assistantTurnIdentity(options, options.thoughtSignature),
+            ),
+            timestamp: this.generateTimestamp(),
+            role: "assistant",
+            content: options.aiResponse,
+            events: options.events || undefined,
+          };
+          conversation.messages.push(assistantMsg);
+
+          // Store API-reported token counts if available
+          if (options.tokenUsage) {
+            conversation.lastApiTokenCount = options.tokenUsage;
+          }
+
+          logger.info("[RedisConversationMemoryManager] Added new messages", {
+            sessionId: conversation.sessionId,
+            userId: conversation.userId,
+          });
+
+          // Use per-request enableSummarization with higher priority than instance config
+          const shouldSummarize =
+            options.enableSummarization !== undefined
+              ? options.enableSummarization
+              : this.config.enableSummarization;
+
+          // Append-only: push just this turn's messages and persist a SMALL
+          // metadata blob. A session not yet using split storage (new, or a
+          // legacy blob) is converted once here, then every later turn appends.
+          await this.persistConversation(
+            conversation,
+            options.sessionId,
+            options.userId,
+            wasSplitStorage ? messageCountBeforeTurn : undefined,
+          );
+
+          // Scheduled AFTER the write, never before it. On the single turn that
+          // converts a legacy session, `checkAndSummarize` re-reads the blob and
+          // writes it back; observing the pre-conversion blob would make it
+          // re-serialize the record WITHOUT the split marker, so a later SET
+          // would strip the marker while the companion LIST already held the
+          // messages — the next read would then serve the stale inline copy.
+          if (shouldSummarize) {
+            const normalizedUserId = options.userId || "randomUser";
+            const summarizationKey = `${options.sessionId}:${normalizedUserId}`;
+
+            // Only trigger summarization if not already in progress for this session
+            if (!this.summarizationInProgress.has(summarizationKey)) {
+              const summarizeWithContext = context.bind(
+                context.active(),
+                async () => {
+                  try {
+                    await this.checkAndSummarize(
+                      conversation,
+                      tokenThreshold,
+                      options.sessionId,
+                      options.userId,
+                      options.requestId,
+                    );
+                  } catch (error) {
+                    logger.error("Background summarization failed", {
+                      sessionId: conversation.sessionId,
+                      error:
+                        error instanceof Error ? error.message : String(error),
+                    });
+                  }
+                },
+              );
+              setImmediate(summarizeWithContext);
+            } else {
+              logger.debug(
+                "[RedisConversationMemoryManager] Summarization already in progress, skipping",
+                {
+                  sessionId: options.sessionId,
+                  userId: normalizedUserId,
+                },
+              );
+            }
+          }
+
+          // Log turn storage metadata for observability
+          const blobSizeBytes = Buffer.byteLength(
+            serializeConversationMetadata(conversation),
+            "utf8",
+          );
+          logger.info("[ConversationMemory] Turn stored", {
+            requestId: options.requestId,
+            sessionId: options.sessionId,
+            blobSizeBytes,
+            totalMessages: conversation.messages.length,
+            userMsgChars: options.userMessage.length,
+            assistantMsgChars: options.aiResponse.length,
+          });
+
+          if (blobSizeBytes > 512 * 1024) {
+            logger.warn("[ConversationMemory] Large session blob", {
+              requestId: options.requestId,
+              sessionId: options.sessionId,
+              blobSizeBytes,
+              messageCount: conversation.messages.length,
+            });
+          }
+
+          if (options.userId) {
+            await this.addUserSession(options.userId, options.sessionId);
+          }
+
+          span.setAttribute("message.count", conversation.messages.length);
+          span.setStatus({ code: SpanStatusCode.OK });
+          logger.debug(
+            "[RedisConversationMemoryManager] Successfully stored conversation turn",
+            {
+              sessionId: options.sessionId,
+              totalMessages: conversation.messages.length,
+              title: conversation.title,
             },
           );
+        } catch (error) {
+          span.setStatus({
+            code: SpanStatusCode.ERROR,
+            message: error instanceof Error ? error.message : String(error),
+          });
+          span.recordException(
+            error instanceof Error ? error : new Error(String(error)),
+          );
+          throw new ConversationMemoryError(
+            `Failed to store conversation turn in Redis for session ${options.sessionId}`,
+            "STORAGE_ERROR",
+            {
+              sessionId: options.sessionId,
+              error: error instanceof Error ? error.message : String(error),
+            },
+          );
+        } finally {
+          span.end();
         }
-      }
-
-      const serializedData = serializeConversation(conversation);
-      await this.redisClient.set(redisKey, serializedData);
-
-      if (this.redisConfig.ttl > 0) {
-        await this.redisClient.expire(redisKey, this.redisConfig.ttl);
-      }
-
-      if (options.userId) {
-        await this.addUserSession(options.userId, options.sessionId);
-      }
-
-      logger.debug(
-        "[RedisConversationMemoryManager] Successfully stored conversation turn",
-        {
-          sessionId: options.sessionId,
-          totalMessages: conversation.messages.length,
-          title: conversation.title,
-        },
-      );
-    } catch (error) {
-      throw new ConversationMemoryError(
-        `Failed to store conversation turn in Redis for session ${options.sessionId}`,
-        "STORAGE_ERROR",
-        {
-          sessionId: options.sessionId,
-          error: error instanceof Error ? error.message : String(error),
-        },
-      );
-    }
+      },
+    );
   }
 
   /**
@@ -544,11 +886,11 @@ export class RedisConversationMemoryManager {
     threshold: number,
     sessionId: string,
     userId?: string,
+    requestId?: string,
   ): Promise<void> {
     const normalizedUserId = userId || "randomUser";
     const summarizationKey = `${sessionId}:${normalizedUserId}`;
 
-    // Acquire lock - if already in progress, skip
     if (this.summarizationInProgress.has(summarizationKey)) {
       logger.debug(
         "[RedisConversationMemoryManager] Summarization already in progress, skipping",
@@ -576,19 +918,55 @@ export class RedisConversationMemoryManager {
         lastActivity: new Date(conversation.updatedAt).getTime(),
       };
 
-      const contextMessages = buildContextFromPointer(session);
-      const tokenCount = this.estimateTokens(contextMessages);
+      const summarized = await this.summarizationEngine.checkAndSummarize(
+        session,
+        threshold,
+        this.config,
+        "[RedisConversationMemoryManager]",
+        requestId,
+      );
 
-      conversation.lastTokenCount = tokenCount;
-      conversation.lastCountedAt = Date.now();
+      conversation.lastTokenCount = session.lastTokenCount;
+      conversation.lastCountedAt = session.lastCountedAt;
 
-      if (tokenCount >= threshold) {
-        await this.summarizeSessionTokenBased(
-          conversation,
-          threshold,
-          sessionId,
-          userId,
-        );
+      if (summarized) {
+        conversation.summarizedUpToMessageId = session.summarizedUpToMessageId;
+        conversation.summarizedMessage = session.summarizedMessage;
+
+        if (this.redisClient) {
+          const redisKey = getSessionKey(this.redisConfig, sessionId, userId);
+
+          // Re-read current state to avoid clobbering messages added during summarization
+          const latestData = await this.redisClient.get(redisKey);
+          if (latestData) {
+            const latestConversation = deserializeConversation(latestData);
+            if (latestConversation) {
+              // Apply only summarization metadata onto the fresh state
+              latestConversation.summarizedUpToMessageId =
+                conversation.summarizedUpToMessageId;
+              latestConversation.summarizedMessage =
+                conversation.summarizedMessage;
+              latestConversation.lastTokenCount = conversation.lastTokenCount;
+              latestConversation.lastCountedAt = conversation.lastCountedAt;
+              // Only summarization metadata changed, so the companion LIST is
+              // left alone. Critical: this re-read was NOT hydrated, so for a
+              // split session `messages` is empty — writing it with
+              // serializeConversation would drop the marker and make the record
+              // look like a legacy blob with zero messages (silent data loss).
+              const freshSerialized = usesSplitMessageStorage(
+                latestConversation,
+              )
+                ? serializeConversationMetadata(latestConversation)
+                : serializeConversation(latestConversation);
+              await setWithTtl(
+                this.redisClient,
+                redisKey,
+                freshSerialized,
+                this.redisConfig.ttl,
+              );
+            }
+          }
+        }
       }
     } catch (error) {
       logger.error("Token counting or summarization failed", {
@@ -596,167 +974,306 @@ export class RedisConversationMemoryManager {
         error: error instanceof Error ? error.message : String(error),
       });
     } finally {
-      // Release lock when done
       this.summarizationInProgress.delete(summarizationKey);
     }
   }
 
   /**
-   * Estimate total tokens for a list of messages
+   * True only for keys holding a conversation BLOB — the sole key type these
+   * scan-then-GET paths may read.
+   *
+   * `${keyPrefix}*` also matches the companion message LISTs and, when a
+   * custom key prefix does not end in `conversation:`, the user-index SETs
+   * (whose derived prefix then collapses onto `keyPrefix`). `GET` against
+   * either raises WRONGTYPE, and counting them would inflate session totals.
    */
-  private estimateTokens(messages: ChatMessage[]): number {
-    return messages.reduce((total, msg) => {
-      return total + TokenUtils.estimateTokenCount(msg.content);
-    }, 0);
+  private isConversationBlobKey(key: string): boolean {
+    return (
+      !isSessionMessagesKey(key) &&
+      !key.endsWith(":sessions") &&
+      !key.startsWith(this.redisConfig.userSessionsKeyPrefix)
+    );
   }
 
   /**
-   * Token-based summarization (pointer-based, non-destructive)
+   * Hydrate a deserialized blob's messages from the companion LIST when the
+   * session uses split storage. Legacy blobs (messages inline) pass through
+   * untouched — that is what makes the migration backward compatible.
    */
-  private async summarizeSessionTokenBased(
+  private async hydrateMessages(
+    conversation: RedisConversationObject | null,
+    redisKey: string,
+  ): Promise<RedisConversationObject | null> {
+    if (!conversation || !usesSplitMessageStorage(conversation)) {
+      return conversation;
+    }
+    if (!this.redisClient) {
+      return conversation;
+    }
+    // `getSession` and `buildContextMessages` guard their own GET with
+    // `withTimeout`; both now also depend on this read, so leaving it unguarded
+    // would let a hung LIST read block the request thread anyway.
+    const entries = await withTimeout(
+      this.redisClient.lRange(`${redisKey}${MESSAGES_KEY_SUFFIX}`, 0, -1),
+      REDIS_TIMEOUT_MS,
+    );
+    // `lRange` is typed `(string | Buffer)[]` — the client returns Buffers when
+    // a connection is opened in binary mode. Normalize rather than assert, so
+    // a binary-mode client reads its history instead of throwing on parse.
+    conversation.messages = parseStoredMessages(
+      entries.map((entry) => entry.toString()),
+    );
+    return conversation;
+  }
+
+  /** Message count without materializing them — LLEN for split sessions. */
+  private async countMessages(
     conversation: RedisConversationObject,
-    threshold: number,
+    redisKey: string,
+  ): Promise<number> {
+    if (!usesSplitMessageStorage(conversation) || !this.redisClient) {
+      return conversation.messages.length;
+    }
+    // `lLen` is typed `number | \`${number}\`` (RESP3 can deliver it as a
+    // string), and callers add it to numbers — coerce so the count never
+    // concatenates instead of summing.
+    return Number(
+      await withTimeout(
+        this.redisClient.lLen(`${redisKey}${MESSAGES_KEY_SUFFIX}`),
+        REDIS_TIMEOUT_MS,
+      ),
+    );
+  }
+
+  /** Load a session, messages included, regardless of storage format. */
+  private async loadConversation(
     sessionId: string,
     userId?: string,
-  ): Promise<void> {
-    const startIndex = conversation.summarizedUpToMessageId
-      ? conversation.messages.findIndex(
-          (m) => m.id === conversation.summarizedUpToMessageId,
-        ) + 1
-      : 0;
-
-    const recentMessages = conversation.messages.slice(startIndex);
-
-    if (recentMessages.length === 0) {
-      return;
+  ): Promise<RedisConversationObject | null> {
+    if (!this.redisClient) {
+      return null;
     }
-
-    // We only want to include user, assistant, and system messages in summarization
-    const filteredRecentMessages = recentMessages.filter(
-      (msg) => msg.role !== "tool_call" && msg.role !== "tool_result",
+    const redisKey = getSessionKey(this.redisConfig, sessionId, userId);
+    return this.hydrateMessages(
+      deserializeConversation(await this.redisClient.get(redisKey)),
+      redisKey,
     );
-
-    const targetRecentTokens = threshold * RECENT_MESSAGES_RATIO;
-    const splitIndex = await this.findSplitIndexByTokens(
-      filteredRecentMessages,
-      targetRecentTokens,
-    );
-
-    const messagesToSummarize = filteredRecentMessages.slice(0, splitIndex);
-
-    if (messagesToSummarize.length === 0) {
-      return;
-    }
-
-    const summary = await generateSummary(
-      messagesToSummarize,
-      this.config,
-      "[RedisConversationMemoryManager]",
-      conversation.summarizedMessage,
-    );
-
-    if (!summary) {
-      logger.warn(
-        `[RedisConversationMemoryManager] Summary generation failed for session ${conversation.sessionId}`,
-      );
-      return;
-    }
-
-    const lastSummarized = messagesToSummarize[messagesToSummarize.length - 1];
-    conversation.summarizedUpToMessageId = lastSummarized.id;
-    conversation.summarizedMessage = summary;
-    if (this.redisClient) {
-      const redisKey = getSessionKey(this.redisConfig, sessionId, userId);
-      const serializedData = serializeConversation(conversation);
-      await this.redisClient.set(redisKey, serializedData);
-
-      if (this.redisConfig.ttl > 0) {
-        await this.redisClient.expire(redisKey, this.redisConfig.ttl);
-      }
-    }
   }
 
   /**
-   * Find split index to keep recent messages within target token count
+   * Persist a conversation, splitting messages into the companion LIST.
+   * `appendFrom` appends only messages from that index onward (the per-turn
+   * fast path); omit it to rewrite the LIST wholesale, which is also how a
+   * legacy blob gets converted.
    */
-  private async findSplitIndexByTokens(
-    messages: ChatMessage[],
-    targetRecentTokens: number,
-  ): Promise<number> {
-    let recentTokens = 0;
-    let splitIndex = messages.length;
-
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msgTokens = TokenUtils.estimateTokenCount(messages[i].content);
-
-      if (recentTokens + msgTokens > targetRecentTokens) {
-        splitIndex = i + 1;
-        break;
-      }
-
-      recentTokens += msgTokens;
+  private async persistConversation(
+    conversation: RedisConversationObject,
+    sessionId: string,
+    userId: string | undefined,
+    appendFrom?: number,
+  ): Promise<void> {
+    if (!this.redisClient) {
+      return;
     }
-
-    // Ensure we're summarizing at least something
-    return Math.max(1, splitIndex);
+    const redisKey = getSessionKey(this.redisConfig, sessionId, userId);
+    const messagesKey = getSessionMessagesKey(
+      this.redisConfig,
+      sessionId,
+      userId,
+    );
+    // One MULTI, not four to six independent commands. The replace path is a
+    // DEL followed by an RPUSH, and on the legacy-conversion path the inline
+    // blob is the only copy of the history until the SET lands — so a failure
+    // between any two of them leaves the session either empty or unrecoverable.
+    // Grouping them also collapses the round trips, which is the point of the
+    // append-only layout.
+    const tx = this.redisClient.multi();
+    if (appendFrom === undefined) {
+      tx.del(messagesKey);
+    }
+    const toPush =
+      appendFrom === undefined
+        ? conversation.messages
+        : conversation.messages.slice(appendFrom);
+    if (toPush.length > 0) {
+      tx.rPush(messagesKey, encodeStoredMessages(toPush));
+    }
+    tx.set(redisKey, serializeConversationMetadata(conversation));
+    if (this.redisConfig.ttl > 0) {
+      tx.expire(redisKey, this.redisConfig.ttl);
+      tx.expire(messagesKey, this.redisConfig.ttl);
+    }
+    await withTimeout(tx.exec(), REDIS_TIMEOUT_MS);
   }
 
   /**
    * Build context messages for AI prompt injection (TOKEN-BASED)
    * Returns messages from pointer onwards (or all if no pointer)
-   * Filters out tool_call and tool_result messages when summarization is enabled
+   * Applies sendToolPreview toggle and hydrates result.result for backward compat
    */
   async buildContextMessages(
     sessionId: string,
     userId?: string,
     enableSummarization?: boolean,
+    requestId?: string,
   ): Promise<ChatMessage[]> {
-    logger.info("[RedisConversationMemoryManager] Building context messages", {
+    logger.debug("[RedisConversationMemoryManager] Building context messages", {
       sessionId,
       userId,
-      method: "buildContextMessages",
+      enableSummarization,
     });
-
-    const redisKey = getSessionKey(this.redisConfig, sessionId, userId);
-    const conversationData = await this.redisClient?.get(redisKey);
-    const conversation = deserializeConversation(conversationData || null);
-
-    if (!conversation) {
+    await this.ensureInitialized();
+    if (!this.redisClient) {
+      logger.warn(
+        "[RedisConversationMemoryManager] Redis client not available in buildContextMessages",
+      );
       return [];
     }
+    const redisClient = this.redisClient;
 
-    const session: SessionMemory = {
-      sessionId: conversation.sessionId,
-      userId: conversation.userId,
-      messages: conversation.messages,
-      summarizedUpToMessageId: conversation.summarizedUpToMessageId,
-      summarizedMessage: conversation.summarizedMessage,
-      tokenThreshold: conversation.tokenThreshold,
-      lastTokenCount: conversation.lastTokenCount,
-      lastCountedAt: conversation.lastCountedAt,
-      createdAt: new Date(conversation.createdAt).getTime(),
-      lastActivity: new Date(conversation.updatedAt).getTime(),
-    };
+    // NLK-GAP-012: Add span for buildContext CRUD operation
+    return redisTracer.startActiveSpan(
+      "memory.buildContext",
+      {
+        kind: SpanKind.CLIENT,
+        attributes: {
+          "session.id": sessionId,
+          ...(userId && { "user.id": userId }),
+        },
+      },
+      async (span) => {
+        try {
+          logger.info(
+            "[RedisConversationMemoryManager] Building context messages",
+            {
+              sessionId,
+              userId,
+              method: "buildContextMessages",
+            },
+          );
 
-    const contextMessages = buildContextFromPointer(session);
-    const isSummarizationEnabled =
-      enableSummarization !== undefined
-        ? enableSummarization
-        : this.config.enableSummarization === true;
+          const redisKey = getSessionKey(this.redisConfig, sessionId, userId);
+          const conversationData = await withTimeout(
+            redisClient.get(redisKey),
+            REDIS_TIMEOUT_MS,
+          );
+          const conversation = await this.hydrateMessages(
+            deserializeConversation(conversationData || null),
+            redisKey,
+          );
 
-    let finalMessages = contextMessages;
-    if (isSummarizationEnabled) {
-      finalMessages = contextMessages.filter(
-        (msg) => msg.role !== "tool_call" && msg.role !== "tool_result",
-      );
-    }
+          logger.debug(
+            "[RedisConversationMemoryManager] Retrieved conversation for context building",
+            {
+              sessionId,
+              userId,
+              conversationFound: !!conversation,
+            },
+          );
 
-    logger.info("[RedisConversationMemoryManager] Retrieved context messages", {
-      sessionId,
-      userId,
-    });
+          if (!conversation) {
+            span.setAttribute("session.found", false);
+            span.setStatus({ code: SpanStatusCode.OK });
+            return [];
+          }
 
-    return finalMessages;
+          const session: SessionMemory = {
+            sessionId: conversation.sessionId,
+            userId: conversation.userId,
+            messages: conversation.messages,
+            summarizedUpToMessageId: conversation.summarizedUpToMessageId,
+            summarizedMessage: conversation.summarizedMessage,
+            tokenThreshold: conversation.tokenThreshold,
+            lastTokenCount: conversation.lastTokenCount,
+            lastCountedAt: conversation.lastCountedAt,
+            createdAt: new Date(conversation.createdAt).getTime(),
+            lastActivity: new Date(conversation.updatedAt).getTime(),
+          };
+
+          const contextMessages = buildContextFromPointer(session, requestId);
+
+          logger.debug(
+            "[RedisConversationMemoryManager] Built context messages from pointer",
+            {
+              sessionId,
+              userId,
+              contextMessageCount: contextMessages.length,
+              pointerMessageId: session.summarizedUpToMessageId || "none",
+            },
+          );
+
+          const sendToolPreview =
+            this.config?.contextCompaction?.sendToolPreview === true;
+
+          // Map tool_result messages: apply preview toggle + hydrate result.result
+          const finalMessages = contextMessages.map((msg) => {
+            if (msg.role !== "tool_result") {
+              return msg;
+            }
+
+            // Toggle: swap content to preview if enabled AND a preview exists
+            const content =
+              sendToolPreview && msg.metadata?.toolOutputPreview
+                ? msg.metadata.toolOutputPreview
+                : msg.content;
+
+            // Hydrate result.result from content for backward compatibility
+            // (result.result is no longer stored — inferred from content at read time)
+            let hydratedResult = msg.result;
+            if (msg.result && msg.result.result === undefined) {
+              let parsedResult: unknown = content;
+              try {
+                parsedResult = JSON.parse(content);
+              } catch {
+                /* plain text — use as-is */
+              }
+              hydratedResult = { ...msg.result, result: parsedResult };
+            }
+
+            logger.debug(
+              "[RedisConversationMemoryManager] Processing tool_result message for context",
+              {
+                sessionId,
+                userId,
+                messageId: msg.id,
+                sendToolPreview,
+                hasPreview: !!msg.metadata?.toolOutputPreview,
+                contentLength: content ? String(content).length : 0,
+                resultHydrated: hydratedResult !== msg.result,
+              },
+            );
+
+            return { ...msg, content, result: hydratedResult };
+          });
+
+          // Tool messages now have real content and participate in context properly.
+          // The tool output pruner (Stage 1) handles bounding old tool outputs.
+
+          span.setAttribute("context.message_count", finalMessages.length);
+          span.setStatus({ code: SpanStatusCode.OK });
+          logger.info(
+            "[RedisConversationMemoryManager] Retrieved context messages",
+            {
+              sessionId,
+              userId,
+            },
+          );
+
+          return finalMessages;
+        } catch (error) {
+          span.setStatus({
+            code: SpanStatusCode.ERROR,
+            message: error instanceof Error ? error.message : String(error),
+          });
+          span.recordException(
+            error instanceof Error ? error : new Error(String(error)),
+          );
+          throw error;
+        } finally {
+          span.end();
+        }
+      },
+    );
   }
 
   /**
@@ -810,6 +1327,12 @@ export class RedisConversationMemoryManager {
           title: conversation.title,
           createdAt: conversation.createdAt,
           updatedAt: conversation.updatedAt,
+          metadata: conversation.additionalMetadata?.agenticLoopReports
+            ? {
+                agenticLoopReports:
+                  conversation.additionalMetadata.agenticLoopReports,
+              }
+            : undefined,
         };
       }
 
@@ -931,7 +1454,10 @@ export class RedisConversationMemoryManager {
     if (!this.redisClient) {
       logger.warn(
         "[RedisConversationMemoryManager] Redis client not available for getUserSessionObject",
-        { userId, sessionId },
+        {
+          userId,
+          sessionId,
+        },
       );
       return null;
     }
@@ -953,7 +1479,10 @@ export class RedisConversationMemoryManager {
       }
 
       // Deserialize the complete conversation object
-      const conversation = deserializeConversation(conversationData);
+      const conversation = await this.hydrateMessages(
+        deserializeConversation(conversationData),
+        sessionKey,
+      );
       if (!conversation) {
         logger.debug(
           "[RedisConversationMemoryManager] Failed to deserialize conversation data",
@@ -998,11 +1527,33 @@ export class RedisConversationMemoryManager {
   }
 
   /**
+   * Announce a stored title. A throwing listener is logged rather than
+   * propagated: the title is already persisted, and the caller's catch block
+   * reports title-generation failures.
+   */
+  private emitTitleGenerated(event: ConversationTitleGeneratedEvent): void {
+    try {
+      this.eventEmitter?.emit("conversation:titleGenerated", event);
+    } catch (listenerError) {
+      logger.warn(
+        "[RedisConversationMemoryManager] conversation:titleGenerated listener threw",
+        {
+          sessionId: event.sessionId,
+          error:
+            listenerError instanceof Error
+              ? listenerError.message
+              : String(listenerError),
+        },
+      );
+    }
+  }
+
+  /**
    * Generate a conversation title from the first user message
    * Uses AI to create a concise, descriptive title (5-8 words)
    */
   async generateConversationTitle(userMessage: string): Promise<string> {
-    logger.debug(
+    logger.info(
       "[RedisConversationMemoryManager] Generating conversation title",
       {
         userMessageLength: userMessage.length,
@@ -1016,18 +1567,23 @@ export class RedisConversationMemoryManager {
         conversationMemory: { enabled: false },
       });
 
-      const titlePrompt = `Generate a clear, concise, and descriptive title (5–8 words maximum) for a conversation based on the following user message. 
-The title must meaningfully reflect the topic or intent of the message. 
-Do not output anything unrelated, vague, or generic. 
+      const defaultTitlePrompt = `Generate a clear, concise, and descriptive title (20-25 letters maximum) for a conversation based on the following user message.
+The title must meaningfully reflect the topic or intent of the message.
+Do not output anything unrelated, vague, or generic.
 Do not say you cannot create a title. Always return a valid title.
 
-User message: "${userMessage}`;
+User message: "${userMessage}"`;
+
+      const customPrompt = process.env.NEUROLINK_TITLE_PROMPT;
+      const titlePrompt = customPrompt
+        ? customPrompt.replace(/\$\{userMessage\}/g, userMessage)
+        : defaultTitlePrompt;
 
       const result = await titleGenerator.generate({
         input: { text: titlePrompt },
         provider: this.config.summarizationProvider || "vertex",
         model: this.config.summarizationModel || "gemini-2.5-flash",
-        disableTools: false,
+        disableTools: true, // Title generation doesn't need tools — saves ~600 tokens of tool descriptions
       });
 
       // Clean up the generated title
@@ -1038,15 +1594,11 @@ User message: "${userMessage}`;
       title = title.replace(/['"]/g, ""); // Remove quotes
       title = title.replace(/\.$/, ""); // Remove trailing period
 
-      if (title.length > 60) {
-        title = title.substring(0, 57) + "...";
-      }
-
       if (title.length < 3) {
         title = "New Conversation";
       }
 
-      logger.debug(
+      logger.info(
         "[RedisConversationMemoryManager] Generated conversation title",
         {
           originalLength: result.content?.length || 0,
@@ -1097,11 +1649,111 @@ User message: "${userMessage}`;
   }
 
   /**
+   * Get the raw messages array for a session.
+   * Returns the full messages list without context filtering or summarization.
+   */
+  async getSessionMessages(
+    sessionId: string,
+    userId?: string,
+  ): Promise<ChatMessage[]> {
+    await this.ensureInitialized();
+    if (!this.redisClient) {
+      return [];
+    }
+
+    try {
+      const redisKey = getSessionKey(this.redisConfig, sessionId, userId);
+      const conversationData = await this.redisClient.get(redisKey);
+      const conversation = await this.hydrateMessages(
+        deserializeConversation(conversationData || null),
+        redisKey,
+      );
+      return conversation?.messages ?? [];
+    } catch (error) {
+      logger.error(
+        "[RedisConversationMemoryManager] Failed to get session messages",
+        {
+          sessionId,
+          userId,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      );
+      return [];
+    }
+  }
+
+  /**
+   * Replace the entire messages array for a session.
+   * The session must already exist in Redis.
+   */
+  async setSessionMessages(
+    sessionId: string,
+    messages: ChatMessage[],
+    userId?: string,
+  ): Promise<void> {
+    await this.ensureInitialized();
+    if (!this.redisClient) {
+      throw new ConversationMemoryError(
+        "Redis client not initialized",
+        "STORAGE_ERROR",
+        { sessionId },
+      );
+    }
+
+    try {
+      const redisKey = getSessionKey(this.redisConfig, sessionId, userId);
+      const conversationData = await this.redisClient.get(redisKey);
+      const conversation = deserializeConversation(conversationData || null);
+
+      if (!conversation) {
+        throw new ConversationMemoryError(
+          `Session ${sessionId} not found`,
+          "STORAGE_ERROR",
+          { sessionId },
+        );
+      }
+
+      conversation.messages = messages;
+      conversation.updatedAt = new Date().toISOString();
+      // Reset summarization pointers — the old summary no longer applies
+      // to the replaced messages array
+      conversation.summarizedUpToMessageId = undefined;
+      conversation.summarizedMessage = undefined;
+      conversation.lastTokenCount = undefined;
+      conversation.lastCountedAt = undefined;
+
+      // Wholesale replacement: rewrite the LIST rather than appending.
+      await this.persistConversation(conversation, sessionId, userId);
+
+      logger.debug(
+        "[RedisConversationMemoryManager] Session messages replaced",
+        {
+          sessionId,
+          userId,
+          messageCount: messages.length,
+        },
+      );
+    } catch (error) {
+      if (error instanceof ConversationMemoryError) {
+        throw error;
+      }
+      throw new ConversationMemoryError(
+        `Failed to set session messages for session ${sessionId}`,
+        "STORAGE_ERROR",
+        {
+          sessionId,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      );
+    }
+  }
+
+  /**
    * Close Redis connection
    */
   public async close(): Promise<void> {
     if (this.redisClient) {
-      await this.redisClient.quit();
+      await releasePooledRedisClient(this.redisConfig);
       this.redisClient = null;
       this.isInitialized = false;
       logger.info("Redis connection closed");
@@ -1130,19 +1782,33 @@ User message: "${userMessage}`;
       },
     );
 
+    // Companion message LISTs share the session key prefix, so the SCAN above
+    // returns them too. GET on a LIST raises WRONGTYPE, and counting them as
+    // sessions would double `totalSessions` — filter them out exactly as the
+    // session listing already skips `:sessions` index keys.
+    const sessionKeys = keys.filter((key) => this.isConversationBlobKey(key));
+
     // Count messages in each session
     let totalTurns = 0;
 
-    for (const key of keys) {
+    for (const key of sessionKeys) {
       const conversationData = await this.redisClient.get(key);
-      const conversation = deserializeConversation(conversationData);
+      const conversation = await this.hydrateMessages(
+        deserializeConversation(conversationData),
+        key,
+      );
       if (conversation?.messages) {
-        totalTurns += conversation.messages.length / MESSAGES_PER_TURN;
+        // Pinned skill messages are extra rows inside a turn — exclude them
+        // so a skill-activating turn still counts as one turn.
+        totalTurns +=
+          conversation.messages.filter(
+            (msg: ChatMessage) => !msg.metadata?.isSkill,
+          ).length / MESSAGES_PER_TURN;
       }
     }
 
     return {
-      totalSessions: keys.length,
+      totalSessions: sessionKeys.length,
       totalTurns,
     };
   }
@@ -1159,21 +1825,57 @@ User message: "${userMessage}`;
     if (!this.redisClient) {
       return false;
     }
+    const redisClient = this.redisClient;
 
-    const redisKey = getSessionKey(this.redisConfig, sessionId, userId);
-    const result = await this.redisClient.del(redisKey);
+    // NLK-GAP-012: Add span for clearSession CRUD operation
+    return redisTracer.startActiveSpan(
+      "memory.clear",
+      {
+        kind: SpanKind.CLIENT,
+        attributes: {
+          "session.id": sessionId,
+          ...(userId && { "user.id": userId }),
+        },
+      },
+      async (span) => {
+        try {
+          const redisKey = getSessionKey(this.redisConfig, sessionId, userId);
+          // Delete the companion message LIST as well: leaving it behind would
+          // leak the messages and let a re-created session inherit them.
+          const result = await withTimeout(
+            redisClient.del([redisKey, `${redisKey}${MESSAGES_KEY_SUFFIX}`]),
+            REDIS_TIMEOUT_MS,
+          );
 
-    if (result > 0) {
-      // Remove session from user's session set
-      if (userId) {
-        await this.removeUserSession(userId, sessionId);
-      }
+          if (Number(result) > 0) {
+            // Remove session from user's session set
+            if (userId) {
+              await this.removeUserSession(userId, sessionId);
+            }
 
-      logger.info("Redis session cleared", { sessionId });
-      return true;
-    }
+            span.setAttribute("session.deleted", true);
+            span.setStatus({ code: SpanStatusCode.OK });
+            logger.info("Redis session cleared", { sessionId });
+            return true;
+          }
 
-    return false;
+          span.setAttribute("session.deleted", false);
+          span.setStatus({ code: SpanStatusCode.OK });
+          return false;
+        } catch (error) {
+          span.setStatus({
+            code: SpanStatusCode.ERROR,
+            message: error instanceof Error ? error.message : String(error),
+          });
+          span.recordException(
+            error instanceof Error ? error : new Error(String(error)),
+          );
+          throw error;
+        } finally {
+          span.end();
+        }
+      },
+    );
   }
 
   /**
@@ -1311,8 +2013,6 @@ User message: "${userMessage}`;
                   : String(sessionError),
             },
           );
-          // Continue with other sessions even if one fails
-          continue;
         }
       }
 
@@ -1328,6 +2028,104 @@ User message: "${userMessage}`;
       );
       return results;
     }
+  }
+
+  /**
+   * List all sessions with metadata for CLI/API usage
+   * Implements IConversationMemoryManager.listSessions
+   * @param userId - Optional user identifier to filter sessions
+   * @returns Array of session list items with metadata
+   */
+  public async listSessions(userId?: string): Promise<SessionListItem[]> {
+    await this.ensureInitialized();
+    if (!this.redisClient) {
+      return [];
+    }
+
+    const now = Date.now();
+    const list: SessionListItem[] = [];
+
+    if (userId) {
+      // List sessions for a specific user
+      const sessionIds = await this.getUserSessions(userId);
+      for (const sessionId of sessionIds) {
+        const session = await this.getUserSessionObject(userId, sessionId);
+        if (!session) {
+          continue;
+        }
+        list.push({
+          id: session.sessionId,
+          title: session.title || session.sessionId,
+          createdAt: session.createdAt,
+          updatedAt: session.updatedAt,
+          userId: session.userId,
+          messageCount: session.messages.length,
+          lastActive: this.formatTimeAgo(
+            now - new Date(session.updatedAt).getTime(),
+          ),
+        });
+      }
+    } else {
+      // List all sessions across all users by scanning Redis keys
+      const keys = await scanKeys(
+        this.redisClient,
+        `${this.redisConfig.keyPrefix}*`,
+      );
+      for (const key of keys) {
+        // Skip user session index keys (they end with :sessions) and the
+        // companion message LISTs — GET on a LIST raises WRONGTYPE.
+        if (!this.isConversationBlobKey(key)) {
+          continue;
+        }
+        const raw = await this.redisClient.get(key);
+        if (!raw) {
+          continue;
+        }
+        const session = deserializeConversation(raw);
+        if (!session) {
+          continue;
+        }
+        list.push({
+          id: session.sessionId,
+          title: session.title || session.sessionId,
+          createdAt: session.createdAt,
+          updatedAt: session.updatedAt,
+          userId: session.userId,
+          // LLEN for split sessions: the blob's inline array is empty here
+          // because this branch reads the raw key without hydrating.
+          messageCount: await this.countMessages(session, key),
+          lastActive: this.formatTimeAgo(
+            now - new Date(session.updatedAt).getTime(),
+          ),
+        });
+      }
+    }
+
+    return list.sort(
+      (a, b) =>
+        new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
+    );
+  }
+
+  /**
+   * Format milliseconds into human-readable time ago string
+   */
+  private formatTimeAgo(ms: number): string {
+    const seconds = Math.floor(ms / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const hours = Math.floor(minutes / 60);
+    const days = Math.floor(hours / 24);
+
+    if (days > 0) {
+      return `${days} day${days > 1 ? "s" : ""} ago`;
+    }
+    if (hours > 0) {
+      return `${hours} hour${hours > 1 ? "s" : ""} ago`;
+    }
+    if (minutes > 0) {
+      return `${minutes} minute${minutes > 1 ? "s" : ""} ago`;
+    }
+    return "just now";
   }
 
   /**
@@ -1390,68 +2188,303 @@ User message: "${userMessage}`;
       },
     );
 
-    // Create a mapping from toolCallId to toolName for matching tool results
-    const toolCallMap = new Map<string, string>();
+    try {
+      // Create a mapping from toolCallId to toolName for matching tool results
+      const toolCallMap = new Map<string, string>();
 
-    // Create separate messages for tool calls and build the mapping
-    for (const toolCall of pendingData.toolCalls) {
-      const toolCallId = String(toolCall.toolCallId);
-      const toolName = String(toolCall.toolName);
+      // Create separate messages for tool calls and build the mapping
+      for (const toolCall of pendingData.toolCalls) {
+        const toolCallId = toolCall.toolCallId ?? "";
+        const toolName = toolCall.toolName ?? "";
 
-      // Store in mapping for tool results
-      toolCallMap.set(toolCallId, toolName);
+        // Store in mapping for tool results
+        toolCallMap.set(toolCallId, toolName);
 
-      const toolCallMessage: ChatMessage = {
-        id: randomUUID(),
-        timestamp:
-          toolCall.timestamp?.toISOString() || this.generateTimestamp(),
-        role: "tool_call",
-        content: "", // Can be empty for tool calls
-        tool: toolName,
-        args: (toolCall.args ||
-          toolCall.arguments ||
-          toolCall.parameters ||
-          {}) as Record<string, unknown>,
-      };
-      conversation.messages.push(toolCallMessage);
-    }
+        const toolCallMessage: ChatMessage = {
+          id: randomUUID(),
+          timestamp:
+            toolCall.timestamp?.toISOString() || this.generateTimestamp(),
+          role: "tool_call",
+          content: "", // Can be empty for tool calls
+          tool: toolName,
+          // Persisted so repairToolPairs can pair by ID rather than adjacency —
+          // a parallel batch writes all calls before any result, so position
+          // carries no pairing information.
+          ...(toolCallId ? { toolCallId } : {}),
+          args: (toolCall.args ||
+            toolCall.arguments ||
+            toolCall.parameters ||
+            {}) as Record<string, unknown>,
+          metadata: {
+            ...(toolCall.thoughtSignature
+              ? { thoughtSignature: String(toolCall.thoughtSignature) }
+              : {}),
+            ...(toolCall.stepIndex !== null && toolCall.stepIndex !== undefined
+              ? { stepIndex: Number(toolCall.stepIndex) }
+              : {}),
+          },
+        };
+        conversation.messages.push(toolCallMessage);
+      }
 
-    // Create separate messages for tool results using the mapping
-    for (const toolResult of pendingData.toolResults) {
-      const toolCallId = String(
-        toolResult.toolCallId || toolResult.id || "unknown",
-      );
-      const toolName = toolCallMap.get(toolCallId) || "unknown";
+      // Create separate messages for tool results using the mapping
+      for (const toolResult of pendingData.toolResults) {
+        const toolCallId = String(
+          toolResult.toolCallId || toolResult.id || "unknown",
+        );
+        const toolName =
+          toolCallMap.get(toolCallId) ||
+          String(toolResult.toolName || "unknown");
+        const toolResultRecord = toolResult as Record<string, unknown>;
+        const selectedResultField =
+          "output" in toolResultRecord ? "output" : "result";
+        const toolResultValue =
+          selectedResultField === "output"
+            ? toolResultRecord.output
+            : toolResult.result;
 
-      const toolResultMessage: ChatMessage = {
-        id: randomUUID(),
-        timestamp:
-          toolResult.timestamp?.toISOString() || this.generateTimestamp(),
-        role: "tool_result",
-        content: "", // Can be empty for tool results
-        tool: toolName, // Now correctly extracted from tool call mapping
-        result: {
-          success: !toolResult.error,
-          result: toolResult.result,
-          error: toolResult.error ? String(toolResult.error) : undefined,
+        // Serialize the tool result to string for content field
+        let serializedResult: string;
+        if (typeof toolResultValue === "string") {
+          serializedResult = toolResultValue;
+        } else if (toolResultValue === undefined || toolResultValue === null) {
+          serializedResult = String(toolResultValue ?? "null");
+        } else {
+          try {
+            serializedResult = JSON.stringify(toolResultValue, null, 2);
+          } catch (serializeError) {
+            serializedResult = `[Serialization failed: ${serializeError instanceof Error ? serializeError.message : String(serializeError)}]`;
+          }
+        }
+
+        // Generate preview (uses existing config fields that were previously unused)
+        const { preview, truncated, originalSize } = generateToolOutputPreview(
+          serializedResult,
+          {
+            maxBytes: this.config?.contextCompaction?.maxToolOutputBytes,
+            maxLines: this.config?.contextCompaction?.maxToolOutputLines,
+          },
+        );
+
+        // Extract artifact ID if this result was externalized by McpOutputNormalizer.
+        // The surrogate carries `_meta.neurolinkArtifactId` on the raw result object.
+        let artifactId: string | undefined;
+        try {
+          const rawResult = toolResultValue;
+          if (rawResult && typeof rawResult === "object") {
+            const meta = (rawResult as Record<string, unknown>)._meta;
+            if (meta && typeof meta === "object") {
+              const idValue = (meta as Record<string, unknown>)[
+                NEUROLINK_ARTIFACT_ID_KEY
+              ];
+              if (typeof idValue === "string") {
+                artifactId = idValue;
+              }
+            }
+          }
+        } catch {
+          // Ignore extraction errors — artifact ID is best-effort metadata
+        }
+
+        // Build metadata — only store preview when truncation occurred (no duplication)
+        const metadata: ChatMessageMetadata = {
+          truncated,
+          ...(truncated && { toolOutputPreview: preview }),
+          ...(truncated && { originalSize }),
+          ...(artifactId && { artifactId }),
+          ...(toolResult.stepIndex !== null &&
+          toolResult.stepIndex !== undefined
+            ? { stepIndex: Number(toolResult.stepIndex) }
+            : {}),
+        };
+
+        // Build result — success/error metadata only, NOT the output data.
+        // An `isError: true` payload the tool RETURNED (converted throw,
+        // breaker refusal, MCP failure) is a failure as much as a thrown one,
+        // and is flagged here so replay never reports it as "→ ok".
+        const resultError =
+          toolResult.error !== undefined && toolResult.error !== null
+            ? String(toolResult.error)
+            : extractIsErrorText(toolResultValue);
+        const result: ToolResultData = {
+          success: resultError === undefined,
+          // result.result intentionally NOT stored — inferred from content at read time
+          error: resultError,
+        };
+
+        const toolResultMessage: ChatMessage = {
+          id: randomUUID(),
+          timestamp:
+            toolResult.timestamp?.toISOString() || this.generateTimestamp(),
+          role: "tool_result",
+          content: serializedResult, // Full output (was "")
+          tool: toolName,
+          // Only a REAL id is persisted: the "unknown" sentinel above would
+          // otherwise collide across every unidentifiable result and pair them
+          // to each other. Absent id falls back to legacy positional pairing.
+          ...(toolCallId && toolCallId !== "unknown" ? { toolCallId } : {}),
+          result,
+          metadata,
+        };
+
+        conversation.messages.push(toolResultMessage);
+      }
+
+      logger.debug(
+        "[RedisConversationMemoryManager] Successfully flushed pending tool data",
+        {
+          sessionId,
+          userId,
+          toolMessagesAdded:
+            pendingData.toolCalls.length + pendingData.toolResults.length,
+          totalMessages: conversation.messages.length,
         },
-      };
-
-      conversation.messages.push(toolResultMessage);
+      );
+    } finally {
+      // Always clean up pending data, even on failure, to prevent infinite retry loops
+      this.pendingToolExecutions.delete(pendingKey);
     }
+  }
 
-    // Remove the pending data now that it's been flushed
-    this.pendingToolExecutions.delete(pendingKey);
-
+  /**
+   * Update agentic loop report metadata for a conversation session.
+   * Upserts a report entry by reportId — updates existing or adds new.
+   * Follows the read → patch → write pattern (same as title generation).
+   *
+   * @param sessionId The session identifier
+   * @param userId The user identifier (optional)
+   * @param report The report metadata to upsert
+   */
+  public async updateAgenticLoopReport(
+    sessionId: string,
+    userId: string | undefined,
+    report: AgenticLoopReportMetadata,
+  ): Promise<void> {
     logger.debug(
-      "[RedisConversationMemoryManager] Successfully flushed pending tool data",
+      "[RedisConversationMemoryManager] Updating agentic loop report",
       {
         sessionId,
         userId,
-        toolMessagesAdded:
-          pendingData.toolCalls.length + pendingData.toolResults.length,
-        totalMessages: conversation.messages.length,
+        reportId: report.reportId,
+        reportType: report.reportType,
+        reportStatus: report.reportStatus,
       },
     );
+
+    await this.ensureInitialized();
+
+    if (!this.redisClient) {
+      logger.warn(
+        "[RedisConversationMemoryManager] Redis client not available for report update",
+        { sessionId, userId },
+      );
+      return;
+    }
+
+    try {
+      const redisKey = getSessionKey(
+        this.redisConfig,
+        sessionId,
+        userId || undefined,
+      );
+      const conversationData = await withTimeout(
+        this.redisClient.get(redisKey),
+        5000,
+      );
+
+      if (!conversationData) {
+        logger.warn(
+          "[RedisConversationMemoryManager] No conversation found for report update",
+          { sessionId, userId },
+        );
+        return;
+      }
+
+      const conversation = deserializeConversation(conversationData);
+      if (!conversation) {
+        logger.warn(
+          "[RedisConversationMemoryManager] Failed to deserialize conversation for report update",
+          { sessionId, userId },
+        );
+        return;
+      }
+
+      // Initialize additionalMetadata and agenticLoopReports if needed
+      if (!conversation.additionalMetadata) {
+        conversation.additionalMetadata = {};
+      }
+      if (!conversation.additionalMetadata.agenticLoopReports) {
+        conversation.additionalMetadata.agenticLoopReports = [];
+      }
+
+      // Upsert: find existing report by reportId and update, or push new entry
+      const existingIndex =
+        conversation.additionalMetadata.agenticLoopReports.findIndex(
+          (r) => r.reportId === report.reportId,
+        );
+
+      if (existingIndex >= 0) {
+        conversation.additionalMetadata.agenticLoopReports[existingIndex] =
+          report;
+        logger.debug(
+          "[RedisConversationMemoryManager] Updated existing agentic loop report",
+          { sessionId, reportId: report.reportId },
+        );
+      } else {
+        conversation.additionalMetadata.agenticLoopReports.push(report);
+        logger.debug(
+          "[RedisConversationMemoryManager] Added new agentic loop report",
+          { sessionId, reportId: report.reportId },
+        );
+      }
+
+      conversation.updatedAt = new Date().toISOString();
+
+      // Write back to Redis. Metadata-only change, so the companion LIST is
+      // untouched — but the split marker must survive (see the summarization
+      // writeback above for why dropping it loses messages).
+      const serializedData = usesSplitMessageStorage(conversation)
+        ? serializeConversationMetadata(conversation)
+        : serializeConversation(conversation);
+      await withTimeout(
+        setWithTtl(
+          this.redisClient,
+          redisKey,
+          serializedData,
+          this.redisConfig.ttl,
+        ),
+        5000,
+      );
+
+      logger.info(
+        "[RedisConversationMemoryManager] Successfully updated agentic loop report",
+        {
+          sessionId,
+          userId,
+          reportId: report.reportId,
+          reportStatus: report.reportStatus,
+        },
+      );
+    } catch (error) {
+      logger.error(
+        "[RedisConversationMemoryManager] Failed to update agentic loop report",
+        {
+          sessionId,
+          userId,
+          reportId: report.reportId,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      );
+      throw new ConversationMemoryError(
+        "Failed to update agentic loop report",
+        "STORAGE_ERROR",
+        {
+          sessionId,
+          userId,
+          reportId: report.reportId,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      );
+    }
   }
 }

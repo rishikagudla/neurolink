@@ -1,14 +1,15 @@
 import { AIProviderFactory } from "../../core/factory.js";
 import { logger } from "../../utils/logger.js";
+import { vetRegexPattern } from "./regexSafety.js";
 import type {
   BadWordsConfig,
+  LanguageModelV3GenerateResult,
+  LanguageModelV3StreamPart,
   ContentFilteringResult,
   EvaluationActionResult,
   PrecallEvaluationConfig,
   PrecallEvaluationResult,
-} from "../../types/guardrails.js";
-import type { LanguageModelV1CallOptions } from "ai";
-
+} from "../../types/index.js";
 export const DEFAULT_EVALUATION_PROMPT = `
 Evaluate the following user input for safety and appropriateness. Respond ONLY with valid JSON:
 
@@ -31,30 +32,46 @@ Evaluate the following user input for safety and appropriateness. Respond ONLY w
 User Input: "{USER_INPUT}"
 `;
 
+/** Longest slice of a refused pattern written to the log. */
+const MAX_LOGGED_PATTERN_LENGTH = 60;
+
+const describePattern = (pattern: string): string =>
+  pattern.length > MAX_LOGGED_PATTERN_LENGTH
+    ? `${pattern.slice(0, MAX_LOGGED_PATTERN_LENGTH)}...`
+    : pattern;
+
 /**
- * Extract user input from LanguageModelV1CallOptions
+ * Extract user input from middleware params
  */
-export function extractUserInput(params: LanguageModelV1CallOptions): string {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function extractUserInput(params: any): string {
   if (typeof params.prompt === "string") {
     return params.prompt;
   }
 
-  return params.prompt
-    .map((msg) => {
-      if (msg.role === "user") {
-        if (typeof msg.content === "string") {
-          return msg.content;
-        } else if (Array.isArray(msg.content)) {
-          return msg.content
-            .filter((part) => part.type === "text")
-            .map((part) => part.text)
-            .join(" ");
+  return (
+    params.prompt
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .map((msg: any) => {
+        if (msg.role === "user") {
+          if (typeof msg.content === "string") {
+            return msg.content;
+          } else if (Array.isArray(msg.content)) {
+            return (
+              msg.content
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                .filter((part: any) => part.type === "text")
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                .map((part: any) => part.text)
+                .join(" ")
+            );
+          }
         }
-      }
-      return "";
-    })
-    .filter(Boolean)
-    .join("\n");
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n")
+  );
 }
 
 export function parseEvaluationResponse(
@@ -96,11 +113,13 @@ export function parseEvaluationResponse(
  * @returns An object indicating if the request should be blocked and the (potentially transformed) params.
  */
 export async function handlePrecallGuardrails(
-  params: LanguageModelV1CallOptions,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  params: any,
   config: PrecallEvaluationConfig,
 ): Promise<{
   shouldBlock: boolean;
-  transformedParams: LanguageModelV1CallOptions;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  transformedParams: any;
 }> {
   const userInput = extractUserInput(params);
   let transformedParams = params;
@@ -150,7 +169,7 @@ export async function performPrecallEvaluation(
   try {
     const provider = await AIProviderFactory.createProvider(
       config.provider || "google-ai",
-      config.evaluationModel || "gemini-1.5-flash",
+      config.evaluationModel || "gemini-2.5-flash",
     );
 
     const evaluationPrompt =
@@ -233,6 +252,14 @@ export function applyEvaluationActions(
 
         patterns.forEach((pattern, index) => {
           try {
+            const verdict = vetRegexPattern(pattern);
+            if (!verdict.safe) {
+              logger.error(
+                `[GuardrailsUtils] Refusing sanitization pattern "${describePattern(pattern)}": ${verdict.reason}. The pattern is skipped.`,
+              );
+              return;
+            }
+
             const regex = new RegExp(pattern, "gi");
             const before = sanitized;
             let matchCount = 0;
@@ -293,14 +320,13 @@ export function applyEvaluationActions(
 /**
  * Apply parameter sanitization to request parameters
  */
-export function applySanitization(
-  params: LanguageModelV1CallOptions,
-  sanitizedInput: string,
-): LanguageModelV1CallOptions {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function applySanitization(params: any, sanitizedInput: string): any {
   const sanitizedParams = { ...params };
 
   if (Array.isArray(params.prompt)) {
-    const sanitizedPrompt = params.prompt.map((msg) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sanitizedPrompt = params.prompt.map((msg: any) => {
       if (msg.role === "user") {
         if (typeof msg.content === "string") {
           return {
@@ -308,7 +334,8 @@ export function applySanitization(
             content: [{ type: "text" as const, text: sanitizedInput }],
           };
         } else if (Array.isArray(msg.content)) {
-          const sanitizedContent = msg.content.map((part) => {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const sanitizedContent = msg.content.map((part: any) => {
             if (part.type === "text") {
               return { ...part, text: sanitizedInput };
             }
@@ -330,28 +357,34 @@ export function escapeRegExp(string: string): string {
   return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-export function createBlockedResponse() {
+export function createBlockedResponse(): LanguageModelV3GenerateResult {
   return {
-    text: "Request contains inappropriate content and has been blocked.",
-    usage: { promptTokens: 0, completionTokens: 0 },
-    finishReason: "stop" as const,
+    content: [
+      {
+        type: "text",
+        text: "Request contains inappropriate content and has been blocked.",
+      },
+    ],
+    usage: { inputTokens: { total: 0 }, outputTokens: { total: 0 } },
+    finishReason: { unified: "stop" },
     warnings: [],
-    rawCall: { rawPrompt: null, rawSettings: {} },
   };
 }
 
-export function createBlockedStream() {
-  return new ReadableStream({
+export function createBlockedStream(): ReadableStream<LanguageModelV3StreamPart> {
+  return new ReadableStream<LanguageModelV3StreamPart>({
     start(controller) {
+      controller.enqueue({ type: "text-start", id: "blocked" });
       controller.enqueue({
         type: "text-delta",
-        textDelta:
-          "Request contains inappropriate content and has been blocked.",
+        id: "blocked",
+        delta: "Request contains inappropriate content and has been blocked.",
       });
+      controller.enqueue({ type: "text-end", id: "blocked" });
       controller.enqueue({
         type: "finish",
-        finishReason: "stop",
-        usage: { promptTokens: 0, completionTokens: 0 },
+        finishReason: { unified: "stop" },
+        usage: { inputTokens: { total: 0 }, outputTokens: { total: 0 } },
       });
       controller.close();
     },
@@ -390,6 +423,8 @@ export function applyContentFiltering(
     let hasChanges = false;
     const appliedFilters: string[] = [];
     let totalMatches = 0;
+    let regexPatternsApplied = 0;
+    let regexPatternsRejected = 0;
     const replacementText = badWordsConfig.replacementText || "[REDACTED]";
 
     // Priority 1: Use regex patterns if provided
@@ -409,22 +444,17 @@ export function applyContentFiltering(
 
       for (const pattern of badWordsConfig.regexPatterns) {
         try {
-          // TODO: Add blocking for overly complex or long patterns
-          if (pattern.length > 1000) {
-            logger.warn(
-              `[ContentFiltering:${context}] Regex pattern exceeds max length (1000 chars): "${pattern.substring(0, 50)}..."`,
+          const verdict = vetRegexPattern(pattern);
+          if (!verdict.safe) {
+            regexPatternsRejected++;
+            logger.error(
+              `[ContentFiltering:${context}] Refusing regex pattern "${describePattern(pattern)}": ${verdict.reason}. The pattern is skipped.`,
             );
+            continue;
           }
 
           const regex = new RegExp(pattern, "gi");
-
-          const testStart = Date.now();
-          regex.test("test");
-          if (Date.now() - testStart > 100) {
-            logger.warn(
-              `[ContentFiltering:${context}] Regex pattern "${pattern}" appears to be too complex (slow test execution).`,
-            );
-          }
+          regexPatternsApplied++;
 
           const before = filteredText;
           let matchCount = 0;
@@ -482,7 +512,8 @@ export function applyContentFiltering(
       hasChanges,
       appliedFilters,
       filteringStats: {
-        regexPatternsApplied: badWordsConfig.regexPatterns?.length || 0,
+        regexPatternsApplied,
+        regexPatternsRejected,
         stringFiltersApplied: badWordsConfig.list?.length || 0,
         totalMatches,
       },

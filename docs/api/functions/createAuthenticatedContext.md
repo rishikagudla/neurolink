@@ -1,0 +1,45 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / createAuthenticatedContext
+
+# Function: createAuthenticatedContext()
+
+> **createAuthenticatedContext**(`user`, `session`, `request`, `provider`): [`AuthenticatedContext`](../type-aliases/AuthenticatedContext.md)
+
+Create an authenticated context
+
+Helper to build an AuthenticatedContext object.
+
+## Parameters
+
+### user
+
+[`AuthUser`](../type-aliases/AuthUser.md)
+
+The authenticated user
+
+### session
+
+[`AuthSession`](../type-aliases/AuthSession.md)
+
+The user's session
+
+### request
+
+[`AuthRequestContext`](../type-aliases/AuthRequestContext.md)
+
+The original request context
+
+### provider
+
+[`AuthProviderType`](../type-aliases/AuthProviderType.md)
+
+The auth provider type
+
+## Returns
+
+[`AuthenticatedContext`](../type-aliases/AuthenticatedContext.md)
+
+Complete authenticated context

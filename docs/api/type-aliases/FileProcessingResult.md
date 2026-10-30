@@ -1,0 +1,259 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / FileProcessingResult
+
+# Type Alias: FileProcessingResult
+
+> **FileProcessingResult** = `object`
+
+File processing result after detection and conversion
+
+## Properties
+
+### type
+
+> **type**: [`FileType`](FileType.md)
+
+---
+
+### content
+
+> **content**: `string` \| `Buffer`
+
+---
+
+### mimeType
+
+> **mimeType**: `string`
+
+---
+
+### images?
+
+> `optional` **images?**: (`Buffer` \| `string` \| [`ImageWithAltText`](ImageWithAltText.md))[]
+
+Additional images extracted from the file (e.g., video keyframes, audio
+cover art).
+
+An entry may carry alt text, which is how a video keyframe states the
+timestamp it was sampled at. Bare bytes still work — the field was
+widened, not changed.
+
+---
+
+### metadata
+
+> **metadata**: `object`
+
+#### confidence
+
+> **confidence**: `number`
+
+#### size?
+
+> `optional` **size?**: `number`
+
+#### filename?
+
+> `optional` **filename?**: `string`
+
+#### extension?
+
+> `optional` **extension?**: `string` \| `null`
+
+#### rowCount?
+
+> `optional` **rowCount?**: `number`
+
+#### totalLines?
+
+> `optional` **totalLines?**: `number`
+
+#### columnCount?
+
+> `optional` **columnCount?**: `number`
+
+#### columnNames?
+
+> `optional` **columnNames?**: `string`[]
+
+#### sampleData?
+
+> `optional` **sampleData?**: `string` \| `unknown`[]
+
+#### hasEmptyColumns?
+
+> `optional` **hasEmptyColumns?**: `boolean`
+
+#### columnMetadata?
+
+> `optional` **columnMetadata?**: [`CSVColumnMetadata`](CSVColumnMetadata.md)[]
+
+Enhanced column metadata with type detection and statistics
+
+#### dataQualityWarnings?
+
+> `optional` **dataQualityWarnings?**: [`CSVDataQualityWarning`](CSVDataQualityWarning.md)[]
+
+Data quality warnings
+
+#### dataQualityScore?
+
+> `optional` **dataQualityScore?**: `number`
+
+Overall data quality score (0-100)
+
+#### hasHeaders?
+
+> `optional` **hasHeaders?**: `boolean`
+
+Whether headers were detected
+
+#### detectedDelimiter?
+
+> `optional` **detectedDelimiter?**: `string`
+
+Detected delimiter
+
+#### detectedEncoding?
+
+> `optional` **detectedEncoding?**: `string`
+
+Detected (or overridden) character encoding used to decode the CSV (#362)
+
+#### encodingConfidence?
+
+> `optional` **encodingConfidence?**: `number`
+
+Confidence (0-100) of the detected encoding (#362)
+
+#### columnNameMapping?
+
+> `optional` **columnNameMapping?**: `object`[]
+
+Original→sanitized column-name mapping when sanitizeColumnNames is on (#378)
+
+#### parseTimedOut?
+
+> `optional` **parseTimedOut?**: `boolean`
+
+True when the parse hit its time budget and returned partial rows (#379)
+
+#### version?
+
+> `optional` **version?**: `string`
+
+#### estimatedPages?
+
+> `optional` **estimatedPages?**: `number` \| `null`
+
+#### provider?
+
+> `optional` **provider?**: `string`
+
+#### apiType?
+
+> `optional` **apiType?**: [`PDFAPIType`](PDFAPIType.md)
+
+#### requiresCitations?
+
+> `optional` **requiresCitations?**: `boolean` \| `"auto"`
+
+Provider's citations requirement for visual PDF analysis (#349).
+
+#### officeFormat?
+
+> `optional` **officeFormat?**: [`OfficeDocumentType`](OfficeDocumentType.md)
+
+#### pageCount?
+
+> `optional` **pageCount?**: `number`
+
+#### slideCount?
+
+> `optional` **slideCount?**: `number`
+
+#### sheetCount?
+
+> `optional` **sheetCount?**: `number`
+
+#### sheetNames?
+
+> `optional` **sheetNames?**: `string`[]
+
+#### author?
+
+> `optional` **author?**: `string`
+
+#### createdDate?
+
+> `optional` **createdDate?**: `string`
+
+#### modifiedDate?
+
+> `optional` **modifiedDate?**: `string`
+
+#### hasFormulas?
+
+> `optional` **hasFormulas?**: `boolean`
+
+#### hasImages?
+
+> `optional` **hasImages?**: `boolean`
+
+#### frameCount?
+
+> `optional` **frameCount?**: `number`
+
+#### hasKeyframes?
+
+> `optional` **hasKeyframes?**: `boolean`
+
+#### durationSec?
+
+> `optional` **durationSec?**: `number`
+
+Clip length in seconds, when the processor could measure it.
+
+Surfaced here so the native-delivery gate does not have to re-probe a
+container the processor has already opened. Absent when probing failed
+— an unknown duration, not a zero-length clip.
+
+#### duration?
+
+> `optional` **duration?**: `number`
+
+Media duration in seconds, read from the container header.
+
+Sourced from the demuxed stream rather than from the transcription
+backend, so it is present for every audio file — including one that was
+never transcribed because no provider was configured.
+
+#### language?
+
+> `optional` **language?**: `string`
+
+Language of the transcript, as reported by the transcription provider
+(BCP-47 or ISO-639-1 depending on the backend), or the language the
+caller pinned via `AudioProcessorOptions.language`.
+
+Absent when the file was not transcribed — its absence therefore means
+"unknown", never "not speech".
+
+#### transcriptionLength?
+
+> `optional` **transcriptionLength?**: `number`
+
+Character count of the transcript.
+
+`0` is a meaningful value distinct from `undefined`: it means a provider
+ran and returned an empty transcript (silence, music, no speech), where
+`undefined` means no transcription was attempted at all.
+
+#### transcriptionProvider?
+
+> `optional` **transcriptionProvider?**: `string`
+
+Which backend produced the transcript, e.g. "openai-whisper".

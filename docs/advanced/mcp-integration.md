@@ -1,19 +1,5 @@
 # 🔧 MCP (Model Context Protocol) Integration Guide
 
-## ✅ IMPLEMENTATION STATUS: COMPLETE (2025-01-07)
-
-**Generate Function Migration completed - MCP integration enhanced with factory patterns**
-
-- ✅ MCP tools work seamlessly with modern `generate()` method
-- ✅ Factory pattern provides better MCP tool management
-- ✅ Enhanced error handling for MCP server connections
-- ✅ All existing MCP configurations continue working
-
-> **Migration Note**: MCP integration enhanced but remains transparent.
-> Use `generate()` for future-ready MCP workflows.
-
----
-
 **NeuroLink Universal AI Platform with External Server Connectivity**
 
 ---
@@ -90,7 +76,7 @@ import { NeuroLink } from "@juspay/neurolink";
 const neurolink = new NeuroLink();
 
 // Add external servers dynamically
-await neurolink.addMCPServer("bitbucket", {
+await neurolink.addExternalMCPServer("bitbucket", {
   command: "npx",
   args: ["-y", "@nexus2520/bitbucket-mcp-server"],
   env: {
@@ -100,21 +86,30 @@ await neurolink.addMCPServer("bitbucket", {
 });
 
 // Add database integration
-await neurolink.addMCPServer("database", {
+await neurolink.addExternalMCPServer("database", {
   command: "node",
   args: ["./custom-db-server.js"],
   env: { DB_CONNECTION: "postgresql://..." },
 });
 
-// Verify registration
+// Verify registration — getMCPStatus() also triggers MCP initialization,
+// so always call it before listMCPServers() to ensure the subsystem is ready.
 const status = await neurolink.getMCPStatus();
 console.log("Active servers:", status.totalServers);
+
+const servers = await neurolink.listMCPServers();
+console.log(
+  "Registered servers:",
+  servers.map((s) => s.name),
+);
 ```
 
-### **4. Execute Tools (Coming Soon)**
+### **4. Execute Tools (Planned)**
 
-```bash
-# Execute tools from connected servers
+> This feature is planned for a future release.
+
+```text
+# Execute tools from connected servers (planned — not yet implemented)
 npx neurolink mcp exec filesystem read_file --params '{"path": "README.md"}'
 npx neurolink mcp exec github create_issue --params '{"title": "New feature", "body": "Description"}'
 ```
@@ -236,9 +231,9 @@ neurolink mcp remove <server>
 
 ## ⚙️ **Configuration**
 
-### **External Server Configuration** [Coming Soon]
+### **External Server Configuration**
 
-External MCP servers will be configured in `.mcp-config.json`:
+External MCP servers are configured in `.mcp-config.json`:
 
 ```json
 {
@@ -266,9 +261,60 @@ External MCP servers will be configured in `.mcp-config.json`:
 }
 ```
 
+### **Who loads `.mcp-config.json`, and when**
+
+A project config names commands to run and URLs to connect to, so **a directory is not a trust boundary**: a cloned repository's `.mcp-config.json` must not run its servers with your credentials just because you ran something inside it.
+
+**SDK.** `new NeuroLink()` never reads the working directory's file on its own. Name the file, or opt into the directory, in the constructor:
+
+```typescript
+// Load a specific file (relative paths resolve against the working directory)
+const neurolink = new NeuroLink({
+  mcp: { configPath: "./config/mcp-servers.json" },
+});
+
+// Load <cwd>/.mcp-config.json — only for a directory you control
+const trusted = new NeuroLink({ mcp: { trustProjectConfig: true } });
+```
+
+Servers added with `addExternalMCPServer()` / `addInMemoryMCPServer()` are unaffected. The legacy `ProviderRegistry.setOptions({ enableManualMCP: true })` switch is now honoured too: set after construction, it re-enables the old working-directory discovery for that process.
+
+**CLI.** `neurolink` still discovers `./.mcp-config.json`, but loads it only after you have trusted that exact content. The file's SHA-256 is recorded in `~/.neurolink/trusted-mcp-configs.json` (`0600`, directory `0700`); a file that changes has to be trusted again.
+
+- In a terminal, the first tool-enabled command shows the servers (names, commands, URLs, `env` key names — never values) and asks `Trust this file and start these servers? [y/N]`.
+- Non-interactively (CI, pipes), an untrusted file is refused with exit status 1 at the moment it would load, with the same summary. Decide with one of:
+  - `neurolink generate "…" --trust-mcp-config` or `NEUROLINK_TRUST_MCP_CONFIG=1` — trust and record the hash;
+  - `NEUROLINK_TRUST_MCP_CONFIG=0` — run without the project config;
+  - `--disable-tools` — no MCP server is needed.
+- `neurolink --help`, `--version`, and any command that never initialises MCP are not affected.
+
+### **`${VAR}` references**
+
+`${NAME}` in a server's **`env`** and **`args`** is replaced with `process.env.NAME`. Only names matching `^[A-Z][A-Z0-9_]*$` are expanded; anything else is left as written. `${NAME}` is **never** expanded in `headers` or `url` — those values travel to a remote host, so a reference there would send the variable's value off the machine. A `${…}` left in a header is sent literally and logged as a warning.
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}" }
+    }
+  }
+}
+```
+
+### **What a stdio server inherits**
+
+A spawned server receives the MCP SDK's minimal default environment (`HOME`, `PATH`, `SHELL`, `TERM`, `USER`, `LOGNAME` on POSIX) plus its own `env`. It no longer receives the whole parent `process.env`, so provider keys and OAuth tokens held by the host do not reach an `npx -y …` server unless you pass them through: `"env": { "OPENAI_API_KEY": "${OPENAI_API_KEY}" }`. A server that genuinely needs everything can set `"inheritParentEnv": true`.
+
+### **Transport URLs**
+
+For `http`, `sse` and `websocket` servers the URL must use `https:` / `wss:` unless the host is loopback (`localhost`, `127.0.0.0/8`, `::1`), and the host must not be — or resolve to — a private, link-local, CGNAT or cloud-metadata address. A server on your own network opts out per entry with `"allowPrivateNetwork": true`, which also permits plaintext `http:` / `ws:` to private addresses; public hosts always need TLS. The WebSocket transport cannot send `headers` or `auth` (the handshake carries none), so a WebSocket server configured with either fails to connect instead of connecting unauthenticated — use `http` or `sse` for authenticated servers.
+
 ### **Environment Variables**
 
-Set these in your `.env` file for server authentication:
+Set these in your `.env` file for server authentication (the CLI loads `.env`; the SDK does not — see [Environment Variables](/docs/getting-started/environment-variables)):
 
 ```bash
 # Custom Server Configuration
@@ -442,6 +488,42 @@ neurolink mcp add project-server "python local-server.py" --cwd "/path/to/projec
 
 ---
 
+## 🚀 Advanced MCP Features
+
+NeuroLink provides advanced MCP capabilities for production environments with multiple servers and complex tool ecosystems.
+
+### Tool Router
+
+Intelligent tool call routing for multi-server environments with round-robin, least-loaded, capability-based, and session affinity strategies.
+
+### Tool Cache
+
+Cache tool results with configurable LRU, FIFO, or LFU eviction strategies, pattern-based invalidation, and cache statistics.
+
+### Request Batcher
+
+Batch multiple tool calls for efficient execution with automatic batch sizing and server-grouped batching.
+
+### Tool Annotations
+
+Add safety metadata to tools (readOnly, destructive, idempotent) with automatic safety level inference and annotation-based filtering.
+
+### Custom MCP Servers
+
+Create custom MCP servers using the `MCPServerBase` abstract class with built-in tool registration, event emission, and lifecycle management.
+
+### Elicitation Protocol
+
+Interactive tool input during execution supporting text, select, multi-select, confirmation, file upload, and form elicitation types.
+
+### Multi-Server Manager
+
+Load balancing and coordination across multiple MCP servers with server groups and a unified tool interface.
+
+> **Full Documentation**: See the [MCP Enhancements Guide](../features/mcp-enhancements.md) for complete API reference, configuration options, and usage examples.
+
+---
+
 ## 🚨 **Troubleshooting**
 
 ### **Common Issues**
@@ -548,7 +630,7 @@ neurolink workflow "
 
 - [MCP Testing Guide](mcp-testing-guide.md)
 - [CLI Command Reference](../cli/commands.md#mcp)
-- [API Integration](api-reference.md#mcp-integration)
+- [API Integration](../sdk/api-reference.md)
 
 ### **Community Servers**
 
@@ -558,14 +640,6 @@ neurolink workflow "
 ---
 
 ## 🚀 **What's Next?**
-
-### **Coming Soon**
-
-- ✅ **Tool Execution** - Direct tool invocation from CLI
-- ✅ **Workflow Orchestration** - Multi-step tool workflows
-- ✅ **AI Integration** - Tools accessible during AI generation
-- ✅ **Performance Optimization** - Parallel tool execution
-- ✅ **Advanced Security** - Fine-grained permissions
 
 ### **Get Involved**
 

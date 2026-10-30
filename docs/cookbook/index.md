@@ -15,6 +15,15 @@ Each recipe follows a consistent structure:
 
 ## Recipe Categories
 
+### Getting Started
+
+<!-- Absolute paths required: sync-docs.ts incorrectly resolves relative paths for new cookbook files -->
+
+- [**Basic Streaming**](/docs/cookbook/basic-streaming) - Stream AI responses in real time with the `result.stream` pattern
+- [**Multimodal Images**](/docs/cookbook/multimodal-images) - Send images to vision models for analysis, OCR, and comparison
+- [**Provider Switching**](/docs/cookbook/provider-switching) - Switch providers at runtime, compare outputs, and implement fallback
+- [**Embeddings Basics**](/docs/cookbook/embeddings-basics) - Generate embeddings, compare similarity, and build semantic search
+
 ### Reliability & Error Handling
 
 - [**Streaming with Retry Logic**](streaming-with-retry.md) - Handle network interruptions and implement automatic retry for streaming responses
@@ -36,6 +45,7 @@ Each recipe follows a consistent structure:
 
 - [**Structured Output with JSON Schema**](structured-output.md) - Extract structured data with type safety
 - [**Tool Chaining**](tool-chaining.md) - Chain multiple MCP tool calls together
+- [**AutoResearch Quickstart**](autoresearch-quickstart.md) - Set up an autonomous AI experiment loop in under 5 minutes
 
 ## How to Use These Recipes
 

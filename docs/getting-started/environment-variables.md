@@ -4,18 +4,55 @@ This guide provides comprehensive setup instructions for all AI providers suppor
 
 ## 🚀 Quick Setup
 
-### Automatic .env Loading ✨ NEW!
+### Automatic .env Loading
 
-NeuroLink CLI automatically loads environment variables from `.env` files in your project directory:
+The **CLI** loads environment variables from the `.env` file in your current directory (or from the file named by `DOTENV_CONFIG_PATH`) at startup:
 
 ```bash
-# Create .env file (automatically loaded)
+# Create .env file (loaded by the CLI)
 echo 'OPENAI_API_KEY="sk-your-key"' > .env
 echo 'AWS_ACCESS_KEY_ID="your-key"' >> .env
 
 # Test configuration
 npx @juspay/neurolink status
 ```
+
+The **SDK does not** read `.env` when it is imported. A library must not pick up files from whatever directory the host process happens to run in — a cloned repository's `.env` could otherwise set `ANTHROPIC_BASE_URL` and send your real key to a host of its choosing. An application that wants the CLI's behaviour opts in explicitly, either way:
+
+```typescript
+import { loadDotenv, NeuroLink } from "@juspay/neurolink";
+
+await loadDotenv(); // same rules as the CLI, see below
+const neurolink = new NeuroLink();
+```
+
+```bash
+NEUROLINK_DOTENV=1 node app.js   # the SDK loads .env at import
+```
+
+**Endpoint overrides need a trustworthy file.** dotenv never overrides a variable that is already set, but it sets every one that is not — including the variables that decide _where_ a request goes: every provider `*_BASE_URL` / `*_ENDPOINT(S)` variable, the `NEUROLINK_*_DIR` directories and `DOTENV_CONFIG_PATH`. For exactly those names the `.env` file must be owned by the current user and must not be group- or world-writable; otherwise they are removed again and named in a stderr line (`Refused 1 endpoint override(s) from … ANTHROPIC_BASE_URL`). When they are kept, a one-line notice lists them (`.env at … set endpoint override(s): ANTHROPIC_BASE_URL`), with a reminder when the file is outside your home directory. Export such a variable in your shell to use it regardless.
+
+| Variable             | Effect                                                                                                                        |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `NEUROLINK_DOTENV=0` | Disable `.env` loading everywhere (CLI included).                                                                             |
+| `NEUROLINK_DOTENV=1` | Make the SDK load `.env` when imported. Must be set in the real environment — it cannot come from the file it enables.        |
+| `DOTENV_CONFIG_PATH` | Load this file instead of `./.env`. `DOTENV_CONFIG_PATH=/dev/null` is the documented way to run a test with no `.env` at all. |
+
+### Project MCP configuration (`.mcp-config.json`)
+
+A project `.mcp-config.json` names commands to run and URLs to connect to, so it is treated like `.env` — a directory is not a trust boundary:
+
+- The **SDK** never loads it from the working directory on its own. Pass `new NeuroLink({ mcp: { configPath: "./.mcp-config.json" } })` to name a file, or `mcp: { trustProjectConfig: true }` for a directory you control.
+- The **CLI** loads it only after you have trusted that exact content: the file's SHA-256 is recorded in `~/.neurolink/trusted-mcp-configs.json` (mode `0600`). In a terminal you are shown the servers and asked; non-interactively the command refuses with exit status 1 until you decide.
+
+| Variable / flag                | Effect                                                                                |
+| ------------------------------ | ------------------------------------------------------------------------------------- |
+| `--trust-mcp-config`           | Trust the working directory's `.mcp-config.json` as it is now, and remember its hash. |
+| `NEUROLINK_TRUST_MCP_CONFIG=1` | Same as the flag, for non-interactive runs (CI).                                      |
+| `NEUROLINK_TRUST_MCP_CONFIG=0` | Run without the project config.                                                       |
+| `NEUROLINK_SKIP_MCP=true`      | Skip MCP initialisation entirely (built-in and external servers alike).               |
+
+See [MCP Integration](/docs/mcp/integration) for what the file may contain and how `${VAR}` references, the stdio environment and transport URLs are checked.
 
 ### Manual Export (Also Supported)
 
@@ -238,6 +275,10 @@ NO_PROXY="localhost,127.0.0.1,.company.com"
 | `HTTP_PROXY`  | Proxy server for HTTP requests  | `http://proxy.company.com:8080`    |
 | `NO_PROXY`    | Domains to bypass proxy         | `localhost,127.0.0.1,.company.com` |
 
+The shared HTTP proxy fetch accepts comma- or whitespace-separated `NO_PROXY` entries. Entries are case-insensitive: `*` bypasses all; `example.com`, `.example.com` and `*.example.com` cover the host and its subdomains; `example.com:8443` restricts a match to that effective port (HTTP defaults to 80, HTTPS to 443). One trailing dot is normalized for domain names. IPv4/IPv6 literals match exactly, including `[::1]:8080`; IPv4 CIDR entries apply only to literal IPv4 targets, and IPv6 CIDR is unsupported. Dot-only entries (`.` or `..`) match nothing.
+
+These rules apply to request paths that use NeuroLink's HTTP proxy fetch. Native AWS handlers, Gemini Live WebSockets and Vertex ADC token requests use separate transports/dependency rules. See [Enterprise & Proxy Setup](enterprise-proxy-setup.md) for those limits. The legacy AWS proxy selector uses a smaller comma-separated matcher; it supports exact hosts, leading-dot subdomain suffixes and `*`, without the full port/wildcard/CIDR syntax. It is not automatically injected into the native Bedrock constructors.
+
 ### Authenticated Proxy
 
 ```bash
@@ -263,7 +304,7 @@ OPENAI_API_KEY="sk-proj-your-openai-api-key"
 #### Optional Variables
 
 ```bash
-OPENAI_MODEL="gpt-4o"                    # Default: gpt-4o
+OPENAI_MODEL="gpt-4o-mini"              # Default: gpt-4o-mini
 OPENAI_BASE_URL="https://api.openai.com" # Default: OpenAI API
 ```
 
@@ -278,10 +319,16 @@ OPENAI_BASE_URL="https://api.openai.com" # Default: OpenAI API
 
 #### Supported Models
 
-- `gpt-4o` (default) - Latest GPT-4 Optimized
-- `gpt-4o-mini` - Faster, cost-effective option
+Examples, not the full list. The [OpenAI guide](providers/openai.md) lists every model the SDK names, including the GPT-6 and `gpt-5.4-nano` models.
+
+- `gpt-5.4` - GPT-5.4 model
+- `gpt-5.4-mini` - Faster, cost-effective GPT-5.4 option
+- `gpt-4o-mini` (default) - Cost-effective, fast
+- `gpt-4o` - Previous generation multimodal model
 - `gpt-4-turbo` - High-performance model
 - `gpt-3.5-turbo` - Legacy cost-effective option
+
+With no model set, NeuroLink uses the explicit `model` option, then `OPENAI_MODEL`, then the default in the model configuration (`MODEL_CONFIG_URL`, otherwise the repository's `config/models.json`), then the registry default `gpt-4o-mini`. Constructing `OpenAIProvider` directly with none of these falls back to `gpt-5.4`.
 
 ---
 
@@ -395,20 +442,23 @@ VERTEX_MODEL="gemini-2.5-pro"           # Default: gemini-2.5-pro
 
 ### 4. Anthropic (Direct)
 
-#### Required Variables
+Anthropic supports two authentication methods: **API key** (traditional) and **OAuth token** (for Claude subscription users).
+
+#### Method 1: API Key (Traditional)
+
+##### Required Variables
 
 ```bash
 ANTHROPIC_API_KEY="sk-ant-api03-your-anthropic-key"
 ```
 
-#### Optional Variables
+##### Optional Variables
 
 ```bash
 ANTHROPIC_MODEL="claude-3-5-sonnet-20241022"  # Default model
-ANTHROPIC_BASE_URL="https://api.anthropic.com" # Default endpoint
 ```
 
-#### How to Get Anthropic API Key
+##### How to Get Anthropic API Key
 
 1. Visit [Anthropic Console](https://console.anthropic.com)
 2. Sign up or log in
@@ -416,6 +466,65 @@ ANTHROPIC_BASE_URL="https://api.anthropic.com" # Default endpoint
 4. Click **Create Key**
 5. Copy the key (starts with `sk-ant-api03-`)
 6. Add billing information for usage
+
+#### Method 2: OAuth Token (Claude Subscription)
+
+Use OAuth authentication to access Claude models through a Claude Pro, Max, or Team subscription instead of pay-per-token API billing.
+
+##### Required Variables
+
+```bash
+# Either of these (ANTHROPIC_OAUTH_TOKEN takes precedence)
+ANTHROPIC_OAUTH_TOKEN="your-oauth-access-token"
+CLAUDE_OAUTH_TOKEN="your-oauth-access-token"
+```
+
+The OAuth token value can be a plain access token string or a JSON object with the following fields:
+
+```json
+{
+  "accessToken": "your-access-token",
+  "refreshToken": "your-refresh-token",
+  "expiresAt": 1735689600000
+}
+```
+
+Where `expiresAt` is the token expiry time in Unix milliseconds.
+
+##### Optional Variables
+
+```bash
+ANTHROPIC_MODEL="claude-3-5-sonnet-20241022"            # Default model
+ANTHROPIC_SUBSCRIPTION_TIER="pro"                        # Subscription tier override
+```
+
+`ANTHROPIC_SUBSCRIPTION_TIER` controls which models and rate limits are available. Valid values:
+
+| Tier     | Description                                     |
+| -------- | ----------------------------------------------- |
+| `free`   | Free tier with limited access                   |
+| `pro`    | Claude Pro subscription (default for OAuth)     |
+| `max`    | Claude Max subscription                         |
+| `max_5`  | Claude Max with 5x usage                        |
+| `max_20` | Claude Max with 20x usage                       |
+| `api`    | Standard API key access (default without OAuth) |
+
+If `ANTHROPIC_SUBSCRIPTION_TIER` is not set, the tier is auto-detected: `pro` when using OAuth, `api` when using an API key.
+
+#### Environment Variables Reference
+
+| Variable                         | Required | Default                            | Description                                                                |
+| -------------------------------- | -------- | ---------------------------------- | -------------------------------------------------------------------------- |
+| `ANTHROPIC_API_KEY`              | \*       | -                                  | Anthropic API key (required if not using OAuth)                            |
+| `ANTHROPIC_OAUTH_TOKEN`          | \*       | -                                  | OAuth access token, plain string or JSON (required if not using API key)   |
+| `CLAUDE_OAUTH_TOKEN`             | \*       | -                                  | Alternative OAuth token env var (same format as `ANTHROPIC_OAUTH_TOKEN`)   |
+| `ANTHROPIC_MODEL`                | No       | `claude-3-5-sonnet-20241022`       | Default model to use                                                       |
+| `ANTHROPIC_SUBSCRIPTION_TIER`    | No       | Auto-detected (`pro` or `api`)     | Subscription tier override: `free`, `pro`, `max`, `max_5`, `max_20`, `api` |
+| `ANTHROPIC_ENABLE_BETA_FEATURES` | No       | `true` (OAuth) / `false` (API key) | Enable Anthropic beta headers (OAuth beta, extended thinking)              |
+| `ANTHROPIC_OAUTH_REFRESH_TOKEN`  | No       | -                                  | OAuth refresh token (used for automatic token renewal)                     |
+| `ANTHROPIC_AUTH_METHOD`          | No       | Auto-detected                      | Force auth method: `api_key` or `oauth`                                    |
+
+\* One of `ANTHROPIC_API_KEY`, `ANTHROPIC_OAUTH_TOKEN`, or `CLAUDE_OAUTH_TOKEN` must be set.
 
 #### Supported Models
 
@@ -505,8 +614,8 @@ HUGGINGFACE_API_KEY="hf_your_huggingface_token"
 #### Optional Variables
 
 ```bash
-HUGGINGFACE_MODEL="microsoft/DialoGPT-medium"    # Default model
-HUGGINGFACE_ENDPOINT="https://api-inference.huggingface.co"  # Default endpoint
+HUGGINGFACE_MODEL="Qwen/Qwen2.5-72B-Instruct"  # Default model
+HUGGINGFACE_BASE_URL="https://router.huggingface.co/v1"  # Default endpoint
 ```
 
 #### How to Get Hugging Face API Token
@@ -519,11 +628,17 @@ HUGGINGFACE_ENDPOINT="https://api-inference.huggingface.co"  # Default endpoint
 
 #### Supported Models
 
-- **Open Source**: Access to 100,000+ community models
-- `microsoft/DialoGPT-medium` (default) - Conversational AI
-- `gpt2` - Classic GPT-2
-- `EleutherAI/gpt-neo-2.7B` - Large open model
-- Any model from [Hugging Face Hub](https://huggingface.co/models)
+Requests go to the unified router (`router.huggingface.co/v1`), which serves
+a curated set of ~140 models — **not** the whole Hub. An id absent from the
+router answers 400 "not supported by any provider you have enabled", which is
+why the legacy defaults (DialoGPT, GPT-2, GPT-Neo) no longer work.
+
+- `Qwen/Qwen2.5-72B-Instruct` (default) - tool-capable, strong multilingual
+- `meta-llama/Llama-3.1-8B-Instruct` - fastest of the served set, tool-capable
+- `meta-llama/Llama-3.3-70B-Instruct` - stronger general reasoning
+- `deepseek-ai/DeepSeek-V3` - highest quality of the served set
+- `Qwen/Qwen2.5-Coder-32B-Instruct` - code-focused
+- Any id listed by `GET https://router.huggingface.co/v1/models`
 
 ---
 
@@ -641,7 +756,7 @@ LiteLLM provides access to 100+ AI models through a unified proxy interface:
 
 #### Benefits
 
-- **100+ Models**: Access to all major AI providers through one interface
+- **100+ Models**: Access to a broad range of AI providers through one interface
 - **Cost Optimization**: Automatic routing to cost-effective models
 - **Unified API**: OpenAI-compatible API for all models
 - **Load Balancing**: Automatic failover and load distribution
@@ -799,12 +914,406 @@ npx @juspay/neurolink sagemaker setup
 
 ---
 
+### 12. DeepSeek
+
+#### Required Variables
+
+```bash
+DEEPSEEK_API_KEY="sk-your-deepseek-api-key"
+```
+
+#### Optional Variables
+
+```bash
+DEEPSEEK_MODEL="deepseek-chat"                    # Default: deepseek-chat (use deepseek-reasoner for R1)
+DEEPSEEK_BASE_URL="https://api.deepseek.com"      # Default: DeepSeek API
+```
+
+#### How to Get DeepSeek API Key
+
+1. Visit [DeepSeek Platform](https://platform.deepseek.com/api_keys)
+2. Sign up or log in to your account
+3. Navigate to **API Keys** section
+4. Click **Create API Key**
+5. Copy the key
+
+#### Supported Models
+
+- `deepseek-chat` (default) - DeepSeek V3, high-quality general chat
+- `deepseek-reasoner` - DeepSeek R1, extended chain-of-thought reasoning
+
+---
+
+### 13. NVIDIA NIM
+
+#### Required Variables
+
+```bash
+NVIDIA_NIM_API_KEY="nvapi-your-nvidia-api-key"
+```
+
+#### Optional Variables
+
+```bash
+NVIDIA_NIM_MODEL="openai/gpt-oss-20b"                         # Default model
+NVIDIA_NIM_BASE_URL="https://integrate.api.nvidia.com/v1"   # Default: NVIDIA cloud API (override for self-hosted NIM)
+```
+
+#### NIM-Specific Extras (rarely needed)
+
+```bash
+# Sampling extras passed as request body extensions
+NVIDIA_NIM_TOP_K=                      # Integer, -1 = disabled (default)
+NVIDIA_NIM_MIN_P=                      # Float, 0 = disabled (default)
+NVIDIA_NIM_REPETITION_PENALTY=         # Float, 1.0 = disabled (default)
+NVIDIA_NIM_MIN_TOKENS=                 # Integer, 0 = disabled (default)
+NVIDIA_NIM_CHAT_TEMPLATE=              # Override model chat template string (advanced)
+```
+
+#### How to Get NVIDIA NIM API Key
+
+1. Visit [NVIDIA Build](https://build.nvidia.com/)
+2. Sign in with your NVIDIA developer account
+3. Open **Settings → API Keys**
+4. Generate a new API key (Bearer token)
+
+#### Supported Models
+
+- `openai/gpt-oss-20b` (default) - OpenAI gpt-oss 20B, 128K context, tool calling
+- Any model listed at [build.nvidia.com/models](https://build.nvidia.com/models)
+
+---
+
+### 14. LM Studio (Local)
+
+LM Studio is a local provider — no API key is required for standard installations.
+
+#### Optional Variables
+
+```bash
+LM_STUDIO_BASE_URL="http://localhost:1234/v1"    # Default: local LM Studio server
+LM_STUDIO_MODEL=""                               # Blank = auto-discover from /v1/models
+# LM_STUDIO_API_KEY=                             # Only set when running behind an auth-proxying reverse-proxy
+```
+
+#### How to Set Up LM Studio
+
+1. Install LM Studio from [lmstudio.ai](https://lmstudio.ai/)
+2. Open LM Studio and download a model (e.g., Llama 3.2 3B Instruct)
+3. Click **Local Server** → **Start Server**
+4. The server starts at `http://localhost:1234/v1` by default
+5. NeuroLink auto-discovers the loaded model; no `LM_STUDIO_MODEL` needed
+
+**Note:** `LM_STUDIO_API_KEY` is only needed if you run LM Studio behind an authenticating reverse-proxy. Vanilla local installs do not require an API key.
+
+---
+
+### 15. llama.cpp (Local)
+
+llama.cpp (llama-server) is a local provider — no API key is required for standard installations.
+
+#### Optional Variables
+
+```bash
+LLAMACPP_BASE_URL="http://localhost:8080/v1"     # Default: local llama-server
+LLAMACPP_MODEL=""                                # Blank = use whatever model llama-server has loaded
+# LLAMACPP_API_KEY=                              # Only set when running behind an auth-proxying reverse-proxy
+```
+
+#### How to Set Up llama.cpp
+
+1. Build llama.cpp from source: [github.com/ggerganov/llama.cpp](https://github.com/ggerganov/llama.cpp#build)
+2. Download a GGUF model file
+3. Start llama-server:
+
+   ```bash
+   # Basic usage
+   ./llama-server -m model.gguf --port 8080
+
+   # With tool/function-call support (required for MCP tools)
+   ./llama-server -m model.gguf --port 8080 --jinja
+   ```
+
+4. NeuroLink auto-discovers the loaded model; no `LLAMACPP_MODEL` needed
+
+**Note:** `LLAMACPP_API_KEY` is only needed if you run llama-server behind an authenticating reverse-proxy. Vanilla local installs do not require an API key.
+
+---
+
+### 16. OpenAI TTS
+
+OpenAI TTS uses the same `OPENAI_API_KEY` as the OpenAI LLM provider. No additional credentials are required.
+
+#### Required Variables
+
+```bash
+OPENAI_API_KEY="sk-proj-your-openai-api-key"  # Shared with the OpenAI LLM provider
+```
+
+#### How to Get the API Key
+
+See [OpenAI](#1-openai) above — the same key is used for both LLM and TTS.
+
+#### Supported Models
+
+- `tts-1` (default) - Optimized for speed
+- `tts-1-hd` - Optimized for audio quality
+
+---
+
+### 17. ElevenLabs TTS + STT
+
+#### Required Variables
+
+```bash
+ELEVENLABS_API_KEY="your-elevenlabs-api-key"
+```
+
+One key serves the `elevenlabs` TTS handler, the `elevenlabs-stt` (Scribe)
+STT handler and `elevenlabs-music`.
+
+#### Optional Variables
+
+```bash
+# API base URL including the /v1 prefix — for a proxy or a test stub.
+ELEVENLABS_BASE_URL="https://api.elevenlabs.io/v1"
+# Base URL for Scribe (speech-to-text) only; wins over ELEVENLABS_BASE_URL
+# for STT, so transcription can go through a different host than TTS.
+ELEVENLABS_STT_BASE_URL="https://api.elevenlabs.io/v1"
+```
+
+#### How to Get ElevenLabs API Key
+
+1. Visit [ElevenLabs](https://elevenlabs.io)
+2. Sign up or log in to your account
+3. Navigate to **Profile → API Key**
+4. Copy the key
+
+#### Supported Models
+
+- `eleven_multilingual_v2` (default) - Best quality, 29 languages
+- `eleven_v3` - Most expressive, 70+ languages, accepts `language`
+- `eleven_turbo_v2_5` - Low-latency streaming, 32 languages, accepts `language`
+- `eleven_flash_v2_5` - Fastest, suitable for real-time use, accepts `language`
+- `eleven_flash_v2`, `eleven_turbo_v2`, `eleven_monolingual_v1` - English variants
+- STT: `scribe_v2` (default), `scribe_v2_medical`; `scribe_v1` and `scribe_v1_experimental` are deprecated
+
+See the [ElevenLabs provider guide](/docs/getting-started/providers/elevenlabs)
+for formats (Opus 48 kHz for `ogg`/`opus`), speed clamping, retries and the
+Scribe STT options.
+
+---
+
+### 18. Deepgram STT
+
+#### Required Variables
+
+```bash
+DEEPGRAM_API_KEY="your-deepgram-api-key"
+```
+
+#### Optional Variables
+
+```bash
+# REST base URL (a proxy, a self-hosted Deepgram or a test stub). The live
+# stream uses the same host on the WebSocket scheme (https → wss).
+DEEPGRAM_BASE_URL="https://api.deepgram.com/v1"
+```
+
+#### How to Get Deepgram API Key
+
+1. Visit [Deepgram Console](https://console.deepgram.com)
+2. Sign up or log in to your account
+3. Navigate to **API Keys**
+4. Click **Create a New API Key**
+5. Copy the key
+
+#### Supported Models
+
+- `nova-2` (default) - High accuracy, broad language support
+- `nova-3` - Latest, highest accuracy
+- `base` - Balanced accuracy and speed
+
+---
+
+### 19. Azure Speech Services (TTS + STT)
+
+Azure Speech Services provides both text-to-speech and speech-to-text through Microsoft Azure Cognitive Services.
+
+#### Required Variables
+
+```bash
+AZURE_SPEECH_KEY="your-azure-speech-key"
+AZURE_SPEECH_REGION="eastus"              # Azure region where your Speech resource is deployed
+```
+
+#### Optional Variables
+
+If you also use Google STT or Gemini Live alongside Azure, set the canonical
+Google credentials:
+
+```bash
+GOOGLE_AI_API_KEY="AIza-your-google-ai-studio-key"   # canonical
+# GEMINI_API_KEY="AIza-your-key"                     # alias (also accepted)
+# GOOGLE_API_KEY="AIza-your-key"                     # legacy alias (also accepted)
+# GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa.json    # service account (Google STT)
+```
+
+#### How to Set Up Azure Speech Services
+
+1. Sign in to [Azure Portal](https://portal.azure.com)
+2. Create a **Speech** resource under **Azure AI services**
+3. Go to **Keys and Endpoint** in your Speech resource
+4. Copy **Key 1** and note the **Location/Region**
+5. Set `AZURE_SPEECH_KEY` and `AZURE_SPEECH_REGION`
+
+#### Supported Capabilities
+
+- **TTS**: Azure Neural TTS with 400+ voices across 140+ languages
+- **STT**: Azure Speech-to-Text with real-time and batch transcription
+
+#### Environment Variables Reference
+
+| Variable              | Required | Default | Description                                         |
+| --------------------- | -------- | ------- | --------------------------------------------------- |
+| `AZURE_SPEECH_KEY`    | ✅       | -       | Azure Speech Services API key                       |
+| `AZURE_SPEECH_REGION` | ✅       | -       | Azure region (e.g., `eastus`, `westeurope`)         |
+| `GOOGLE_AI_API_KEY`   | ❌       | -       | Canonical Google API key (Google STT / Gemini Live) |
+| `GEMINI_API_KEY`      | ❌       | -       | Accepted alias for `GOOGLE_AI_API_KEY`              |
+| `GOOGLE_API_KEY`      | ❌       | -       | Legacy alias for `GOOGLE_AI_API_KEY`                |
+| `ELEVENLABS_API_KEY`  | ❌       | -       | ElevenLabs key, if using ElevenLabs alongside       |
+| `DEEPGRAM_API_KEY`    | ❌       | -       | Deepgram key, if using Deepgram alongside           |
+
+---
+
+### 20. Speech-to-Text: `transcribe()` and the built-in Whistle engine
+
+`neurolink.transcribe()`, `neurolink.transcribeStream()`, the
+`neurolink transcribe` CLI command, the transcription server routes and audio
+attached to `generate()` all choose their engine the same way:
+
+1. `NEUROLINK_STT_PROVIDER`, when it names a known STT provider, alias or named
+   endpoint (an unknown name is logged and ignored);
+2. otherwise the first **configured** provider in descriptor order — `whisper`
+   (OpenAI-compatible), `deepgram`, `elevenlabs-stt`, `google-stt`,
+   `azure-stt` — configured by the keys in sections 1, 17, 18 and 19 above;
+3. otherwise **Whistle**, the built-in local engine, which needs no key.
+
+#### Engine selection
+
+```bash
+# Default STT provider (name or alias: whisper, deepgram, scribe, google-stt,
+# azure-stt, whistle, or a NEUROLINK_STT_ENDPOINTS name).
+NEUROLINK_STT_PROVIDER="deepgram"
+# Model for the provider NEUROLINK_STT_PROVIDER / the default rule picked.
+# Not applied to a provider named explicitly in a call or with --provider.
+NEUROLINK_STT_MODEL="nova-3"
+# Default language code; omit it, or set "auto", to let the engine detect it.
+NEUROLINK_STT_LANGUAGE="en"
+```
+
+#### OpenAI-compatible STT (`whisper`)
+
+```bash
+# Key for the /audio/transcriptions endpoint. Only the default base URL
+# (api.openai.com) falls back to OPENAI_API_KEY; a custom OPENAI_STT_BASE_URL
+# never receives it, and a NEUROLINK_STT_ENDPOINTS entry sends its own
+# "apiKey" or no key at all.
+OPENAI_STT_API_KEY="sk-..."
+# Any OpenAI-compatible /audio/transcriptions server (vLLM, LiteLLM, a
+# self-hosted Whisper / Qwen3-ASR wrapper). Default: https://api.openai.com/v1
+OPENAI_STT_BASE_URL="http://localhost:8004/v1"
+OPENAI_STT_MODEL="whisper-1"          # default model
+OPENAI_STT_TIMEOUT_MS="120000"        # request timeout for long recordings
+
+# Several self-hosted engines at once, each a provider of its own (usable as
+# each other's fallback or second opinion). Keys are the provider names; a
+# name that collides with a shipped provider is ignored.
+# Per endpoint: baseURL (required), apiKey, model, timeoutMs, and for a server
+# that can take a language prior / answer with a language verdict only (the
+# IndicConformer wrapper): priorLanguageForm ("auto-{lang}") and lidModel.
+NEUROLINK_STT_ENDPOINTS='{"qwen-asr":{"baseURL":"http://gpu-box:8004/v1","model":"qwen3-asr"},"indic":{"baseURL":"http://gpu-box:8007/v1","model":"indic-conformer","priorLanguageForm":"auto-{lang}","lidModel":"indic-conformer-lid"}}'
+```
+
+#### Correction layer
+
+```bash
+# Text provider and model for the correction rewrite, when a request names
+# none (a request's correction.rewrite.provider/model still wins).
+NEUROLINK_STT_REWRITE_PROVIDER="openai"
+NEUROLINK_STT_REWRITE_MODEL="gpt-4o-mini"
+# Text provider and model that render transcripts into other languages
+# (`output.languages`), when a request names none; unset, the rewrite's.
+NEUROLINK_STT_OUTPUT_PROVIDER="openai"
+NEUROLINK_STT_OUTPUT_MODEL="gpt-4o"
+```
+
+The dictionary guard uses whichever `decide` provider is configured (see the
+decision providers at the top of this page) and fails open without one.
+
+#### Whistle (built-in local engine)
+
+Whistle runs on this machine in WebAssembly. Its three files (about 17 MB,
+pinned Hugging Face revisions verified by SHA-256) ship inside the package
+under `models/whistle/`, so nothing is downloaded. A download happens only
+when that copy is missing, into `~/.neurolink/models/whistle`.
+
+```bash
+# Where Whistle's files live. Precedence: credentials.stt.whistle.modelDir,
+# then NEUROLINK_WHISTLE_DIR, then $NEUROLINK_MODEL_DIR/whistle, then the
+# package's own models/whistle, then ~/.neurolink/models/whistle.
+NEUROLINK_WHISTLE_DIR="/opt/models/whistle"
+NEUROLINK_MODEL_DIR="/opt/models"       # root for local model files
+# 0 / false / off / no forbids the fallback download (air-gapped hosts, CI).
+# With no copy anywhere Whistle then reports itself unconfigured.
+NEUROLINK_WHISTLE_AUTO_DOWNLOAD="0"
+# 1 / true / on / yes sends the request's vocabulary (dictionary terms
+# included) to the engine as keywords. Off by default: the engine can loop
+# on long keyword lists. The model name "whistle-keywords" does the same per
+# request.
+NEUROLINK_WHISTLE_KEYWORDS="1"
+```
+
+| Variable                                 | Default                                | Description                                                                                   |
+| ---------------------------------------- | -------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `NEUROLINK_STT_PROVIDER`                 | first configured, else Whistle         | Default STT provider, alias or named endpoint                                                 |
+| `NEUROLINK_STT_MODEL`                    | provider default                       | Model for the env-chosen provider                                                             |
+| `NEUROLINK_STT_LANGUAGE`                 | `auto`                                 | Default language; `auto` lets the engine detect                                               |
+| `NEUROLINK_STT_ENDPOINTS`                | -                                      | JSON map of named OpenAI-compatible STT endpoints                                             |
+| `NEUROLINK_STT_REWRITE_PROVIDER`         | instance default                       | Text provider for the correction rewrite                                                      |
+| `NEUROLINK_STT_REWRITE_MODEL`            | provider default                       | Model for the correction rewrite                                                              |
+| `NEUROLINK_STT_OUTPUT_PROVIDER`          | the rewrite's provider                 | Text provider for output-language renderings                                                  |
+| `NEUROLINK_STT_OUTPUT_MODEL`             | the rewrite's model                    | Model for output-language renderings                                                          |
+| `NEUROLINK_STT_REALTIME_PROFILES`        | -                                      | JSON map of profiles an OpenAI-Realtime client selects by `model` on `/v1/realtime`           |
+| `NEUROLINK_STT_EVAL_LANGFUSE_PUBLIC_KEY` | -                                      | With the secret key: export `POST /v1/evals/stt` batches and scores to this Langfuse project  |
+| `NEUROLINK_STT_EVAL_LANGFUSE_SECRET_KEY` | -                                      | Secret key of the evaluation Langfuse project                                                 |
+| `NEUROLINK_STT_EVAL_LANGFUSE_BASE_URL`   | `https://cloud.langfuse.com`           | Langfuse host for the evaluation export                                                       |
+| `NEUROLINK_STT_EVAL_DIR`                 | - (memory only)                        | Directory where `POST /v1/evals/stt` keeps one JSON-lines file per call, replayed on start    |
+| `OPENAI_STT_API_KEY`                     | `OPENAI_API_KEY` (api.openai.com only) | Key for the OpenAI-compatible STT endpoint; a custom base URL never receives `OPENAI_API_KEY` |
+| `OPENAI_STT_PRIOR_LANGUAGE_FORM`         | -                                      | `language` template (`auto-{lang}`) that carries a language prior to a custom STT server      |
+| `OPENAI_STT_LID_MODEL`                   | -                                      | Model name the custom STT server runs in language-verdict-only mode (the batch probe)         |
+| `OPENAI_STT_VOCABULARY_PROMPT`           | on                                     | Send dictionary terms as a "Names and terms used" prompt; `0` for servers that echo it        |
+| `OPENAI_STT_BASE_URL`                    | `https://api.openai.com/v1`            | OpenAI-compatible `/audio/transcriptions` base URL                                            |
+| `OPENAI_STT_MODEL`                       | `whisper-1`                            | Default model for `whisper`                                                                   |
+| `OPENAI_STT_TIMEOUT_MS`                  | handler default                        | Request timeout for `whisper`                                                                 |
+| `DEEPGRAM_BASE_URL`                      | `https://api.deepgram.com/v1`          | Deepgram REST base URL (stream uses the same host over `wss://`)                              |
+| `ELEVENLABS_STT_BASE_URL`                | `ELEVENLABS_BASE_URL`                  | ElevenLabs Scribe base URL                                                                    |
+| `NEUROLINK_WHISTLE_DIR`                  | see precedence above                   | Directory holding Whistle's files (default: the bundled copy)                                 |
+| `NEUROLINK_MODEL_DIR`                    | `~/.neurolink/models`                  | Root for local model files (`<root>/whistle`)                                                 |
+| `NEUROLINK_WHISTLE_AUTO_DOWNLOAD`        | on                                     | `0`/`false`/`off`/`no` forbids the fallback download                                          |
+| `NEUROLINK_WHISTLE_KEYWORDS`             | off                                    | `1`/`true`/`on`/`yes` biases Whistle on the request's vocabulary                              |
+
+See [The transcribe inference type](/docs/features/transcribe) and
+[Whistle](/docs/getting-started/providers/whistle).
+
+---
+
 ## 🔧 Configuration Examples
 
 ### Complete .env File Example
 
 ```bash
-# NeuroLink Environment Configuration - All 11 Providers
+# NeuroLink Environment Configuration - Commonly Used Providers
 
 # OpenAI Configuration
 OPENAI_API_KEY="sk-proj-your-openai-key"
@@ -830,8 +1339,13 @@ GOOGLE_VERTEX_PROJECT="your-gcp-project"
 GOOGLE_VERTEX_LOCATION="us-central1"
 VERTEX_MODEL="gemini-2.5-pro"
 
-# Anthropic Configuration
+# Anthropic Configuration (API key or OAuth token)
 ANTHROPIC_API_KEY="sk-ant-api03-your-key"
+# ANTHROPIC_OAUTH_TOKEN="your-oauth-token"     # Alternative: OAuth token for Claude subscription
+# ANTHROPIC_SUBSCRIPTION_TIER="pro"            # Optional: free, pro, max, max_5, max_20, api
+# ANTHROPIC_ENABLE_BETA_FEATURES="true"        # Optional: enable beta headers (default: true for OAuth)
+# ANTHROPIC_OAUTH_REFRESH_TOKEN=""             # Optional: OAuth refresh token for auto-renewal
+# ANTHROPIC_AUTH_METHOD="oauth"                # Optional: force auth method (api_key or oauth)
 
 # Google AI Studio Configuration
 GOOGLE_AI_API_KEY="AIza-your-google-ai-key"
@@ -845,7 +1359,7 @@ AZURE_MODEL="gpt-4o"
 
 # Hugging Face Configuration
 HUGGINGFACE_API_KEY="hf_your_huggingface_token"
-HUGGINGFACE_MODEL="microsoft/DialoGPT-medium"
+HUGGINGFACE_MODEL="Qwen/Qwen2.5-72B-Instruct"
 
 # Ollama Configuration (Local AI - No API Key Required)
 OLLAMA_BASE_URL="http://localhost:11434"
@@ -859,6 +1373,26 @@ MISTRAL_MODEL="mistral-small"
 LITELLM_BASE_URL="http://localhost:4000"
 LITELLM_API_KEY="sk-anything"
 LITELLM_MODEL="openai/gpt-4o-mini"
+
+# DeepSeek Configuration
+DEEPSEEK_API_KEY="sk-your-deepseek-key"
+DEEPSEEK_MODEL="deepseek-chat"
+# DEEPSEEK_BASE_URL=https://api.deepseek.com
+
+# NVIDIA NIM Configuration
+NVIDIA_NIM_API_KEY="nvapi-your-nvidia-key"
+NVIDIA_NIM_MODEL="openai/gpt-oss-20b"
+# NVIDIA_NIM_BASE_URL=https://integrate.api.nvidia.com/v1
+
+# LM Studio Configuration (local — no API key required)
+LM_STUDIO_BASE_URL="http://localhost:1234/v1"
+# LM_STUDIO_MODEL=                 # blank = auto-discover
+# LM_STUDIO_API_KEY=               # only for reverse-proxy setups
+
+# llama.cpp Configuration (local — no API key required)
+LLAMACPP_BASE_URL="http://localhost:8080/v1"
+# LLAMACPP_MODEL=                  # blank = auto-discover
+# LLAMACPP_API_KEY=                # only for reverse-proxy setups
 ```
 
 ### Docker/Container Configuration
@@ -913,6 +1447,29 @@ npx @juspay/neurolink get-best-provider
 
 ## 🔒 Security Best Practices
 
+### Attachment loading (`NEUROLINK_ATTACHMENT_*`)
+
+What the SDK may read or fetch when a call names a file path or a URL
+(`input.files`, `input.images`, `rag.files`, `transcribe({ audio })`). Each
+variable mirrors a field of the `attachments` constructor option, which wins
+when both are set. See [Attachment Security](/docs/features/attachment-security).
+
+```bash
+# Directories a local path may resolve into (":"- or ";"-separated).
+# Unset: any readable file, with a one-time warning.
+NEUROLINK_ATTACHMENT_ROOTS=/srv/uploads:/var/lib/app/files
+# Accept http:// attachment URLs (default: HTTPS only)
+NEUROLINK_ATTACHMENT_ALLOW_INSECURE_URLS=1
+# Fetch loopback / private / link-local / cloud-metadata targets (default: refused)
+NEUROLINK_ATTACHMENT_ALLOW_PRIVATE_NETWORK=1
+# Refuse redirects outright (default: followed, re-checked per hop)
+NEUROLINK_ATTACHMENT_FOLLOW_REDIRECTS=0
+# Cap on any single attachment read or download, in bytes
+NEUROLINK_ATTACHMENT_MAX_BYTES=67108864
+# Accept Redis session/user ids containing ':' '*' '?' '[' with a warning while migrating
+NEUROLINK_REDIS_ALLOW_LEGACY_IDS=1
+```
+
 ### API Key Management
 
 - ✅ **Use .env files** for local development
@@ -938,6 +1495,22 @@ service-account*.json
 - Implement **key rotation** policies
 - Monitor **API usage** and **rate limits**
 - Use **least privilege** access policies
+
+### Serving over HTTP (`neurolink serve`)
+
+`neurolink serve` listens on `127.0.0.1` unless `--host` says otherwise, and
+refuses to bind a non-loopback host without an API key. These variables govern
+the listener; see
+[/docs/reference/server-configuration](/docs/reference/server-configuration):
+
+```bash
+NEUROLINK_SERVER_API_KEY=key1,key2          # Required on every route except the health probes
+NEUROLINK_SERVER_ALLOW_UNAUTHENTICATED=1    # Run open on purpose: non-loopback bind without a key, tool/MCP execution open
+NEUROLINK_SERVER_ENABLE_BUILTIN_TOOLS=1     # Keep the built-in filesystem tools in the server's registry (off by default)
+NEUROLINK_SERVER_WS_ALLOW_QUERY_TOKEN=1     # Accept the key as ?token= on the transcription WebSocket (off by default)
+NEUROLINK_SERVER_TIMEOUT_MS=30000           # Per-request timeout (504 past it)
+NEUROLINK_STT_EVAL_ENABLED=1                # Mount the STT evaluation collector, /v1/evals/stt (off by default)
+```
 
 ---
 

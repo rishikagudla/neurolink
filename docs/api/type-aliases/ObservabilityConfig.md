@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v8.32.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,26 +8,14 @@
 
 > **ObservabilityConfig** = `object`
 
-Defined in: [types/observability.ts:51](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/observability.ts#L51)
+## Description
 
-Complete observability configuration for Neurolink SDK
+Observability configuration for the NeuroLink SDK. Langfuse turns on automatically when `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are set and `LANGFUSE_ENABLED` is not `false`, `0`, `off` or `no`; `false` turns it off.
 
 ## Properties
 
 ### langfuse?
 
-> `optional` **langfuse**: [`LangfuseConfig`](LangfuseConfig.md)
+> `optional` **langfuse?**: `boolean` \| [`NeurolinkLangfuseConfig`](NeurolinkLangfuseConfig.md)
 
-Defined in: [types/observability.ts:53](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/observability.ts#L53)
-
-Langfuse configuration
-
----
-
-### openTelemetry?
-
-> `optional` **openTelemetry**: [`OpenTelemetryConfig`](OpenTelemetryConfig.md)
-
-Defined in: [types/observability.ts:55](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/observability.ts#L55)
-
-OpenTelemetry configuration
+`false` disables Langfuse, `true` or an options object enables it.

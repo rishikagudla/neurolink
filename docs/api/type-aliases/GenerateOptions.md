@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v8.32.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,26 +8,28 @@
 
 > **GenerateOptions** = `object`
 
-Defined in: [types/generateTypes.ts:24](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L24)
-
 Generate function options type - Primary method for content generation
 Supports multimodal content while maintaining backward compatibility
 
 ## Properties
 
-### input
+### input?
 
-> **input**: `object`
+> `optional` **input?**: `object`
 
-Defined in: [types/generateTypes.ts:25](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L25)
+Input content for generation. Optional for media-only modes (avatar, music,
+video) where all configuration lives in `output`; the SDK synthesises an
+empty `input` automatically when this field is omitted.
 
-#### text
+#### text?
 
-> **text**: `string`
+> `optional` **text?**: `string`
+
+Prompt text. Optional for media-only modes (avatar, music) that are driven by uploaded files rather than a prompt.
 
 #### images?
 
-> `optional` **images**: (`Buffer` \| `string` \| `ImageWithAltText`)[]
+> `optional` **images?**: (`Buffer` \| `string` \| [`ImageWithAltText`](ImageWithAltText.md))[]
 
 Images to include in the request.
 Supports simple image data (Buffer, string) or objects with alt text for accessibility.
@@ -47,55 +49,123 @@ images: [
 
 #### csvFiles?
 
-> `optional` **csvFiles**: (`Buffer` \| `string`)[]
+> `optional` **csvFiles?**: (`Buffer` \| `string`)[]
 
 #### pdfFiles?
 
-> `optional` **pdfFiles**: (`Buffer` \| `string`)[]
+> `optional` **pdfFiles?**: (`Buffer` \| `string`)[]
+
+#### audioFiles?
+
+> `optional` **audioFiles?**: (`Buffer` \| `string`)[]
+
+#### nativeAudioFiles?
+
+> `optional` **nativeAudioFiles?**: [`MultimodalAudioEntry`](MultimodalAudioEntry.md)[]
+
+Audio whose bytes should be delivered to the provider, populated during
+detection rather than by callers.
+
+Separate from `audioFiles` above, which is the caller-facing input that
+yields a metadata summary. This one carries the decoded bytes forward so
+a provider that can actually listen receives the audio instead of a
+description of it; providers that cannot fall back to the summary and
+this is ignored.
 
 #### videoFiles?
 
-> `optional` **videoFiles**: (`Buffer` \| `string`)[]
+> `optional` **videoFiles?**: (`Buffer` \| `string`)[]
+
+#### nativeVideoFiles?
+
+> `optional` **nativeVideoFiles?**: [`MultimodalVideoEntry`](MultimodalVideoEntry.md)[]
+
+Video collected during file detection, carried through to a provider
+that can watch it. Populated by detection rather than by callers.
+
+Separate from `videoFiles` above, which is the caller-facing input that
+yields a metadata summary plus extracted keyframes. This one carries the
+decoded bytes forward so a provider that accepts video receives the clip
+itself; providers that cannot fall back to the frames and this is
+ignored.
 
 #### files?
 
-> `optional` **files**: (`Buffer` \| `string`)[]
+> `optional` **files?**: (`Buffer` \| `string` \| [`FileWithMetadata`](FileWithMetadata.md))[]
 
 #### content?
 
-> `optional` **content**: `Content`[]
+> `optional` **content?**: [`Content`](Content.md)[]
+
+#### segments?
+
+> `optional` **segments?**: [`DirectorSegment`](DirectorSegment.md)[]
+
+Director Mode segments. When provided, Director Mode is activated automatically.
+Each segment contains its own prompt and image.
+Must contain 2-10 segments.
 
 ---
 
 ### output?
 
-> `optional` **output**: `object`
-
-Defined in: [types/generateTypes.ts:72](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L72)
+> `optional` **output?**: `object`
 
 Output configuration options
 
 #### format?
 
-> `optional` **format**: `"text"` \| `"structured"` \| `"json"`
+> `optional` **format?**: `"text"` \| `"structured"` \| `"json"`
 
 Output format for text generation
 
 #### mode?
 
-> `optional` **mode**: `"text"` \| `"video"`
+> `optional` **mode?**: `"text"` \| `"video"` \| `"ppt"` \| `"avatar"` \| `"music"`
 
 Output mode - determines the type of content generated
 
 - "text": Standard text generation (default)
 - "video": Video generation using models like Veo 3.1
+- "ppt": PowerPoint presentation generation
+- "avatar": Talking-head / lip-sync video (D-ID, HeyGen, Replicate-MuseTalk)
+- "music": Music / sound generation (Beatoven, ElevenLabs Music, Lyria, Replicate)
 
 #### video?
 
-> `optional` **video**: `VideoOutputOptions`
+> `optional` **video?**: [`VideoOutputOptions`](VideoOutputOptions.md)
 
 Video generation configuration (used when mode is "video")
 Requires an input image and text prompt
+
+#### ppt?
+
+> `optional` **ppt?**: [`PPTOutputOptions`](PPTOutputOptions.md)
+
+PowerPoint generation configuration (used when mode is "ppt")
+Generates slides based on text prompt
+
+#### director?
+
+> `optional` **director?**: [`DirectorModeOptions`](DirectorModeOptions.md)
+
+Director Mode configuration (only used when input.segments is provided)
+Controls transition prompts, durations, and concurrency.
+
+#### avatar?
+
+> `optional` **avatar?**: [`AvatarOptions`](AvatarOptions.md)
+
+Avatar generation configuration (used when mode is "avatar")
+Combines a portrait image with audio (or text via TTS) to produce
+a lip-synced talking-head video.
+
+#### music?
+
+> `optional` **music?**: [`MusicOptions`](MusicOptions.md)
+
+Music generation configuration (used when mode is "music")
+Generates music / sound from a text prompt.
 
 #### Examples
 
@@ -121,53 +191,137 @@ output: {
 
 ### csvOptions?
 
-> `optional` **csvOptions**: `object`
+> `optional` **csvOptions?**: [`CSVProcessorOptions`](CSVProcessorOptions.md)
 
-Defined in: [types/generateTypes.ts:89](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L89)
+---
 
-#### maxRows?
+### officeOptions?
 
-> `optional` **maxRows**: `number`
+> `optional` **officeOptions?**: [`OfficeProcessorOptions`](OfficeProcessorOptions.md)
 
-#### formatStyle?
+Office document processing options. Currently consumed by the XLSX path
+(`sheetName`, `formatStyle`); see OfficeProcessorOptions.
 
-> `optional` **formatStyle**: `"raw"` \| `"markdown"` \| `"json"`
+---
 
-#### includeHeaders?
+### pdfOptions?
 
-> `optional` **includeHeaders**: `boolean`
+> `optional` **pdfOptions?**: `object`
+
+PDF processing options (#258).
+
+#### password?
+
+> `optional` **password?**: `string`
+
+Password for an encrypted PDF (image-conversion fallback path).
+
+#### maxCanvasPixels?
+
+> `optional` **maxCanvasPixels?**: `number`
+
+Max rendered-canvas pixels per page (#260 memory guard); oversized pages auto-downscale.
+
+#### scale?
+
+> `optional` **scale?**: `number`
+
+Render scale for the image fallback used by providers without native PDF
+support (#297). Higher is sharper but costs roughly the square in memory
+and tokens. Range 0.1-10; defaults to PDF_LIMITS.DEFAULT_SCALE (1.5).
+
+#### maxPages?
+
+> `optional` **maxPages?**: `number`
+
+Max pages converted by the image fallback (#297). Pages beyond this are
+not sent to the model at all. Defaults to PDF_LIMITS.DEFAULT_MAX_PAGES (20).
+
+---
+
+### imageOptions?
+
+> `optional` **imageOptions?**: `object`
+
+Options for images that need transcoding before a vision provider can
+read them (HEIC, TIFF, BMP, ICO, JPEG 2000, AVIF — see
+`adapters/imageFormatSupport.ts`).
+
+#### outputFormat?
+
+> `optional` **outputFormat?**: [`VisionImageOutputFormat`](VisionImageOutputFormat.md)
+
+Transcode target for an incompatible image. Defaults to `"png"` — the
+module's own default, unchanged unless a caller opts in here.
 
 ---
 
 ### videoOptions?
 
-> `optional` **videoOptions**: `object`
+> `optional` **videoOptions?**: [`VideoProcessorOptions`](VideoProcessorOptions.md)
 
-Defined in: [types/generateTypes.ts:96](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L96)
+Video processing options — keyframe budget, encoder settings, and
+whether to transcribe the clip's spoken audio.
 
-#### frames?
+The canonical shape, rather than a third structurally-identical copy of
+it: `StreamOptions` and `TextGenerationOptions` declare the same field,
+and the inline copies had already drifted apart in what they documented.
 
-> `optional` **frames**: `number`
+---
 
-#### quality?
+### audioOptions?
 
-> `optional` **quality**: `number`
+> `optional` **audioOptions?**: `object`
 
-#### format?
+Audio transcription options for attached audio files (#413/#440).
 
-> `optional` **format**: `"jpeg"` \| `"png"`
+An attached audio file is transcribed automatically when a backend is
+configured; this is only needed to override which one, or to help it.
+Without it the first configured backend wins, in the order OpenAI
+(Whisper), Google, Azure.
 
-#### transcribeAudio?
+#### provider?
 
-> `optional` **transcribeAudio**: `boolean`
+> `optional` **provider?**: `string`
+
+Transcription backend: "openai" (aliases "whisper", "openai-whisper"),
+"google" or "azure". An unavailable or unrecognised choice is never
+swapped for another backend: no transcript is produced, and the
+selection reason is logged as a warning.
+
+#### transcriptionModel?
+
+> `optional` **transcriptionModel?**: `string`
+
+Transcription model, e.g. "whisper-1". Backend-specific.
+
+#### language?
+
+> `optional` **language?**: `string`
+
+Language hint, e.g. "en". Improves accuracy on non-English speech.
+
+#### prompt?
+
+> `optional` **prompt?**: `string`
+
+OpenAI/Whisper-only context prompt to bias transcription (proper nouns,
+jargon). Ignored by Google and Azure.
+
+#### Example
+
+```typescript
+await neurolink.generate({
+  input: { text: "Summarise this call", files: ["./call.mp3"] },
+  audioOptions: { provider: "openai", language: "en" },
+});
+```
 
 ---
 
 ### tts?
 
-> `optional` **tts**: `TTSOptions`
-
-Defined in: [types/generateTypes.ts:135](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L135)
+> `optional` **tts?**: [`TTSOptions`](TTSOptions.md)
 
 Text-to-Speech (TTS) configuration
 
@@ -202,17 +356,53 @@ const result = await neurolink.generate({
 
 ---
 
+### stt?
+
+> `optional` **stt?**: [`STTOptions`](STTOptions.md) & `object`
+
+Speech-to-Text (STT) configuration
+
+Enable audio transcription. When enabled, the audio provided via `stt.audio`
+will be transcribed to text and used as the prompt.
+
+#### Type Declaration
+
+##### provider?
+
+> `optional` **provider?**: `string`
+
+##### audio?
+
+> `optional` **audio?**: `Buffer` \| `ArrayBuffer`
+
+#### Example
+
+```typescript
+const neurolink = new NeuroLink();
+const result = await neurolink.generate({
+  input: { text: "" },
+  provider: "openai",
+  stt: {
+    enabled: true,
+    provider: "whisper",
+    language: "en-US",
+    audio: audioBuffer,
+  },
+});
+// STT transcribes the audio, result.transcription contains the transcription
+```
+
+---
+
 ### thinkingConfig?
 
-> `optional` **thinkingConfig**: `object`
-
-Defined in: [types/generateTypes.ts:177](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L177)
+> `optional` **thinkingConfig?**: `object`
 
 Thinking/reasoning configuration for extended thinking models
 
 Enables extended thinking capabilities for supported models.
 
-**Gemini 3 Models** (gemini-3-pro-preview, gemini-3-flash-preview):
+**Gemini 3 Models** (gemini-3.1-pro-preview, gemini-3-flash-preview):
 Use `thinkingLevel` to control reasoning depth:
 
 - `minimal` - Near-zero thinking (Flash only)
@@ -225,21 +415,21 @@ Use `budgetTokens` to set token budget for thinking.
 
 #### enabled?
 
-> `optional` **enabled**: `boolean`
+> `optional` **enabled?**: `boolean`
 
 #### type?
 
-> `optional` **type**: `"enabled"` \| `"disabled"`
+> `optional` **type?**: `"enabled"` \| `"disabled"`
 
 #### budgetTokens?
 
-> `optional` **budgetTokens**: `number`
+> `optional` **budgetTokens?**: `number`
 
 Token budget for thinking (Anthropic models)
 
 #### thinkingLevel?
 
-> `optional` **thinkingLevel**: `"minimal"` \| `"low"` \| `"medium"` \| `"high"`
+> `optional` **thinkingLevel?**: `"minimal"` \| `"low"` \| `"medium"` \| `"high"`
 
 Thinking level for Gemini 3 models: minimal, low, medium, high
 
@@ -249,7 +439,7 @@ Thinking level for Gemini 3 models: minimal, low, medium, high
 const result = await neurolink.generate({
   input: { text: "Solve this complex problem..." },
   provider: "google-ai",
-  model: "gemini-3-pro-preview",
+  model: "gemini-3.1-pro-preview",
   thinkingConfig: {
     thinkingLevel: "high",
   },
@@ -272,87 +462,130 @@ const result = await neurolink.generate({
 
 ### provider?
 
-> `optional` **provider**: [`AIProviderName`](../enumerations/AIProviderName.md) \| `string`
-
-Defined in: [types/generateTypes.ts:187](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L187)
+> `optional` **provider?**: [`AIProviderName`](../enumerations/AIProviderName.md) \| `string`
 
 ---
 
 ### model?
 
-> `optional` **model**: `string`
-
-Defined in: [types/generateTypes.ts:188](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L188)
+> `optional` **model?**: `string`
 
 ---
 
 ### region?
 
-> `optional` **region**: `string`
-
-Defined in: [types/generateTypes.ts:189](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L189)
+> `optional` **region?**: `string`
 
 ---
 
 ### temperature?
 
-> `optional` **temperature**: `number`
-
-Defined in: [types/generateTypes.ts:190](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L190)
+> `optional` **temperature?**: `number`
 
 ---
 
 ### maxTokens?
 
-> `optional` **maxTokens**: `number`
+> `optional` **maxTokens?**: `number`
 
-Defined in: [types/generateTypes.ts:191](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L191)
+---
+
+### compactionThreshold?
+
+> `optional` **compactionThreshold?**: `number`
+
+Fraction of the model's context window at which history is compacted for
+this request, replacing the 0.8 default. Filled in per request by the
+classifier router when a decision provider is configured; always at or
+below the default, never above. See `TextGenerationOptions`.
+
+---
+
+### topP?
+
+> `optional` **topP?**: `number`
+
+Top-p (nucleus) sampling parameter. Controls diversity of generated tokens.
+
+---
+
+### topK?
+
+> `optional` **topK?**: `number`
+
+Top-k sampling parameter. Limits the number of tokens considered. (Google/Gemini models only)
+
+---
+
+### stopSequences?
+
+> `optional` **stopSequences?**: `string`[]
+
+Stop sequences that will halt generation when encountered.
 
 ---
 
 ### systemPrompt?
 
-> `optional` **systemPrompt**: `string`
+> `optional` **systemPrompt?**: `string`
 
-Defined in: [types/generateTypes.ts:192](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L192)
+---
+
+### agentMode?
+
+> `optional` **agentMode?**: [`TerminalAgentModeOption`](TerminalAgentModeOption.md)
+
+Opt-in terminal agent mode: prepends Neurolink's versioned autonomous-agent
+instructions to `systemPrompt`. Omitted means no change in behaviour.
 
 ---
 
 ### schema?
 
-> `optional` **schema**: `ValidationSchema`
-
-Defined in: [types/generateTypes.ts:225](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L225)
+> `optional` **schema?**: [`ValidationSchema`](ValidationSchema.md)
 
 Zod schema for structured output validation
 
 #### Important
 
-Google Gemini Limitation
-Google Vertex AI and Google AI Studio cannot combine function calling with
-structured output. You MUST use `disableTools: true` when using schemas with
-Google providers.
+Google GEMINI limitation (Gemini models only)
+Gemini models (Google AI Studio, and Vertex GEMINI models) cannot combine
+function calling with schema-enforced structured output — a Gemini API
+limitation ("Function calling with a response mime type:
+'application/json' is unsupported"). Vertex CLAUDE models and all other
+providers support tools + schema simultaneously.
 
-Error without disableTools: "Function calling with a response mime type:
-'application/json' is unsupported"
+You do NOT need to set `disableTools` yourself: when the combination is
+impossible, NeuroLink automatically falls back to text-mode JSON coercion
+(see `coerceJsonToSchema`), and `disableTools: true` remains available as
+an explicit override.
 
-This is a documented Google API limitation, not a NeuroLink bug.
-All frameworks (LangChain, Vercel AI SDK, Agno, Instructor) use this approach.
+On the native Anthropic Messages surface (provider "anthropic", including
+via a proxy) tools + schema are honored through an internal `final_result`
+tool the model calls with the structured answer — invisible to callers: it
+never appears in `toolCalls` / `toolExecutions`.
 
 #### Example
 
 ```typescript
-// ✅ Correct for Google providers
+// ✅ Vertex + Claude: tools AND schema together are fully supported
 const result = await neurolink.generate({
   schema: MySchema,
   provider: "vertex",
-  disableTools: true, // Required for Google
+  model: "claude-sonnet-4-6",
 });
 
-// ✅ No restriction for other providers
+// ✅ Direct Anthropic + tools: schema honored via the final_result tool
 const result = await neurolink.generate({
   schema: MySchema,
-  provider: "openai", // Works without disableTools
+  provider: "anthropic",
+});
+
+// ✅ Gemini + tools: SDK auto-falls back to coerced text-mode JSON
+const result = await neurolink.generate({
+  schema: MySchema,
+  provider: "google-ai",
+  model: "gemini-2.5-pro",
 });
 ```
 
@@ -364,153 +597,822 @@ https://ai.google.dev/gemini-api/docs/function-calling
 
 ### tools?
 
-> `optional` **tools**: `Record`\<`string`, `Tool`\>
+> `optional` **tools?**: `Record`\<`string`, [`Tool`](Tool.md)\>
 
-Defined in: [types/generateTypes.ts:226](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L226)
+---
+
+### enabledToolNames?
+
+> `optional` **enabledToolNames?**: `string`[]
+
+Filter available tools by name.
+Only tools with names in this array will be made available.
+Used by dynamic arguments to dynamically select which tools to enable.
+
+#### Example
+
+```typescript
+await neurolink.generate({
+  input: { text: "Search for information" },
+  enabledToolNames: ["websearchGrounding", "readFile"],
+});
+```
 
 ---
 
 ### timeout?
 
-> `optional` **timeout**: `number` \| `string`
+> `optional` **timeout?**: `number` \| `string`
 
-Defined in: [types/generateTypes.ts:227](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L227)
+Request timeout (e.g. 30000, '30s', '2m').
+
+PER-STEP semantics in agentic loops: on providers that run a native
+multi-step tool loop (Vertex Gemini / Vertex Claude), this bounds EACH
+model call in the loop, not the whole turn — a tool-heavy turn may run
+far longer than this value in total. Size it for the slowest single
+step (default 300s), and use `turnTimeoutMs` (or `abortSignal`) for a
+total-turn deadline.
+
+On the AI-SDK loop path (direct Anthropic, litellm, OpenAI-compatible)
+the same split holds only when `turnTimeoutMs` is ALSO set: then this
+value bounds each model call and `turnTimeoutMs` bounds the turn. With
+`turnTimeoutMs` unset, this value bounds the WHOLE turn there (the
+pre-existing defensive behavior, kept for backward compatibility).
+
+When set explicitly, a step timeout is surfaced immediately instead of
+burning internal retries/fallbacks that would re-run the same
+provider+model with the same doomed budget.
+
+---
+
+### turnTimeoutMs?
+
+> `optional` **turnTimeoutMs?**: `number`
+
+Hard wall-clock cap for the WHOLE agentic turn (all model calls + tool
+executions), in milliseconds. When the deadline passes the turn ends
+gracefully with `stopReason: "time-limit"` and an honest time message —
+never the step-cap text. Unset = no turn-level deadline (the library
+imposes no product policy).
+
+Enforced by the native Vertex loops (Gemini + Claude) AND the AI-SDK
+loop path (direct Anthropic, litellm and other OpenAI-compatible
+providers). On the AI-SDK path this value also owns the whole-turn hard
+abort: when set, `timeout` keeps its per-model-call meaning instead of
+bounding the entire loop. An explicit `timeout` also engages the same
+wrap-up when `turnTimeoutMs` is unset. Once the wrap-up window begins (see
+`wrapupTimeLeadMs`), the loop forcibly sets `toolChoice: "none"` for the
+remaining steps — overriding any caller-supplied `toolChoice` or
+`prepareStep` tool selection — and appends an honest time message that a
+caller's `prepareStep` callback does not observe (it runs before the
+wrap-up nudge is applied). An honest partial beats a discarded turn.
+
+---
+
+### stallTimeoutMs?
+
+> `optional` **stallTimeoutMs?**: `number`
+
+Maximum time with NO progress — no stream chunk received, no tool
+execution started or finished, no step started — before the turn ends
+with `stopReason: "stalled"`. Catches wedged tools and hung model calls
+that a whole-turn deadline would let run to the bitter end.
+Unset = disabled.
+
+Enforced by the native Vertex loops (Gemini + Claude) ONLY. Unlike
+`turnTimeoutMs`, the AI-SDK loop path does not implement stall detection,
+so setting this on any other provider has no effect — the turn runs until
+it finishes, times out some other way, or the caller aborts. The narrower
+scope is stated here because the option itself is accepted everywhere:
+without this note a caller would reasonably read silence as coverage.
+
+---
+
+### wrapupTimeLeadMs?
+
+> `optional` **wrapupTimeLeadMs?**: `number`
+
+When the remaining turn time drops below this, a wrap-up nudge rides the
+next tool-result turn telling the model to consolidate what it has and
+produce its final answer. Defaults to 120_000 when `turnTimeoutMs` is
+set; ignored when it is not.
+
+On the AI-SDK loop path the lead is clamped to a quarter of the turn
+budget (so short budgets don't wrap up on step one) and wrap-up steps
+run with a forced `toolChoice: "none"` — see `turnTimeoutMs` for the
+exact override semantics.
+
+---
+
+### toolTimeoutMs?
+
+> `optional` **toolTimeoutMs?**: `number` \| `null`
+
+Per-tool-execution timeout in milliseconds (default 300_000), or `null`
+for no bound at all.
+
+A tool that exceeds it is told to stop — the AbortSignal it was handed is
+aborted — and then fails with an error tool_result costing one step, so
+the turn continues instead of hanging on a wedged tool. A tool that
+ignores its signal keeps running to completion in the background; nothing
+here can stop it, and its eventual result is discarded.
+
+`null` removes the bound and awaits `execute` unguarded, which is what the
+native loops did before they had a per-tool timer. It is the way to keep a
+legitimately long-running tool, since a finite number is always a ceiling
+and `Infinity` silently becomes `setTimeout`'s ~24.9-day cap. The one
+combination refused is `null` together with
+`executionControl.lifetimeTimeoutMs: null`, which would leave the turn
+with no bound anywhere.
+
+---
+
+### abortSignal?
+
+> `optional` **abortSignal?**: `AbortSignal`
+
+AbortSignal for external cancellation of the AI call
+
+---
+
+### toolExecutionCapture?
+
+> `optional` **toolExecutionCapture?**: [`ToolExecutionCaptureOptions`](ToolExecutionCaptureOptions.md)
+
+Bounds for the per-call tool execution records surfaced on
+`GenerateResult.toolExecutions`. Capture is on by default
+(maxResultChars 8192, maxRecords 500); pass larger caps when the caller
+needs full result texts.
+
+---
+
+### disableToolCallRepair?
+
+> `optional` **disableToolCallRepair?**: `boolean`
+
+Disable the schema-driven tool call repair mechanism (BZ-665). Default: false (repair enabled).
 
 ---
 
 ### disableTools?
 
-> `optional` **disableTools**: `boolean`
-
-Defined in: [types/generateTypes.ts:245](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L245)
+> `optional` **disableTools?**: `boolean`
 
 Disable tool execution (including built-in tools)
 
-#### Required
-
-For Google Gemini providers when using schemas
-Google Vertex AI and Google AI Studio require this flag when using
-structured output (schemas) due to Google API limitations.
+Optional with schemas: the tools↔schema exclusion applies only to Google
+GEMINI models (Google AI Studio / Vertex Gemini — a Gemini API
+limitation), and NeuroLink handles it automatically by falling back to
+text-mode JSON coercion. Vertex CLAUDE models support tools + schema
+together. Set this only when you explicitly want a tool-free call.
 
 #### Example
 
 ```typescript
-// Required for Google providers with schemas
+// Explicit override: schema-only call with no tools at all
 await neurolink.generate({
   schema: MySchema,
-  provider: "vertex",
+  provider: "google-ai",
   disableTools: true,
 });
 ```
 
 ---
 
+### toolFilter?
+
+> `optional` **toolFilter?**: `string`[]
+
+Include only these tools by name (whitelist). If set, only matching tools are available.
+
+---
+
+### excludeTools?
+
+> `optional` **excludeTools?**: `string`[]
+
+Exclude these tools by name (blacklist). Applied after toolFilter.
+
+---
+
+### skipToolPromptInjection?
+
+> `optional` **skipToolPromptInjection?**: `boolean`
+
+Skip injecting tool schemas into the system prompt.
+When true, tools are ONLY passed natively via the provider's `tools` parameter,
+avoiding duplicate tool definitions (~30K tokens savings per call).
+Default: false (backward compatible — tool schemas are injected into system prompt).
+
+---
+
+### disableToolCache?
+
+> `optional` **disableToolCache?**: `boolean`
+
+Disable tool result caching for this request (overrides global mcp.cache.enabled)
+
+---
+
+### disableInternalFallback?
+
+> `optional` **disableInternalFallback?**: `boolean`
+
+Disable NeuroLink's internal fallback for this request: the static
+provider-priority walk that runs when no provider was requested, and the
+catalog model-fallback walk a provider performs when its model is
+rejected as invalid. Callers that own fallback order (a caller-supplied
+`providerFallback` / `modelChain`, or a router that retries on its own,
+as the Claude proxy does for its streams) set this so an invalid model
+or an unavailable provider surfaces as exactly that.
+A configured `ModelPool`, `providerFallback` and `modelChain` are the
+caller's own fallback and are unaffected. Mirrors the same flag on
+`StreamOptions`.
+
+---
+
+### maxSteps?
+
+> `optional` **maxSteps?**: `number`
+
+Maximum number of tool execution steps (default: 200)
+
+---
+
+### toolRoots?
+
+> `optional` **toolRoots?**: `string`[]
+
+Directories the built-in file tools and bash's `cwd` argument may touch
+for this call. Can only narrow the instance's `tools.fileRoots` (or the
+working-directory default); a root outside them is rejected before any
+model call. An empty array denies all file access.
+
+---
+
+### toolChoice?
+
+> `optional` **toolChoice?**: [`ToolChoice`](ToolChoice.md)\<`Record`\<`string`, [`Tool`](Tool.md)\>\>
+
+Tool choice configuration for the generation.
+Controls whether and which tools the model must call.
+
+- `"auto"` (default): the model can choose whether and which tools to call
+- `"none"`: no tool calls allowed
+- `"required"`: the model must call at least one tool
+- `{ type: "tool", toolName: string }`: the model must call the specified tool
+
+A forced choice (`"required"` or a named tool) is applied only to the
+first `toolChoiceSteps` steps of the `maxSteps` loop (default 1) and the
+model is then free to answer. Holding a forced choice on every step would
+compel a tool call on every step, and the loop would only end when
+`maxSteps` ran out. `"auto"` and `"none"` are applied unchanged on every
+step. Vertex, Google AI Studio and Bedrock do not honour `toolChoice`.
+
+A named tool that the request does not declare is not sent, because the
+provider would reject the request: a warning is logged and the step uses
+`"auto"`.
+
+---
+
+### toolChoiceSteps?
+
+> `optional` **toolChoiceSteps?**: `number`
+
+How many leading steps a forced `toolChoice` (`"required"` or a named
+tool) stays in force; from that step on the model chooses (`"auto"`).
+A non-negative integer, default 1. `0` never forces. Ignored for
+`"auto"` and `"none"`. A `prepareStep` result that names a `toolChoice`
+overrides this for that step.
+
+---
+
+### replayToolSteps?
+
+> `optional` **replayToolSteps?**: [`ToolReplayMode`](ToolReplayMode.md)
+
+How this request replays the session's stored tool steps
+(`tool_call` / `tool_result` rows in `conversationMessages`) into the
+prompt: `"full"` (real tool-call / tool-result turns), `"marker"` (a
+compact `[called <tool> → ok]` line per call, the default) or `"off"`.
+Overrides `conversationMemory.replayToolSteps` for this request.
+
+---
+
+### prepareStep?
+
+> `optional` **prepareStep?**: (`options`) => `PromiseLike`\<\{ `model?`: [`LanguageModel`](LanguageModel.md); `toolChoice?`: [`ToolChoice`](ToolChoice.md)\<`Record`\<`string`, [`Tool`](Tool.md)\>\>; `experimental_activeTools?`: `string`[]; \} \| `undefined`\>
+
+Optional callback that runs before each step in a multi-step generation.
+
+Honoured field of the result: `toolChoice`, applied to that step only
+and taking precedence over `toolChoice` / `toolChoiceSteps`. A named tool
+the request does not declare is ignored with a warning, as if the hook had
+returned no `toolChoice`.
+
+Not honoured — accepted for source compatibility with the former Vercel
+AI SDK `experimental_prepareStep` shape, but ignored by every native
+loop: `model` (the turn's model cannot change mid-loop) and
+`experimental_activeTools` (tool visibility is fixed for the turn; use
+`toolFilter` / `excludeTools` instead).
+
+`steps` carries one record per completed step (content, text, tool calls,
+tool results, finish reason, usage); `model` is the resolved model id.
+
+#### Parameters
+
+##### options
+
+###### steps
+
+[`StepResult`](StepResult.md)\<`Record`\<`string`, [`Tool`](Tool.md)\>\>[]
+
+###### stepNumber
+
+`number`
+
+###### maxSteps
+
+`number`
+
+###### model
+
+[`LanguageModel`](LanguageModel.md)
+
+#### Returns
+
+`PromiseLike`\<\{ `model?`: [`LanguageModel`](LanguageModel.md); `toolChoice?`: [`ToolChoice`](ToolChoice.md)\<`Record`\<`string`, [`Tool`](Tool.md)\>\>; `experimental_activeTools?`: `string`[]; \} \| `undefined`\>
+
+#### Example
+
+```typescript
+prepareStep: async ({ stepNumber }) => {
+  if (stepNumber === 0) {
+    return {
+      toolChoice: { type: "tool", toolName: "myTool" },
+    };
+  }
+  return { toolChoice: "auto" };
+};
+```
+
+---
+
 ### enableEvaluation?
 
-> `optional` **enableEvaluation**: `boolean`
-
-Defined in: [types/generateTypes.ts:248](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L248)
+> `optional` **enableEvaluation?**: `boolean`
 
 ---
 
 ### enableAnalytics?
 
-> `optional` **enableAnalytics**: `boolean`
-
-Defined in: [types/generateTypes.ts:249](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L249)
+> `optional` **enableAnalytics?**: `boolean`
 
 ---
 
 ### context?
 
-> `optional` **context**: `StandardRecord`
-
-Defined in: [types/generateTypes.ts:250](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L250)
+> `optional` **context?**: [`StandardRecord`](StandardRecord.md) & [`NeurolinkTraceContext`](NeurolinkTraceContext.md)
 
 ---
 
 ### evaluationDomain?
 
-> `optional` **evaluationDomain**: `string`
-
-Defined in: [types/generateTypes.ts:253](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L253)
+> `optional` **evaluationDomain?**: `string`
 
 ---
 
 ### toolUsageContext?
 
-> `optional` **toolUsageContext**: `string`
-
-Defined in: [types/generateTypes.ts:254](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L254)
+> `optional` **toolUsageContext?**: `string`
 
 ---
 
-### conversationHistory?
+### ~~conversationHistory?~~
 
-> `optional` **conversationHistory**: `object`[]
+> `optional` **conversationHistory?**: `object`[]
 
-Defined in: [types/generateTypes.ts:255](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L255)
-
-#### role
+#### ~~role~~
 
 > **role**: `string`
 
-#### content
+#### ~~content~~
 
 > **content**: `string`
+
+#### Deprecated
+
+Use `conversationMessages` instead. This field uses a simple `{role, content}` shape
+that is not consumed by `buildMessagesArray()` — messages passed here will NOT reach the AI model
+as proper conversation turns. `conversationMessages` uses the full `ChatMessage` type and is
+correctly wired through the entire generate pipeline.
+
+---
+
+### conversationMessages?
+
+> `optional` **conversationMessages?**: [`ChatMessage`](ChatMessage.md)[]
+
+Previous conversation as a ChatMessage array.
+Messages are injected as proper multi-turn conversation history before the current prompt,
+so the AI model sees them as real prior exchanges (not text dumped into the prompt).
+Used by task continuation mode and available to external callers.
 
 ---
 
 ### factoryConfig?
 
-> `optional` **factoryConfig**: `object`
-
-Defined in: [types/generateTypes.ts:258](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L258)
+> `optional` **factoryConfig?**: `object`
 
 #### domainType?
 
-> `optional` **domainType**: `string`
+> `optional` **domainType?**: `string`
 
 #### domainConfig?
 
-> `optional` **domainConfig**: `StandardRecord`
+> `optional` **domainConfig?**: [`StandardRecord`](StandardRecord.md)
 
 #### enhancementType?
 
-> `optional` **enhancementType**: `"domain-configuration"` \| `"streaming-optimization"` \| `"mcp-integration"` \| `"legacy-migration"` \| `"context-conversion"`
+> `optional` **enhancementType?**: `"domain-configuration"` \| `"streaming-optimization"` \| `"mcp-integration"` \| `"legacy-migration"` \| `"context-conversion"`
 
 #### preserveLegacyFields?
 
-> `optional` **preserveLegacyFields**: `boolean`
+> `optional` **preserveLegacyFields?**: `boolean`
 
 #### validateDomainData?
 
-> `optional` **validateDomainData**: `boolean`
+> `optional` **validateDomainData?**: `boolean`
 
 ---
 
 ### streaming?
 
-> `optional` **streaming**: `object`
-
-Defined in: [types/generateTypes.ts:272](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/generateTypes.ts#L272)
+> `optional` **streaming?**: `object`
 
 #### enabled?
 
-> `optional` **enabled**: `boolean`
+> `optional` **enabled?**: `boolean`
 
 #### chunkSize?
 
-> `optional` **chunkSize**: `number`
+> `optional` **chunkSize?**: `number`
 
 #### bufferSize?
 
-> `optional` **bufferSize**: `number`
+> `optional` **bufferSize?**: `number`
 
 #### enableProgress?
 
-> `optional` **enableProgress**: `boolean`
+> `optional` **enableProgress?**: `boolean`
 
 #### fallbackToGenerate?
 
-> `optional` **fallbackToGenerate**: `boolean`
+> `optional` **fallbackToGenerate?**: `boolean`
+
+---
+
+### workflow?
+
+> `optional` **workflow?**: `string`
+
+---
+
+### workflowConfig?
+
+> `optional` **workflowConfig?**: [`WorkflowConfig`](WorkflowConfig.md)
+
+---
+
+### rag?
+
+> `optional` **rag?**: [`RAGConfig`](RAGConfig.md)
+
+RAG (Retrieval-Augmented Generation) configuration.
+
+When provided, NeuroLink automatically loads the specified files, chunks them,
+generates embeddings, and creates a search tool that the AI model can invoke
+on demand to find relevant context before answering.
+
+#### Examples
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "What is RAG?" },
+  provider: "vertex",
+  rag: {
+    files: ["./docs/guide.md"],
+  },
+});
+```
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "Explain chunking strategies" },
+  provider: "vertex",
+  rag: {
+    files: ["./docs/guide.md", "./docs/api.md"],
+    strategy: "markdown",
+    chunkSize: 512,
+    topK: 5,
+  },
+});
+```
+
+---
+
+### maxBudgetUsd?
+
+> `optional` **maxBudgetUsd?**: `number`
+
+Maximum budget in USD for this session. When the accumulated cost of all
+generate() calls on this NeuroLink instance exceeds this value, subsequent
+calls will throw a budget-exceeded error before making the API request.
+
+#### Example
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "Summarize this" },
+  maxBudgetUsd: 1.0,
+});
+```
+
+---
+
+### requestId?
+
+> `optional` **requestId?**: `string`
+
+Optional request identifier for observability and log correlation.
+When provided, this ID is forwarded to spans, logs, and telemetry so
+callers can correlate generation traces back to their own request lifecycle.
+
+---
+
+### middleware?
+
+> `optional` **middleware?**: [`MiddlewareFactoryOptions`](MiddlewareFactoryOptions.md)
+
+Per-call middleware configuration.
+
+---
+
+### onFinish?
+
+> `optional` **onFinish?**: [`OnFinishCallback`](OnFinishCallback.md)
+
+Callback invoked when generation completes successfully.
+
+---
+
+### onError?
+
+> `optional` **onError?**: [`OnErrorCallback`](OnErrorCallback.md)
+
+Callback invoked when generation encounters an error.
+
+---
+
+### requestContext?
+
+> `optional` **requestContext?**: `Record`\<`string`, `unknown`\>
+
+Pre-validated user context for the request
+
+---
+
+### useKnowledgeGrounding?
+
+> `optional` **useKnowledgeGrounding?**: `boolean`
+
+Opt this generation call into the knowledge grounding configured on the
+NeuroLink instance. Defaults to `false` when omitted.
+
+---
+
+### knowledgeContext?
+
+> `optional` **knowledgeContext?**: [`KnowledgeRequestScope`](KnowledgeRequestScope.md)
+
+Enabled integrations used to scope knowledge retrieval for this turn.
+Used only when `useKnowledgeGrounding` is true and knowledge grounding is
+enabled on the NeuroLink instance.
+
+---
+
+### auth?
+
+> `optional` **auth?**: `object`
+
+Raw auth token — validated by configured auth provider
+
+#### token
+
+> **token**: `string`
+
+---
+
+### credentials?
+
+> `optional` **credentials?**: [`NeurolinkCredentials`](NeurolinkCredentials.md)
+
+Per-provider credential overrides for this request.
+Overrides instance-level credentials set in `new NeuroLink({ credentials })`.
+Unset providers fall through to instance credentials, then environment variables.
+
+---
+
+### providerFallback?
+
+> `optional` **providerFallback?**: (`error`) => `Promise`\<\{ `provider?`: `string`; `model?`: `string`; \} \| `null`\>
+
+Curator P2-3: per-call fallback callback. Overrides any
+instance-level `providerFallback` set on `new NeuroLink({...})`.
+Invoked for any error except a genuine caller cancel — i.e. this
+call's `abortSignal` fired (network errors, 5xx, timeouts, auth
+failures, model-access-denied, and internal watchdog aborts all invoke
+it); receives the error unmodified. Return `{ provider, model }` to
+retry, `null` to bubble.
+
+#### Parameters
+
+##### error
+
+`unknown`
+
+#### Returns
+
+`Promise`\<\{ `provider?`: `string`; `model?`: `string`; \} \| `null`\>
+
+---
+
+### modelChain?
+
+> `optional` **modelChain?**: `string`[]
+
+Curator P2-3: per-call ordered model chain. Overrides any
+instance-level `modelChain`. Without an explicit `providerFallback`
+callback the chain only advances on model-access-denied errors —
+other failures (network, 5xx, timeouts) bubble immediately.
+
+---
+
+### memory?
+
+> `optional` **memory?**: [`MemoryCallOptions`](MemoryCallOptions.md)
+
+Per-call memory control.
+
+Override the global memory SDK behavior for this specific call.
+All flags default to `true` when the global memory SDK is enabled.
+If the global memory SDK is disabled, these flags have no effect.
+Shared with `StreamOptions` — see `MemoryCallOptions`.
+
+---
+
+### piiDetection?
+
+> `optional` **piiDetection?**: `object`
+
+PII detection — scans and optionally redacts PII from input before the LLM call.
+
+#### enabled?
+
+> `optional` **enabled?**: `boolean`
+
+#### action?
+
+> `optional` **action?**: `"redact"` \| `"abort"` \| `"warn"`
+
+#### detectTypes?
+
+> `optional` **detectTypes?**: (`"email"` \| `"phone"` \| `"ssn"` \| `"creditCard"` \| `"ipAddress"` \| `"address"` \| `"name"` \| `"dateOfBirth"` \| `"passport"` \| `"driversLicense"`)[]
+
+#### customPatterns?
+
+> `optional` **customPatterns?**: `RegExp`[]
+
+#### allowList?
+
+> `optional` **allowList?**: `string`[]
+
+#### redactionText?
+
+> `optional` **redactionText?**: `string`
+
+#### Example
+
+```ts
+{ enabled: true, action: "redact", detectTypes: ["ssn", "email"] }
+```
+
+---
+
+### responseValidation?
+
+> `optional` **responseValidation?**: `object`
+
+Response validation — validates and optionally transforms the LLM response.
+Supports retry-with-feedback when `retryOnFailure: true`.
+
+#### minLength?
+
+> `optional` **minLength?**: `number`
+
+#### maxLength?
+
+> `optional` **maxLength?**: `number`
+
+#### requiredPhrases?
+
+> `optional` **requiredPhrases?**: `string`[]
+
+#### forbiddenPhrases?
+
+> `optional` **forbiddenPhrases?**: `string`[]
+
+#### jsonSchema?
+
+> `optional` **jsonSchema?**: `Record`\<`string`, `unknown`\>
+
+#### customValidator?
+
+> `optional` **customValidator?**: (`text`) => \{ `category`: `string`; `severity`: `"error"` \| `"warning"` \| `"info"`; `message`: `string`; \} \| `null`
+
+##### Parameters
+
+###### text
+
+`string`
+
+##### Returns
+
+\{ `category`: `string`; `severity`: `"error"` \| `"warning"` \| `"info"`; `message`: `string`; \} \| `null`
+
+#### truncationAction?
+
+> `optional` **truncationAction?**: `"abort"` \| `"retry"` \| `"truncate"` \| `"warn"`
+
+#### truncationSuffix?
+
+> `optional` **truncationSuffix?**: `string`
+
+#### retryOnFailure?
+
+> `optional` **retryOnFailure?**: `boolean`
+
+#### maxRetries?
+
+> `optional` **maxRetries?**: `number`
+
+#### Example
+
+```ts
+{ maxLength: 5000, truncationAction: "truncate", retryOnFailure: true }
+```
+
+---
+
+### inputValidation?
+
+> `optional` **inputValidation?**: `object`
+
+Input validation — validates input text before any processing.
+
+#### trimWhitespace?
+
+> `optional` **trimWhitespace?**: `boolean`
+
+#### minLength?
+
+> `optional` **minLength?**: `number`
+
+#### maxLength?
+
+> `optional` **maxLength?**: `number`
+
+#### requireContent?
+
+> `optional` **requireContent?**: `boolean`
+
+---
+
+### ~~processors?~~
+
+> `optional` **processors?**: [`ProcessorPipelineConfig`](ProcessorPipelineConfig.md)
+
+#### Deprecated
+
+Use `piiDetection`, `responseValidation`, and `inputValidation` instead.
+
+---
+
+### skills?
+
+> `optional` **skills?**: [`SkillsCallOptions`](SkillsCallOptions.md)
+
+Per-call skills control. Only effective when the instance was
+constructed with `skills.enabled: true`. Lets a call disable the
+prompt index, or narrow it by scope/tags. Per-call wins over
+instance config.

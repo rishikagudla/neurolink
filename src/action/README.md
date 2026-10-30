@@ -1,16 +1,22 @@
 # NeuroLink GitHub Action
 
-Run AI-powered workflows with 13 providers directly in GitHub Actions.
+Run AI-powered workflows across supported AI providers directly in GitHub Actions.
 
 ## Quick Start
 
 ```yaml
-- uses: juspay/neurolink@v1
+- uses: juspay/neurolink@e42b4db89fa87946e2dd766cf2ab43929c689b8b # v13.8.16
   with:
     anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
     prompt: "Review this code"
     post_comment: true
 ```
+
+The `uses:` line pins a full commit SHA; the comment names the release it
+corresponds to. The action installs the exact `@juspay/neurolink` version it was
+released with (`src/lib/action/cliVersion.ts`) with `--ignore-scripts`, then runs
+`npm audit signatures` before executing it. `neurolink_version: latest` opts out
+of that pin. The committed `action-dist/` bundle is rebuilt and diffed in CI.
 
 ## Supported Providers
 
@@ -32,7 +38,7 @@ Run AI-powered workflows with 13 providers directly in GitHub Actions.
 
 ## Features
 
-- **Multi-provider support** - 13 AI providers with unified interface
+- **Multi-provider support** - a unified interface across supported AI providers
 - **PR/Issue comments** - Auto-post AI responses with comment updates
 - **Cost tracking** - Built-in analytics with `enable_analytics: true`
 - **Quality evaluation** - Response scoring with `enable_evaluation: true`
@@ -42,7 +48,7 @@ Run AI-powered workflows with 13 providers directly in GitHub Actions.
 
 ## Inputs
 
-See [action.yml](action.yml) for complete input documentation.
+See [action.yml](../../action.yml) for complete input documentation.
 
 ## Outputs
 

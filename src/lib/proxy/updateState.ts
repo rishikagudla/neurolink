@@ -1,0 +1,402 @@
+/**
+ * Update State Persistence
+ * Manages persistent state for the proxy auto-update feature.
+ * Tracks check timestamps, suppressed versions, and update history.
+ *
+ * State file location: ~/.neurolink/update-state.json
+ * Suppressed versions expire after 24 hours.
+ */
+
+import fs from "fs";
+import { ensurePrivateDirectorySync } from "../auth/secureFiles.js";
+import os from "os";
+import path from "path";
+import { randomUUID } from "node:crypto";
+import type { UpdateState } from "../types/index.js";
+
+// ============================================
+// Constants
+// ============================================
+
+const STATE_FILENAME = "update-state.json";
+const SUPPRESSION_TTL_MS = 86_400_000; // 24 hours
+const UPDATE_FAILURE_STAGES = new Set([
+  "check",
+  "install",
+  "validation",
+  "restart",
+  "health",
+]);
+
+// ============================================
+// Internal Helpers
+// ============================================
+
+/**
+ * Resolve the path to the update state file.
+ * Accepts an override for testing; defaults to ~/.neurolink/update-state.json.
+ */
+function resolveStatePath(overridePath?: string): string {
+  if (overridePath) {
+    return overridePath;
+  }
+  return path.join(os.homedir(), ".neurolink", STATE_FILENAME);
+}
+
+/**
+ * Ensure the parent directory of the given file path exists.
+ */
+function ensureParentDir(filePath: string): void {
+  // `~/.neurolink` holds credential material; whoever creates it first must
+  // create it owner-only, and re-assert the mode when it already exists.
+  ensurePrivateDirectorySync(path.dirname(filePath));
+}
+
+/** Reject malformed persisted failure metadata before it reaches status output. */
+function isValidLastFailure(
+  value: unknown,
+): value is NonNullable<UpdateState["lastFailure"]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.at === "string" &&
+    typeof candidate.version === "string" &&
+    typeof candidate.stage === "string" &&
+    UPDATE_FAILURE_STAGES.has(candidate.stage) &&
+    typeof candidate.message === "string"
+  );
+}
+
+function isValidDeferredUpdate(
+  value: unknown,
+): value is NonNullable<UpdateState["deferredUpdate"]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.version === "string" &&
+    typeof candidate.since === "string" &&
+    typeof candidate.updatedAt === "string" &&
+    [
+      "waiting_for_quiet",
+      "draining",
+      "drain_timeout",
+      "drain_unavailable",
+      "activity_unavailable",
+    ].includes(String(candidate.reason)) &&
+    (candidate.activeRequests === null ||
+      (typeof candidate.activeRequests === "number" &&
+        Number.isInteger(candidate.activeRequests) &&
+        candidate.activeRequests >= 0))
+  );
+}
+
+// ============================================
+// Exported Functions
+// ============================================
+
+/**
+ * Return an empty/initial UpdateState.
+ */
+export function getDefaultUpdateState(): UpdateState {
+  return {
+    lastCheckAt: new Date(0).toISOString(),
+    lastCheckVersion: "",
+    suppressedVersions: {},
+    installedVersion: null,
+    lastUpdateAt: null,
+    lastUpdateVersion: null,
+    pendingRestartVersion: null,
+    deferredUpdate: null,
+    lastFailure: null,
+  };
+}
+
+/**
+ * Load the update state from disk.
+ * Returns null if the file does not exist.
+ * Returns the default state if the file contains corrupt JSON.
+ *
+ * @param stateFilePath - Override path for testing (default: ~/.neurolink/update-state.json)
+ */
+export function loadUpdateState(stateFilePath?: string): UpdateState | null {
+  const filePath = resolveStatePath(stateFilePath);
+  try {
+    if (!fs.existsSync(filePath)) {
+      return null;
+    }
+    const content = fs.readFileSync(filePath, "utf8");
+    const parsed = JSON.parse(content);
+    // Minimal shape check — reject valid JSON that isn't an UpdateState
+    // Note: typeof null === "object", so we check both
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      typeof parsed.suppressedVersions !== "object" ||
+      parsed.suppressedVersions === null ||
+      Array.isArray(parsed.suppressedVersions) ||
+      typeof parsed.lastCheckAt !== "string"
+    ) {
+      return getDefaultUpdateState();
+    }
+    const candidate = parsed as Partial<UpdateState>;
+    return {
+      ...getDefaultUpdateState(),
+      ...candidate,
+      lastCheckAttemptAt:
+        typeof candidate.lastCheckAttemptAt === "string"
+          ? candidate.lastCheckAttemptAt
+          : undefined,
+      lastCheckError:
+        typeof candidate.lastCheckError === "string"
+          ? candidate.lastCheckError.slice(0, 1_000)
+          : null,
+      suppressedVersions: candidate.suppressedVersions ?? {},
+      // Backfill order matters for state files written before `installedVersion`
+      // existed. Back then `recordUpdateInstalled()` set ONLY
+      // `pendingRestartVersion`, leaving `lastUpdateVersion` on the previously
+      // activated build — so a validated-but-not-yet-running update lives in
+      // `pendingRestartVersion` and is the newer of the two. Reading
+      // `lastUpdateVersion` first would report the superseded version as
+      // installed and re-offer an update that is already on disk.
+      installedVersion:
+        typeof candidate.installedVersion === "string"
+          ? candidate.installedVersion
+          : typeof candidate.pendingRestartVersion === "string"
+            ? candidate.pendingRestartVersion
+            : typeof candidate.lastUpdateVersion === "string"
+              ? candidate.lastUpdateVersion
+              : null,
+      pendingRestartVersion:
+        typeof candidate.pendingRestartVersion === "string"
+          ? candidate.pendingRestartVersion
+          : null,
+      deferredUpdate: isValidDeferredUpdate(candidate.deferredUpdate)
+        ? candidate.deferredUpdate
+        : null,
+      lastFailure: isValidLastFailure(candidate.lastFailure)
+        ? candidate.lastFailure
+        : null,
+    };
+  } catch {
+    // Corrupt or unreadable JSON — return default state
+    return getDefaultUpdateState();
+  }
+}
+
+/**
+ * Save the update state to disk.
+ *
+ * @param state - The UpdateState to persist
+ * @param stateFilePath - Override path for testing (default: ~/.neurolink/update-state.json)
+ */
+export function saveUpdateState(
+  state: UpdateState,
+  stateFilePath?: string,
+): void {
+  const filePath = resolveStatePath(stateFilePath);
+  ensureParentDir(filePath);
+  // A process-unique temp path prevents concurrent update checks from renaming
+  // each other's file. The guard is single-owner now, but this also keeps
+  // explicit update commands safe when they overlap.
+  const tmpPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(state, null, 2), { mode: 0o600 });
+    fs.renameSync(tmpPath, filePath);
+  } finally {
+    try {
+      fs.rmSync(tmpPath, { force: true });
+    } catch {
+      // Best-effort cleanup after a successful rename or interrupted write.
+    }
+  }
+}
+
+/**
+ * Check whether a version is currently suppressed (i.e., suppressed AND within the 24-hour window).
+ *
+ * @param version - Semver version string to check
+ * @param stateFilePath - Override path for testing
+ */
+export function isVersionSuppressed(
+  version: string,
+  stateFilePath?: string,
+): boolean {
+  const state = loadUpdateState(stateFilePath);
+  if (!state) {
+    return false;
+  }
+  const entry = state.suppressedVersions[version];
+  if (!entry) {
+    return false;
+  }
+  return Date.now() - Date.parse(entry.suppressedAt) < SUPPRESSION_TTL_MS;
+}
+
+/**
+ * Add a version to the suppressed list and persist.
+ *
+ * @param version - Semver version string to suppress
+ * @param reason - Human-readable reason for suppression
+ * @param stateFilePath - Override path for testing
+ */
+export function suppressVersion(
+  version: string,
+  reason: string,
+  stateFilePath?: string,
+): void {
+  const state = loadUpdateState(stateFilePath) ?? getDefaultUpdateState();
+  state.suppressedVersions[version] = {
+    suppressedAt: new Date().toISOString(),
+    reason,
+  };
+  saveUpdateState(state, stateFilePath);
+}
+
+/**
+ * Record a successful update: set lastUpdateAt and lastUpdateVersion, then persist.
+ *
+ * @param version - The version that was successfully installed
+ * @param stateFilePath - Override path for testing
+ */
+export function recordSuccessfulUpdate(
+  version: string,
+  stateFilePath?: string,
+): void {
+  const state = loadUpdateState(stateFilePath) ?? getDefaultUpdateState();
+  state.lastUpdateAt = new Date().toISOString();
+  state.lastUpdateVersion = version;
+  state.installedVersion = version;
+  state.pendingRestartVersion = null;
+  state.deferredUpdate = null;
+  state.lastFailure = null;
+  delete state.suppressedVersions[version];
+  saveUpdateState(state, stateFilePath);
+}
+
+/** Record that the package was validated but live activation is still pending. */
+export function recordUpdateInstalled(
+  version: string,
+  stateFilePath?: string,
+): void {
+  const state = loadUpdateState(stateFilePath) ?? getDefaultUpdateState();
+  state.installedVersion = version;
+  state.pendingRestartVersion = version;
+  state.lastFailure = null;
+  saveUpdateState(state, stateFilePath);
+}
+
+/** Abandon a matching installed version so the next cycle may reinstall it. */
+export function abandonPendingUpdate(
+  version: string,
+  stateFilePath?: string,
+): boolean {
+  const state = loadUpdateState(stateFilePath);
+  if (!state || state.pendingRestartVersion !== version) {
+    return false;
+  }
+  state.pendingRestartVersion = null;
+  saveUpdateState(state, stateFilePath);
+  return true;
+}
+
+/** Persist a stage-specific updater failure so status remains actionable. */
+export function recordUpdateFailure(
+  version: string,
+  stage: NonNullable<UpdateState["lastFailure"]>["stage"],
+  message: string,
+  stateFilePath?: string,
+): void {
+  const state = loadUpdateState(stateFilePath) ?? getDefaultUpdateState();
+  state.lastFailure = {
+    at: new Date().toISOString(),
+    version,
+    stage,
+    message: message.trim().slice(0, 1_000),
+  };
+  saveUpdateState(state, stateFilePath);
+}
+
+/** Persist why a discovered update is waiting without treating it as a failure. */
+export function recordUpdateDeferred(
+  version: string,
+  reason: NonNullable<UpdateState["deferredUpdate"]>["reason"],
+  activeRequests: number | null,
+  stateFilePath?: string,
+): void {
+  const state = loadUpdateState(stateFilePath) ?? getDefaultUpdateState();
+  const now = new Date().toISOString();
+  state.deferredUpdate = {
+    version,
+    since:
+      state.deferredUpdate?.version === version
+        ? state.deferredUpdate.since
+        : now,
+    updatedAt: now,
+    reason,
+    activeRequests,
+  };
+  saveUpdateState(state, stateFilePath);
+}
+
+/** Clear matching updater deferral metadata once work can proceed. */
+export function clearUpdateDeferral(
+  version?: string,
+  stateFilePath?: string,
+): boolean {
+  const state = loadUpdateState(stateFilePath);
+  if (
+    !state?.deferredUpdate ||
+    (version !== undefined && state.deferredUpdate.version !== version)
+  ) {
+    return false;
+  }
+  state.deferredUpdate = null;
+  saveUpdateState(state, stateFilePath);
+  return true;
+}
+
+/** Complete an updater-managed install after a manual or automatic restart. */
+export function reconcileRunningUpdate(
+  runningVersion: string,
+  stateFilePath?: string,
+): boolean {
+  const state = loadUpdateState(stateFilePath);
+  if (!state || state.pendingRestartVersion !== runningVersion) {
+    return false;
+  }
+  recordSuccessfulUpdate(runningVersion, stateFilePath);
+  return true;
+}
+
+/**
+ * Record an update check: set lastCheckAt and lastCheckVersion, then persist.
+ *
+ * @param latestVersion - The latest version found during the check
+ * @param stateFilePath - Override path for testing
+ */
+export function recordCheck(
+  latestVersion: string,
+  stateFilePath?: string,
+): void {
+  const state = loadUpdateState(stateFilePath) ?? getDefaultUpdateState();
+  state.lastCheckAt = new Date().toISOString();
+  state.lastCheckAttemptAt = state.lastCheckAt;
+  state.lastCheckError = null;
+  state.lastCheckVersion = latestVersion;
+  saveUpdateState(state, stateFilePath);
+}
+
+/** Preserve the last successful registry version when discovery fails. */
+export function recordCheckFailure(
+  message: string,
+  stateFilePath?: string,
+): void {
+  const state = loadUpdateState(stateFilePath) ?? getDefaultUpdateState();
+  state.lastCheckAttemptAt = new Date().toISOString();
+  state.lastCheckError = message.slice(0, 1_000);
+  saveUpdateState(state, stateFilePath);
+}

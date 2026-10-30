@@ -6,40 +6,21 @@
  */
 
 import { ProviderFactory } from "../../factories/providerFactory.js";
+import {
+  SpanSerializer,
+  SpanType,
+  SpanStatus,
+  getMetricsAggregator,
+} from "../../observability/index.js";
 import { logger } from "../../utils/logger.js";
 import { rerank } from "../reranker/reranker.js";
 import type {
   BM25Result,
   HybridSearchConfig,
   HybridSearchResult,
-} from "../types.js";
-import type { VectorStore } from "./vectorQueryTool.js";
-
-/**
- * BM25 Index interface
- * Implementations should provide sparse retrieval capabilities
- */
-export interface BM25Index {
-  /**
-   * Search documents using BM25 algorithm
-   * @param query - Search query string
-   * @param topK - Number of results to return
-   * @returns Array of BM25 results
-   */
-  search(query: string, topK?: number): Promise<BM25Result[]>;
-
-  /**
-   * Add documents to the index
-   * @param documents - Documents to index
-   */
-  addDocuments(
-    documents: Array<{
-      id: string;
-      text: string;
-      metadata?: Record<string, unknown>;
-    }>,
-  ): Promise<void>;
-}
+  BM25Index,
+  HybridSearchOptions,
+} from "../../types/index.js";
 
 /**
  * In-memory BM25 implementation for testing and development
@@ -236,25 +217,6 @@ function normalizeScores(scores: Map<string, number>): Map<string, number> {
 }
 
 /**
- * Hybrid search configuration for creating a search function
- */
-export interface HybridSearchOptions {
-  /** Vector store instance */
-  vectorStore: VectorStore;
-  /** BM25 index instance */
-  bm25Index: BM25Index;
-  /** Index name for vector store */
-  indexName: string;
-  /** Embedding model configuration (optional - uses defaults from ProviderFactory if not specified) */
-  embeddingModel?: {
-    provider?: string;
-    modelName?: string;
-  };
-  /** Default search configuration */
-  defaultConfig?: HybridSearchConfig;
-}
-
-/**
  * Create a hybrid search function
  *
  * @param options - Search options
@@ -292,6 +254,14 @@ export function createHybridSearch(options: HybridSearchOptions) {
       reranker: rerankerConfig = defaultConfig.reranker,
     } = config || {};
 
+    const span = SpanSerializer.createSpan(SpanType.RAG, "rag.search", {
+      "rag.operation": "search",
+      "rag.topK": topK,
+      "rag.fusionMethod": fusionMethod,
+      "rag.query": query.slice(0, 200),
+    });
+    const spanStartTime = Date.now();
+
     try {
       // Generate query embedding
       const embeddingProvider = await ProviderFactory.createProvider(
@@ -299,21 +269,14 @@ export function createHybridSearch(options: HybridSearchOptions) {
         embeddingModel?.modelName,
       );
 
-      if (
-        typeof (embeddingProvider as unknown as Record<string, unknown>)
-          .embed !== "function"
-      ) {
+      if (typeof embeddingProvider.embed !== "function") {
         throw new Error(
           `Embedding provider does not support the embed() method. ` +
             `Please use a provider that supports embeddings (e.g., OpenAI text-embedding-3-small, Vertex text-embedding-004).`,
         );
       }
 
-      const queryEmbedding = await (
-        embeddingProvider as unknown as {
-          embed: (s: string) => Promise<number[]>;
-        }
-      ).embed(query);
+      const queryEmbedding = await embeddingProvider.embed(query);
 
       // Parallel retrieval
       const [vectorResults, bm25Results] = await Promise.all([
@@ -439,8 +402,12 @@ export function createHybridSearch(options: HybridSearchOptions) {
       // Apply reranking if configured
       if (enableReranking && rerankerConfig && fusedResults.length > 0) {
         const rerankerModel = await ProviderFactory.createProvider(
-          rerankerConfig.model.provider,
-          rerankerConfig.model.modelName,
+          typeof rerankerConfig.model === "object"
+            ? rerankerConfig.model.provider
+            : rerankerConfig.model,
+          typeof rerankerConfig.model === "object"
+            ? rerankerConfig.model.modelName
+            : rerankerConfig.model,
         );
 
         const rerankedResults = await rerank(
@@ -481,8 +448,24 @@ export function createHybridSearch(options: HybridSearchOptions) {
         queryTime,
       });
 
+      span.durationMs = Date.now() - spanStartTime;
+      const endedSpan = SpanSerializer.endSpan(span, SpanStatus.OK);
+      endedSpan.attributes = {
+        ...endedSpan.attributes,
+        "rag.results_count": fusedResults.length,
+        "rag.vector_results": vectorResults.length,
+        "rag.bm25_results": bm25Results.length,
+      };
+      getMetricsAggregator().recordSpan(endedSpan);
+
       return fusedResults;
     } catch (error) {
+      span.durationMs = Date.now() - spanStartTime;
+      const endedSpan = SpanSerializer.endSpan(span, SpanStatus.ERROR);
+      endedSpan.statusMessage =
+        error instanceof Error ? error.message : String(error);
+      getMetricsAggregator().recordSpan(endedSpan);
+
       logger.error("[HybridSearch] Search failed", {
         query: query.slice(0, 50),
         error: error instanceof Error ? error.message : String(error),

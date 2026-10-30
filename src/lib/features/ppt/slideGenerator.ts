@@ -13,7 +13,6 @@
  * @module presentation/slideGenerator
  */
 
-import PptxGenJS from "pptxgenjs";
 import pLimit from "p-limit";
 import * as fs from "fs";
 import type {
@@ -26,8 +25,8 @@ import type {
   LogoConfig,
   SlideGeneratorConfig,
   SlideGenerationBatchResult,
-} from "./types.js";
-import { SLIDE_DIMENSIONS } from "./types.js";
+} from "../../types/index.js";
+import { SLIDE_DIMENSIONS } from "../../types/index.js";
 import {
   getTheme,
   isImageSlideType,
@@ -35,12 +34,39 @@ import {
   IMAGE_GENERATION_TIMEOUT_MS,
   MAX_CONCURRENT_IMAGE_GENERATIONS,
 } from "./constants.js";
+
+let _pptxGenJS: (new () => PptxPresentation) | null = null;
+export async function loadPptxGenJS(): Promise<new () => PptxPresentation> {
+  if (_pptxGenJS) {
+    return _pptxGenJS;
+  }
+  const mod = await tryImport<typeof import("pptxgenjs")>(
+    "pptxgenjs",
+    "PPT generation",
+  );
+  // ESM/CJS interop: pptxgenjs v4 may double-wrap the default export.
+  // The runtime shape is genuinely dynamic, so probe it as `unknown`.
+  const rawDefault: unknown = mod.default;
+  const Ctor =
+    typeof rawDefault === "function"
+      ? rawDefault
+      : (rawDefault as { default: new () => PptxPresentation }).default;
+  _pptxGenJS = Ctor as new () => PptxPresentation;
+  return _pptxGenJS;
+}
 import { logger } from "../../utils/logger.js";
+import { tryImport } from "../../utils/tryImport.js";
 import {
   withTimeout,
   ErrorFactory,
   NeuroLinkError,
 } from "../../utils/errorHandling.js";
+import {
+  SpanSerializer,
+  SpanType,
+  SpanStatus,
+  getMetricsAggregator,
+} from "../../observability/index.js";
 import { NeuroLink } from "../../neurolink.js";
 import {
   LAYOUT_POSITIONS,
@@ -142,6 +168,15 @@ export class SlideGenerator {
    * Generate a single complete slide
    */
   async generateSlide(slideSchema: SlideSchema): Promise<CompleteSlide> {
+    const span = SpanSerializer.createSpan(
+      SpanType.PPT_GENERATION,
+      "ppt.generateSlide",
+      {
+        "ppt.operation": "generateSlide",
+        "ppt.slideIndex": slideSchema.slideNumber,
+        "ppt.theme": this.theme.name,
+      },
+    );
     const startTime = Date.now();
 
     try {
@@ -201,6 +236,9 @@ export class SlideGenerator {
         },
       );
 
+      const endedSpan = SpanSerializer.endSpan(span, SpanStatus.OK);
+      getMetricsAggregator().recordSpan(endedSpan);
+
       return {
         slideNumber: slideSchema.slideNumber,
         schema: slideSchema,
@@ -209,6 +247,11 @@ export class SlideGenerator {
         generationTime,
       };
     } catch (error) {
+      const endedSpan = SpanSerializer.endSpan(span, SpanStatus.ERROR);
+      endedSpan.statusMessage =
+        error instanceof Error ? error.message : String(error);
+      getMetricsAggregator().recordSpan(endedSpan);
+
       const err =
         error instanceof NeuroLinkError
           ? error
@@ -722,8 +765,6 @@ export class SlideGenerator {
 // ============================================================================
 // FACTORY FUNCTIONS
 // ============================================================================
-
-export { PptxGenJS };
 
 export function createSlideGenerator(
   config: SlideGeneratorConfig,

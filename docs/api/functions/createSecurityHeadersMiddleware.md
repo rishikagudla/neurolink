@@ -1,0 +1,62 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / createSecurityHeadersMiddleware
+
+# Function: createSecurityHeadersMiddleware()
+
+> **createSecurityHeadersMiddleware**(`options?`): [`MiddlewareDefinition`](../type-aliases/MiddlewareDefinition.md)
+
+Create security headers middleware
+Adds common security headers to responses
+
+## Parameters
+
+### options?
+
+#### contentSecurityPolicy?
+
+`string`
+
+Content Security Policy
+
+#### frameOptions?
+
+`false` \| `"DENY"` \| `"SAMEORIGIN"`
+
+X-Frame-Options (default: DENY)
+
+#### contentTypeOptions?
+
+`false` \| `"nosniff"`
+
+X-Content-Type-Options (default: nosniff)
+
+#### hstsMaxAge?
+
+`number` \| `false`
+
+Strict-Transport-Security max age in seconds (default: 31536000)
+
+#### referrerPolicy?
+
+`string` \| `false`
+
+Referrer-Policy (default: strict-origin-when-cross-origin)
+
+#### customHeaders?
+
+`Record`\<`string`, `string`\>
+
+Additional custom headers
+
+## Returns
+
+[`MiddlewareDefinition`](../type-aliases/MiddlewareDefinition.md)
+
+## Example
+
+```typescript
+server.registerMiddleware(createSecurityHeadersMiddleware());
+```

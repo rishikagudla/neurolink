@@ -1,49 +1,314 @@
-/**
- * Tools Manager Module
- *
- * Handles all tool registration, discovery, and execution for AI providers.
- * Extracted from BaseProvider to follow Single Responsibility Principle.
- *
- * Responsibilities:
- * - Tool registration (direct, custom, MCP, external MCP)
- * - Tool discovery and aggregation
- * - Tool creation from definitions and schemas
- * - Tool executor setup
- * - Session context management for MCP tools
- * - Event emission wrapping for tool execution
- *
- * @module core/modules/ToolsManager
- */
-
-import type { Tool } from "ai";
-import { tool as createAISDKTool, jsonSchema } from "ai";
 import { z } from "zod";
-import type { AIProviderName, StandardRecord } from "../../types/index.js";
-import type { ToolArgs } from "../../types/tools.js";
-import type { JsonObject } from "../../types/common.js";
-import { logger } from "../../utils/logger.js";
+import { createToolEventPayload } from "../toolEvents.js";
+import type {
+  AIProviderName,
+  StandardRecord,
+  ToolUtilities,
+  ToolArgs,
+  ToolEventPayload,
+  JsonObject,
+  ToolOutputPreviewOptions,
+} from "../../types/index.js";
 import {
-  getKeysAsString,
-  getKeyCount,
-} from "../../utils/transformationUtils.js";
-import { convertJsonSchemaToZod } from "../../utils/schemaConversion.js";
+  tracers,
+  ATTR,
+  observe,
+  toolSpanName,
+  withSpan,
+} from "../../telemetry/index.js";
+import { SpanStatusCode } from "@opentelemetry/api";
+import { logger } from "../../utils/logger.js";
+import { TOOL_EVENTS_WRAPPED } from "../../types/index.js";
+import { getKeyCount } from "../../utils/transformationUtils.js";
+import { extractIsErrorText } from "../../utils/toolResultStatus.js";
+import { createToolExecutionId } from "../../utils/toolExecutionId.js";
+import {
+  convertJsonSchemaToZod,
+  stripUnsafeRegexPatterns,
+} from "../../utils/schemaConversion.js";
+import { HITLUserRejectedError } from "../../hitl/hitlErrors.js";
+import type { HITLManager } from "../../types/index.js";
+import {
+  generateToolOutputPreview,
+  DEFAULT_MAX_PREVIEW_BYTES,
+  RETRIEVE_CONTEXT_TOOL_NAME,
+} from "../../context/toolOutputLimits.js";
 import type { NeuroLink } from "../../neurolink.js";
+import type { EventWrappedTool, Tool } from "../../types/index.js";
 
 /**
- * Utility functions interface for ToolsManager
+ * Own property stamped on a tool object whose `execute` already emits
+ * `tool:start` / `tool:end`. It lives on the OBJECT, not the function: later
+ * layers (the execution recorder, discovery) replace `execute` via
+ * `{ ...tool, execute }`, which drops a function-identity check but carries a
+ * symbol-keyed own property along — so one execution still yields one pair.
  */
-export interface ToolUtilities {
-  isZodSchema?: (schema: unknown) => boolean;
-  convertToolResult?: (result: unknown) => Promise<unknown>;
-  createPermissiveZodSchema?: () => z.ZodSchema;
-  fixSchemaForOpenAIStrictMode?: (
-    schema: Record<string, unknown>,
-  ) => Record<string, unknown>;
+
+function isEventWrappedTool(tool: unknown): boolean {
+  return (
+    typeof tool === "object" &&
+    tool !== null &&
+    (tool as EventWrappedTool)[TOOL_EVENTS_WRAPPED] === true
+  );
+}
+
+function markEventWrapped<T extends Tool>(tool: T): T {
+  return Object.assign(tool, { [TOOL_EVENTS_WRAPPED]: true as const });
+}
+import { tool as createAISDKTool, jsonSchema } from "../../utils/tool.js";
+
+/** Abort-shaped error so provider loops route it to their cancellation path. */
+function makeToolAbortError(): Error {
+  const e = new Error("Tool execution aborted");
+  e.name = "AbortError";
+  return e;
+}
+
+/**
+ * Built-in tools that change the machine. While HITL is enabled they require
+ * confirmation on every call, whatever `dangerousActions` lists, unless the
+ * host sets `hitl.confirmBuiltinTools: false`. The other built-ins (clock,
+ * arithmetic, reads, directory listings, CSV analysis, web search) are gated
+ * by `dangerousActions` keywords and `customRules` like every other tool.
+ */
+const HITL_ALWAYS_CONFIRM_DIRECT_TOOLS: ReadonlySet<string> = new Set([
+  "writeFile",
+  "executeBashCommand",
+]);
+
+/** serverId the registry uses for the built-in tools; reused in HITL requests. */
+const DIRECT_TOOL_SERVER_ID = "direct";
+
+/** Tool names a provider accepts: 1-64 characters from this set. */
+const TOOL_NAME_SAFE_CHARS = /[^A-Za-z0-9_-]/g;
+const MAX_TOOL_NAME_LENGTH = 64;
+
+/**
+ * `<serverId>__<tool>`, reduced to the characters every provider accepts and
+ * to 64 characters, keeping the tool name's tail (the distinctive part) when
+ * the two together are too long.
+ */
+function qualifyToolName(serverId: string, toolName: string): string {
+  const safeServer = serverId.replace(TOOL_NAME_SAFE_CHARS, "_") || "server";
+  const safeTool = toolName.replace(TOOL_NAME_SAFE_CHARS, "_") || "tool";
+  const joined = `${safeServer}__${safeTool}`;
+  if (joined.length <= MAX_TOOL_NAME_LENGTH) {
+    return joined;
+  }
+  const room = MAX_TOOL_NAME_LENGTH - safeTool.length - 2;
+  return room > 0
+    ? `${safeServer.slice(0, room)}__${safeTool}`
+    : joined.slice(-MAX_TOOL_NAME_LENGTH);
+}
+
+/**
+ * Per-schema cache of the prepared declaration and compiled validator, keyed
+ * by the ORIGINAL MCP tool inputSchema object. createExternalMCPTool runs once
+ * per external tool on EVERY getAllTools() (i.e. every generation call), and
+ * the schema object identity is stable for the lifetime of a server connection
+ * — without the cache the same JSON Schema is cloned, vetted and recompiled on
+ * every generate() (hot-path CPU for 50+-tool deployments). Rediscovery
+ * produces new schema objects, so stale entries fall out via WeakMap
+ * semantics. An `undefined` validator (a schema that failed to compile) is
+ * cached too — hence has()/get() rather than a get()-only check.
+ *
+ * `schema` is the declaration the model sees: strict-mode fixed and with every
+ * regular expression `vetRegexPattern` refused removed. The removal
+ * happens once per schema object, so its warning fires once per schema, not
+ * once per request.
+ */
+const mcpSchemaCache = new WeakMap<
+  Record<string, unknown>,
+  {
+    schema: Record<string, unknown>;
+    validate: Awaited<ReturnType<typeof buildMCPSchemaValidator>>;
+  }
+>();
+
+/**
+ * Build an argument validator for an external MCP tool's JSON Schema, in the
+ * shape the AI SDK's `jsonSchema()` wrapper expects. Returns undefined when
+ * the schema can't be compiled (exotic dialect) — the tool then keeps the
+ * previous declarative-only behaviour instead of failing registration.
+ *
+ * The error message is written for the MODEL (it is fed back verbatim as the
+ * tool-error text): it names the offending fields and restates the contract
+ * (required properties + types) so the retry can succeed on the first attempt.
+ */
+export async function buildMCPSchemaValidator(
+  toolName: string,
+  schema: Record<string, unknown>,
+): Promise<
+  | ((
+      value: unknown,
+    ) => { success: true; value: unknown } | { success: false; error: Error })
+  | undefined
+> {
+  try {
+    const { Validator } = await import("@cfworker/json-schema");
+    // draft-07: the lingua franca of MCP server inputSchemas. shortCircuit
+    // false so the error lists every violation, not just the first.
+    const validator = new Validator(schema as never, "7", false);
+    const required = Array.isArray(schema.required)
+      ? (schema.required as string[])
+      : [];
+    const properties =
+      schema.properties && typeof schema.properties === "object"
+        ? (schema.properties as Record<string, { type?: string }>)
+        : {};
+    const contract = Object.entries(properties)
+      .map(
+        ([key, prop]) =>
+          `${key}${required.includes(key) ? "" : "?"}: ${prop?.type ?? "any"}`,
+      )
+      .join(", ");
+    return (value: unknown) => {
+      try {
+        const result = validator.validate(value);
+        if (result.valid) {
+          return { success: true, value };
+        }
+        // Root-level entries ("#") are mostly generic "instance does not
+        // match schema" noise — EXCEPT missing-required errors, which carry
+        // the offending property name and must reach the model.
+        const details = result.errors
+          .filter(
+            (e) =>
+              e.instanceLocation !== "#" || /required property/i.test(e.error),
+          )
+          .slice(0, 3)
+          .map((e) => {
+            const loc = e.instanceLocation.replace(/^#\/?/, "");
+            return loc ? `${loc}: ${e.error}` : e.error;
+          })
+          .join("; ");
+        return {
+          success: false,
+          error: new Error(
+            `Invalid arguments for tool '${toolName}'${details ? ` — ${details}` : ""}. ` +
+              `Expected: { ${contract} } (send every non-optional property with the exact name and JSON type).`,
+          ),
+        };
+      } catch (validationError) {
+        // Validator crashed on this instance — treat as valid rather than
+        // block the call; the MCP-layer validator still backstops execution.
+        logger.debug(
+          `[ToolsManager] Schema validator failed for '${toolName}', passing through`,
+          {
+            error:
+              validationError instanceof Error
+                ? validationError.message
+                : String(validationError),
+          },
+        );
+        return { success: true, value };
+      }
+    };
+  } catch (compileError) {
+    logger.debug(
+      `[ToolsManager] Could not compile schema validator for '${toolName}' — arguments will not be pre-validated`,
+      {
+        error:
+          compileError instanceof Error
+            ? compileError.message
+            : String(compileError),
+      },
+    );
+    return undefined;
+  }
+}
+
+/**
+ * Race a tool-execution promise against an AbortSignal so the calling loop
+ * observes a deadline/caller abort IMMEDIATELY instead of waiting for the
+ * tool to finish or its execution timeout to expire. The underlying call is
+ * not cancelled (bounded ghost execution — the same tradeoff as the tool
+ * timeout); real transport-level cancellation (executeExternalMCPTool → MCP
+ * client RequestOptions.signal) is tracked as a follow-up.
+ */
+function raceWithAbortSignal<T>(
+  promise: Promise<T>,
+  signal: AbortSignal,
+): Promise<T> {
+  if (signal.aborted) {
+    // Swallow the abandoned settlement so it can't become an unhandled
+    // rejection later.
+    promise.catch(() => {
+      // Swallow the abandoned settlement — it must never surface as an
+      // unhandled rejection after the race has already been decided.
+    });
+    return Promise.reject(makeToolAbortError());
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      promise.catch(() => {
+        // Swallow the abandoned settlement — it must never surface as an
+        // unhandled rejection after the race has already been decided.
+      });
+      reject(makeToolAbortError());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 /**
  * ToolsManager class - Handles all tool management operations
  */
+/** Upper bound on re-measure-and-tighten rounds in truncateMcpContentEnvelope. */
+const MAX_ENVELOPE_TIGHTENING_PASSES = 6;
+
+function serializedByteLength(value: unknown): number | undefined {
+  try {
+    return Buffer.byteLength(JSON.stringify(value), "utf-8");
+  } catch {
+    return undefined;
+  }
+}
+
+function isTextContentItem(
+  item: unknown,
+): item is Record<string, unknown> & { text: string } {
+  return (
+    item !== null &&
+    typeof item === "object" &&
+    (item as Record<string, unknown>).type === "text" &&
+    typeof (item as Record<string, unknown>).text === "string"
+  );
+}
+
+/**
+ * Split `total` bytes across items of the given sizes, water-filling:
+ * smallest first, each item takes the lesser of its own size and an equal
+ * share of what is left, so items that already fit keep everything and the
+ * remainder flows to the larger ones.
+ */
+function waterFillTextBudget(sizes: number[], total: number): number[] {
+  const allocations = new Array<number>(sizes.length).fill(0);
+  const order = sizes
+    .map((_, index) => index)
+    .sort((a, b) => sizes[a] - sizes[b]);
+  let remaining = Math.max(0, total);
+  let left = order.length;
+  for (const index of order) {
+    const share = Math.floor(remaining / left);
+    const give = Math.min(sizes[index], share);
+    allocations[index] = give;
+    remaining -= give;
+    left--;
+  }
+  return allocations;
+}
+
 export class ToolsManager {
   // Tool storage
   protected mcpTools?: Record<string, Tool>;
@@ -51,19 +316,422 @@ export class ToolsManager {
   protected toolExecutor?: (
     toolName: string,
     params: unknown,
+    options?: Record<string, unknown>,
   ) => Promise<unknown>;
 
   // Session context
   protected sessionId?: string;
   protected userId?: string;
 
+  // Execute functions this manager already instrumented for tool events,
+  // so re-wrapping is a no-op rather than a second start/end pair.
+  private readonly eventWrappedExecutes = new WeakSet<
+    (params: unknown, execOptions?: unknown) => Promise<unknown>
+  >();
+
   constructor(
     private readonly providerName: AIProviderName,
-    private readonly directTools: Record<string, unknown>,
+    private directTools: Record<string, unknown>,
     private readonly neurolink?: NeuroLink,
     private readonly utilities?: ToolUtilities,
   ) {
     this.mcpTools = {};
+  }
+
+  /**
+   * BZ-666: Wrap tool execute with output truncation to prevent
+   * context overflow when large results flow into the AI SDK accumulator.
+   *
+   * Passes the AI-SDK second argument (execution options: abortSignal,
+   * toolCallId, messages) through to the inner execute — the native loops
+   * provide an abortSignal there, and dropping it at this wrapper made
+   * every tool uncancellable (deadline overshoot / ghost executions).
+   */
+  private wrapExecuteWithTruncation(
+    toolName: string,
+    originalExecute: (
+      params: unknown,
+      execOptions?: unknown,
+    ) => Promise<unknown>,
+  ): (params: unknown, execOptions?: unknown) => Promise<unknown> {
+    return async (params: unknown, execOptions?: unknown): Promise<unknown> => {
+      const signal = (execOptions as { abortSignal?: AbortSignal } | undefined)
+        ?.abortSignal;
+      const inner = originalExecute(params, execOptions);
+      // Inner executes that ignore the signal (external MCP / custom tools —
+      // the signal isn't plumbed to their transports yet) still return
+      // promptly on abort via the race; the loop's isAbortError handling
+      // treats the rejection as a cancellation, not a tool failure.
+      const result =
+        signal && typeof signal.addEventListener === "function"
+          ? await raceWithAbortSignal(inner, signal)
+          : await inner;
+      return this.truncateToolResult(toolName, result);
+    };
+  }
+
+  /**
+   * The HITL manager of the owning NeuroLink instance, when one is configured.
+   * It lives on the tool registry (`setHITLManager`), which is also where the
+   * registered-tool execution path reads it, so the two paths cannot disagree.
+   */
+  private resolveHITLManager(): HITLManager | undefined {
+    const registry = this.neurolink?.getToolRegistry?.();
+    const manager =
+      registry && typeof registry.getHITLManager === "function"
+        ? registry.getHITLManager()
+        : undefined;
+    return manager && manager.isEnabled() ? manager : undefined;
+  }
+
+  /**
+   * Whether a built-in tool call must be confirmed by a human first.
+   *
+   * Same rule as `MCPToolRegistry.executeTool` applies to registered tools —
+   * `dangerousActions` keywords and `customRules` — plus the built-in tools
+   * that change the machine (`HITL_ALWAYS_CONFIRM_DIRECT_TOOLS`), which are
+   * confirmed on every call unless `hitl.confirmBuiltinTools` is `false`.
+   */
+  private directToolNeedsConfirmation(
+    manager: HITLManager,
+    toolName: string,
+    params: unknown,
+  ): boolean {
+    if (manager.requiresConfirmation(toolName, params)) {
+      return true;
+    }
+    if (!HITL_ALWAYS_CONFIRM_DIRECT_TOOLS.has(toolName)) {
+      return false;
+    }
+    const confirmBuiltins = manager.getConfig().confirmBuiltinTools;
+    return confirmBuiltins !== false;
+  }
+
+  /**
+   * Gate a built-in (direct) tool's execute behind the instance's HITL
+   * manager, with the semantics of the registry path: a denial throws
+   * `HITLUserRejectedError` (the loop reports it to the model as a failed
+   * call), a timeout propagates the manager's `HITLTimeoutError` (or the
+   * auto-approval it is configured for), and user-modified arguments replace
+   * the model's. Without HITL the execute runs untouched.
+   *
+   * Direct tools reach the model through `getAllTools()` and are executed by
+   * the provider loops directly, never through `MCPToolRegistry.executeTool`
+   * — so before this wrapper the registry's HITL check never saw them, and
+   * `writeFile` / `executeBashCommand` ran unconfirmed while the bash tool's
+   * own description promised otherwise.
+   */
+  private wrapExecuteWithHITL(
+    toolName: string,
+    execute: (params: unknown, execOptions?: unknown) => Promise<unknown>,
+  ): (params: unknown, execOptions?: unknown) => Promise<unknown> {
+    return async (params: unknown, execOptions?: unknown): Promise<unknown> => {
+      const manager = this.resolveHITLManager();
+      if (
+        !manager ||
+        !this.directToolNeedsConfirmation(manager, toolName, params)
+      ) {
+        return execute(params, execOptions);
+      }
+      logger.info(`Built-in tool '${toolName}' requires HITL confirmation`);
+      const confirmation = await manager.requestConfirmation(toolName, params, {
+        serverId: DIRECT_TOOL_SERVER_ID,
+        sessionId: this.sessionId,
+        userId: this.userId,
+      });
+      if (!confirmation.approved) {
+        throw new HITLUserRejectedError(
+          `Tool execution rejected by user: ${confirmation.reason || "No reason provided"}`,
+          toolName,
+          confirmation.reason,
+        );
+      }
+      const finalParams =
+        confirmation.modifiedArguments !== undefined
+          ? confirmation.modifiedArguments
+          : params;
+      return execute(finalParams, execOptions);
+    };
+  }
+
+  /**
+   * Byte budget for BZ-666 truncation. Reads the instance-level
+   * `tools.outputTruncationMaxBytes` config (see `ToolConfig` /
+   * `NeuroLink.getToolsConfig()`) so hosts can raise or lower the ceiling
+   * without a new env var or constructor param; falls back to the original
+   * hard-coded 51,200 bytes (== DEFAULT_MAX_PREVIEW_BYTES) so existing
+   * consumers see no behavior change.
+   */
+  private resolveTruncationMaxBytes(): number {
+    const configured =
+      this.neurolink?.getToolsConfig?.()?.outputTruncationMaxBytes;
+    return typeof configured === "number" &&
+      Number.isFinite(configured) &&
+      configured > 0
+      ? configured
+      : DEFAULT_MAX_PREVIEW_BYTES;
+  }
+
+  /**
+   * The default omission notice names `retrieve_context` as the on-demand
+   * read-back tool. That is only true when this NeuroLink instance actually
+   * registered it (Redis or an artifact store must exist — see
+   * `retrieveContextRegistered` in neurolink.ts). Otherwise hand
+   * `generateToolOutputPreview` a notice that doesn't mention it.
+   */
+  private resolveTruncationNotice(): ToolOutputPreviewOptions["notice"] {
+    const hasRetrieveContext =
+      this.neurolink?.getCustomTools?.()?.has(RETRIEVE_CONTEXT_TOOL_NAME) ??
+      false;
+    if (hasRetrieveContext) {
+      return undefined; // defer to generateToolOutputPreview's own default
+    }
+    return (omittedBytes: number) =>
+      `\n\n[... ${omittedBytes} bytes omitted ...]\n\n`;
+  }
+
+  /**
+   * Truncate an MCP `CallToolResult`-shaped envelope (`{content:[...],
+   * isError?}`) — at the top level, or nested under `data` the way
+   * NeuroLink's own `executeExternalMCPTool` / `{success, data}` wrapper
+   * shapes it — WITHOUT collapsing it to the generic `_truncated` sentinel,
+   * while still honouring `maxBytes` for the envelope AS A WHOLE.
+   *
+   * Only TEXT content items are rewritten (byte-accurate head/tail preview,
+   * same mechanism as a plain string result). `isError` and any non-text
+   * items (images, resources, embedded resources, …) pass through
+   * untouched, and every other top-level field on the result is preserved.
+   *
+   * The budget is enforced on the serialized envelope, not per item: the
+   * bytes the envelope occupies with every text item emptied (structure,
+   * non-text items, other fields) come off the top, and what remains is
+   * water-filled across the text items — items that already fit keep their
+   * text and donate the rest of their share to the larger ones. JSON
+   * escaping and the per-item notice add bytes the raw allocation cannot
+   * see, so the result is re-measured and the text budget tightened until
+   * the whole envelope fits.
+   *
+   * Returns `undefined` when `result` doesn't have this shape at all, AND
+   * when the shape cannot be kept within `maxBytes` — no text items, the
+   * non-text payload alone exceeds the budget, or tightening did not
+   * converge — so the caller's generic sentinel path bounds it instead.
+   * Preserving the shape never buys the right to exceed the ceiling.
+   */
+  private truncateMcpContentEnvelope(
+    toolName: string,
+    obj: Record<string, unknown>,
+    maxBytes: number,
+  ): Record<string, unknown> | undefined {
+    const atTopLevel = Array.isArray(obj.content);
+    const dataObj =
+      !atTopLevel && obj.data && typeof obj.data === "object"
+        ? (obj.data as Record<string, unknown>)
+        : undefined;
+    const nestedUnderData = !atTopLevel && Array.isArray(dataObj?.content);
+    if (!atTopLevel && !nestedUnderData) {
+      return undefined;
+    }
+
+    const envelope = atTopLevel ? obj : (dataObj as Record<string, unknown>);
+    const serializedSize = serializedByteLength(obj);
+    if (serializedSize === undefined) {
+      return obj; // unserializable — leave the envelope exactly as-is
+    }
+    if (serializedSize <= maxBytes) {
+      return obj;
+    }
+
+    const content = envelope.content as unknown[];
+    const textIndexes: number[] = [];
+    content.forEach((item, index) => {
+      if (isTextContentItem(item)) {
+        textIndexes.push(index);
+      }
+    });
+    if (textIndexes.length === 0) {
+      return undefined; // nothing trimmable — let the sentinel bound it
+    }
+
+    const rebuild = (
+      replacements: ReadonlyMap<number, string>,
+    ): Record<string, unknown> => {
+      const newContent = content.map((item, index) => {
+        const text = replacements.get(index);
+        return text === undefined
+          ? item
+          : { ...(item as Record<string, unknown>), text };
+      });
+      const newEnvelope = { ...envelope, content: newContent };
+      return atTopLevel ? newEnvelope : { ...obj, data: newEnvelope };
+    };
+
+    // Bytes the envelope costs with every text item emptied. If that alone
+    // is over budget, no amount of text trimming honours the ceiling while
+    // keeping the shape.
+    const fixedBytes = serializedByteLength(
+      rebuild(new Map(textIndexes.map((index) => [index, ""]))),
+    );
+    if (fixedBytes === undefined || fixedBytes >= maxBytes) {
+      return undefined;
+    }
+
+    const notice = this.resolveTruncationNotice();
+    const sizes = textIndexes.map((index) =>
+      Buffer.byteLength((content[index] as { text: string }).text, "utf-8"),
+    );
+    let textBudget = maxBytes - fixedBytes;
+    for (let pass = 0; pass < MAX_ENVELOPE_TIGHTENING_PASSES; pass++) {
+      const allocations = waterFillTextBudget(sizes, textBudget);
+      const replacements = new Map<number, string>();
+      // Record the sizes here, log them only if this pass is the one that
+      // survives. A rejected pass never happened as far as the caller is
+      // concerned, and up to MAX_ENVELOPE_TIGHTENING_PASSES of them can be
+      // rejected on a single call — building their template strings, and the
+      // byteLength each one interpolates, is work paid whether or not debug
+      // logging is even enabled.
+      const truncatedItems: Array<{ index: number; originalSize: number }> = [];
+      textIndexes.forEach((index, k) => {
+        const item = content[index] as { text: string };
+        const { preview, truncated, originalSize } = generateToolOutputPreview(
+          item.text,
+          { maxBytes: allocations[k], notice },
+        );
+        if (truncated) {
+          truncatedItems.push({ index, originalSize });
+          replacements.set(index, preview);
+        }
+      });
+      const candidate = rebuild(replacements);
+      const candidateSize = serializedByteLength(candidate);
+      if (candidateSize !== undefined && candidateSize <= maxBytes) {
+        if (logger.shouldLog("debug")) {
+          for (const { index, originalSize } of truncatedItems) {
+            logger.debug(
+              `[ToolsManager] Truncated '${toolName}' MCP content text item ${index}: ${originalSize} bytes → ${Buffer.byteLength(replacements.get(index) ?? "", "utf-8")} bytes (envelope budget ${maxBytes})`,
+            );
+          }
+        }
+        return candidate;
+      }
+      if (candidateSize === undefined || replacements.size === 0) {
+        break;
+      }
+      // Over by the escaping/notice overhead the allocation could not see:
+      // take that overage (plus a margin) back out of the text budget.
+      textBudget -= candidateSize - maxBytes + Math.ceil(maxBytes * 0.02) + 1;
+      if (textBudget <= 0) {
+        break;
+      }
+    }
+    return undefined; // could not fit while preserving the shape — sentinel
+  }
+
+  /**
+   * BZ-666: Apply generateToolOutputPreview to tool results to prevent
+   * context overflow when large results flow into the AI SDK accumulator.
+   */
+  private truncateToolResult(toolName: string, result: unknown): unknown {
+    if (result === null || result === undefined) {
+      return result;
+    }
+
+    const maxBytes = this.resolveTruncationMaxBytes();
+
+    // Handle string results directly
+    if (typeof result === "string") {
+      const { preview, truncated, originalSize } = generateToolOutputPreview(
+        result,
+        { maxBytes, notice: this.resolveTruncationNotice() },
+      );
+      if (truncated) {
+        logger.debug(
+          `[ToolsManager] Truncated '${toolName}' string output: ${originalSize} bytes → ${Buffer.byteLength(preview, "utf-8")} bytes`,
+        );
+      }
+      return truncated ? preview : result;
+    }
+
+    // Handle object results (e.g. readFile returns { content, ... })
+    if (typeof result === "object") {
+      const obj = result as Record<string, unknown>;
+      let nextObj: Record<string, unknown> | null = null;
+
+      // Truncate "content" if present and oversized (string form only —
+      // an ARRAY "content" is an MCP envelope, handled below)
+      if (typeof obj.content === "string") {
+        const { preview, truncated, originalSize } = generateToolOutputPreview(
+          obj.content,
+          { maxBytes, notice: this.resolveTruncationNotice() },
+        );
+        if (truncated) {
+          logger.debug(
+            `[ToolsManager] Truncated '${toolName}' content field: ${originalSize} bytes → ${Buffer.byteLength(preview, "utf-8")} bytes`,
+          );
+          nextObj = { ...(nextObj ?? obj), content: preview };
+        }
+      }
+
+      // Truncate "data" if present and oversized — both fields can coexist
+      if (typeof obj.data === "string") {
+        const { preview, truncated, originalSize } = generateToolOutputPreview(
+          obj.data,
+          { maxBytes, notice: this.resolveTruncationNotice() },
+        );
+        if (truncated) {
+          logger.debug(
+            `[ToolsManager] Truncated '${toolName}' data field: ${originalSize} bytes → ${Buffer.byteLength(preview, "utf-8")} bytes`,
+          );
+          nextObj = { ...(nextObj ?? obj), data: preview };
+        }
+      }
+
+      if (nextObj) {
+        return nextObj;
+      }
+
+      // MCP CallToolResult envelope — { content: [{type,text}, ...], isError? }
+      // — either at the top level or nested under `data` (NeuroLink's own
+      // executeExternalMCPTool / {success, data} wrapper shape). Preserve the
+      // envelope and truncate only the oversized text items instead of
+      // collapsing the whole thing to the generic sentinel below.
+      const envelopeResult = this.truncateMcpContentEnvelope(
+        toolName,
+        obj,
+        maxBytes,
+      );
+      if (envelopeResult !== undefined) {
+        return envelopeResult;
+      }
+
+      // For other objects, check if their JSON serialization is too large.
+      // Use UTF-8 byte length, not string length, to match the byte budget.
+      try {
+        const jsonStr = JSON.stringify(result);
+        if (Buffer.byteLength(jsonStr, "utf-8") > maxBytes) {
+          const { preview, truncated, originalSize } =
+            generateToolOutputPreview(jsonStr, {
+              maxBytes,
+              notice: this.resolveTruncationNotice(),
+            });
+          if (truncated) {
+            logger.debug(
+              `[ToolsManager] Truncated '${toolName}' JSON output: ${originalSize} bytes → ${Buffer.byteLength(preview, "utf-8")} bytes`,
+            );
+            // Preserve object shape so callers reading structured fields don't
+            // get a type surprise. Attach the preview under a sentinel field.
+            return {
+              _truncated: true,
+              _originalSize: originalSize,
+              _preview: preview,
+            };
+          }
+        }
+      } catch {
+        // JSON serialization failed — return as-is
+      }
+    }
+
+    return result;
   }
 
   /**
@@ -72,6 +740,179 @@ export class ToolsManager {
   setSessionContext(sessionId?: string, userId?: string): void {
     this.sessionId = sessionId;
     this.userId = userId;
+  }
+
+  /**
+   * Emit one tool event. A listener that throws must never reach the tool
+   * loop: it would turn a successful execution into a failed one (the model
+   * then retries a side effect that already happened) and, from inside the
+   * wrapper's catch, produce a second `tool:end` for the same call. Listener
+   * failures are logged and swallowed here instead.
+   */
+  private emitToolEvent(
+    eventName: "tool:start" | "tool:end",
+    toolName: string,
+    payload: Omit<ToolEventPayload, "tool" | "toolName">,
+  ): void {
+    if (!this.neurolink?.getEventEmitter) {
+      return;
+    }
+    try {
+      this.neurolink
+        .getEventEmitter()
+        .emit(eventName, createToolEventPayload(toolName, payload));
+    } catch (listenerError) {
+      logger.warn(`A ${eventName} listener threw for tool ${toolName}`, {
+        error:
+          listenerError instanceof Error
+            ? listenerError.message
+            : String(listenerError),
+      });
+    }
+  }
+
+  /**
+   * Wrap an execute function so one `tool:start` and exactly one `tool:end`
+   * (with the real duration) fire per invocation. Idempotent: a function this
+   * manager already wrapped is returned as is, so a tool that re-enters
+   * resolution (the stream → generate fallback re-resolves `options.tools`)
+   * never emits twice.
+   *
+   * A result the tool RETURNED with `isError: true` (MCP failure, breaker
+   * refusal, a thrown error already converted by `neurolink.executeTool`) is
+   * a failure: `tool:end` carries `success: false` and the extracted text,
+   * as the step-finish emitter this wrapper replaced did.
+   */
+  private wrapExecuteWithEvents(
+    toolName: string,
+    execute: (params: unknown, execOptions?: unknown) => Promise<unknown>,
+  ): (params: unknown, execOptions?: unknown) => Promise<unknown> {
+    if (this.eventWrappedExecutes.has(execute)) {
+      return execute;
+    }
+    const wrapped = async (params: unknown, execOptions?: unknown) => {
+      // The loop's execute options carry the model's tool_call id, which is
+      // what lets a listener pair concurrent same-name start/end events.
+      const toolCallId =
+        execOptions && typeof execOptions === "object"
+          ? (execOptions as { toolCallId?: unknown }).toolCallId
+          : undefined;
+      const idField =
+        typeof toolCallId === "string" && toolCallId.length > 0
+          ? { toolCallId }
+          : {};
+      // Same per-invocation id executeTool gives registered tools, so a
+      // listener can pair this start with its end.
+      const eventIds = {
+        ...idField,
+        executionId: createToolExecutionId(toolName),
+      };
+      return withSpan(
+        {
+          name: toolSpanName(toolName),
+          tracer: tracers.mcp,
+          attributes: { "tool.name": toolName, ...idField },
+        },
+        async (span) => {
+          observe(span, "tool", { input: params });
+          const startTime = Date.now();
+          this.emitToolEvent("tool:start", toolName, {
+            input: params,
+            ...eventIds,
+          });
+
+          let result: unknown;
+          try {
+            result = await execute(params, execOptions);
+          } catch (error) {
+            const errorMsg =
+              error instanceof Error ? error.message : String(error);
+            this.emitToolEvent("tool:end", toolName, {
+              error: errorMsg,
+              success: false,
+              responseTime: Date.now() - startTime,
+              ...eventIds,
+            });
+            throw error;
+          }
+          const isErrorText = extractIsErrorText(result);
+          observe(span, "tool", {
+            output: result,
+            ...(isErrorText !== undefined
+              ? { level: "ERROR", statusMessage: isErrorText }
+              : {}),
+          });
+          this.emitToolEvent("tool:end", toolName, {
+            result,
+            success: isErrorText === undefined,
+            ...(isErrorText !== undefined ? { error: isErrorText } : {}),
+            responseTime: Date.now() - startTime,
+            ...eventIds,
+          });
+          return result;
+        },
+      );
+    };
+    this.eventWrappedExecutes.add(wrapped);
+    return wrapped;
+  }
+
+  /**
+   * Report a tool call the loop rejected BEFORE any execute ran — an unknown
+   * tool name, arguments the schema rejected, a breaker skip. Nothing else
+   * emits for such a call, so listeners (memory event capture, tool spans,
+   * error-rate metrics) saw zero attempts while the result list held the
+   * failures. One `tool:start` / `tool:end(success: false)` pair.
+   */
+  emitRejectedToolCall(
+    toolName: string,
+    error: string,
+    toolCallId?: string,
+  ): void {
+    const idField = toolCallId ? { toolCallId } : {};
+    this.emitToolEvent("tool:start", toolName, { ...idField });
+    this.emitToolEvent("tool:end", toolName, {
+      error,
+      success: false,
+      responseTime: 0,
+      ...idField,
+    });
+  }
+
+  /**
+   * Give per-call tools (`options.tools`) the same `tool:start` / `tool:end`
+   * emission that registered and MCP tools get from their executors. Tools
+   * without an `execute` pass through untouched.
+   */
+  wrapExternalToolsWithEvents(
+    tools: Record<string, Tool>,
+  ): Record<string, Tool> {
+    const wrapped: Record<string, Tool> = {};
+    for (const [toolName, tool] of Object.entries(tools)) {
+      if (isEventWrappedTool(tool)) {
+        wrapped[toolName] = tool;
+        continue;
+      }
+      const execute =
+        tool && typeof tool === "object" && "execute" in tool
+          ? (
+              tool as {
+                execute?: (
+                  params: unknown,
+                  execOptions?: unknown,
+                ) => Promise<unknown>;
+              }
+            ).execute
+          : undefined;
+      wrapped[toolName] =
+        typeof execute === "function"
+          ? markEventWrapped({
+              ...tool,
+              execute: this.wrapExecuteWithEvents(toolName, execute),
+            } as Tool)
+          : tool;
+    }
+    return wrapped;
   }
 
   /**
@@ -86,19 +927,40 @@ export class ToolsManager {
     },
     functionTag: string,
   ): void {
-    // Store custom tools for use in getAllTools()
-    this.customTools = sdk.customTools;
-    this.toolExecutor = sdk.executeTool;
-
-    logger.debug(`[${functionTag}] Setting up tool executor for provider`, {
-      providerName: this.providerName,
-      availableCustomTools: sdk.customTools.size,
-      customToolsStored: !!this.customTools,
-      toolExecutorStored: !!this.toolExecutor,
+    const span = tracers.sdk.startSpan("tools.register", {
+      attributes: {
+        [ATTR.NL_PROVIDER]: this.providerName,
+        "tools.custom_count": sdk.customTools.size,
+      },
     });
 
-    // Note: Tool execution will be handled through getAllTools() -> AI SDK tools
-    // The custom tools are converted to AI SDK format in getAllTools() method
+    try {
+      // Store custom tools for use in getAllTools()
+      this.customTools = sdk.customTools;
+      this.toolExecutor = sdk.executeTool.bind(sdk);
+
+      logger.debug(`[${functionTag}] Setting up tool executor for provider`, {
+        providerName: this.providerName,
+        availableCustomTools: sdk.customTools.size,
+        customToolsStored: !!this.customTools,
+        toolExecutorStored: !!this.toolExecutor,
+      });
+
+      // Note: Tool execution will be handled through getAllTools() -> AI SDK tools
+      // The custom tools are converted to AI SDK format in getAllTools() method
+      span.setStatus({ code: SpanStatusCode.OK });
+    } catch (error) {
+      span.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: error instanceof Error ? error.message : String(error),
+      });
+      if (error instanceof Error) {
+        span.recordException(error);
+      }
+      throw error;
+    } finally {
+      span.end();
+    }
   }
 
   /**
@@ -106,31 +968,76 @@ export class ToolsManager {
    * MCP tools are added when available (without blocking)
    */
   async getAllTools(): Promise<Record<string, Tool>> {
-    // Start with wrapped direct tools that emit events
-    const tools: Record<string, Tool> = {};
+    return withSpan(
+      {
+        name: "tools.getAll",
+        tracer: tracers.sdk,
+        attributes: {
+          [ATTR.NL_PROVIDER]: this.providerName,
+        },
+      },
+      async (span) => {
+        // Start with wrapped direct tools that emit events
+        const tools: Record<string, Tool> = {};
 
-    // Wrap direct tools with event emission
-    await this.processDirectTools(tools);
+        // Wrap direct tools with event emission
+        await this.processDirectTools(tools);
+        const directCount = Object.keys(tools).length;
+        span.setAttribute("tools.direct_count", directCount);
 
-    logger.debug(`[ToolsManager] getAllTools called for ${this.providerName}`, {
-      neurolinkAvailable: !!this.neurolink,
-      neurolinkType: typeof this.neurolink,
-      directToolsCount: getKeyCount(this.directTools),
-    });
-    logger.debug(
-      `[ToolsManager] Direct tools: ${getKeysAsString(this.directTools)}`,
+        logger.debug(
+          `[ToolsManager] getAllTools called for ${this.providerName}`,
+          {
+            directToolsCount: getKeyCount(this.directTools),
+          },
+        );
+
+        // Process all tool types using dedicated helper methods
+        await this.processCustomTools(tools);
+        const customCount = Object.keys(tools).length - directCount;
+        span.setAttribute("tools.custom_count", customCount);
+
+        await this.processExternalMCPTools(tools);
+        const externalCount =
+          Object.keys(tools).length - directCount - customCount;
+        span.setAttribute("tools.external_mcp_count", externalCount);
+
+        await this.processMCPTools(tools);
+        const totalCount = Object.keys(tools).length;
+        span.setAttribute(ATTR.NL_TOOL_COUNT, totalCount);
+
+        // Record tool names for debugging (truncated)
+        const toolNames = Object.keys(tools);
+        span.setAttribute(
+          "tools.names",
+          toolNames.slice(0, 20).join(",") +
+            (toolNames.length > 20 ? `...+${toolNames.length - 20}` : ""),
+        );
+
+        // Log a compact summary instead of full tool list
+        logger.debug(
+          `[ToolsManager] getAllTools complete: ${toolNames.length} tools available`,
+          {
+            provider: this.providerName,
+            toolCount: toolNames.length,
+            toolNames:
+              toolNames.length <= 10
+                ? toolNames
+                : [
+                    ...toolNames.slice(0, 10),
+                    `... and ${toolNames.length - 10} more`,
+                  ],
+          },
+        );
+
+        // NOTE: insertion order here is phase order (direct → custom →
+        // external MCP), which the signature-dedup pass depends on (keep-first
+        // must prefer built-in implementations). Deterministic name-sorting
+        // for prompt-cache stability happens AFTER filtering+dedup, in
+        // BaseProvider.applyToolFiltering.
+        return tools;
+      },
     );
-
-    // Process all tool types using dedicated helper methods
-    await this.processCustomTools(tools);
-    await this.processExternalMCPTools(tools);
-    await this.processMCPTools(tools);
-
-    logger.debug(
-      `[ToolsManager] getAllTools returning tools: ${getKeysAsString(tools)}`,
-    );
-
-    return tools;
   }
 
   /**
@@ -138,6 +1045,15 @@ export class ToolsManager {
    */
   getDirectTools(): Record<string, unknown> {
     return this.directTools;
+  }
+
+  /**
+   * Replace the direct tools for this provider instance — used to bind the
+   * built-in file tools to one request's root policy. Providers are created
+   * per request, so this never leaks a boundary into another request.
+   */
+  setDirectTools(tools: Record<string, unknown>): void {
+    this.directTools = tools;
   }
 
   /**
@@ -163,22 +1079,10 @@ export class ToolsManager {
     }
 
     logger.debug(
-      `Loading ${Object.keys(this.directTools).length} direct tools with event emission`,
+      `[ToolsManager] Loading ${Object.keys(this.directTools).length} direct tools`,
     );
 
     for (const [toolName, directTool] of Object.entries(this.directTools)) {
-      logger.debug(`Processing direct tool: ${toolName}`, {
-        toolName,
-        hasExecute:
-          directTool &&
-          typeof directTool === "object" &&
-          "execute" in directTool,
-        hasDescription:
-          directTool &&
-          typeof directTool === "object" &&
-          "description" in directTool,
-      });
-
       // Wrap the direct tool's execute function with event emission
       if (
         directTool &&
@@ -186,71 +1090,32 @@ export class ToolsManager {
         "execute" in directTool
       ) {
         const originalExecute = (
-          directTool as { execute: (params: unknown) => Promise<unknown> }
+          directTool as {
+            execute: (
+              params: unknown,
+              execOptions?: unknown,
+            ) => Promise<unknown>;
+          }
         ).execute;
 
-        // Create a new tool with wrapped execute function
-        tools[toolName] = {
+        // Create a new tool with wrapped execute function (BZ-666/BZ-664 guards applied).
+        // HITL sits INSIDE the truncation wrapper so a pending confirmation is
+        // raced against the loop's abort signal like any other tool wait.
+        const guardedExecute = this.wrapExecuteWithTruncation(
+          toolName,
+          this.wrapExecuteWithHITL(toolName, originalExecute),
+        );
+        tools[toolName] = markEventWrapped({
           ...(directTool as Tool),
-          execute: async (params: unknown) => {
-            // 🔧 EMIT TOOL START EVENT - Bedrock-compatible format
-            if (this.neurolink?.getEventEmitter) {
-              const emitter = this.neurolink.getEventEmitter();
-              emitter.emit("tool:start", { tool: toolName, input: params });
-              logger.debug(`Direct tool:start event emitted for ${toolName}`, {
-                toolName,
-                input: params,
-                hasEmitter: !!emitter,
-              });
-            }
-
-            try {
-              const result = await originalExecute(params);
-
-              // 🔧 EMIT TOOL END EVENT - Bedrock-compatible format
-              if (this.neurolink?.getEventEmitter) {
-                const emitter = this.neurolink.getEventEmitter();
-                emitter.emit("tool:end", { tool: toolName, result });
-                logger.debug(`Direct tool:end event emitted for ${toolName}`, {
-                  toolName,
-                  result:
-                    typeof result === "string"
-                      ? result.substring(0, 100)
-                      : JSON.stringify(result).substring(0, 100),
-                  hasEmitter: !!emitter,
-                });
-              }
-
-              return result;
-            } catch (error) {
-              // 🔧 EMIT TOOL END EVENT FOR ERROR - Bedrock-compatible format
-              if (this.neurolink?.getEventEmitter) {
-                const emitter = this.neurolink.getEventEmitter();
-                const errorMsg =
-                  error instanceof Error ? error.message : String(error);
-                emitter.emit("tool:end", { tool: toolName, error: errorMsg });
-                logger.debug(
-                  `Direct tool:end error event emitted for ${toolName}`,
-                  {
-                    toolName,
-                    error: errorMsg,
-                    hasEmitter: !!emitter,
-                  },
-                );
-              }
-              throw error;
-            }
-          },
-        } as Tool;
+          execute: this.wrapExecuteWithEvents(toolName, guardedExecute),
+        } as Tool);
       } else {
         // Fallback: include tool as-is if it doesn't have execute function
         tools[toolName] = directTool as Tool;
       }
     }
 
-    logger.debug(`Direct tools processing complete`, {
-      directToolsProcessed: Object.keys(this.directTools).length,
-    });
+    // Direct tools processing complete — count already logged at start
   }
 
   /**
@@ -266,13 +1131,6 @@ export class ToolsManager {
     );
 
     for (const [toolName, toolDef] of this.customTools.entries()) {
-      logger.debug(`Processing custom tool: ${toolName}`, {
-        toolDef: typeof toolDef,
-        hasExecute:
-          toolDef && typeof toolDef === "object" && "execute" in toolDef,
-        hasName: toolDef && typeof toolDef === "object" && "name" in toolDef,
-      });
-
       // Validate tool definition has required execute function
       const toolInfo =
         (toolDef as Record<string, unknown> | undefined) ||
@@ -288,14 +1146,22 @@ export class ToolsManager {
           },
         );
         if (tool && !tools[toolName]) {
+          // BZ-666/BZ-664: Wrap custom tool execute with guards
+          const origExec = (
+            tool as {
+              execute?: (p: unknown, o?: unknown) => Promise<unknown>;
+            }
+          ).execute;
+          if (origExec) {
+            const guarded = this.wrapExecuteWithTruncation(toolName, origExec);
+            (tool as Record<string, unknown>).execute = guarded;
+          }
           tools[toolName] = tool;
         }
       }
     }
 
-    logger.debug(`[ToolsManager] Custom tools processing complete`, {
-      customToolsProcessed: this.customTools.size,
-    });
+    // Custom tools processing complete — count already logged at start
   }
 
   /**
@@ -329,37 +1195,49 @@ export class ToolsManager {
       !this.neurolink ||
       typeof this.neurolink.getExternalMCPTools !== "function"
     ) {
-      logger.debug(`[ToolsManager] No external MCP tool interface available`, {
-        hasNeuroLink: !!this.neurolink,
-        hasGetExternalMCPTools:
-          this.neurolink &&
-          typeof this.neurolink.getExternalMCPTools === "function",
-      });
       return;
     }
 
     try {
-      logger.debug(
-        `[ToolsManager] Loading external MCP tools for ${this.providerName}`,
-      );
-
       const externalTools = await this.neurolink.getExternalMCPTools();
-      logger.debug(
-        `[ToolsManager] Found ${externalTools.length} external MCP tools`,
-      );
 
+      // Which server owns each external name added in this pass, so a
+      // collision names both sides. Names present before this phase belong to
+      // a built-in or a registered tool.
+      const externalOwners = new Map<string, string>();
+      let addedCount = 0;
       for (const tool of externalTools) {
-        const mcpTool = await this.createExternalMCPTool(tool);
-        if (mcpTool && !tools[tool.name]) {
-          tools[tool.name] = mcpTool;
-          logger.debug(
-            `[ToolsManager] Successfully added external MCP tool: ${tool.name}`,
+        const serverId = tool.serverId || "unknown";
+        let registeredName = tool.name;
+        if (tools[tool.name]) {
+          // A silent first-wins drop here left the losing server's tool
+          // unreachable, with the outcome depending on connection order
+          //. Keep both: the later one is registered
+          // under `<serverId>__<tool>` so the model can still call it.
+          const owner = externalOwners.get(tool.name);
+          const qualified = qualifyToolName(serverId, tool.name);
+          if (tools[qualified]) {
+            logger.warn(
+              `[ToolsManager] Tool name collision: '${tool.name}' from server '${serverId}' is already provided by ${owner ? `server '${owner}'` : "a built-in or registered tool"}, and the qualified name '${qualified}' is taken too; the '${serverId}' copy is not exposed to the model`,
+            );
+            continue;
+          }
+          logger.warn(
+            `[ToolsManager] Tool name collision: '${tool.name}' from server '${serverId}' is already provided by ${owner ? `server '${owner}'` : "a built-in or registered tool"}; the '${serverId}' copy is exposed as '${qualified}'`,
           );
+          registeredName = qualified;
+        }
+        const mcpTool = await this.createExternalMCPTool(tool, registeredName);
+        if (mcpTool) {
+          tools[registeredName] = mcpTool;
+          externalOwners.set(registeredName, serverId);
+          addedCount++;
         }
       }
 
-      logger.debug(`[ToolsManager] External MCP tools loading complete`, {
-        totalToolsAdded: externalTools.length,
+      logger.debug(`[ToolsManager] External MCP tools loaded`, {
+        found: externalTools.length,
+        added: addedCount,
       });
     } catch (error) {
       logger.error(
@@ -380,11 +1258,13 @@ export class ToolsManager {
       description?: string;
       parameters?: unknown;
       inputSchema?: unknown;
+      /** Per-tool timeout in milliseconds, set at registration time */
+      timeoutMs?: number;
+      /** Per-tool max retries, set at registration time */
+      maxRetries?: number;
     },
   ): Promise<Tool | null> {
     try {
-      logger.debug(`[ToolsManager] Converting custom tool: ${toolName}`);
-
       let finalSchema: z.ZodSchema | ReturnType<typeof jsonSchema>;
       let originalInputSchema: Record<string, unknown> | undefined;
 
@@ -417,154 +1297,204 @@ export class ToolsManager {
         finalSchema = z.object({});
       }
 
-      return createAISDKTool({
-        description: toolInfo.description || `Tool ${toolName}`,
-        parameters: finalSchema,
-        execute: async (params) => {
-          const startTime = Date.now();
-          let executionId: string | undefined;
-
-          if (this.neurolink?.emitToolStart) {
-            executionId = this.neurolink.emitToolStart(
-              toolName,
-              params,
-              startTime,
-            );
-            logger.debug(
-              `Custom tool:start emitted via NeuroLink for ${toolName}`,
+      // Emits its own tool:start / tool:end through neurolink.executeTool, so
+      // it is marked as instrumented and never wrapped a second time.
+      return markEventWrapped(
+        createAISDKTool<unknown, unknown>({
+          description: toolInfo.description || `Tool ${toolName}`,
+          inputSchema: finalSchema, // AI SDK v6 uses inputSchema (not parameters)
+          execute: async (params: unknown) => {
+            const customToolSpan = tracers.sdk.startSpan(
+              "tools.execute_custom",
               {
-                toolName,
-                executionId,
-                input: params,
-                hasNativeEmission: true,
-              },
-            );
-          }
-
-          try {
-            // 🔧 PARAMETER FLOW TRACING - Before NeuroLink executeTool call
-            logger.debug(
-              `About to call NeuroLink executeTool for ${toolName}`,
-              {
-                toolName,
-                paramsBeforeExecution: {
-                  type: typeof params,
-                  isNull: params === null,
-                  isUndefined: params === undefined,
-                  isEmpty:
-                    params &&
-                    typeof params === "object" &&
-                    Object.keys(params as object).length === 0,
-                  keys:
-                    params && typeof params === "object"
-                      ? Object.keys(params as object)
-                      : "NOT_OBJECT",
-                  keysLength:
-                    params && typeof params === "object"
-                      ? Object.keys(params as object).length
-                      : 0,
+                attributes: {
+                  "tool.name": toolName,
+                  "tool.type": "custom",
+                  // Pure wrapper around the `tool` observation of the same
+                  // call: it stays an OpenTelemetry span but is not exported.
+                  [ATTR.NL_INTERNAL]: true,
                 },
-                executorInfo: {
-                  hasExecutor: typeof toolInfo.execute === "function",
-                  executorType: typeof toolInfo.execute,
-                },
-                timestamp: Date.now(),
-                phase: "BEFORE_NEUROLINK_EXECUTE",
               },
             );
 
-            const result = await toolInfo.execute(params as ToolArgs);
+            const startTime = Date.now();
+            let executionId: string | undefined;
 
-            // 🔧 PARAMETER FLOW TRACING - After NeuroLink executeTool call
-            logger.debug(`NeuroLink executeTool completed for ${toolName}`, {
-              toolName,
-              resultInfo: {
-                type: typeof result,
-                isNull: result === null,
-                isUndefined: result === undefined,
-                hasError:
-                  result && typeof result === "object" && "error" in result,
-              },
-              timestamp: Date.now(),
-              phase: "AFTER_NEUROLINK_EXECUTE",
-            });
+            try {
+              // Route through NeuroLink.executeTool() when available for MCP enhancement support
+              // (cache, middleware, annotations, circuit breaker, routing)
+              if (this.toolExecutor) {
+                // Per-tool timeout and retries flow through the customTools map
+                // (set at registration via ToolRegistrationOptions).
+                // The execute wrapper in registerTool already enforces timeouts,
+                // but we also forward them to toolExecutor for MCP-level handling.
+                const toolTimeoutMs = toolInfo.timeoutMs;
+                const toolMaxRetries = toolInfo.maxRetries;
+                const hasRegistrationOptions =
+                  toolTimeoutMs !== undefined || toolMaxRetries !== undefined;
+                const result = await this.toolExecutor(
+                  toolName,
+                  params,
+                  hasRegistrationOptions
+                    ? {
+                        ...(toolTimeoutMs !== undefined && {
+                          timeout: toolTimeoutMs,
+                        }),
+                        ...(toolMaxRetries !== undefined && {
+                          maxRetries: toolMaxRetries,
+                        }),
+                      }
+                    : undefined,
+                );
 
-            const convertedResult = this.utilities?.convertToolResult
-              ? await this.utilities.convertToolResult(result)
-              : result;
-            const endTime = Date.now();
+                const convertedResult = this.utilities?.convertToolResult
+                  ? await this.utilities.convertToolResult(result)
+                  : result;
+                const endTime = Date.now();
 
-            let errorResult: string | undefined = undefined;
+                customToolSpan.setAttribute(
+                  "tool.duration_ms",
+                  endTime - startTime,
+                );
 
-            if (
-              convertedResult &&
-              typeof convertedResult === "object" &&
-              "isError" in convertedResult &&
-              convertedResult.isError
-            ) {
-              try {
-                errorResult = JSON.stringify(convertedResult);
-              } catch (error) {
-                logger.error(
-                  `Failed to serialize error result for ${toolName}`,
-                  error,
+                let errorResult: string | undefined = undefined;
+                if (
+                  convertedResult &&
+                  typeof convertedResult === "object" &&
+                  "isError" in convertedResult &&
+                  convertedResult.isError
+                ) {
+                  try {
+                    errorResult = JSON.stringify(convertedResult);
+                  } catch (error) {
+                    logger.error(
+                      `Failed to serialize error result for ${toolName}`,
+                      error,
+                    );
+                  }
+                }
+
+                customToolSpan.setAttribute(
+                  "tool.result.status",
+                  errorResult ? "error" : "success",
+                );
+                if (errorResult) {
+                  customToolSpan.setStatus({
+                    code: SpanStatusCode.ERROR,
+                    message: `Tool ${toolName} returned isError: true`,
+                  });
+                } else {
+                  customToolSpan.setStatus({ code: SpanStatusCode.OK });
+                }
+
+                return convertedResult;
+              }
+
+              // Fallback: direct execution (standalone usage without NeuroLink SDK)
+              if (this.neurolink?.emitToolStart) {
+                executionId = this.neurolink.emitToolStart(
+                  toolName,
+                  params,
+                  startTime,
                 );
               }
-            }
+              const result = await toolInfo.execute(params as ToolArgs);
 
-            // 🔧 NATIVE NEUROLINK EVENT EMISSION - Tool End (Success or Handled Error)
-            if (this.neurolink?.emitToolEnd) {
-              this.neurolink.emitToolEnd(
-                toolName,
-                convertedResult,
-                errorResult,
-                startTime,
-                endTime,
-                executionId,
-              );
-              logger.debug(
-                `Custom tool:end emitted via NeuroLink for ${toolName}`,
-                {
+              const convertedResult = this.utilities?.convertToolResult
+                ? await this.utilities.convertToolResult(result)
+                : result;
+              const endTime = Date.now();
+
+              let errorResult: string | undefined = undefined;
+
+              if (
+                convertedResult &&
+                typeof convertedResult === "object" &&
+                "isError" in convertedResult &&
+                convertedResult.isError
+              ) {
+                try {
+                  errorResult = JSON.stringify(convertedResult);
+                } catch (error) {
+                  logger.error(
+                    `Failed to serialize error result for ${toolName}`,
+                    error,
+                  );
+                }
+              }
+
+              // Emit tool end event (success or handled error)
+              if (this.neurolink?.emitToolEnd) {
+                this.neurolink.emitToolEnd(
                   toolName,
+                  convertedResult,
+                  errorResult,
+                  startTime,
+                  endTime,
                   executionId,
-                  duration: endTime - startTime,
-                  hasResult: convertedResult !== undefined,
-                  hasNativeEmission: true,
-                },
-              );
-            }
+                );
+              }
 
-            return convertedResult;
-          } catch (error) {
-            const endTime = Date.now();
-            const errorMsg =
-              error instanceof Error ? error.message : String(error);
-
-            // 🔧 NATIVE NEUROLINK EVENT EMISSION - Tool End (Error)
-            if (this.neurolink?.emitToolEnd) {
-              this.neurolink.emitToolEnd(
-                toolName,
-                undefined, // no result
-                errorMsg,
-                startTime,
-                endTime,
-                executionId,
+              customToolSpan.setAttribute(
+                "tool.duration_ms",
+                endTime - startTime,
               );
-              logger.info(
-                `Custom tool:end error emitted via NeuroLink for ${toolName}`,
-                {
+              customToolSpan.setAttribute(
+                "tool.result.status",
+                errorResult ? "error" : "success",
+              );
+              if (errorResult) {
+                customToolSpan.setStatus({
+                  code: SpanStatusCode.ERROR,
+                  message: `Tool ${toolName} returned isError: true`,
+                });
+              } else {
+                customToolSpan.setStatus({ code: SpanStatusCode.OK });
+              }
+
+              return convertedResult;
+            } catch (error) {
+              const endTime = Date.now();
+              const errorMsg =
+                error instanceof Error ? error.message : String(error);
+
+              // Emit tool end event (error) — only for fallback path
+              // When toolExecutor is used, executeTool() handles event emission
+              if (!this.toolExecutor && this.neurolink?.emitToolEnd) {
+                this.neurolink.emitToolEnd(
                   toolName,
+                  undefined, // no result
+                  errorMsg,
+                  startTime,
+                  endTime,
                   executionId,
-                  duration: endTime - startTime,
-                  error: errorMsg,
-                  hasNativeEmission: true,
-                },
+                );
+                logger.debug(
+                  `Custom tool error: ${toolName} (${endTime - startTime}ms)`,
+                  { error: errorMsg },
+                );
+              }
+
+              customToolSpan.setAttribute(
+                "tool.duration_ms",
+                endTime - startTime,
               );
+              customToolSpan.setAttribute("tool.result.status", "error");
+              customToolSpan.recordException(
+                error instanceof Error ? error : new Error(errorMsg),
+              );
+              customToolSpan.setStatus({
+                code: SpanStatusCode.ERROR,
+                message: errorMsg,
+              });
+
+              throw error;
+            } finally {
+              customToolSpan.end();
             }
-            throw error;
-          }
-        },
-      });
+          },
+        }),
+      );
     } catch (toolCreationError) {
       logger.error(`Failed to create tool: ${toolName}`, toolCreationError);
       return null;
@@ -572,150 +1502,125 @@ export class ToolsManager {
   }
 
   /**
-   * Create an external MCP tool
+   * Prepare an external tool's declaration and validator from its inputSchema,
+   * once per schema object (see mcpSchemaCache).
+   *
+   * The schema is a remote server's data. Every `pattern` and every
+   * `patternProperties` key in it is compiled with `new RegExp` by the
+   * validator on each check, so one nested-quantifier pattern from a server
+   * could stall the event loop for seconds per tool call.
+   * Patterns `vetRegexPattern` refuses are removed before the validator is
+   * built and reported once, at warn level.
    */
-  private async createExternalMCPTool(tool: {
-    name: string;
-    description?: string;
-    inputSchema?: StandardRecord;
-    serverId?: string;
-  }): Promise<Tool | null> {
-    try {
-      logger.debug(`[ToolsManager] Converting external MCP tool: ${tool.name}`);
+  private async prepareExternalToolSchema(
+    toolName: string,
+    serverId: string,
+    originalSchema: Record<string, unknown>,
+  ): Promise<{
+    schema: Record<string, unknown>;
+    validate: Awaited<ReturnType<typeof buildMCPSchemaValidator>>;
+  }> {
+    const cached = mcpSchemaCache.get(originalSchema);
+    if (cached) {
+      return cached;
+    }
+    // Clone and fix the schema for OpenAI strict mode compatibility
+    const fixedSchema = this.utilities?.fixSchemaForOpenAIStrictMode
+      ? this.utilities.fixSchemaForOpenAIStrictMode(originalSchema)
+      : originalSchema;
+    const { schema, drops } = stripUnsafeRegexPatterns(fixedSchema);
+    if (drops.length > 0) {
+      logger.warn(
+        `[ToolsManager] Removed ${drops.length} regular expression pattern(s) from the schema of tool '${toolName}' (server '${serverId}') because they could stall the process; the affected fields are validated without them`,
+        { drops: drops.map(({ path, reason }) => ({ path, reason })) },
+      );
+    }
+    // A jsonSchema() wrapper WITHOUT a validate function is declarative
+    // only — the AI SDK passes any parsed arguments straight through
+    // (safeValidateTypes short-circuits on `validate == null`). That let
+    // malformed calls (missing required params, "123" for a number)
+    // reach execution, where the MCP-layer validator rejected them at
+    // the cost of a full model round-trip. Attach a real validator so
+    // invalid calls fail at parse time, where experimental_repairToolCall
+    // can still fix them silently.
+    const validate = await buildMCPSchemaValidator(toolName, schema);
+    const prepared = { schema, validate };
+    mcpSchemaCache.set(originalSchema, prepared);
+    return prepared;
+  }
 
+  /**
+   * Create an external MCP tool. `registeredName` is the key the tool is
+   * exposed under — normally `tool.name`, or `<serverId>__<tool.name>` after a
+   * collision — and is what events and spans report; execution always goes to
+   * the owning server by the tool's own name.
+   */
+  private async createExternalMCPTool(
+    tool: {
+      name: string;
+      description?: string;
+      inputSchema?: StandardRecord;
+      serverId?: string;
+    },
+    registeredName: string = tool.name,
+  ): Promise<Tool | null> {
+    try {
       // Use original JSON Schema from MCP tool if available, otherwise use permissive schema
       let finalSchema;
       if (tool.inputSchema && typeof tool.inputSchema === "object") {
-        // Clone and fix the schema for OpenAI strict mode compatibility
-        const originalSchema = tool.inputSchema as Record<string, unknown>;
-        const fixedSchema = this.utilities?.fixSchemaForOpenAIStrictMode
-          ? this.utilities.fixSchemaForOpenAIStrictMode(originalSchema)
-          : originalSchema;
-        finalSchema = jsonSchema(fixedSchema);
+        const { schema, validate } = await this.prepareExternalToolSchema(
+          tool.name,
+          tool.serverId || "unknown",
+          tool.inputSchema as Record<string, unknown>,
+        );
+        finalSchema = jsonSchema(schema, validate ? { validate } : {});
       } else {
         finalSchema = this.utilities?.createPermissiveZodSchema
           ? this.utilities.createPermissiveZodSchema()
           : z.object({});
       }
 
-      return createAISDKTool({
-        description: tool.description || `External MCP tool ${tool.name}`,
-        parameters: finalSchema,
-        execute: async (params) => {
-          logger.debug(`Executing external MCP tool: ${tool.name}`, {
-            toolName: tool.name,
+      // BZ-666/BZ-664: Wrap the raw MCP execute with guards before event wrapping
+      const rawExecute = async (params: unknown): Promise<unknown> => {
+        if (
+          this.neurolink &&
+          typeof this.neurolink.executeExternalMCPTool === "function"
+        ) {
+          return this.neurolink.executeExternalMCPTool(
+            tool.serverId || "unknown",
+            tool.name,
+            params as JsonObject,
+          );
+        }
+        throw new Error(
+          `Cannot execute external MCP tool: NeuroLink executeExternalMCPTool not available`,
+        );
+      };
+      const guardedExecute = this.wrapExecuteWithTruncation(
+        registeredName,
+        rawExecute,
+      );
+
+      const loggedExecute = async (params: unknown, execOptions?: unknown) => {
+        try {
+          return await guardedExecute(params, execOptions);
+        } catch (mcpError) {
+          logger.error(`External MCP tool failed: ${tool.name}`, {
             serverId: tool.serverId,
-            params: JSON.stringify(params),
-            paramsType: typeof params,
-            hasNeurolink: !!this.neurolink,
-            hasExecuteFunction:
-              this.neurolink &&
-              typeof this.neurolink.executeExternalMCPTool === "function",
-            timestamp: Date.now(),
+            error:
+              mcpError instanceof Error ? mcpError.message : String(mcpError),
           });
+          throw mcpError;
+        }
+      };
 
-          // 🔧 EMIT TOOL START EVENT - Bedrock-compatible format
-          if (this.neurolink?.getEventEmitter) {
-            const emitter = this.neurolink.getEventEmitter();
-            emitter.emit("tool:start", { tool: tool.name, input: params });
-            logger.debug(`tool:start event emitted for ${tool.name}`, {
-              toolName: tool.name,
-              input: params,
-              hasEmitter: !!emitter,
-            });
-          }
-
-          // Execute via NeuroLink's direct tool execution
-          if (
-            this.neurolink &&
-            typeof this.neurolink.executeExternalMCPTool === "function"
-          ) {
-            try {
-              const result = await this.neurolink.executeExternalMCPTool(
-                tool.serverId || "unknown",
-                tool.name,
-                params as JsonObject,
-              );
-
-              // 🔧 EMIT TOOL END EVENT - Bedrock-compatible format
-              if (this.neurolink?.getEventEmitter) {
-                const emitter = this.neurolink.getEventEmitter();
-                emitter.emit("tool:end", { tool: tool.name, result });
-                logger.debug(`tool:end event emitted for ${tool.name}`, {
-                  toolName: tool.name,
-                  result:
-                    typeof result === "string"
-                      ? result.substring(0, 100)
-                      : JSON.stringify(result).substring(0, 100),
-                  hasEmitter: !!emitter,
-                });
-              }
-
-              logger.debug(`External MCP tool executed: ${tool.name}`, {
-                toolName: tool.name,
-                result:
-                  typeof result === "string"
-                    ? result.substring(0, 200)
-                    : JSON.stringify(result).substring(0, 200),
-                resultType: typeof result,
-                timestamp: Date.now(),
-              });
-
-              return result;
-            } catch (mcpError) {
-              // 🔧 EMIT TOOL END EVENT FOR ERROR - Bedrock-compatible format
-              if (this.neurolink?.getEventEmitter) {
-                const emitter = this.neurolink.getEventEmitter();
-                const errorMsg =
-                  mcpError instanceof Error
-                    ? mcpError.message
-                    : String(mcpError);
-                emitter.emit("tool:end", { tool: tool.name, error: errorMsg });
-                logger.debug(`tool:end error event emitted for ${tool.name}`, {
-                  toolName: tool.name,
-                  error: errorMsg,
-                  hasEmitter: !!emitter,
-                });
-              }
-
-              logger.error(`External MCP tool failed: ${tool.name}`, {
-                toolName: tool.name,
-                serverId: tool.serverId,
-                error:
-                  mcpError instanceof Error
-                    ? mcpError.message
-                    : String(mcpError),
-                errorStack:
-                  mcpError instanceof Error ? mcpError.stack : undefined,
-                params: JSON.stringify(params),
-                timestamp: Date.now(),
-              });
-              throw mcpError;
-            }
-          } else {
-            const error = `Cannot execute external MCP tool: NeuroLink executeExternalMCPTool not available`;
-
-            // 🔧 EMIT TOOL END EVENT FOR ERROR - Bedrock-compatible format
-            if (this.neurolink?.getEventEmitter) {
-              const emitter = this.neurolink.getEventEmitter();
-              emitter.emit("tool:end", { tool: tool.name, error });
-              logger.debug(`tool:end error event emitted for ${tool.name}`, {
-                toolName: tool.name,
-                error,
-                hasEmitter: !!emitter,
-              });
-            }
-
-            logger.error(`${error}`, {
-              toolName: tool.name,
-              hasNeurolink: !!this.neurolink,
-              neurolinkType: typeof this.neurolink,
-              timestamp: Date.now(),
-            });
-            throw new Error(error);
-          }
-        },
-      });
+      return markEventWrapped(
+        createAISDKTool<unknown, unknown>({
+          description: tool.description || `External MCP tool ${tool.name}`,
+          inputSchema: finalSchema, // AI SDK v6 uses inputSchema (not parameters)
+          execute: this.wrapExecuteWithEvents(registeredName, loggedExecute),
+        }),
+      );
     } catch (toolCreationError) {
       logger.error(
         `Failed to create external MCP tool: ${tool.name}`,

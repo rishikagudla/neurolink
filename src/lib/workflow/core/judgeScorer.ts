@@ -3,22 +3,28 @@
  * Judge-based scoring system for ensemble response evaluation
  */
 
+import { SpanStatusCode } from "@opentelemetry/api";
 import { AIProviderFactory } from "../../core/factory.js";
 import { logger } from "../../utils/logger.js";
+import {
+  SpanSerializer,
+  SpanType,
+  SpanStatus,
+  getMetricsAggregator,
+} from "../../observability/index.js";
+import { withSpan } from "../../telemetry/withSpan.js";
+import { tracers } from "../../telemetry/tracers.js";
 import { MAX_REASONING_LENGTH } from "../config.js";
 import type {
   EnsembleResponse,
   JudgeConfig,
   JudgeScores,
   MultiJudgeScores,
-} from "../types.js";
-import { WorkflowError } from "../types.js";
-import type {
   ParsedJudgeResponse,
   ScoreOptions,
-  ScoreResult,
-} from "./types/index.js";
-
+  JudgeScoreResult,
+} from "../../types/index.js";
+import { WorkflowError } from "../../types/index.js";
 const functionTag = "JudgeScorer";
 
 // ============================================================================
@@ -32,7 +38,27 @@ const functionTag = "JudgeScorer";
  */
 export async function scoreEnsemble(
   options: ScoreOptions,
-): Promise<ScoreResult> {
+): Promise<JudgeScoreResult> {
+  return withSpan(
+    {
+      name: "neurolink.workflow.judge.score",
+      tracer: tracers.workflow,
+      observationType: "span",
+      attributes: {
+        "workflow.judges_count": options.judges.length,
+        "workflow.responses_count": options.responses.length,
+        "workflow.pattern":
+          options.judges.length > 1 ? "multi-judge" : "single-judge",
+      },
+    },
+    async (otelSpan) => scoreEnsembleInner(options, otelSpan),
+  );
+}
+
+async function scoreEnsembleInner(
+  options: ScoreOptions,
+  otelSpan: import("@opentelemetry/api").Span,
+): Promise<JudgeScoreResult> {
   const startTime = Date.now();
   const {
     judges,
@@ -42,6 +68,12 @@ export async function scoreEnsemble(
     timeout,
     workflowDefaults,
   } = options;
+  const span = SpanSerializer.createSpan(SpanType.WORKFLOW, "workflow.judge", {
+    "workflow.operation": "judge",
+    "workflow.judge_count": judges.length,
+    "workflow.response_count": responses.length,
+    "workflow.pattern": judges.length > 1 ? "multi-judge" : "single-judge",
+  });
 
   logger.info(`[${functionTag}] Starting judge scoring`, {
     judgeCount: judges.length,
@@ -74,9 +106,15 @@ export async function scoreEnsemble(
         workflowDefaults?.judgePrompt,
       );
 
+      const judgeTime = Date.now() - startTime;
+      span.durationMs = judgeTime;
+      const endedSpan = SpanSerializer.endSpan(span, SpanStatus.OK);
+      getMetricsAggregator().recordSpan(endedSpan);
+      otelSpan.setAttribute("workflow.judge_time_ms", judgeTime);
+
       return {
         scores: judgeResult,
-        judgeTime: Date.now() - startTime,
+        judgeTime,
       };
     } else {
       // Multi-judge voting
@@ -89,15 +127,37 @@ export async function scoreEnsemble(
         workflowDefaults?.judgePrompt,
       );
 
+      const judgeTime = Date.now() - startTime;
+      span.durationMs = judgeTime;
+      const endedSpan = SpanSerializer.endSpan(span, SpanStatus.OK);
+      getMetricsAggregator().recordSpan(endedSpan);
+      otelSpan.setAttribute("workflow.judge_time_ms", judgeTime);
+      otelSpan.setAttribute("workflow.judges_completed", judges.length);
+
       return {
         scores: multiJudgeResult,
-        judgeTime: Date.now() - startTime,
+        judgeTime,
       };
     }
   } catch (error) {
     const err = error as Error;
     logger.error(`[${functionTag}] Judge scoring failed`, {
       error: err.message,
+    });
+
+    span.durationMs = Date.now() - startTime;
+    const endedSpan = SpanSerializer.endSpan(
+      span,
+      SpanStatus.ERROR,
+      err.message,
+    );
+    getMetricsAggregator().recordSpan(endedSpan);
+
+    // Mark the outer OTel span as ERROR since we return instead of rethrowing
+    otelSpan.recordException(err);
+    otelSpan.setStatus({
+      code: SpanStatusCode.ERROR,
+      message: err.message,
     });
 
     const workflowError =

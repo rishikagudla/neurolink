@@ -10,7 +10,9 @@ import type {
   SageMakerUsage,
   SageMakerStreamingToolCall,
   SageMakerStructuredOutput,
-} from "../../types/providers.js";
+  BracketCountingState,
+  StreamingParser,
+} from "../../types/index.js";
 import { isNonNullObject } from "../../utils/typeUtils.js";
 import {
   createStructuredOutputParser,
@@ -20,22 +22,11 @@ import {
 import { SageMakerError } from "./errors.js";
 import { logger } from "../../utils/logger.js";
 import { randomUUID } from "crypto";
-
+import { estimateTokens } from "../../utils/tokenEstimation.js";
 /**
  * Constants for JSON parsing and validation
  */
 const MIN_JSON_OBJECT_LENGTH = 2; // Minimum length for JSON object "{}"
-
-/**
- * Shared bracket counting state and utilities
- * Used by both validateJSONCompleteness and StructuredOutputParser
- */
-export interface BracketCountingState {
-  braceCount: number;
-  bracketCount: number;
-  inString: boolean;
-  escapeNext: boolean;
-}
 
 /**
  * Process a single character for bracket counting logic
@@ -191,26 +182,6 @@ export function parseToolCallArguments(args: string): {
     // String doesn't look like complete JSON, treat as delta
     return { argumentsDelta: trimmedArgs };
   }
-}
-
-/**
- * Base interface for streaming response parsers
- */
-export interface StreamingParser {
-  /** Parse a chunk of streaming data */
-  parse(chunk: Uint8Array): SageMakerStreamChunk[];
-
-  /** Check if a chunk indicates completion */
-  isComplete(chunk: SageMakerStreamChunk): boolean;
-
-  /** Extract final usage information */
-  extractUsage(finalChunk: SageMakerStreamChunk): SageMakerUsage | undefined;
-
-  /** Get parser name for debugging */
-  getName(): string;
-
-  /** Reset parser state for new stream */
-  reset(): void;
 }
 
 /**
@@ -384,10 +355,13 @@ export class HuggingFaceStreamParser extends BaseStreamingParser {
     }
 
     const tokens = details.tokens as Record<string, unknown>;
+    const promptTokens = Number(tokens.input) || 0;
+    const completionTokens = Number(tokens.generated) || 0;
     return {
-      promptTokens: Number(tokens.input) || 0,
-      completionTokens: Number(tokens.generated) || 0,
-      total: Number(tokens.total) || 0,
+      promptTokens,
+      completionTokens,
+      // Endpoints that omit the total must not report 0 next to real counts.
+      total: Number(tokens.total) || promptTokens + completionTokens,
     };
   }
 
@@ -590,10 +564,13 @@ export class LlamaStreamParser extends BaseStreamingParser {
   }
 
   private parseLlamaUsage(usage: Record<string, unknown>): SageMakerUsage {
+    const promptTokens = Number(usage.prompt_tokens) || 0;
+    const completionTokens = Number(usage.completion_tokens) || 0;
     return {
-      promptTokens: Number(usage.prompt_tokens) || 0,
-      completionTokens: Number(usage.completion_tokens) || 0,
-      total: Number(usage.total_tokens) || 0,
+      promptTokens,
+      completionTokens,
+      // Endpoints that omit total_tokens must not report 0 next to real counts.
+      total: Number(usage.total_tokens) || promptTokens + completionTokens,
     };
   }
 
@@ -743,11 +720,14 @@ export class CustomStreamParser extends BaseStreamingParser {
   ): SageMakerUsage | undefined {
     const usage = (data.usage || data.tokens || {}) as Record<string, unknown>;
 
+    const promptTokens = Number(usage.prompt_tokens || usage.input_tokens) || 0;
+    const completionTokens =
+      Number(usage.completion_tokens || usage.output_tokens) || 0;
     return {
-      promptTokens: Number(usage.prompt_tokens || usage.input_tokens) || 0,
-      completionTokens:
-        Number(usage.completion_tokens || usage.output_tokens) || 0,
-      total: Number(usage.total_tokens) || 0,
+      promptTokens,
+      completionTokens,
+      // Endpoints that omit total_tokens must not report 0 next to real counts.
+      total: Number(usage.total_tokens) || promptTokens + completionTokens,
     };
   }
 }
@@ -815,9 +795,8 @@ export function estimateTokenUsage(
   prompt: string,
   completion: string,
 ): SageMakerUsage {
-  // Rough estimation: ~4 characters per token for English text
-  const promptTokens = Math.ceil(prompt.length / 4);
-  const completionTokens = Math.ceil(completion.length / 4);
+  const promptTokens = estimateTokens(prompt, "sagemaker");
+  const completionTokens = estimateTokens(completion, "sagemaker");
 
   return {
     promptTokens,

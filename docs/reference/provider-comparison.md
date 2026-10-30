@@ -1,9 +1,11 @@
 # AI Provider Comparison Guide
 
-**Last Updated:** January 1, 2026
-**NeuroLink Version:** 8.26.1
+> ⚠️ **STALE DOCUMENT** — This comparison predates the current provider roster, including the JSON-catalog providers, and is due for a fresh pass. Provider rows below may be missing or out of date; see the [README](https://github.com/juspay/neurolink/blob/release/README.md) for the current provider list.
 
-Complete comparison of all 13 AI providers supported by NeuroLink, including capabilities, pricing, and use case recommendations.
+**Last Updated:** May 2026
+**NeuroLink Version:** 9.62.0
+
+Comparison of NeuroLink's text and multimodal AI providers, including capabilities, pricing, and use case recommendations. (Note: voice providers — OpenAI TTS, ElevenLabs, Deepgram, Azure Speech, Google TTS/STT, [60db](../getting-started/providers/sixtydb.md), Whisper, OpenAI Realtime, Gemini Live — are documented separately under [Voice Providers](../getting-started/providers/index.md).)
 
 ---
 
@@ -12,7 +14,7 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 | Provider          | Text | Stream | Tools | Vision | PDF | Thinking | Struct Out | Free Tier | Setup Time |
 | ----------------- | ---- | ------ | ----- | ------ | --- | -------- | ---------- | --------- | ---------- |
 | OpenAI            | ✓    | ✓      | ✓     | ✓      | ✗   | ✗        | ✓          | ✗         | 2 min      |
-| Anthropic         | ✓    | ✓      | ✓     | ✓      | ✓   | ✓        | ✓          | ✗         | 2 min      |
+| Anthropic ^1^     | ✓    | ✓      | ✓     | ✓      | ✓   | ✓        | ✓          | ⚠️        | 2 min      |
 | Google AI Studio  | ✓    | ✓      | ✓     | ✓      | ✓   | ✓        | ⚠️         | ✓         | 2 min      |
 | Google Vertex     | ✓    | ✓      | ✓     | ✓      | ✓   | ✓        | ⚠️         | ✗         | 15 min     |
 | Amazon Bedrock    | ✓    | ✓      | ✓     | ⚠️     | ✓   | ✗        | ✓          | ✗         | 10 min     |
@@ -24,6 +26,10 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 | Ollama            | ✓    | ✓      | ✓     | ⚠️     | ✗   | ✗        | ✗          | ✓         | 5 min      |
 | OpenAI Compatible | ✓    | ✓      | ✓     | ⚠️     | ✗   | ✗        | ✓          | ⚠️        | 5 min      |
 | OpenRouter        | ✓    | ✓      | ⚠️    | ⚠️     | ✗   | ✗        | ✓          | ⚠️        | 2 min      |
+| DeepSeek          | ✓    | ✓      | ✓     | ✗      | ✗   | ✓        | ✓          | ✗         | 2 min      |
+| NVIDIA NIM        | ✓    | ✓      | ✓     | ⚠️     | ✗   | ✓        | ✓          | ✗         | 5 min      |
+| LM Studio         | ✓    | ✓      | ⚠️    | ⚠️     | ✗   | ⚠️       | ⚠️         | ✓         | 5 min      |
+| llama.cpp         | ✓    | ✓      | ⚠️    | ⚠️     | ✗   | ⚠️       | ⚠️         | ✓         | 10 min     |
 
 **Legend:**
 
@@ -31,23 +37,29 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 - ⚠️ Partial/Model-Dependent
 - ✗ Not Supported
 
+^1^ Anthropic supports both API Key and OAuth authentication. Free tier access is available via Claude subscription (OAuth). See [Anthropic Deep Dive](#2-anthropic) for details.
+
 ---
 
-## 2025 Pricing Comparison
+## Pricing Comparison
 
 ### Pay-per-Token Providers
 
 | Provider             | Input (per 1M tokens) | Output (per 1M tokens) | Vision         | Best Value Model              |
 | -------------------- | --------------------- | ---------------------- | -------------- | ----------------------------- |
 | **OpenAI**           | $2.50 - $60.00        | $10.00 - $180.00       | $5.00 - $60.00 | GPT-4o-mini: $0.15/$0.60      |
-| **Anthropic**        | $3.00 - $15.00        | $15.00 - $75.00        | Same           | Claude Haiku: $0.25/$1.25     |
+| **Anthropic** ^2^    | $3.00 - $15.00        | $15.00 - $75.00        | Same           | Claude Haiku: $0.25/$1.25     |
 | **Google AI Studio** | FREE - $7.00          | FREE - $21.00          | FREE - $7.00   | Gemini 2.5 Flash: FREE        |
 | **Google Vertex**    | $0.35 - $35.00        | $1.05 - $105.00        | $0.35 - $35.00 | Gemini 2.5 Flash: $0.35/$1.05 |
 | **Amazon Bedrock**   | $3.00 - $15.00        | $15.00 - $75.00        | $3.00 - $15.00 | Claude Haiku: $0.25/$1.25     |
 | **Azure OpenAI**     | $2.50 - $60.00        | $10.00 - $180.00       | $5.00 - $60.00 | GPT-4o-mini: $0.15/$0.60      |
 | **Mistral**          | $0.25 - $8.00         | $0.75 - $24.00         | $0.25 - $8.00  | Mistral Small: $0.20/$0.60    |
-| **HuggingFace**      | FREE - $1.00          | FREE - $1.00           | N/A            | DialoGPT: FREE                |
+| **HuggingFace**      | FREE - $1.00          | FREE - $1.00           | N/A            | Qwen 2.5 72B: FREE            |
 | **OpenRouter**       | $0.00 - $60.00        | $0.00 - $180.00        | Varies         | Many free models              |
+| **DeepSeek**         | $0.14 - $2.19         | $0.28 - $8.75          | N/A            | deepseek-chat: $0.14/$0.28    |
+| **NVIDIA NIM**       | Varies by model       | Varies by model        | Varies         | Free credits for new users    |
+
+^2^ Anthropic also offers subscription-based pricing as an alternative to per-token API pricing: Free tier (limited), Pro ($20/mo), Max ($100+/mo with 5x-20x usage). NeuroLink supports both API key and OAuth (subscription) authentication. See [Anthropic Deep Dive](#2-anthropic).
 
 ### Self-Hosted / Custom Pricing
 
@@ -57,8 +69,17 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 | **LiteLLM**           | Proxy  | Backend provider costs   | No additional fee, proxy overhead only            |
 | **Ollama**            | Local  | Hardware costs only      | FREE (uses local compute)                         |
 | **OpenAI Compatible** | Custom | Backend-dependent        | Varies by endpoint provider                       |
+| **LM Studio**         | Local  | Hardware costs only      | FREE (uses local compute)                         |
+| **llama.cpp**         | Local  | Hardware costs only      | FREE (uses local compute)                         |
 
 ### Free Tier Details
+
+**Anthropic (via Claude subscription):**
+
+- Free tier available via OAuth authentication (claude.ai account)
+- Limited daily messages and lower rate limits
+- Access to Claude Haiku models
+- No API key required (uses OAuth 2.0 flow)
 
 **Google AI Studio:**
 
@@ -84,6 +105,20 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 - Uses local compute
 - No API limits
 
+**LM Studio:**
+
+- Completely FREE
+- Uses local compute (GPU or CPU)
+- No API limits or network dependency
+- Requires LM Studio desktop app
+
+**llama.cpp:**
+
+- Completely FREE
+- Uses local compute (GPU or CPU)
+- No API limits or network dependency
+- Requires llama-server binary
+
 **OpenRouter:**
 
 - Many FREE models available:
@@ -97,7 +132,7 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 
 ### Text Generation
 
-**All providers support text generation**, but quality varies:
+**Providers support text generation**, but quality varies:
 
 **Tier 1 (Highest Quality):**
 
@@ -109,7 +144,7 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 
 - Azure OpenAI (same as OpenAI)
 - Google Gemini 2.5 Pro
-- Anthropic Claude 3.5 Sonnet
+- Anthropic Claude 4.0 Sonnet
 
 **Tier 3 (Good Quality):**
 
@@ -141,6 +176,10 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 - ✓ Ollama
 - ✓ OpenAI Compatible
 - ✓ OpenRouter
+- ✓ DeepSeek
+- ✓ NVIDIA NIM
+- ✓ LM Studio
+- ✓ llama.cpp
 
 **Partial/Limited Streaming:**
 
@@ -160,9 +199,13 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 - ✓ Google AI Studio - Gemini models
 - ✓ Amazon Bedrock - Converse API tool support
 - ✓ LiteLLM - Proxies to backend providers
+- ✓ DeepSeek - Both deepseek-chat and deepseek-reasoner
 
 **Model-Dependent Support:**
 
+- ⚠️ NVIDIA NIM - Depends on hosted model (Llama 3.x: yes; embedding-only models: no)
+- ⚠️ LM Studio - Depends on loaded model (Llama 3.1+, Mistral 7B Instruct v0.3, etc.)
+- ⚠️ llama.cpp - Requires `--jinja` server flag; depends on loaded model
 - ⚠️ HuggingFace - Only specific models:
   - Llama 3.1+ series
   - Hermes 3 models
@@ -190,7 +233,7 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 - **OpenAI** - GPT-4o, GPT-5 series, O-series
   - 10 images max
   - PNG, JPEG, WEBP, GIF
-- **Anthropic** - Claude 4.5, 4.x, 3.x series
+- **Anthropic** - Claude 4.5 Sonnet/Haiku, Claude 4.0 Opus/Sonnet
   - 20 images max
   - Excellent vision quality
 - **Google Vertex/AI Studio** - Gemini 2.5+, 3.x
@@ -211,11 +254,15 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 - ⚠️ **OpenAI Compatible** - Backend-dependent
 - ⚠️ **OpenRouter** - Model-dependent (Claude, GPT-4o, Gemini support vision)
 - ⚠️ **Amazon Bedrock** - Claude models support vision
+- ⚠️ **NVIDIA NIM** - Depends on hosted model (e.g., Phi-3-vision, Llama 3.2 Vision)
+- ⚠️ **LM Studio** - Depends on loaded model (LLaVA, Llama 3.2 Vision, Qwen-VL, etc.)
+- ⚠️ **llama.cpp** - Depends on loaded model (LLaVA, Llama 3.2 Vision, etc.)
 
 **No Vision Support:**
 
 - ✗ HuggingFace
 - ✗ Amazon SageMaker
+- ✗ DeepSeek (API does not accept image input)
 
 ---
 
@@ -239,6 +286,10 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 - ✗ OpenAI Compatible
 - ✗ OpenRouter
 - ✗ Amazon SageMaker
+- ✗ DeepSeek
+- ✗ NVIDIA NIM
+- ✗ LM Studio
+- ✗ llama.cpp
 
 ---
 
@@ -246,13 +297,25 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 
 **Native Extended Thinking:**
 
-- ✓ **Anthropic** - Claude 4.5 Sonnet, Opus (best)
+- ✓ **Anthropic** - All Claude 4.0+ models (best)
+  - Claude Sonnet 4, Opus 4, Opus 4.1, Sonnet 4.5, Opus 4.5, Haiku 4.5, Sonnet 4.6, Opus 4.6
   - Thinking levels: minimal, low, medium, high
   - Transparent reasoning process
-- ✓ **Google AI Studio** - Gemini 2.5+, Gemini 3
+  - Available on Pro and Max subscription tiers (not Free)
+- ✓ **Google AI Studio** - Gemini 2.5 Pro, Gemini 2.5 Flash, Gemini 3 Flash, Gemini 3.1 Pro
   - Thinking levels: minimal, low, medium, high
   - Configurable thinking budget
 - ✓ **Google Vertex** - Same as AI Studio (Gemini only, not Claude)
+
+**Native Extended Thinking (continued):**
+
+- ✓ **DeepSeek** - deepseek-reasoner (R1) model exposes chain-of-thought natively; deepseek-chat supports opt-in thinking mode
+- ✓ **NVIDIA NIM** - Hosted Nemotron-Reasoning and DeepSeek-R1 models; controlled via `thinkingLevel` option
+
+**Model-Dependent Thinking:**
+
+- ⚠️ **LM Studio** - Depends on loaded model (Qwen3, DeepSeek-R1-distill variants expose reasoning)
+- ⚠️ **llama.cpp** - Depends on loaded model (DeepSeek-R1-distill GGUF variants expose reasoning)
 
 **No Extended Thinking:**
 
@@ -281,6 +344,7 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 - ✓ **LiteLLM** - Proxies to backend
 - ✓ **OpenAI Compatible** - OpenAI-compatible endpoints
 - ✓ **OpenRouter** - Model-dependent
+- ✓ **DeepSeek** - JSON schema support via OpenAI-compatible API
 
 **Partial Support (Tools OR Schema, Not Both):**
 
@@ -290,6 +354,12 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 - ⚠️ **Google Vertex** - ❌ Cannot combine (Gemini models only)
   - Claude models on Vertex CAN combine
   - Gemini models have same limitation as AI Studio
+
+**Model-Dependent Structured Output:**
+
+- ⚠️ **NVIDIA NIM** - Model-dependent reliability; capable frontier models work well
+- ⚠️ **LM Studio** - Model-dependent reliability; small local models may struggle with strict schemas
+- ⚠️ **llama.cpp** - Model-dependent reliability; small local models may struggle with strict schemas
 
 **No Structured Output:**
 
@@ -304,7 +374,7 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 ### 1. OpenAI
 
 **Provider ID:** `openai`
-**Default Model:** `gpt-4o`
+**Default Model:** `gpt-4o-mini`
 
 **Strengths:**
 
@@ -328,7 +398,7 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 - Complex reasoning tasks
 - When budget allows premium pricing
 
-**2025 Pricing:**
+**Pricing:**
 
 - GPT-4o: $2.50/$10.00 per 1M tokens
 - GPT-4o-mini: $0.15/$0.60 per 1M tokens
@@ -339,21 +409,25 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 ### 2. Anthropic
 
 **Provider ID:** `anthropic`
-**Default Model:** `claude-sonnet-4-5-20250929`
+**Default Model:** `claude-sonnet-4-6`
+**Auth Methods:** API Key, OAuth 2.0 (unique among providers)
 
 **Strengths:**
 
 - **Extended thinking** - Best reasoning capabilities
 - **Native PDF support** - Document understanding
+- **Dual auth support** - API key for developers, OAuth for subscription users
+- **Subscription tiers** - Free, Pro ($20/mo), Max ($100+/mo) as alternatives to per-token pricing
 - 200K token context window
 - Strong safety features
 - Excellent for analysis and research
 
 **Weaknesses:**
 
-- Higher cost than some alternatives
+- Higher cost than some alternatives (API pricing)
 - Smaller ecosystem than OpenAI
 - Limited regional availability
+- Subscription tiers have model access restrictions (e.g., Opus requires Max tier)
 
 **Best For:**
 
@@ -361,12 +435,21 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 - Document processing workflows
 - Agentic workflows with tools
 - When extended thinking is valuable
+- Subscription users who prefer flat-rate pricing over per-token costs
 
-**2025 Pricing:**
+**Pricing:**
+
+_Per-Token API Pricing:_
 
 - Claude Haiku 4.5: $0.25/$1.25 per 1M tokens
 - Claude Sonnet 4.5: $3.00/$15.00 per 1M tokens
 - Claude Opus 4.5: $15.00/$75.00 per 1M tokens
+
+_Subscription Pricing (via OAuth):_
+
+- **Free**: Limited daily messages, Sonnet access
+- **Pro** ($20/mo): Higher limits, priority access, extended thinking
+- **Max** ($100+/mo): 5x-20x usage, Opus access, highest rate limits
 
 ---
 
@@ -396,7 +479,7 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 - Budget-conscious production apps
 - When extended thinking + PDF support needed
 
-**2025 Pricing:**
+**Pricing:**
 
 - Gemini 2.5 Flash: **FREE** (up to 1M tokens/day)
 - Gemini 2.5 Pro: $1.25/$5.00 per 1M tokens
@@ -408,7 +491,7 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 ### 4. Google Vertex AI
 
 **Provider ID:** `vertex`
-**Default Model:** `gemini-2.5-flash`
+**Default Model:** `claude-sonnet-4-6`
 
 **Strengths:**
 
@@ -432,7 +515,7 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 - Production deployments requiring SLAs
 - Regulated industries
 
-**2025 Pricing:**
+**Pricing:**
 
 - Gemini 2.5 Flash: $0.35/$1.05 per 1M tokens
 - Gemini 3 Pro: $7.00/$21.00 per 1M tokens
@@ -443,7 +526,7 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 ### 5. Amazon Bedrock
 
 **Provider ID:** `bedrock`
-**Default Model:** `anthropic.claude-3-sonnet-20240229-v1:0`
+**Default Model:** env-based (`BEDROCK_MODEL`); recommend `anthropic.claude-sonnet-4-6`
 
 **Strengths:**
 
@@ -466,7 +549,7 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 - Compliance-heavy industries (HIPAA, SOC2)
 - When you need Claude + Llama + others
 
-**2025 Pricing:**
+**Pricing:**
 
 - Claude Haiku: $0.25/$1.25 per 1M tokens
 - Claude Sonnet: $3.00/$15.00 per 1M tokens
@@ -478,7 +561,7 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 ### 6. Amazon SageMaker
 
 **Provider ID:** `sagemaker`
-**Default Model:** Custom endpoint
+**Default Model:** env-based (`SAGEMAKER_MODEL`)
 
 **Strengths:**
 
@@ -501,7 +584,7 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 - When you need full model control
 - Specialized domain models
 
-**2025 Pricing:**
+**Pricing:**
 
 - Instance-based: ml.g5.xlarge ~$1.41/hour
 - ml.g5.2xlarge ~$2.03/hour
@@ -512,7 +595,7 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 ### 7. Azure OpenAI
 
 **Provider ID:** `azure`
-**Default Model:** `gpt-4o`
+**Default Model:** `gpt-4o-mini`
 
 **Strengths:**
 
@@ -535,7 +618,7 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 - Azure-based infrastructure
 - Regulated industries
 
-**2025 Pricing:**
+**Pricing:**
 
 - Same as OpenAI pricing
 - Billed through Azure subscription
@@ -547,7 +630,7 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 ### 8. Mistral
 
 **Provider ID:** `mistral`
-**Default Model:** `mistral-small-2506`
+**Default Model:** `mistral-large-latest`
 
 **Strengths:**
 
@@ -570,7 +653,7 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 - When you prefer European hosting
 - Open-source friendly organizations
 
-**2025 Pricing:**
+**Pricing:**
 
 - Mistral Small: $0.20/$0.60 per 1M tokens
 - Mistral Medium: $2.50/$7.50 per 1M tokens
@@ -581,7 +664,7 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 ### 9. HuggingFace
 
 **Provider ID:** `huggingface`
-**Default Model:** `microsoft/DialoGPT-medium`
+**Default Model:** `Qwen/Qwen2.5-72B-Instruct`
 
 **Strengths:**
 
@@ -604,7 +687,7 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 - Testing cutting-edge models
 - Budget-constrained projects
 
-**2025 Pricing:**
+**Pricing:**
 
 - Free tier: 1,000 requests/month
 - Inference API: From FREE to ~$1.00 per 1M tokens
@@ -620,7 +703,7 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 **Strengths:**
 
 - Access to 100+ models via proxy
-- Unified interface for all providers
+- Unified interface across supported providers
 - Cost tracking and analytics
 - Load balancing and failover
 
@@ -638,7 +721,7 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 - Load balancing across providers
 - A/B testing different models
 
-**2025 Pricing:**
+**Pricing:**
 
 - No additional cost (uses backend provider pricing)
 - Self-hosted proxy is FREE
@@ -649,7 +732,7 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 ### 11. Ollama
 
 **Provider ID:** `ollama`
-**Default Model:** `llama3.1:8b`
+**Default Model:** `llama3.2:latest`
 
 **Strengths:**
 
@@ -673,7 +756,7 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 - Cost-sensitive projects
 - Development and testing
 
-**2025 Pricing:**
+**Pricing:**
 
 - **FREE** (hardware costs only)
 - Requires local GPU for best performance
@@ -707,7 +790,7 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 - Private cloud deployments
 - When you control the backend
 
-**2025 Pricing:**
+**Pricing:**
 
 - Depends entirely on backend provider
 - Self-hosted: Infrastructure costs only
@@ -742,7 +825,7 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 - Rapid prototyping
 - When you want provider flexibility
 
-**2025 Pricing:**
+**Pricing:**
 
 - **Free models available:**
   - Google Gemini 2.0 Flash: FREE
@@ -751,6 +834,177 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 - **Paid models:**
   - Claude 3.5 Sonnet: $3.00/$15.00 per 1M tokens
   - GPT-4o: $2.50/$10.00 per 1M tokens
+
+---
+
+### 14. DeepSeek
+
+**Provider ID:** `deepseek`
+**Default Model:** `deepseek-chat`
+**Aliases:** `ds`
+
+**Strengths:**
+
+- Very competitive pricing (among the cheapest frontier-quality models)
+- deepseek-reasoner (R1) — strong open-weight reasoning model
+- OpenAI-compatible API — minimal integration overhead
+- Tool calling supported on both models
+
+**Weaknesses:**
+
+- No vision / multimodal support
+- Cloud-only (data sent to DeepSeek servers in China — consider for compliance)
+- No PDF support
+
+**Best For:**
+
+- Cost-sensitive text and reasoning workloads
+- Agentic tool-calling pipelines where budget matters
+- Experimenting with open-weight-quality reasoning at low cost
+
+**Pricing:**
+
+- deepseek-chat (V3): ~$0.14/$0.28 per 1M tokens
+- deepseek-reasoner (R1): ~$0.55/$2.19 per 1M tokens
+
+---
+
+### 15. NVIDIA NIM
+
+**Provider ID:** `nvidia-nim`
+**Default Model:** `openai/gpt-oss-20b`
+**Aliases:** `nvidia`, `nim`
+
+**Strengths:**
+
+- Access to NVIDIA-hosted Llama, Mistral, Nemotron, DeepSeek models
+- Thinking/reasoning supported on Nemotron-Reasoning and DeepSeek-R1 models
+- Vision supported on vision-capable models (Phi-3-vision, Llama 3.2 Vision)
+- OpenAI-compatible API with NIM-specific extras (top_k, min_p, reasoning_budget)
+- Graceful retry on 400 errors — drops unsupported extras automatically
+
+**Weaknesses:**
+
+- Tool and vision capability depends entirely on the specific hosted model
+- Requires NVIDIA NGC API key
+- No PDF support
+
+**Best For:**
+
+- Running NVIDIA-optimized Llama/Mistral/Nemotron models in the cloud
+- Reasoning workloads via hosted DeepSeek-R1 or Nemotron
+- Developers already in the NVIDIA ecosystem (NGC, DGX Cloud)
+
+**Pricing:**
+
+- Varies by model; new accounts receive free credits
+- See https://build.nvidia.com/models for per-model pricing
+
+---
+
+### 16. LM Studio
+
+**Provider ID:** `lm-studio`
+**Default Model:** Auto-discovered from running server
+**Aliases:** `lmstudio`, `lms`
+
+**Strengths:**
+
+- **Completely FREE** (local execution via LM Studio desktop app)
+- Maximum privacy — no data sent to cloud
+- Auto-discovers the currently loaded model via `/v1/models`
+- Vision supported on compatible models (LLaVA, Llama 3.2 Vision, Qwen-VL, etc.)
+- Tool calling supported on compatible models
+
+**Weaknesses:**
+
+- Requires LM Studio app and a loaded model
+- Model quality and capability depend entirely on what is loaded
+- No PDF support
+- Small local models may give inconsistent structured output
+
+**Best For:**
+
+- Privacy-critical local inference
+- Offline / air-gapped environments
+- Development and experimentation without cloud costs
+- Testing multiple open-weight models via a GUI
+
+**Pricing:**
+
+- **FREE** (hardware costs only)
+- Requires local GPU for best performance
+
+---
+
+### 17. llama.cpp
+
+**Provider ID:** `llamacpp`
+**Default Model:** Auto-discovered from running llama-server
+**Aliases:** `llama.cpp`, `llama-cpp`
+
+**Strengths:**
+
+- **Completely FREE** (local execution via llama-server)
+- Maximum privacy — no data sent to cloud
+- GGUF model support — run quantized models on CPU or GPU
+- Auto-discovers loaded model via `/v1/models`
+- Vision supported on compatible models (LLaVA, Llama 3.2 Vision)
+- Tool calling supported when server started with `--jinja` flag
+
+**Weaknesses:**
+
+- Requires building / downloading llama-server and a GGUF model
+- Tool calling requires `--jinja` flag at server startup
+- Model quality depends on the GGUF model loaded
+- No PDF support
+- Small local models may give inconsistent structured output
+
+**Best For:**
+
+- Maximum privacy and air-gapped deployments
+- CPU inference without a GPU
+- Running heavily quantized models at low resource cost
+- Power users who want direct control over model serving
+
+**Pricing:**
+
+- **FREE** (hardware costs only)
+- No API costs or rate limits
+
+---
+
+---
+
+## Voice Providers
+
+Voice providers handle audio I/O and are distinct from LLM text-generation providers. They are categorised by function: Text-to-Speech (TTS), Speech-to-Text (STT), and Realtime (bidirectional audio over WebSocket).
+
+| Provider            | Type     | Protocol         | Streaming | Formats                                               | Auth                                               |
+| ------------------- | -------- | ---------------- | --------- | ----------------------------------------------------- | -------------------------------------------------- |
+| **google-ai** (TTS) | TTS      | REST (gRPC SDK)  | No        | MP3, WAV, OGG                                         | Service Account (`GOOGLE_APPLICATION_CREDENTIALS`) |
+| **openai-tts**      | TTS      | REST             | No        | MP3, WAV, OGG, Opus                                   | API Key                                            |
+| **elevenlabs**      | TTS      | REST             | No        | MP3, WAV (PCM), Opus                                  | API Key                                            |
+| **azure-tts**       | TTS      | REST             | No        | MP3, WAV (PCM), Opus                                  | API Key + Region                                   |
+| **whisper**         | STT      | REST             | No        | WAV, MP3, M4A, FLAC, OGG, Opus, WebM, MP4, MPEG, MPGA | API Key                                            |
+| **google-stt**      | STT      | REST             | No        | WAV, FLAC, MP3, OGG                                   | API Key or Service Account                         |
+| **deepgram**        | STT      | REST + WebSocket | Yes       | WAV, MP3, OGG, FLAC                                   | API Key                                            |
+| **azure-stt**       | STT      | REST             | No        | WAV¹, OGG, Opus                                       | API Key + Region                                   |
+| **openai-realtime** | Realtime | WebSocket        | Yes       | PCM16, WAV, Opus                                      | API Key                                            |
+| **gemini-live**     | Realtime | WebSocket        | Yes       | WAV, Opus                                             | API Key (or Service Account)                       |
+
+¹ Azure STT's short-audio REST endpoint does not decode MP3 — passing
+`format: "mp3"` to `azure-stt` throws `STT_INVALID_AUDIO_FORMAT` early.
+Convert to WAV first (`ffmpeg -i in.mp3 -ar 16000 -ac 1 out.wav`) or use a
+different STT provider for MP3 input. See `docs/getting-started/providers/azure-speech.md`.
+
+**Legend:**
+
+- **TTS** — Text-to-Speech: converts text to audio
+- **STT** — Speech-to-Text: transcribes audio to text
+- **Realtime** — Bidirectional voice session with the model over a persistent WebSocket
+
+See also: [Voice Provider Selection](#voice-provider-selection) | [Voice Providers Index](../getting-started/providers/index.md#voice-providers)
 
 ---
 
@@ -811,7 +1065,19 @@ Complete comparison of all 13 AI providers supported by NeuroLink, including cap
 - Works offline
 - Completely FREE
 
-**🥈 Alternative: Mistral**
+**🥈 Alternative: LM Studio**
+
+- 100% local execution via desktop app
+- No data sent to cloud
+- GUI-driven model management
+
+**🥉 Alternative: llama.cpp**
+
+- 100% local execution — even CPU-only deployments
+- Maximum control over model serving
+- Completely FREE
+
+**Also Consider: Mistral**
 
 - GDPR compliant
 - European data centers
@@ -915,12 +1181,18 @@ if (hasImages) {
 ```typescript
 // Use local for privacy-sensitive
 if (sensitiveData) {
-  provider = "ollama"; // Local, FREE
+  provider = "ollama"; // Local, FREE — or "lm-studio" / "llamacpp"
 }
 
 // Use cloud for complex tasks
 if (needsAdvancedReasoning) {
   provider = "anthropic"; // Extended thinking
+}
+
+// Use DeepSeek for cost-efficient reasoning
+if (needsReasoningButBudgetConstrained) {
+  provider = "deepseek"; // Low-cost frontier-quality reasoning
+  model = "deepseek-reasoner";
 }
 ```
 
@@ -938,7 +1210,7 @@ Need highest quality?
     └─ No → Continue
         │
         Need complete privacy?
-        ├─ Yes → Ollama (local, free)
+        ├─ Yes → Ollama / LM Studio / llama.cpp (local, free)
         └─ No → Continue
             │
             Need PDF processing?
@@ -954,7 +1226,7 @@ Need highest quality?
                     └─ No → Continue
                         │
                         Need free tier?
-                        ├─ Yes → Google AI Studio (best) or OpenRouter or HuggingFace
+                        ├─ Yes → Google AI Studio (best) or Anthropic (OAuth) or OpenRouter or HuggingFace
                         └─ No → Continue
                             │
                             Need EU compliance?
@@ -981,7 +1253,7 @@ Need highest quality?
 | Provider         | GDPR | HIPAA | SOC2 | ISO 27001 |
 | ---------------- | ---- | ----- | ---- | --------- |
 | OpenAI           | ✓    | ✓\*   | ✓    | ✓         |
-| Anthropic        | ✓    | ✓\*   | ✓    | ✓         |
+| Anthropic ^3^    | ✓    | ✓\*   | ✓    | ✓         |
 | Google AI Studio | ✓    | ✗     | ✓    | ✓         |
 | Google Vertex    | ✓    | ✓\*   | ✓    | ✓         |
 | Amazon Bedrock   | ✓    | ✓\*   | ✓    | ✓         |
@@ -990,6 +1262,8 @@ Need highest quality?
 | Ollama           | ✓    | ✓     | N/A  | N/A       |
 
 \* HIPAA compliance requires Business Associate Agreement (BAA)
+
+^3^ Anthropic supports API Key and OAuth 2.0 authentication. OAuth uses PKCE flow with automatic token refresh. Credentials stored in `~/.neurolink/tokens.json` with 0600 permissions.
 
 ---
 
@@ -1020,6 +1294,7 @@ _Note: Benchmarks vary by model, region, and load_
 - Extended thinking
 - PDF support
 - Better for complex analysis
+- Subscription-based pricing option (Pro $20/mo, Max $100+/mo) as alternative to per-token
 
 **Code changes:**
 
@@ -1031,12 +1306,21 @@ const result = await neurolink.generate({
   prompt: "Analyze this document",
 });
 
-// After
+// After (API key auth - same as before)
 const result = await neurolink.generate({
   provider: "anthropic",
-  model: "claude-sonnet-4-5-20250929",
+  model: "claude-sonnet-4-6",
   prompt: "Analyze this document",
   thinkingLevel: "high", // New capability
+});
+
+// After (OAuth subscription auth - auto-detected from stored credentials)
+// Run `neurolink auth login --provider anthropic` first to authenticate
+const result = await neurolink.generate({
+  provider: "anthropic",
+  model: "claude-sonnet-4-6",
+  prompt: "Analyze this document",
+  thinkingLevel: "high",
 });
 ```
 
@@ -1056,17 +1340,130 @@ const result = await neurolink.generate({
 
 ---
 
+## Voice Provider Selection
+
+### Text-to-Speech (TTS)
+
+**Best quality: `openai-tts` with model tts-1-hd**
+
+```typescript
+import { NeuroLink } from "@juspay/neurolink";
+const neurolink = new NeuroLink();
+
+const result = await neurolink.generate({
+  input: { text: "Hello, world!" },
+  tts: {
+    enabled: true,
+    provider: "openai-tts",
+    voice: "nova",
+    model: "tts-1-hd",
+  },
+});
+// result.audio contains the synthesized speech
+```
+
+**Best multilingual: `elevenlabs`**
+
+ElevenLabs supports the widest range of languages and voice cloning, making it the default choice for multilingual or branded voice experiences.
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "Hola, ¿cómo estás?" },
+  tts: { enabled: true, provider: "elevenlabs", voice: "your-voice-id" },
+});
+```
+
+**Most cost-effective: `google-ai` (1M chars free tier)**
+
+Google Cloud Text-to-Speech provides a generous free tier (1M characters/month for standard voices) and is ideal for high-volume applications on GCP.
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "Cost-effective synthesis at scale." },
+  tts: { enabled: true, provider: "google-ai", voice: "en-US-Standard-A" },
+});
+```
+
+**Enterprise: `azure-tts` (SSML support)**
+
+Azure Cognitive Services TTS has the most comprehensive SSML support, including fine-grained prosody control, making it the standard choice for enterprise IVR and accessibility pipelines.
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "Welcome to Neurolink." },
+  tts: { enabled: true, provider: "azure-tts", voice: "en-US-AriaNeural" },
+});
+```
+
+---
+
+### Speech-to-Text (STT)
+
+**Best accuracy: `whisper` (OpenAI)**
+
+OpenAI Whisper consistently ranks highest on transcription benchmarks across languages and noisy environments.
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "" },
+  stt: { enabled: true, provider: "whisper", audio: audioBuffer },
+});
+// result.transcription.text contains the transcribed text
+```
+
+**Best streaming: `deepgram` (WebSocket real-time)**
+
+Deepgram is the only STT provider with native WebSocket streaming support, enabling sub-300 ms word-level transcription for live audio.
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "" },
+  stt: { enabled: true, provider: "deepgram", audio: audioBuffer },
+});
+```
+
+**Best for Google Cloud users: `google-stt`**
+
+Tight integration with GCP infrastructure, support for 125+ languages, and speaker diarization make `google-stt` the natural choice when already on Google Cloud.
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "" },
+  stt: { enabled: true, provider: "google-stt", audio: audioBuffer },
+});
+```
+
+**Enterprise: `azure-stt`**
+
+Azure Cognitive Services STT offers custom model training, batch transcription, and fine-grained compliance controls for regulated industries.
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "" },
+  stt: { enabled: true, provider: "azure-stt", audio: audioBuffer },
+});
+```
+
+---
+
 ## Conclusion
 
 **Choose based on priorities:**
 
-1. **Budget Priority** → Google AI Studio (free) or OpenRouter (free models)
+1. **Budget Priority** → Google AI Studio (free) or OpenRouter (free models) or Anthropic Free tier (via OAuth)
 2. **Quality Priority** → OpenAI or Anthropic
-3. **Privacy Priority** → Ollama (local)
-4. **Reasoning Priority** → Anthropic (extended thinking)
+3. **Privacy Priority** → Ollama / LM Studio / llama.cpp (local)
+4. **Reasoning Priority** → Anthropic (extended thinking) or DeepSeek-R1 (cost-efficient)
 5. **Document Priority** → Anthropic or Google AI Studio (PDF support)
 6. **Compliance Priority** → Azure OpenAI or Bedrock
-7. **Flexibility Priority** → OpenRouter (300+ models)
+7. **Flexibility Priority** → OpenRouter (300+ models) or NVIDIA NIM (curated NVIDIA-hosted models)
+8. **Flat-Rate Pricing** → Anthropic subscription (Pro $20/mo, Max $100+/mo)
+9. **Zero Cloud Cost** → LM Studio or llama.cpp (local execution)
+10. **TTS Quality** → `openai-tts` (tts-1-hd) or `elevenlabs` (multilingual)
+11. **TTS Cost** → `google-ai` TTS (1M chars/month free tier)
+12. **STT Accuracy** → `whisper` (OpenAI)
+13. **STT Streaming** → `deepgram` (WebSocket, sub-300 ms)
+14. **Realtime Voice** → `openai-realtime` or `gemini-live`
 
 **NeuroLink Advantage:**
 
@@ -1079,3 +1476,6 @@ See also:
 
 - [Provider Capabilities Audit](./provider-capabilities-audit.md) - Detailed technical capabilities
 - [Provider Selection Wizard](../guides/provider-selection.md) - Interactive decision guide
+- [Claude Subscription Support](../features/claude-subscription.md) - OAuth authentication and subscription tiers for Anthropic
+- [Voice Provider Selection](./provider-comparison.md#voice-provider-selection) - TTS, STT, and Realtime provider recommendations
+- [Voice Providers Index](../getting-started/providers/index.md#voice-providers) - Voice provider setup cards

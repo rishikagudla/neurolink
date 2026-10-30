@@ -3,76 +3,21 @@
  * Provides response caching for server adapters
  */
 
-import type { MiddlewareDefinition, ServerContext } from "../types.js";
-
-/**
- * Cache configuration
- */
-export type CacheConfig = {
-  /** Default TTL in milliseconds */
-  ttlMs: number;
-
-  /** Maximum cache size (number of entries) */
-  maxSize?: number;
-
-  /**
-   * Custom key generator
-   * Default: method + path + sorted query params
-   */
-  keyGenerator?: (ctx: ServerContext) => string;
-
-  /**
-   * Methods to cache (default: GET only)
-   */
-  methods?: string[];
-
-  /**
-   * Paths to cache (default: all paths)
-   */
-  paths?: string[];
-
-  /**
-   * Paths to exclude from caching
-   */
-  excludePaths?: string[];
-
-  /**
-   * Custom cache store
-   * Default: in-memory store
-   */
-  store?: CacheStore;
-
-  /**
-   * Whether to include query params in cache key
-   * Default: true
-   */
-  includeQuery?: boolean;
-
-  /**
-   * Custom TTL per path pattern
-   */
-  ttlByPath?: Record<string, number>;
-};
-
+import type {
+  CacheEntry,
+  MiddlewareDefinition,
+  ResponseCacheEntry,
+  ServerCacheConfig,
+  ServerContext,
+} from "../../types/index.js";
+import type { CacheStore } from "../../types/index.js";
 /**
  * Cache entry
  */
-export type CacheEntry = {
-  data: unknown;
-  createdAt: number;
-  ttlMs: number;
-  headers?: Record<string, string>;
-};
 
 /**
  * Cache store interface
  */
-export interface CacheStore {
-  get(key: string): Promise<CacheEntry | undefined>;
-  set(key: string, entry: CacheEntry): Promise<void>;
-  delete(key: string): Promise<void>;
-  clear(): Promise<void>;
-}
 
 /**
  * In-memory LRU cache store
@@ -160,7 +105,7 @@ export class InMemoryCacheStore implements CacheStore {
  * ```
  */
 export function createCacheMiddleware(
-  config: CacheConfig,
+  config: ServerCacheConfig,
 ): MiddlewareDefinition {
   const {
     ttlMs,
@@ -238,10 +183,15 @@ export function createCacheMiddleware(
 }
 
 /**
- * Default cache key generator
+ * Default cache key generator. An authenticated user's id is part of the key,
+ * so one caller's cached response is never served to another; without a user
+ * the key is the request alone, as before.
  */
 function defaultKeyGenerator(ctx: ServerContext): string {
   const parts = [ctx.method, ctx.path];
+  if (ctx.user?.id) {
+    parts.push(`user=${ctx.user.id}`);
+  }
 
   // Include sorted query params
   const queryKeys = Object.keys(ctx.query).sort();
@@ -336,6 +286,13 @@ export class LRUCache<K, V> {
   }
 
   /**
+   * Iterate over all keys currently in the cache
+   */
+  keys(): IterableIterator<K> {
+    return this.cache.keys();
+  }
+
+  /**
    * Delete a key from the cache
    */
   delete(key: K): boolean {
@@ -376,14 +333,6 @@ export class LRUCache<K, V> {
 // ============================================
 // Response Cache Store (Synchronous)
 // ============================================
-
-/**
- * Response cache entry
- */
-type ResponseCacheEntry<T> = {
-  value: T;
-  expiresAt: number;
-};
 
 /**
  * Synchronous response cache store with TTL support
@@ -474,11 +423,7 @@ export class ResponseCacheStore<T = unknown> {
     let invalidated = 0;
     const keysToDelete: string[] = [];
 
-    // Get all keys (requires accessing internal cache)
-    const internalCache = (
-      this.cache as unknown as { cache: Map<string, unknown> }
-    ).cache;
-    for (const key of internalCache.keys()) {
+    for (const key of this.cache.keys()) {
       const matches =
         pattern instanceof RegExp ? pattern.test(key) : key.includes(pattern);
       if (matches) {

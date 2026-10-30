@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v8.32.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,8 +8,6 @@
 
 > **AnalyticsData** = `object`
 
-Defined in: [types/analytics.ts:34](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/analytics.ts#L34)
-
 Analytics data structure (consolidated from core analytics)
 
 ## Properties
@@ -18,23 +16,17 @@ Analytics data structure (consolidated from core analytics)
 
 > **provider**: `string`
 
-Defined in: [types/analytics.ts:35](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/analytics.ts#L35)
-
 ---
 
 ### model?
 
-> `optional` **model**: `string`
-
-Defined in: [types/analytics.ts:36](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/analytics.ts#L36)
+> `optional` **model?**: `string`
 
 ---
 
 ### tokenUsage
 
-> **tokenUsage**: `TokenUsage`
-
-Defined in: [types/analytics.ts:37](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/analytics.ts#L37)
+> **tokenUsage**: [`TokenUsage`](TokenUsage.md)
 
 ---
 
@@ -42,28 +34,71 @@ Defined in: [types/analytics.ts:37](https://github.com/juspay/neurolink/blob/1be
 
 > **requestDuration**: `number`
 
-Defined in: [types/analytics.ts:38](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/analytics.ts#L38)
-
 ---
 
 ### timestamp
 
 > **timestamp**: `string`
 
-Defined in: [types/analytics.ts:39](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/analytics.ts#L39)
-
 ---
 
 ### cost?
 
-> `optional` **cost**: `number`
-
-Defined in: [types/analytics.ts:40](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/analytics.ts#L40)
+> `optional` **cost?**: `number`
 
 ---
 
 ### context?
 
-> `optional` **context**: `JsonValue`
+> `optional` **context?**: [`JsonValue`](JsonValue.md)
 
-Defined in: [types/analytics.ts:41](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/analytics.ts#L41)
+---
+
+### stepsUsed?
+
+> `optional` **stepsUsed?**: `number`
+
+Number of agentic steps (model calls) the turn used.
+
+---
+
+### toolCallCount?
+
+> `optional` **toolCallCount?**: `number`
+
+Number of external tool calls the turn made (final_result excluded).
+
+---
+
+### stopReason?
+
+> `optional` **stopReason?**: `string`
+
+Why the turn ended — see GenerateStopReason.
+
+---
+
+### elapsedMs?
+
+> `optional` **elapsedMs?**: `number`
+
+Wall-clock duration of the turn in milliseconds.
+
+---
+
+### rawFinishReason?
+
+> `optional` **rawFinishReason?**: `string`
+
+Verbatim provider finish/stop reason for the terminal model call.
+
+---
+
+### limits?
+
+> `optional` **limits?**: [`ClaudeLimitSnapshot`](ClaudeLimitSnapshot.md)
+
+Account limit state observed on this request — subscription window
+headroom, reset times, and (via the NeuroLink Claude proxy) which account
+served it and how much the pool has left. Present for Anthropic traffic
+whose response carried rate-limit headers.

@@ -1,0 +1,817 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$comment": "Documentation-grade mirror of src/lib/providers/catalog/schema.ts for editor red-squiggle validation. The zod schema is authoritative \u2014 keep this file in sync by hand when that one changes. This mirror cannot express the zod schema's cross-field refinements (e.g. models.default must be a key of models.catalog, wire's baseURL-XOR-baseURLTemplate rule, errorRules requiring status or pattern); those are enforced only at parse time by parseProviderCatalogJson (chat entries) or parseCatalogEntry (entries that set inferenceKinds). The if/then/else near the end lists which keys each kind requires and forbids.",
+  "title": "NeuroLink Provider Catalog",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "displayName",
+    "aliases",
+    "wire",
+    "models",
+    "setup",
+    "evidence"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Editor-only pointer to this file. Accepted and ignored by the parser."
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+    },
+    "displayName": {
+      "type": "string"
+    },
+    "enumTypeName": {
+      "type": "string",
+      "pattern": "^[A-Za-z_$][A-Za-z0-9_$]*$",
+      "description": "Exported <Name>Models enum name override. Default: PascalCase(id) + \"Models\"."
+    },
+    "credentialsKey": {
+      "type": "string",
+      "description": "Overrides the derived camelCase NeurolinkCredentials key. Required where the derived name would rename a pre-existing public credential field (see together-ai -> \"together\")."
+    },
+    "aliases": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "inferenceKinds": {
+      "const": ["decide"],
+      "description": "Present on decide entries only; its absence makes the file a chat entry."
+    },
+    "tier": {
+      "const": 2
+    },
+    "decisionLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maxStateTokens"],
+      "description": "Decide entries only. Input the provider can read; a request over a limit is refused before any network call.",
+      "properties": {
+        "maxStateTokens": { "type": "integer", "minimum": 1 },
+        "maxQuestions": { "type": "integer", "minimum": 1 },
+        "questionTypes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["boolean", "choice", "score", "value", "choice-unknown"]
+          },
+          "description": "The question types the provider reads; choice-unknown is a choice that sets unknown: true. Absent means boolean, choice and score. openai-decisions may list only boolean, choice and score."
+        },
+        "maxScoreLevels": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Most levels one score question may have."
+        },
+        "maxChoiceOptions": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Most options one choice question may have."
+        },
+        "nonAsciiTokensPerChar": { "type": "number", "exclusiveMinimum": 0 },
+        "digitTokensPerChar": { "type": "number", "exclusiveMinimum": 0 },
+        "symbolTokensPerChar": { "type": "number", "exclusiveMinimum": 0 },
+        "astralTokensPerChar": { "type": "number", "exclusiveMinimum": 0 },
+        "advisory": { "type": "boolean" },
+        "media": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["maxImages", "video", "maxRequestBytes"],
+          "description": "What a request may carry besides text. With dialect system-one it requires decide.media, which names the body keys the prepared media is written under; with openai-decisions it stands alone and video must be false.",
+          "properties": {
+            "maxImages": { "type": "integer", "minimum": 1 },
+            "video": {
+              "type": "boolean",
+              "description": "Whether one video is accepted. True requires decide.media.videoKey; false forbids it."
+            },
+            "maxRequestBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Ceiling on the encoded request body, in bytes."
+            },
+            "audio": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["maxSeconds"],
+              "description": "One audio clip is accepted. Requires decide.media.audioKey; not valid with openai-decisions.",
+              "properties": {
+                "maxSeconds": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Seconds of audio the model reads; a WAV, FLAC or Ogg clip that runs longer is refused."
+                }
+              }
+            }
+          }
+        },
+        "models": {
+          "type": "object",
+          "description": "Per-model limits keyed by a models.catalog key (enforced by the zod schema).",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["maxStateTokens"],
+            "properties": {
+              "maxStateTokens": { "type": "integer", "minimum": 1 },
+              "nonAsciiTokensPerChar": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    "decide": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dialect", "order", "endpoint", "model", "errors"],
+      "description": "Decide entries only: how a decision provider is called and how its errors are classified.",
+      "properties": {
+        "dialect": {
+          "enum": ["system-one", "openai-decisions"],
+          "description": "The wire family. openai-decisions places images in the request input itself, so it refuses decide.media, a video allowance and any model placement other than body (enforced by the zod schema)."
+        },
+        "order": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Decision order; lower runs first and every decide provider's order is unique."
+        },
+        "baseURLRequired": {
+          "type": "boolean",
+          "description": "True when the provider has no built-in endpoint. wire must then set neither baseURL nor baseURLTemplate, and endpoint must contain {baseURL}."
+        },
+        "baseURLNormalize": {
+          "type": "array",
+          "items": { "enum": ["strip-trailing-slash", "strip-v1-suffix"] },
+          "description": "Applied to the base URL in list order. strip-v1-suffix removes one trailing /v1, in either case."
+        },
+        "baseURLShape": {
+          "enum": ["origin"],
+          "description": "Refuses a normalised base URL that is not an https URL (http is allowed only for localhost, 127.0.0.1 and [::1]) without userinfo, a query string or a fragment. Omitted means no check."
+        },
+        "endpoint": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Request URL. {baseURL} is the only placeholder."
+        },
+        "model": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["placement"],
+          "properties": {
+            "placement": { "enum": ["body", "body-unless-alias"] },
+            "alias": {
+              "type": "string",
+              "minLength": 1,
+              "description": "A models.catalog key that means send no model. Only with placement body-unless-alias."
+            }
+          }
+        },
+        "authHeader": {
+          "enum": ["bearer", "x-api-key"],
+          "description": "How the API key is sent. bearer, the default when omitted, sends Authorization: Bearer <key>. x-api-key sends x-api-key: <key> and no Authorization header at all. This is the decide request's own setting; quirks.authHeaderStyle belongs to the chat path and is not read here."
+        },
+        "stateEncoding": {
+          "enum": ["text"],
+          "description": "text makes the state that goes out always a string: a string is sent unchanged (not trimmed), any other value is sent as its JSON text, and a state that is blank after trimming is refused before any request, as an invalid_request. Omitted means the state goes out as given."
+        },
+        "media": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["imagesKey"],
+          "description": "Body keys prepared media is written under, after model, state and questions: imagesKey only when the request carries an image, videoKey only when it carries a video, audioKey only when it carries audio, and all differ. With dialect system-one it requires decisionLimits.media; videoKey is required exactly when that allowance's video is true, and audioKey exactly when it sets audio. Not valid with openai-decisions.",
+          "properties": {
+            "imagesKey": { "$ref": "#/definitions/decideMediaKey" },
+            "videoKey": { "$ref": "#/definitions/decideMediaKey" },
+            "audioKey": { "$ref": "#/definitions/decideMediaKey" }
+          }
+        },
+        "capableModel": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["model", "questionTypes"],
+          "description": "A models.catalog key (not the default) the request is sent to instead of the default when the call names no model, no model variable is set, and the request carries media or a question of one of questionTypes; that model's decisionLimits row is the one checked. questionTypes must be listed in decisionLimits.questionTypes.",
+          "properties": {
+            "model": { "type": "string", "minLength": 1 },
+            "questionTypes": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "boolean",
+                  "choice",
+                  "score",
+                  "value",
+                  "choice-unknown"
+                ]
+              }
+            }
+          }
+        },
+        "ambientKeyGuard": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["baseURLEnvVars", "trustedOrigins"],
+          "description": "Keeps a key found only in the environment from becoming the default decision provider while another host is named. The key is skipped for default resolution when any baseURLEnvVars variable, or any credentials field in credentialBaseURLs (read from the credentials the resolver is given: the instance's merged with the call's), holds a URL whose origin (scheme, host and port, compared case-insensitively; path and trailing slash ignored) is not in trustedOrigins; a value that does not parse as an http(s) URL counts as untrusted and a blank one as unset. It does not apply when the provider's own base-URL variable is set or credentials supply a key or a base URL, and never to a call that names the provider. The zod schema also refuses what JSON Schema cannot say: an origin without a valid host (such as 999.999.999.999) or with a port above 65535, a variable, an origin or a credentials field listed twice, and the provider's own base-URL variable in baseURLEnvVars.",
+          "properties": {
+            "baseURLEnvVars": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 8,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "maxLength": 64,
+                "pattern": "^[A-Z][A-Z0-9_]*$"
+              }
+            },
+            "trustedOrigins": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 8,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "maxLength": 100,
+                "pattern": "^https?://[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:[0-9]{1,5})?$"
+              }
+            },
+            "credentialBaseURLs": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 8,
+              "uniqueItems": true,
+              "description": "Credentials fields that move the key's other users off the vendor's host, such as the chat provider's credentials.openai.baseURL. Omitted means only the environment is read.",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["key", "field"],
+                "properties": {
+                  "key": {
+                    "type": "string",
+                    "maxLength": 64,
+                    "pattern": "^[a-zA-Z][a-zA-Z0-9]*$"
+                  },
+                  "field": { "enum": ["baseURL"] }
+                }
+              }
+            }
+          }
+        },
+        "requestIdHeaders": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+          }
+        },
+        "response": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "modelPaths": {
+              "type": "array",
+              "items": { "$ref": "#/definitions/decidePath" }
+            }
+          }
+        },
+        "errors": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["rules", "default", "bodyShapes"],
+          "properties": {
+            "rules": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind"],
+                "properties": {
+                  "status": {
+                    "anyOf": [
+                      { "$ref": "#/definitions/httpStatus" },
+                      {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": { "$ref": "#/definitions/httpStatus" }
+                      }
+                    ]
+                  },
+                  "statusMin": { "$ref": "#/definitions/httpStatus" },
+                  "messagePattern": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200,
+                    "description": "The rule also needs the error message to match this case-insensitive regular expression (first 2,000 characters, key removed). Bounded: outside a character class no unescaped *, + or {n,}, no quantifier on a group, no count above 255, and the counts side by side multiply to at most 4,096 ways (each ? is 2, each {n,m} is m-n+1)."
+                  },
+                  "kind": { "$ref": "#/definitions/decisionErrorKind" },
+                  "retryable": { "type": "boolean" },
+                  "hint": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 300,
+                    "description": "Text added after the error message, behind a dash, when this rule matches. For a status the vendor uses for more than one cause. {apiKeyEnvVar} is the only placeholder."
+                  }
+                }
+              }
+            },
+            "default": { "$ref": "#/definitions/decisionErrorKind" },
+            "bodyShapes": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["path"],
+                "properties": {
+                  "path": { "$ref": "#/definitions/decidePath" },
+                  "isArray": { "type": "boolean" },
+                  "formatter": { "enum": ["fastapi-validation"] },
+                  "kind": { "$ref": "#/definitions/decisionErrorKind" },
+                  "retryable": { "type": "boolean" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "wire": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "baseURL": {
+          "type": "string"
+        },
+        "baseURLTemplate": {
+          "type": "string"
+        },
+        "extraCredentials": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z_$][A-Za-z0-9_$]*$"
+          },
+          "maxItems": 1
+        },
+        "missingCredentialMessage": {
+          "type": "string"
+        },
+        "apiKeyFallbackEnvVars": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Additional env vars validateApiKey() tries, in order, when the primary apiKeyEnvVar is unset (e.g. HF_TOKEN alongside HUGGINGFACE_API_KEY)."
+        },
+        "envOverrides": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "apiKey": {
+              "type": "string"
+            },
+            "baseURL": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "models": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["default", "catalog"],
+      "properties": {
+        "default": {
+          "type": "string"
+        },
+        "fallbacks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "fallbackModelName": {
+          "type": "string",
+          "description": "Default: fallbacks[1] ?? fallbacks[0]."
+        },
+        "registryDefaultModel": {
+          "type": "string",
+          "description": "Default: models.default."
+        },
+        "defaultContextWindow": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991,
+          "description": "Source-supported positive safe integer model default ceiling; unknown values are incomplete authoring drafts."
+        },
+        "defaultMaxOutputTokens": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991,
+          "description": "Source-supported positive safe integer model default ceiling; unknown values are incomplete authoring drafts."
+        },
+        "catalog": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["vision", "status", "description"],
+            "properties": {
+              "contextWindow": {
+                "type": "number"
+              },
+              "maxOutputTokens": {
+                "type": "number"
+              },
+              "pricingPerMTok": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["input", "output"],
+                "properties": {
+                  "input": {
+                    "type": "number"
+                  },
+                  "output": {
+                    "type": "number"
+                  },
+                  "cachedInput": {
+                    "type": "number"
+                  }
+                }
+              },
+              "vision": {
+                "type": "boolean"
+              },
+              "tools": {
+                "type": "boolean"
+              },
+              "status": {
+                "type": "string",
+                "enum": ["production", "preview", "retired"]
+              },
+              "description": {
+                "type": "string"
+              },
+              "enumMember": {
+                "type": "string",
+                "pattern": "^[A-Za-z_$][A-Za-z0-9_$]*$"
+              }
+            }
+          }
+        },
+        "topModels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "description": "Ordered curated subset of catalog keys for wizard/choice surfaces. Falls back to the full catalog in file order when absent."
+        },
+        "visionModel": {
+          "type": "string",
+          "description": "The live-verified vision model capability tests should exercise. Must be a key of models.catalog whose entry has vision: true (enforced by the zod schema, not expressible here). Default: first vision:true model in file order."
+        },
+        "testModel": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The live-verified model the capability matrix drives, for providers whose default is retired upstream or gated off the testing account. May name a model outside models.catalog. Default: models.default. Never affects the runtime default."
+        }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "text",
+        "streaming",
+        "tools",
+        "toolsWithStreaming",
+        "structuredOutput",
+        "structuredOutputWithTools",
+        "embeddings",
+        "thinking"
+      ],
+      "properties": {
+        "text": {
+          "type": "boolean"
+        },
+        "streaming": {
+          "type": "boolean"
+        },
+        "tools": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "const": "model-dependent"
+            }
+          ],
+          "description": "\"model-dependent\" when tool support varies per served model and the vendor doesn't reject tools for unsupported ones (e.g. HuggingFace's router)."
+        },
+        "toolsWithStreaming": {
+          "type": "boolean"
+        },
+        "structuredOutput": {
+          "type": "boolean"
+        },
+        "structuredOutputWithTools": {
+          "type": "boolean"
+        },
+        "embeddings": {
+          "type": "boolean"
+        },
+        "thinking": {
+          "type": "boolean"
+        }
+      }
+    },
+    "errorRules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["class", "message"],
+        "properties": {
+          "status": {
+            "type": "number"
+          },
+          "pattern": {
+            "type": "string"
+          },
+          "patternStatuses": {
+            "type": "array",
+            "items": { "type": "integer" },
+            "minItems": 1,
+            "description": "Restrict pattern to these HTTP statuses; status matching stays independent."
+          },
+          "class": {
+            "type": "string",
+            "enum": [
+              "authentication",
+              "rate-limit",
+              "invalid-model",
+              "network",
+              "provider"
+            ]
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "quirks": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxTokensField": {
+          "const": "max_completion_tokens",
+          "description": "Send the caller's fitted maxTokens budget as max_completion_tokens and omit max_tokens. Omitted preserves the ordinary field."
+        },
+        "omitStreamOptions": {
+          "type": "boolean",
+          "description": "Omit stream_options for endpoints that do not document that extension. Does not discard usage returned without requesting it."
+        },
+        "timeoutErrorClass": {
+          "const": "provider"
+        },
+        "registryDefaultIgnoresModelEnvVar": {
+          "type": "boolean"
+        },
+        "messageContentFormat": {
+          "type": "string",
+          "enum": ["string"],
+          "description": "Vendor accepts messages[].content only as a plain string, rejecting OpenAI's content-parts array and the null used on an assistant message with tool_calls. Normalized by ConfiguredOpenAICompatProvider."
+        },
+        "responseFormatDowngrade": {
+          "type": "string",
+          "enum": ["json-schema-to-json-object"],
+          "description": "Vendor rejects response_format: { type: \"json_schema\" } outright but accepts { type: \"json_object\" }. ConfiguredOpenAICompatProvider downgrades the request so generate({ schema }) keeps working."
+        },
+        "replayReasoningContent": {
+          "type": "boolean",
+          "description": "Vendor wants each assistant turn's reasoning_content sent back on every later request of the conversation (DeepSeek documents a 400 without it once tools are in play). Off for every other provider, since strict OpenAI-compatible backends reject the unknown field."
+        },
+        "rejectRequiredToolChoice": {
+          "type": "boolean",
+          "description": "Reject tool_choice=required with nonempty tools before sending. Preserve auto/none/named choices and do not silently downgrade caller intent. Omitted leaves other providers unchanged."
+        },
+        "authHeaderStyle": {
+          "type": "string",
+          "enum": ["x-api-key"],
+          "description": "Vendor's chat-completions endpoint authenticates with X-Api-Key instead of the inherited Authorization: Bearer default (Reka's OpenAPI spec declares exactly one security scheme, an apiKey in header X-Api-Key). Normalized by ConfiguredOpenAICompatProvider.getAuthHeaders()."
+        }
+      }
+    },
+    "timeouts": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Descriptor-only generate/stream turn-budget override consumed by buildCatalogDescriptor(); never read by the OpenAI-compat runtime path.",
+      "properties": {
+        "generateMs": {
+          "type": "number"
+        },
+        "streamMs": {
+          "type": "number"
+        },
+        "decideMs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Decide entries only: the per-call budget for decide(), in milliseconds. When omitted, the base provider's default timeout applies."
+        },
+        "decideMsPerKStateTokens": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Decide entries only: added to decideMs for every 1,000 estimated state tokens, for a model whose latency grows with the state."
+        }
+      }
+    },
+    "autoSelectPriority": {
+      "type": "number",
+      "description": "Descriptor-only ascending auto-select priority override (lower = tried first in getBestProvider()'s fallback chain). Absent = provider is not part of the auto-select chain."
+    },
+    "setup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "apiKeyFormat", "billingPolicy", "instructions"],
+      "properties": {
+        "url": {
+          "type": "string"
+        },
+        "apiKeyFormat": {
+          "type": ["string", "null"]
+        },
+        "billingPolicy": {
+          "type": "string",
+          "enum": [
+            "free-tier",
+            "free-with-card",
+            "no-free-tier",
+            "promotional-credit"
+          ],
+          "description": "Promotional credit is conditional; setup instructions must state activation, eligibility and expiry without asserting current account entitlement."
+        },
+        "instructions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "description": {
+          "type": "string",
+          "description": "Label shown by the setup wizard for the credential (default: \"API key\")."
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rosterVerified", "liveMatrix", "addedInPR"],
+      "properties": {
+        "rosterVerified": {
+          "$ref": "#/definitions/probeEvidence"
+        },
+        "authProbe": {
+          "$ref": "#/definitions/probeEvidence"
+        },
+        "billingProbe": {
+          "$ref": "#/definitions/probeEvidence"
+        },
+        "liveMatrix": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["date", "result"],
+          "properties": {
+            "date": {
+              "type": "string",
+              "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+            },
+            "result": {
+              "type": "string"
+            }
+          }
+        },
+        "addedInPR": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "if": { "required": ["inferenceKinds"] },
+  "then": {
+    "required": ["decide"],
+    "not": {
+      "anyOf": [
+        { "required": ["capabilities"] },
+        { "required": ["quirks"] },
+        { "required": ["errorRules"] },
+        { "required": ["autoSelectPriority"] }
+      ]
+    },
+    "properties": {
+      "models": {
+        "properties": {
+          "fallbacks": false,
+          "fallbackModelName": false,
+          "registryDefaultModel": false,
+          "defaultContextWindow": false,
+          "defaultMaxOutputTokens": false,
+          "visionModel": false
+        }
+      },
+      "timeouts": { "properties": { "generateMs": false, "streamMs": false } },
+      "wire": {
+        "properties": {
+          "baseURLTemplate": false,
+          "extraCredentials": false,
+          "missingCredentialMessage": false,
+          "apiKeyFallbackEnvVars": false
+        }
+      }
+    }
+  },
+  "else": {
+    "required": ["capabilities", "errorRules"],
+    "not": {
+      "anyOf": [{ "required": ["decide"] }, { "required": ["decisionLimits"] }]
+    },
+    "properties": {
+      "models": {
+        "required": [
+          "fallbacks",
+          "defaultContextWindow",
+          "defaultMaxOutputTokens"
+        ]
+      },
+      "timeouts": {
+        "properties": { "decideMs": false, "decideMsPerKStateTokens": false }
+      }
+    }
+  },
+  "definitions": {
+    "httpStatus": { "type": "integer", "minimum": 100, "maximum": 599 },
+    "decideMediaKey": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9_]*$",
+      "not": {
+        "enum": [
+          "model",
+          "state",
+          "questions",
+          "__proto__",
+          "constructor",
+          "prototype"
+        ]
+      }
+    },
+    "decisionErrorKind": {
+      "enum": [
+        "authentication",
+        "invalid_request",
+        "max_tokens_exceeded",
+        "rate_limit",
+        "overloaded",
+        "server",
+        "timeout",
+        "network"
+      ]
+    },
+    "decidePath": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Dot-separated segments without whitespace; never __proto__, constructor or prototype."
+    },
+    "probeEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["date"],
+      "properties": {
+        "date": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+        },
+        "status": {
+          "type": "number"
+        },
+        "code": {
+          "type": "string"
+        },
+        "method": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

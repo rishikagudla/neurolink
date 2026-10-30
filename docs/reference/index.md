@@ -6,45 +6,16 @@ Complete reference documentation for NeuroLink configuration, troubleshooting, a
 
 This section provides comprehensive reference materials for advanced usage, configuration, and problem-solving.
 
-<div class="grid cards" markdown>
-
-- :material-help-circle: **[Troubleshooting](troubleshooting.md)**
-
-  ***
-
-  Common issues, error messages, and solutions for NeuroLink CLI and SDK usage.
-
-- :material-cog: **[Configuration](configuration.md)**
-
-  ***
-
-  Complete configuration reference including environment variables, provider settings, and optimization.
-
-- :material-shield-check: **[Provider Capabilities Audit](provider-capabilities-audit.md)**
-
-  ***
-
-  Comprehensive audit of all 12 provider implementations with capability matrices and configuration examples.
-
-- :material-compare: **[Provider Comparison](provider-comparison.md)**
-
-  ***
-
-  Detailed comparison of all 12 supported AI providers with features, costs, and recommendations.
-
-- :material-frequently-asked-questions: **[FAQ](faq.md)**
-
-  ***
-
-  Frequently asked questions about NeuroLink features, limitations, and best practices.
-
-- :material-alert-circle: **[Error Codes](error-codes.md)**
-
-  ***
-
-  Complete error code reference with categorized codes, severity levels, and resolution guidance.
-
-</div>
+- **[Troubleshooting](troubleshooting.md)** — Common issues, error messages, and solutions for NeuroLink CLI and SDK usage.
+- **[Configuration](configuration.md)** — Complete configuration reference including environment variables, provider settings, and optimization.
+- **[Provider Capabilities Audit](provider-capabilities-audit.md)** — Capability matrix for the 13 text/multimodal providers it historically tracks — the other 27 are covered in the per-provider guides with capability matrices and configuration examples.
+- **[Provider Comparison](provider-comparison.md)** — Detailed comparison of the hand-written provider implementations with features, costs, and recommendations.
+- **[FAQ](faq.md)** — Frequently asked questions about NeuroLink features, limitations, and best practices.
+- **[Error Codes](error-codes.md)** — Complete error code reference with categorized codes, severity levels, and resolution guidance.
+- **[Analytics](analytics.md)** — Comprehensive guide to NeuroLink analytics, metrics, token tracking, cost monitoring, and observability integration.
+- **[Telemetry Guide](../telemetry-guide.md)** — OTLP setup, exporter behavior, and the local OpenObserve workflow for the Claude proxy.
+- **[Server Configuration](./server-configuration.md)** — Configuration reference for server adapters including Hono, Express, Fastify, and Koa framework integration.
+- **[MCP Enhancements API](../features/mcp-enhancements.md#api-reference)** — API reference for MCP enhancements including ToolRouter, ToolCache, RequestBatcher, tool annotations, and elicitation protocol.
 
 ## 🔧 Quick Reference
 
@@ -97,6 +68,12 @@ neurolink config init              # Interactive setup
 neurolink mcp discover             # Find available servers
 neurolink mcp list                 # List installed servers
 neurolink mcp install <server>     # Install MCP server
+
+# Claude proxy + local telemetry
+neurolink proxy setup
+neurolink proxy status --format json
+neurolink proxy telemetry setup
+neurolink proxy telemetry status
 ```
 
 ### SDK Quick Reference
@@ -258,6 +235,6 @@ When reporting issues, include:
 
 ### Related Projects
 
-- **[Vercel AI SDK](https://github.com/vercel/ai)** - Underlying provider implementations
+- **[Vercel AI SDK](https://github.com/vercel/ai)** - Separate framework NeuroLink interoperates with via the client SDK's `LanguageModelV1` adapter
 - **[Model Context Protocol](https://modelcontextprotocol.io)** - Tool integration standard
 - **[TypeScript](https://www.typescriptlang.org/)** - Type safety and development

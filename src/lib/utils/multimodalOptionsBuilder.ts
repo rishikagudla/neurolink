@@ -1,4 +1,5 @@
-import type { StreamOptions } from "../types/streamTypes.js";
+import type { StreamOptions } from "../types/index.js";
+import { getAttachmentPolicy } from "./attachmentPolicy.js";
 
 /**
  * Builds a normalized multimodal options payload for streaming providers.
@@ -13,7 +14,11 @@ import type { StreamOptions } from "../types/streamTypes.js";
  *   - input.files: Auto-detected file types
  *   - input.csvFiles: CSV files for tabular data
  *   - input.pdfFiles: PDF documents (Buffer | string paths)
+ *   - input.audioFiles: Audio files (Buffer | string paths)
+ *   - input.videoFiles: Video files (Buffer | string paths)
  *   - csvOptions: CSV parsing options
+ *   - videoOptions: Video frame/quality/format/transcription options
+ *   - officeOptions: DOCX/XLSX sheet selection and output-format options
  *   - systemPrompt: System-level instructions
  *   - conversationMessages: Chat history
  *   - temperature: Model temperature (0-1)
@@ -24,8 +29,9 @@ import type { StreamOptions } from "../types/streamTypes.js";
  * @param {string} providerName - Provider identifier (e.g., "vertex", "openai", "anthropic")
  * @param {string} modelName - Model identifier (e.g., "gemini-2.5-flash", "gpt-4o")
  * @returns {object} Normalized options object with:
- *   - input: { text, images, content, files, csvFiles, pdfFiles }
+ *   - input: { text, images, content, files, csvFiles, pdfFiles, audioFiles, videoFiles }
  *   - csvOptions: CSV processing options
+ *   - officeOptions: Office (DOCX/XLSX) processing options
  *   - systemPrompt: System prompt string
  *   - conversationHistory: Message history array
  *   - provider: Provider name
@@ -55,10 +61,28 @@ export function buildMultimodalOptions(
       files: options.input?.files,
       csvFiles: options.input?.csvFiles,
       pdfFiles: options.input?.pdfFiles,
+      // #1259: this is a whitelist — a field omitted here is dropped
+      // silently, and the model answers as though nothing were attached.
+      // audioFiles/videoFiles were missing, so Bedrock received neither.
+      audioFiles: options.input?.audioFiles,
+      videoFiles: options.input?.videoFiles,
     },
     csvOptions: options.csvOptions,
+    pdfOptions: options.pdfOptions,
+    imageOptions: options.imageOptions,
+    // Same whitelist hazard as above, one level up: `videoFiles` reaching
+    // the processor is not enough on its own — without `videoOptions` too,
+    // the frame/quality/format/transcribeAudio knobs a caller set on
+    // `StreamOptions` never reach VideoProcessor on the Bedrock branch, and
+    // it silently falls back to the duration-tier default.
+    videoOptions: options.videoOptions,
+    // Same #1259 whitelist-drop bug class as audioFiles/videoFiles above:
+    // omitted here, Bedrock's multimodal generate()/stream() path always got
+    // sheetName/formatStyle undefined regardless of what the caller passed.
+    officeOptions: options.officeOptions,
     systemPrompt: options.systemPrompt,
     conversationHistory: options.conversationMessages,
+    replayToolSteps: options.replayToolSteps,
     provider: providerName,
     model: modelName,
     temperature: options.temperature,
@@ -66,5 +90,9 @@ export function buildMultimodalOptions(
     enableAnalytics: options.enableAnalytics,
     enableEvaluation: options.enableEvaluation,
     context: options.context,
+    fileRegistry: (options as Record<string, unknown>).fileRegistry,
+    attachmentPolicy: getAttachmentPolicy(
+      options as { attachmentPolicy?: unknown },
+    ),
   };
 }

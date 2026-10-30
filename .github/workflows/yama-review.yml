@@ -1,0 +1,240 @@
+# Yama PR Review — AI code review on every PR targeting the `release` branch.
+#
+# Yama v6 (the prompts-driven reviewer): config lives in ./.yama/ (config.json +
+# MCP.json + prompts.json + skills/), reviewed like any code. The reviewer runs
+# .yama/prompts.json top to bottom in one session — review and post, then
+# validate what landed — reading code from the LOCAL checkout and recalling
+# earlier reviews' learnings from the COMMITTED memory database at
+# .yama/memory/hippocampus.sqlite (updated post-merge by yama-learn.yml).
+#
+# Verdict contract (v6, amended 2026-10): the verdict is DELIVERED as the pull
+# request's review state, where reviewers read it — CHANGES_REQUESTED for
+# NEEDS_WORK, a COMMENTED review for NO_BLOCKERS. Yama NEVER submits an
+# APPROVED review: it reads untrusted pull-request text (description, comments,
+# code comments), so an approval from it would let a prompt injection satisfy
+# the human-review requirement. The guard step below fails the job if an
+# APPROVED review from this run exists, and dismisses it. This "Yama PR Review"
+# check goes red when the run itself BREAKS or when that contract is violated;
+# green means "review delivered", never "approved" — merge gating stays with
+# branch protection and human review.
+#
+# Supply chain (2026-10): @juspay/yama is pinned to an exact version, the
+# code-review-graph server is installed from a hash-verified requirements file
+# (.yama/requirements-code-review-graph.txt) rather than fetched by uvx at run
+# time, and .yama/ (config, MCP servers, prompts, skills, memory) is taken from
+# the BASE branch, so a pull request cannot redefine the reviewer's stdio MCP
+# command or prompts and run it with YAMA_GITHUB_TOKEN in its environment.
+#
+# Silent-no-op guard (juspay/neurolink#1754): a run can exit 0 having posted
+# nothing at all — seen on #1746, where Yama's own GitHub client read the repo
+# slug as `juspay/juspay`, got 404s on every call, and treated the empty result
+# as "nothing to report" instead of failing. The "Guard against a silent no-op
+# review" step below re-reads the PR through this job's OWN GITHUB_TOKEN (never
+# through Yama's client, so it can't inherit the same misconfigured slug) and
+# fails the job if no review with a verdict and a summary landed on this PR
+# since the run started. That closes the observable half of #1754 — a silent
+# no-op can no longer pass as green — but not the root cause: the repo-slug bug
+# is inside @juspay/yama's own GitHub client construction, which this repo does
+# not own and cannot fix here. See #1754 for that follow-up.
+#
+# Required repository secrets:
+#   YAMA_GITHUB_TOKEN : real PAT (PRs read/write + contents read) — the hosted
+#                       GitHub MCP endpoint rejects the ephemeral Actions token.
+#   LITELLM_BASE_URL / LITELLM_API_KEY : the gateway the models in
+#                       .yama/config.json live on.
+#
+# Fork PRs (no secrets) pass cleanly so the required check never deadlocks.
+
+name: Yama PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [release]
+
+concurrency:
+  group: yama-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  yama-review:
+    # This job name IS the required status-check context in branch protection —
+    # keep the two in sync (.github/settings.yml).
+    name: Yama PR Review
+    runs-on: ubuntu-latest
+    # Two prompts, each bounded by .yama/config.json's turnTimeoutMs (40m), so a
+    # slow model is cut off by the agent — which reports honestly — rather than
+    # by the runner, which kills the job and reports nothing.
+    timeout-minutes: 120
+
+    steps:
+      - name: Preflight (fork + secrets)
+        id: gate
+        env:
+          PAT: ${{ secrets.YAMA_GITHUB_TOKEN }}
+          LITELLM_BASE_URL: ${{ secrets.LITELLM_BASE_URL }}
+          LITELLM_API_KEY: ${{ secrets.LITELLM_API_KEY }}
+          IS_SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+        run: |
+          if [ "$IS_SAME_REPO" != "true" ]; then
+            echo "::notice::Fork PR — secrets unavailable; skipping Yama review (check passes)."
+            echo "run=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ -z "$PAT" ] || [ -z "$LITELLM_BASE_URL" ] || [ -z "$LITELLM_API_KEY" ]; then
+            echo "::notice::Missing YAMA_GITHUB_TOKEN / LITELLM_* secrets; skipping Yama review (check passes)."
+            echo "run=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "run=true" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The reviewer reads code from disk; full history keeps base/head
+          # diffs correct for the graph server and git-based inspection.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22.23.4"
+
+      # The reviewer's own configuration is not under review. actions/checkout on
+      # pull_request gives the MERGE commit, so .yama/MCP.json (which names a
+      # stdio command to spawn), prompts.json, config.json, the skills and the
+      # memory database would all be whatever the pull request says. Replace the
+      # directory with the base branch's copy before anything reads it. A change
+      # to .yama/ therefore takes effect only after it has merged.
+      - name: Use the base branch's reviewer configuration
+        if: steps.gate.outputs.run == 'true'
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+          rm -rf .yama
+          git checkout "origin/${BASE_REF}" -- .yama
+          git status --short -- .yama || true
+          echo "Reviewer configuration taken from origin/${BASE_REF}."
+
+      - name: Set up uv (code-review-graph server)
+        if: steps.gate.outputs.run == 'true'
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+
+      # Hash-verified install of the graph server and its whole dependency tree.
+      # `--require-hashes` makes uv refuse any artifact whose sha256 is not in
+      # the committed requirements file, so a substituted wheel for any package
+      # fails here instead of running with the secrets below in its environment.
+      - name: Install code-review-graph (hash-verified)
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          uv venv --python 3.12 "${RUNNER_TEMP}/code-review-graph"
+          uv pip install --python "${RUNNER_TEMP}/code-review-graph/bin/python" \
+            --require-hashes -r .yama/requirements-code-review-graph.txt
+          echo "${RUNNER_TEMP}/code-review-graph/bin" >> "$GITHUB_PATH"
+          "${RUNNER_TEMP}/code-review-graph/bin/code-review-graph" --help >/dev/null
+
+      - name: Pre-build the code graph
+        if: steps.gate.outputs.run == 'true'
+        # Builds the graph store at the repo root. Non-fatal: the review runs
+        # without graph context.
+        run: |
+          code-review-graph build \
+            || echo "::warning::graph build failed (non-fatal; the review runs without graph context)"
+
+      - name: Record review start time
+        if: steps.gate.outputs.run == 'true'
+        id: started
+        # Recorded BEFORE Yama runs so the guard below only counts a review
+        # posted by THIS run, not one left over from an earlier synchronize.
+        run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Yama review
+        if: steps.gate.outputs.run == 'true'
+        # Exact version, not a range: `npx --yes @juspay/yama@^6.1.1` fetched
+        # whatever 6.x was newest at run time, outside any cooldown, and ran it
+        # with YAMA_GITHUB_TOKEN and the LiteLLM key in its environment. 6.1.1 is
+        # the v6 config layout this wiring targets, with the NeuroLink that
+        # restarts a dying stdio MCP server (juspay/neurolink #1610). Bump it
+        # deliberately, in both Yama workflows at once.
+        env:
+          YAMA_VERSION: "6.1.1"
+          YAMA_GITHUB_TOKEN: ${{ secrets.YAMA_GITHUB_TOKEN }}
+          LITELLM_API_KEY: ${{ secrets.LITELLM_API_KEY }}
+          LITELLM_BASE_URL: ${{ secrets.LITELLM_BASE_URL }}
+          # Branch names are attacker-controllable; they go through env, never
+          # straight into the shell.
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        working-directory: .yama
+        run: |
+          npx --yes "@juspay/yama@${YAMA_VERSION}" run "pr=$PR_NUMBER" "branch=$HEAD_REF" 2>&1 | tee review-run.log
+          exit "${PIPESTATUS[0]}"
+
+      - name: Guard against a silent no-op review, and against an approval
+        if: steps.gate.outputs.run == 'true'
+        # Two checks through this job's own GITHUB_TOKEN — a reader independent
+        # of whatever repo-slug bug may exist in Yama's internal GitHub client:
+        #
+        # 1. The step above can exit 0 without posting anything (#1754). Fail
+        #    loudly if no review with a verdict and a summary body landed since
+        #    this run started. Zero inline comments alone is not a failure (a
+        #    clean PR legitimately gets a COMMENTED review with none); zero
+        #    reviews is.
+        # 2. An automated reviewer that reads untrusted PR text must never hold
+        #    an APPROVED review on the PR: if branch protection counts the PAT
+        #    owner's approval, a prompt injection would satisfy the human-review
+        #    requirement. Any APPROVED review posted since this run started is
+        #    dismissed and fails the job.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          STARTED_AT: ${{ steps.started.outputs.at }}
+        run: |
+          set -euo pipefail
+          if [ -z "${STARTED_AT}" ]; then
+            echo "::error::STARTED_AT is empty, so the recency check below would be trivially true for any historical review and silently reintroduce the #1754 no-op bug. Failing closed instead."
+            exit 1
+          fi
+          # --paginate applies --jq per page, not to the combined result, so a
+          # naive `--jq '... | length'` would print one count per page instead
+          # of a true total on any PR with more than one page of reviews. Emit
+          # the matching-review array per page instead, then slurp all pages
+          # and concatenate before counting.
+          recent=$(gh api --paginate "repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews?per_page=100" \
+            --jq '[.[] | select(.submitted_at != null and .submitted_at >= env.STARTED_AT)
+                   | {id, state, body_len: (.body | length)}]' | jq -s 'add // []')
+          approved_ids=$(jq -r '.[] | select(.state == "APPROVED") | .id' <<<"$recent")
+          if [ -n "$approved_ids" ]; then
+            for review_id in $approved_ids; do
+              gh api -X PUT "repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews/${review_id}/dismissals" \
+                -f message="Automated reviewer must not approve; dismissed by yama-review.yml" \
+                -f event="DISMISS" >/dev/null || echo "::warning::could not dismiss review ${review_id}"
+            done
+            echo "::error::Yama posted an APPROVED review on ${REPOSITORY}#${PR_NUMBER} (ids: $(echo $approved_ids | tr '\n' ' ')). An automated reviewer that reads untrusted pull-request text must never approve; the review was dismissed and the job fails so this is visible."
+            exit 1
+          fi
+          posted=$(jq '[.[] | select((.state == "COMMENTED" or .state == "CHANGES_REQUESTED") and .body_len > 0)] | length' <<<"$recent")
+          echo "Reviews with a verdict and a summary posted since ${STARTED_AT}: ${posted}"
+          if [ "$posted" -eq 0 ]; then
+            echo "::error::Yama review exited 0 but posted no review with a verdict and a summary on ${REPOSITORY}#${PR_NUMBER} since ${STARTED_AT}. This is the silent no-op from juspay/neurolink#1754 (Yama's internal GitHub client can read the wrong repo slug, get a 404, and treat it as \"nothing to report\"). Failing the job so this can no longer pass as green."
+            exit 1
+          fi
+
+      - name: Archive the run log
+        # A run that failed still logged what it did, and that is what you read.
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: yama-review-${{ github.event.pull_request.number }}-${{ github.run_id }}
+          path: .yama/review-run.log
+          retention-days: 14

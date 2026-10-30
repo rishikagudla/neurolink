@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v8.32.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,9 +8,8 @@
 
 > **OAuthTokens** = `object`
 
-Defined in: [types/mcpTypes.ts:828](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L828)
-
-OAuth tokens structure for MCP HTTP transport authentication
+OAuth tokens structure (relaxed version for general use).
+Use StoredOAuthTokens when persisting (stricter — expiresAt and tokenType required).
 
 ## Properties
 
@@ -18,37 +17,29 @@ OAuth tokens structure for MCP HTTP transport authentication
 
 > **accessToken**: `string`
 
-Defined in: [types/mcpTypes.ts:830](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L830)
-
-Access token for API authentication
+The access token for API authentication
 
 ---
 
 ### refreshToken?
 
-> `optional` **refreshToken**: `string`
+> `optional` **refreshToken?**: `string`
 
-Defined in: [types/mcpTypes.ts:832](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L832)
-
-Refresh token for obtaining new access tokens
+The refresh token for obtaining new access tokens
 
 ---
 
 ### expiresAt?
 
-> `optional` **expiresAt**: `number`
+> `optional` **expiresAt?**: `number`
 
-Defined in: [types/mcpTypes.ts:834](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L834)
-
-Token expiration timestamp (Unix epoch in milliseconds)
+Token expiration timestamp (Unix epoch)
 
 ---
 
-### tokenType
+### tokenType?
 
-> **tokenType**: `string`
-
-Defined in: [types/mcpTypes.ts:836](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L836)
+> `optional` **tokenType?**: `string`
 
 Token type (typically "Bearer")
 
@@ -56,8 +47,6 @@ Token type (typically "Bearer")
 
 ### scope?
 
-> `optional` **scope**: `string`
-
-Defined in: [types/mcpTypes.ts:838](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/mcpTypes.ts#L838)
+> `optional` **scope?**: `string`
 
 OAuth scope granted

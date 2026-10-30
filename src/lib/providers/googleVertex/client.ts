@@ -1,0 +1,9450 @@
+/* eslint-disable max-lines-per-function */
+// Native SDK imports - no more @ai-sdk/google-vertex dependency
+import fs from "fs";
+import { LangfuseOtelSpanAttributes } from "@langfuse/tracing";
+import { guardToolExecutor } from "../../core/toolExecutionGuards.js";
+import path from "path";
+import type { ZodType } from "zod";
+import type { AnthropicVertex as AnthropicVertexType } from "@anthropic-ai/vertex-sdk";
+import {
+  AIProviderName,
+  ErrorCategory,
+  ErrorSeverity,
+} from "../../constants/enums.js";
+import { BaseProvider } from "../../core/baseProvider.js";
+import { unwrapImagePayload } from "../../adapters/imageFormatSupport.js";
+import {
+  appendNativeAudioParts,
+  appendNativeVideoParts,
+} from "../googleNativeGemini3/utils.js";
+import { getMimeTypeForExtension } from "../../processors/config/mimeConstants.js";
+import {
+  DEFAULT_GEMINI_STREAM_TIMEOUT_MS,
+  DEFAULT_MAX_STEPS,
+  DEFAULT_TOOL_MAX_RETRIES,
+  GLOBAL_LOCATION_MODELS,
+  resolveToolTimeoutMs,
+  TOOL_STORAGE_TIMEOUT_MS,
+} from "../../core/constants.js";
+import { resolveRequestKind } from "../../core/resolveRequestKind.js";
+import { ModelConfigurationManager } from "../../core/modelConfiguration.js";
+import { isSchemaComplexityError } from "../../core/modules/structuredOutputPolicy.js";
+import {
+  redactUrlForError,
+  stringifyContentSafe,
+} from "../../utils/logSanitize.js";
+import type { NeuroLink } from "../../neurolink.js";
+import { googleSdkProxyHttpOptions } from "../../proxy/proxyFetch.js";
+import type {
+  AgenticLoopOptions,
+  GeminiTurnContent,
+  NativeToolDeclarationsResult,
+  EmbedInput,
+  UnknownRecord,
+  ZodUnknownSchema,
+  EnhancedGenerateResult,
+  GenerateStopReason,
+  TextGenerationOptions,
+  GenAIClient,
+  GoogleGenAIClass,
+  AnthropicVertexSettings,
+  StreamOptions,
+  StreamResult,
+  Tool,
+  ToolWithLegacyParams,
+  VertexNativePart,
+  VertexNativeLoopPart,
+  VertexGenaiFunctionDeclaration,
+  VertexAnthropicMessage,
+  VertexAnthropicTool,
+  VertexAnthropicContentBlock,
+  VertexToolStep,
+  VertexSegment,
+  ChatMessage,
+  MinimalChatMessage,
+  MultimodalAudioEntry,
+  MultimodalVideoEntry,
+  ProviderErrorRule,
+  LanguageModelV3,
+  LanguageModelV3CallOptions,
+  LanguageModelV3StreamPart,
+  ModelMessage,
+  TokenUsage,
+  MiddlewareFactoryOptions,
+} from "../../types/index.js";
+import {
+  AuthenticationError,
+  InvalidModelError,
+  NetworkError,
+  ProviderError,
+  RateLimitError,
+} from "../../types/index.js";
+import {
+  classifyProviderError,
+  messageNamesStatus,
+} from "../../utils/errorClassifier.js";
+import { ERROR_CODES, NeuroLinkError } from "../../utils/errorHandling.js";
+import { applyVertexAnthropicCacheBreakpoints } from "../../utils/anthropicCacheBreakpoints.js";
+import { FileDetector } from "../../utils/fileDetector.js";
+import {
+  mergeMediaFileAliases,
+  normalizeVisionImageFormats,
+  processUnifiedFilesArray,
+} from "../../utils/messageBuilder.js";
+import { logger } from "../../utils/logger.js";
+import { drainDetachedPump } from "../../utils/drainDetachedPump.js";
+import { releaseIterator } from "../../utils/streamCancellation.js";
+import {
+  fireOnErrorOnce,
+  getLifecycleMiddlewareConfig,
+  isLifecycleStreamCallbacksOwnedByBaseProvider,
+} from "../../utils/lifecycleCallbacks.js";
+import {
+  GEMINI_ELISION_NOTE,
+  planGeminiLoopReclaim,
+  previewGeminiToolResponseText,
+} from "../../context/geminiLoopGuard.js";
+import {
+  ANTHROPIC_ELISION_NOTE,
+  planAnthropicLoopReclaim,
+  previewAnthropicToolResultText,
+} from "../../context/anthropicLoopGuard.js";
+import {
+  hasRestrictedOutputLimit,
+  RESTRICTED_OUTPUT_TOKEN_LIMIT,
+  toVertexAnthropicModelId,
+} from "../../utils/modelDetection.js";
+import { detectImageMimeType } from "../../utils/imageDetection.js";
+import { resolveClaudeMaxTokens } from "../../utils/tokenLimits.js";
+import {
+  validateApiKey,
+  createVertexProjectConfig,
+  createGoogleAuthConfig,
+} from "../../utils/providerConfig.js";
+import {
+  convertZodToJsonSchema,
+  inlineJsonSchema,
+  ensureNestedSchemaTypes,
+} from "../../utils/schemaConversion.js";
+import { createNativeThinkingConfig } from "../../utils/thinkingConfig.js";
+import { TimeoutError, withTimeout } from "../../utils/async/index.js";
+import { parseTimeout } from "../../utils/timeout.js";
+import {
+  appendStepText,
+  buildContextCapMessage,
+  buildDedupedEngineTools,
+  buildLoopExitMessage,
+  buildToolLoopCapMessage,
+  buildWrapupNudgeText,
+  createContextGuard,
+  createTurnClock,
+  extractThoughtSignature,
+  isAbortError,
+  mapGeminiFinishReason,
+  prependConversationMessages,
+  resolveTurnStopReason,
+  DedupExecuteMap,
+} from "../googleNativeGemini3/index.js";
+import {
+  createGeminiLoopAdapter,
+  describeGeminiRequest,
+} from "../../core/geminiLoopAdapter.js";
+import { runAgenticLoop } from "../../core/loopEngine.js";
+import { createAnthropicLoopAdapter } from "../anthropic/loopAdapter.js";
+import { createStreamChannel } from "../../core/streamChannel.js";
+import { toNativeToolDeclarations } from "../../core/nativeToolFormat.js";
+import {
+  getAvailableInputTokens,
+  getContextWindowSize,
+} from "../../constants/contextWindows.js";
+import { resolveLiveTool } from "../../tools/toolDiscovery.js";
+import {
+  ATTR,
+  recordsSpanInputs,
+  spanContentAttribute,
+  spanModelRequestAttribute,
+  tracers,
+  withClientSpan,
+  withClientStreamSpan,
+  withSpan,
+} from "../../telemetry/index.js";
+import { recordsSpanContent } from "../../telemetry/attributes.js";
+import { inTurnlessTree } from "../../telemetry/tracers.js";
+import {
+  observe,
+  observeGeneration,
+  observeTrace,
+} from "../../telemetry/observation.js";
+import { withGeneration, withStepSpan } from "../../telemetry/withSpan.js";
+import {
+  context as otelContext,
+  SpanKind,
+  SpanStatusCode,
+  trace as otelTrace,
+} from "@opentelemetry/api";
+import { transformToolExecutions } from "../../utils/transformationUtils.js";
+import { resolveToolExecutionRecords } from "../../core/toolExecutionRecorder.js";
+import {
+  modelSupportsForcedToolChoice,
+  resolveSamplingParams,
+} from "../../models/modelRegistry.js";
+import { sanitizeAnthropicMessagesForTrace } from "../../utils/anthropicTraceSanitizer.js";
+import { extractToolFailureText } from "../../utils/mcpErrorText.js";
+import type {
+  Schema,
+  LanguageModel,
+  ImageWithAltText,
+  CollectedChunkResult,
+  NativeFunctionCall,
+  SpanModelRequest,
+  VertexUsageCounter,
+} from "../../types/index.js";
+
+// Import proper types for multimodal message handling
+
+// Dynamic import helper for native Anthropic Vertex SDK
+let anthropicVertexModule: typeof import("@anthropic-ai/vertex-sdk") | null =
+  null;
+
+async function getAnthropicVertexModule(): Promise<
+  typeof import("@anthropic-ai/vertex-sdk")
+> {
+  if (!anthropicVertexModule) {
+    anthropicVertexModule = await import("@anthropic-ai/vertex-sdk");
+  }
+  return anthropicVertexModule;
+}
+
+// Enhanced Anthropic support check - now uses native SDK
+const hasAnthropicSupport = (): boolean => {
+  // Always return true as we have the native SDK available
+  // Actual availability is checked at runtime when creating the client
+  return true;
+};
+
+// Parse stored rows into ordered segments, grouping tool_call/tool_result by (turn, step).
+function collectHistorySegments(
+  conversationMessages: Array<ChatMessage | MinimalChatMessage>,
+): VertexSegment[] {
+  const segments: VertexSegment[] = [];
+  const stepMap = new Map<string, VertexToolStep>();
+  let turnCounter = 0;
+
+  const getStep = (stepIndex: number | undefined): VertexToolStep => {
+    const key = `${turnCounter}:${stepIndex ?? "x"}`;
+    let step = stepMap.get(key);
+    if (!step) {
+      step = { type: "tool_step", callParts: [], resultParts: [] };
+      stepMap.set(key, step);
+      segments.push(step);
+    }
+    return step;
+  };
+
+  for (const msg of conversationMessages) {
+    if (msg.role === "tool_call") {
+      getStep(msg.metadata?.stepIndex).callParts.push({
+        name: msg.tool || "unknown",
+        input: msg.args || {},
+      });
+      continue;
+    }
+    if (msg.role === "tool_result") {
+      getStep(msg.metadata?.stepIndex).resultParts.push(
+        msg.content && msg.content.length > 0 ? msg.content : "(no output)",
+      );
+      continue;
+    }
+    const role =
+      msg.role === "assistant"
+        ? "assistant"
+        : msg.role === "user"
+          ? "user"
+          : null;
+    if (!role || !msg.content || msg.content.trim().length === 0) {
+      continue;
+    }
+    // New turn → fresh step namespace for any following tool rows.
+    turnCounter++;
+    segments.push({ type: "regular", role, parts: [msg.content] });
+  }
+  return segments;
+}
+
+// Append blocks to the trailing turn if it shares the role, else start a new turn.
+function pushTurn(
+  messages: VertexAnthropicMessage[],
+  role: "user" | "assistant",
+  blocks: VertexAnthropicContentBlock[],
+): void {
+  const last = messages[messages.length - 1];
+  if (last && last.role === role && Array.isArray(last.content)) {
+    last.content.push(...blocks);
+  } else {
+    messages.push({ role, content: [...blocks] });
+  }
+}
+
+// Pair a tool step's calls/results by position; unbalanced extras are dropped
+// because Anthropic 400s on an orphaned tool_use/tool_result reference.
+function pairToolStep(
+  step: VertexToolStep,
+  ordinal: number,
+): {
+  uses: VertexAnthropicContentBlock[];
+  results: VertexAnthropicContentBlock[];
+} {
+  const calls = step.callParts as Array<{
+    name: string;
+    input: Record<string, unknown>;
+  }>;
+  const resultStrings = step.resultParts as string[];
+  const paired = Math.min(calls.length, resultStrings.length);
+  if (paired !== calls.length || paired !== resultStrings.length) {
+    logger.debug(
+      "[GoogleVertex] Unbalanced tool step in Claude history replay",
+      {
+        calls: calls.length,
+        results: resultStrings.length,
+        paired,
+      },
+    );
+  }
+  const uses: VertexAnthropicContentBlock[] = [];
+  const results: VertexAnthropicContentBlock[] = [];
+  for (let i = 0; i < paired; i++) {
+    const id = `hist_${ordinal}_${i}`;
+    uses.push({
+      type: "tool_use",
+      id,
+      name: calls[i].name,
+      input: calls[i].input,
+    });
+    results.push({
+      type: "tool_result",
+      tool_use_id: id,
+      content: resultStrings[i],
+    });
+  }
+  return { uses, results };
+}
+
+// Drop leading turns until the first is a real user turn — Anthropic requires it
+// (covers a leading assistant/tool step and an orphaned tool_result-only turn).
+function trimLeadingNonUser(messages: VertexAnthropicMessage[]): void {
+  const isToolResultOnly = (m: VertexAnthropicMessage): boolean =>
+    Array.isArray(m.content) &&
+    m.content.length > 0 &&
+    m.content.every((block) => block.type === "tool_result");
+  while (
+    messages.length > 0 &&
+    (messages[0].role !== "user" || isToolResultOnly(messages[0]))
+  ) {
+    messages.shift();
+  }
+}
+
+// Rebuild Anthropic history with paired tool_use/tool_result turns from stored rows.
+export function buildAnthropicHistoryMessages(
+  conversationMessages: Array<ChatMessage | MinimalChatMessage>,
+): VertexAnthropicMessage[] {
+  const messages: VertexAnthropicMessage[] = [];
+  let stepOrdinal = 0;
+  for (const seg of collectHistorySegments(conversationMessages)) {
+    if (seg.type === "regular") {
+      pushTurn(messages, seg.role === "assistant" ? "assistant" : "user", [
+        { type: "text", text: String(seg.parts[0] ?? "") },
+      ]);
+      continue;
+    }
+    const { uses, results } = pairToolStep(seg, stepOrdinal);
+    if (uses.length === 0) {
+      continue;
+    }
+    stepOrdinal++;
+    pushTurn(messages, "assistant", uses);
+    pushTurn(messages, "user", results);
+  }
+  trimLeadingNonUser(messages);
+
+  if (logger.shouldLog("debug")) {
+    const blocks = messages.flatMap((m) =>
+      Array.isArray(m.content) ? m.content : [],
+    );
+    logger.debug("[GoogleVertex] Replayed Claude history with tool turns", {
+      historyMessages: messages.length,
+      toolUseBlocks: blocks.filter((b) => b.type === "tool_use").length,
+      toolResultBlocks: blocks.filter((b) => b.type === "tool_result").length,
+    });
+  }
+  return messages;
+}
+
+// Append the live user turn, merging into a trailing user turn to avoid back-to-back user messages.
+export function appendUserMessage(
+  messages: VertexAnthropicMessage[],
+  content: VertexAnthropicMessage["content"],
+): void {
+  const last = messages[messages.length - 1];
+  if (last && last.role === "user") {
+    const head = Array.isArray(last.content)
+      ? last.content
+      : [{ type: "text" as const, text: last.content }];
+    const tail = Array.isArray(content)
+      ? content
+      : [{ type: "text" as const, text: content }];
+    last.content = [...head, ...tail];
+    return;
+  }
+  messages.push({ role: "user", content });
+}
+
+/**
+ * Recursively strip JSON-schema fields that Vertex Gemini's function-call AND
+ * `responseSchema` (structured output) validators reject with 400
+ * INVALID_ARGUMENT. Vertex implements OpenAPI 3.0 Schema strictly and rejects
+ * extension fields that the broader JSON Schema spec allows. The fields
+ * stripped here have no semantic meaning for the model, so removing them is
+ * safe for every caller.
+ *
+ * Fields removed:
+ * - `additionalProperties` — extension; Vertex rejects on any nested object.
+ * - `default` — Vertex rejects defaults on object/array-typed properties and
+ *   on properties that are also marked `required`. Safest to strip globally
+ *   because the model never inspects them.
+ * - `$schema`, `$id`, `$ref`, `definitions`, `$defs` — JSON-Schema-meta
+ *   fields that Vertex doesn't recognise.
+ * - `examples` — accepted by some Gemini variants but not 2.5-flash; strip
+ *   to avoid the model rejecting tool schemas under that path.
+ * - `errorMessage` — emitted by `convertZodToJsonSchema` (which enables
+ *   zod-to-json-schema's `errorMessages: true`) for any field carrying a
+ *   custom message, e.g. `z.string().regex(re, { message })`. Vertex's
+ *   `response_schema` validator rejects it with `Unknown name "errorMessage"
+ *   … Cannot find field`, failing the whole structured-output request.
+ *
+ * Exported for deterministic unit testing of the sanitization contract.
+ */
+export function stripAdditionalPropertiesDeep(
+  schema: Record<string, unknown> | undefined,
+): void {
+  if (!schema || typeof schema !== "object") {
+    return;
+  }
+  const FIELDS_TO_STRIP = [
+    "additionalProperties",
+    "default",
+    "$schema",
+    "$id",
+    "$ref",
+    "definitions",
+    "$defs",
+    "examples",
+    "errorMessage",
+  ] as const;
+  for (const field of FIELDS_TO_STRIP) {
+    if (field in schema) {
+      delete (schema as Record<string, unknown>)[field];
+    }
+  }
+  // JSON Schema Draft-4 `exclusiveMinimum: true` / `exclusiveMaximum: true`
+  // (boolean form) is rejected by Vertex's OpenAPI 3.0 validator, which
+  // expects a numeric bound. zod-to-json-schema's openApi3 target still
+  // emits the Draft-4 form for `z.number().positive()` etc. Translate the
+  // boolean form into the numeric form when paired with `minimum` /
+  // `maximum`; otherwise drop it (the model doesn't validate, so the
+  // constraint is informational only).
+  if (typeof schema.exclusiveMinimum === "boolean") {
+    if (
+      schema.exclusiveMinimum === true &&
+      typeof schema.minimum === "number"
+    ) {
+      schema.exclusiveMinimum = schema.minimum;
+      delete schema.minimum;
+    } else {
+      delete schema.exclusiveMinimum;
+    }
+  }
+  if (typeof schema.exclusiveMaximum === "boolean") {
+    if (
+      schema.exclusiveMaximum === true &&
+      typeof schema.maximum === "number"
+    ) {
+      schema.exclusiveMaximum = schema.maximum;
+      delete schema.maximum;
+    } else {
+      delete schema.exclusiveMaximum;
+    }
+  }
+  // Strip `maximum` values that exceed int32 range — Vertex's protobuf
+  // serializer treats `type: "integer"` as int32 and rejects bounds beyond
+  // 2^31. zod's `.positive().int()` emits Number.MAX_SAFE_INTEGER as the
+  // upper bound (8.9e15), which trips this. The constraint is informational
+  // for the model anyway, so dropping it is safe.
+  const INT32_MAX = 2147483647;
+  if (typeof schema.maximum === "number" && schema.maximum > INT32_MAX) {
+    delete schema.maximum;
+  }
+  if (typeof schema.minimum === "number" && schema.minimum < -INT32_MAX) {
+    delete schema.minimum;
+  }
+  if (schema.properties && typeof schema.properties === "object") {
+    for (const child of Object.values(
+      schema.properties as Record<string, unknown>,
+    )) {
+      if (child && typeof child === "object") {
+        stripAdditionalPropertiesDeep(child as Record<string, unknown>);
+      }
+    }
+  }
+  if (schema.items && typeof schema.items === "object") {
+    if (Array.isArray(schema.items)) {
+      for (const item of schema.items) {
+        if (item && typeof item === "object") {
+          stripAdditionalPropertiesDeep(item as Record<string, unknown>);
+        }
+      }
+    } else {
+      stripAdditionalPropertiesDeep(schema.items as Record<string, unknown>);
+    }
+  }
+  for (const key of ["allOf", "anyOf", "oneOf"] as const) {
+    if (Array.isArray(schema[key])) {
+      for (const branch of schema[key] as unknown[]) {
+        if (branch && typeof branch === "object") {
+          stripAdditionalPropertiesDeep(branch as Record<string, unknown>);
+        }
+      }
+    }
+  }
+}
+
+// Configuration helpers - now using consolidated utility
+const getVertexProjectId = (): string => {
+  return validateApiKey(createVertexProjectConfig());
+};
+
+const getVertexLocation = (): string => {
+  return (
+    process.env.GOOGLE_CLOUD_LOCATION ||
+    process.env.VERTEX_LOCATION ||
+    process.env.GOOGLE_VERTEX_LOCATION ||
+    "us-central1"
+  );
+};
+
+/**
+ * Resolve the effective Vertex region for a given model.
+ *
+ * Policy (matches the bugfixes-suite contract):
+ *  - Every Gemini model (`gemini-*`) is force-routed to the `global` endpoint
+ *    regardless of any caller-supplied region. Regional endpoints 404 for
+ *    Gemini 3.x previews and the regional/global behaviour for 2.x is
+ *    consistent enough that pinning all Gemini traffic to global is the
+ *    right safe default. The legacy `GLOBAL_LOCATION_MODELS` allowlist is
+ *    kept as a defence-in-depth fallback so any non-`gemini-` identifiers
+ *    that still need global (e.g. image-gen aliases) keep working.
+ *  - Non-Gemini models (Claude on Vertex, embeddings, custom models) keep
+ *    the caller-supplied region or fall back to env-derived defaults.
+ *
+ * @param modelName - The target model identifier.
+ * @param configuredLocation - Caller-provided region (e.g. options.region).
+ *   Used as the fallback for non-Gemini models; ignored for Gemini.
+ * @returns The region string to pass to the @google/genai client.
+ */
+export const resolveVertexLocation = (
+  modelName: string | undefined,
+  configuredLocation?: string,
+): string => {
+  const fallback = configuredLocation || getVertexLocation();
+  if (!modelName) {
+    return fallback;
+  }
+  const lower = modelName.toLowerCase();
+  const isGemini =
+    lower.startsWith("gemini-") ||
+    lower.includes("/gemini-") ||
+    GLOBAL_LOCATION_MODELS.some(
+      (m) =>
+        lower === m.toLowerCase() ||
+        lower.includes(m.toLowerCase()) ||
+        m.toLowerCase().includes(lower),
+    );
+  if (isGemini) {
+    return process.env.GOOGLE_VERTEX_GLOBAL_LOCATION || "global";
+  }
+  return fallback;
+};
+
+/**
+ * Backwards-compatible internal alias kept so existing call sites compile
+ * unchanged. New code should call `resolveVertexLocation` directly.
+ */
+const resolveVertexRegionForModel = resolveVertexLocation;
+
+const getDefaultVertexModel = (): string => {
+  // Use gemini-2.5-flash as default - latest and best price-performance model
+  // Override with VERTEX_MODEL environment variable if needed
+  return process.env.VERTEX_MODEL || "gemini-2.5-flash";
+};
+
+const hasGoogleCredentials = (): boolean => {
+  return !!(
+    process.env.GOOGLE_APPLICATION_CREDENTIALS_NEUROLINK ||
+    process.env.GOOGLE_APPLICATION_CREDENTIALS ||
+    process.env.GOOGLE_SERVICE_ACCOUNT_KEY ||
+    (process.env.GOOGLE_AUTH_CLIENT_EMAIL &&
+      process.env.GOOGLE_AUTH_PRIVATE_KEY)
+  );
+};
+
+// Create Anthropic-specific Vertex settings for native @anthropic-ai/vertex-sdk
+const createVertexAnthropicSettings = async (
+  region?: string,
+  timeoutMs?: number,
+  direct?: { apiKey: string; projectId?: string },
+  baseURL?: string,
+): Promise<AnthropicVertexSettings> => {
+  const location = region || getVertexLocation();
+  // Express-style auth carries its own credentials, so the ADC-derived project
+  // is neither available nor needed; asking for it would throw before the
+  // request is ever built. It cannot be EMPTY either — the SDK rejects a
+  // falsy projectId outright ("No projectId was given and it could not be
+  // resolved from credentials") — so a configured project is used when there
+  // is one and a placeholder stands in otherwise. The value only ever appears
+  // in the request path, which an endpoint reached this way is expected to
+  // route on its own.
+  const project = direct
+    ? direct.projectId?.trim() || "express"
+    : getVertexProjectId();
+
+  return {
+    projectId: project,
+    region: location,
+    ...(timeoutMs !== undefined && { timeout: timeoutMs }),
+    // The SDK's built-in retry honors Retry-After hints without any upper
+    // bound (a 429 with retry-after: 8549 sleeps 2.4h per retry, invisible
+    // to fallback orchestration). Retries are the orchestrator's job.
+    maxRetries: 0,
+    // Outside the express branch too: an endpoint override is about WHERE the
+    // request goes, not how it is authenticated, so a caller using ADC against
+    // a gateway needs it just as much.
+    ...(baseURL ? { baseURL } : {}),
+    ...(direct
+      ? {
+          // The token goes on the request directly. `accessToken` on the SDK's
+          // own options looks like it should do this and does not — the client
+          // stores it and never reads it for auth, so prepareOptions() still
+          // awaits Application Default Credentials and the call fails with a
+          // credentials error that names nothing useful. `authClient` is the
+          // option the SDK actually consults.
+          authClient: {
+            getRequestHeaders: async () => ({
+              Authorization: `Bearer ${direct.apiKey}`,
+            }),
+            projectId: null,
+          },
+        }
+      : {}),
+  };
+};
+
+// Helper function to determine if a model is an Anthropic model
+const isAnthropicModel = (modelName: string): boolean => {
+  return modelName.toLowerCase().includes("claude");
+};
+
+/**
+ * Bridge a native Vertex stream loop's chunk iterable into a V3
+ * `ReadableStream`, so `wrapLanguageModel`'s `doStream` can drive it through
+ * the middleware chain. Lazy and pull-based — one native chunk in, one V3
+ * part out per `pull()` — because the native Anthropic loop
+ * (`executeNativeAnthropicStream`) is genuinely live: it returns its
+ * `StreamResult` while a background loop is still generating, with
+ * `usage`/`finishReason` as getters that settle only once the loop's
+ * channel closes. Eagerly draining the source here would silently turn that
+ * real-time stream into collect-then-replay. The Gemini3 loop's chunks are
+ * already fully resolved by the time this runs, so the same lazy pull is
+ * just as correct there — it has nothing left to wait on.
+ *
+ * Mirrors `chunksToV3Stream` in `openaiChatCompletionsBase.ts`, which is not
+ * exported, hence a local copy adapted to the native `{content, reasoning?}`
+ * chunk shape instead of `OpenAICompatStreamChunk`.
+ *
+ * `cancel()` releases the native iterator without awaiting it
+ * (`releaseIterator`), and the not-awaiting is what matters. The native
+ * `source` is `createStreamChannel`'s single-flight generator: `.return()`
+ * called while a `.next()` is in flight is queued behind it and only runs once
+ * that pending `.next()` settles (the next upstream frame, or the loop's own
+ * turn clock). A `ReadableStream` with the default `highWaterMark` calls
+ * `pull()` ahead of demand, so a `.next()` is routinely outstanding when the
+ * consumer breaks. Awaiting `iterator.return()` here would hold open
+ * `v3StreamToNativeChunks`'s `reader.cancel()`, and with it the `for await`
+ * exit inside `BaseProvider`'s lifecycle wrapper, whose `finally` is what runs
+ * `teardown()` — the abort of the call's own signal that actually releases the
+ * upstream connection. A held-open upstream would then keep the consumer's
+ * `break` parked until a frame or the turn clock arrived. Releasing without
+ * waiting lets `teardown()` run at once; the queued `.return()` then completes
+ * by itself once that abort settles the pending `.next()`.
+ */
+const nativeChunksToV3Stream = (
+  source: StreamResult["stream"],
+  completion: () => LanguageModelV3StreamPart,
+): ReadableStream<LanguageModelV3StreamPart> => {
+  const iterator = source[Symbol.asyncIterator]();
+  return new ReadableStream<LanguageModelV3StreamPart>({
+    async pull(controller) {
+      try {
+        const next = await iterator.next();
+        if (next.done) {
+          controller.enqueue(completion());
+          controller.close();
+          return;
+        }
+        const chunk = next.value;
+        if ("content" in chunk && typeof chunk.content === "string") {
+          if (
+            "reasoning" in chunk &&
+            typeof chunk.reasoning === "string" &&
+            chunk.reasoning.length > 0
+          ) {
+            controller.enqueue({
+              type: "reasoning-delta",
+              delta: chunk.reasoning,
+            });
+          }
+          if (chunk.content.length > 0) {
+            controller.enqueue({ type: "text-delta", delta: chunk.content });
+          }
+        }
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    cancel() {
+      releaseIterator(iterator);
+    },
+  });
+};
+
+/**
+ * Drain a V3 `ReadableStream` (the middleware-wrapped native stream) back
+ * into the `{content, reasoning?}` chunk shape `StreamResult.stream`
+ * callers already iterate. `onFinish` captures the terminal `finish` part
+ * instead of yielding it — native chunk consumers have never seen a
+ * finish-shaped chunk and don't expect one.
+ *
+ * Mirrors `v3StreamToChunks` in `openaiChatCompletionsBase.ts` (also not
+ * exported).
+ */
+async function* v3StreamToNativeChunks(
+  stream: ReadableStream<LanguageModelV3StreamPart>,
+  onFinish: (
+    part: Extract<LanguageModelV3StreamPart, { type: "finish" }>,
+  ) => void,
+): AsyncGenerator<{ content: string; reasoning?: string }> {
+  const reader = stream.getReader();
+  let done = false;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) {
+        done = true;
+        return;
+      }
+      const part = next.value;
+      if (part.type === "text-delta") {
+        yield { content: part.delta };
+      } else if (part.type === "reasoning-delta") {
+        yield { content: "", reasoning: part.delta };
+      } else if (part.type === "finish") {
+        onFinish(part);
+      } else if (part.type === "error") {
+        throw part.error;
+      }
+    }
+  } finally {
+    try {
+      if (!done) {
+        await reader.cancel();
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+}
+
+/**
+ * Google Vertex AI Provider v2 - BaseProvider Implementation
+ *
+ * Features:
+ * - Extends BaseProvider for shared functionality
+ * - Preserves existing Google Cloud authentication
+ * - Maintains Anthropic model support via dynamic imports
+ * - Fresh model creation for each request
+ * - Enhanced error handling with setup guidance
+ * - Tool registration and context management
+ *
+ * @important Tools + Schema Support (Fixed)
+ * Gemini models on Vertex AI now support combining function calling (tools) with
+ * structured output (JSON schema) simultaneously. The fix works by NOT setting
+ * `responseMimeType: "application/json"` when tools are present, which was
+ * causing the Google API error.
+ *
+ * The `responseSchema` is still set to guide the output structure, allowing
+ * tools to execute AND the final output to follow the schema format.
+ *
+ * @example Gemini models with tools + schemas
+ * ```typescript
+ * const provider = new GoogleVertexProvider("gemini-2.5-flash");
+ * const result = await provider.generate({
+ *   input: { text: "Analyze data using tools" },
+ *   schema: MySchema,
+ *   output: { format: "json" },
+ *   // No need for disableTools: true anymore!
+ * });
+ * ```
+ *
+ * @example Claude models (always supported both)
+ * ```typescript
+ * const provider = new GoogleVertexProvider("claude-3-5-sonnet-20241022");
+ * const result = await provider.generate({
+ *   input: { text: "Analyze data" },
+ *   schema: MySchema,
+ *   output: { format: "json" }
+ * });
+ * ```
+ *
+ * @note "Too many states for serving" errors can still occur with very complex schemas + tools.
+ *       Solution: Simplify schema or reduce number of tools if this occurs.
+ * @see https://cloud.google.com/vertex-ai/docs/generative-ai/learn/models
+ */
+
+/** Byte budget above which an old tool response is previewed, not kept whole. */
+const TOOL_RESPONSE_PREVIEW_BYTES = 2048;
+
+/**
+ * Reclaim context from a Gemini-shaped loop history IN PLACE.
+ *
+ * Returns true when something was actually reclaimed, which tells the caller
+ * it is safe to continue the loop instead of stopping. Mutates `contents` so
+ * the caller's array identity (captured by the request builder) stays valid.
+ */
+function reclaimVertexLoopContext(
+  contents: Array<{ role: string; parts: VertexNativeLoopPart[] }>,
+  modelName: string,
+  observedPromptTokens: number,
+): boolean {
+  const plan = planGeminiLoopReclaim({
+    contents,
+    // The usable INPUT budget, not the whole window: the window has to hold the
+    // model's output too, and the AI Studio twin already reclaims against this
+    // same definition.
+    availableInputTokens: getAvailableInputTokens("vertex", modelName),
+    provider: "vertex",
+    observedPromptTokens,
+  });
+  if (!plan) {
+    return false;
+  }
+
+  const dropSet = new Set(plan.drop);
+  const truncateSet = new Set(plan.truncate);
+  const rebuilt: Array<{ role: string; parts: VertexNativeLoopPart[] }> = [];
+  for (let i = 0; i < contents.length; i++) {
+    if (dropSet.has(i)) {
+      continue;
+    }
+    const content = contents[i];
+    if (truncateSet.has(i) && Array.isArray(content.parts)) {
+      rebuilt.push({
+        ...content,
+        parts: content.parts.map((part): VertexNativeLoopPart => {
+          if (!("functionResponse" in part)) {
+            return part;
+          }
+          const fn = part.functionResponse;
+          const text = JSON.stringify(fn.response) ?? "";
+          if (text.length <= TOOL_RESPONSE_PREVIEW_BYTES) {
+            return part;
+          }
+          // Rebuilt rather than cast: `functionResponse` requires `name`, and
+          // Critical Rule 14 forbids casting through `unknown` to paper over it.
+          return {
+            functionResponse: {
+              name: fn.name,
+              response: { result: previewGeminiToolResponseText(text) },
+            },
+          };
+        }),
+      });
+      continue;
+    }
+    rebuilt.push(content);
+  }
+
+  if (dropSet.size > 0) {
+    // Gemini requires the history to start with a user turn; the note is
+    // inserted before the first surviving tool turn, never at the end where a
+    // "history was removed" cue would follow the content it refers to.
+    let noteIndex = rebuilt.findIndex(
+      (c) =>
+        Array.isArray(c.parts) &&
+        c.parts.some(
+          (part) =>
+            !!(part as { functionCall?: unknown }).functionCall ||
+            !!(part as { functionResponse?: unknown }).functionResponse,
+        ),
+    );
+    if (noteIndex < 0) {
+      noteIndex = Math.min(1, rebuilt.length);
+    }
+    rebuilt.splice(noteIndex, 0, {
+      role: "user",
+      parts: [{ text: GEMINI_ELISION_NOTE } as VertexNativeLoopPart],
+    });
+  }
+
+  contents.length = 0;
+  contents.push(...rebuilt);
+  return true;
+}
+
+/**
+ * Reclaim context from a Vertex+Claude loop history IN PLACE.
+ *
+ * Same parity upgrade as the Gemini path, but this loop carries Anthropic
+ * content blocks, so it reuses the Anthropic adapter. Returns true when
+ * something was reclaimed and the loop may continue.
+ */
+function reclaimVertexAnthropicContext(
+  messages: VertexAnthropicMessage[],
+  modelName: string,
+  observedPromptTokens: number,
+): boolean {
+  const plan = planAnthropicLoopReclaim({
+    conversation: messages,
+    // Usable input budget, matching the Gemini twin above.
+    availableInputTokens: getAvailableInputTokens("vertex", modelName),
+    fixedOverheadTokens: 0,
+    provider: "vertex",
+    observedPromptTokens,
+    // This loop plans only when its context guard trips, so the count it hands
+    // over is the guard's projection for the request about to be sent, not a
+    // previous request's total. Without saying so the planner has no
+    // denominator, calibration stays pinned at 1, and the reclaim is inert:
+    // the guard fires on real tokens at the same ratio the planner tests its
+    // smaller char estimate against, so the plan never fires and the turn stops
+    // instead of continuing.
+    observedDescribesCurrentPayload: true,
+  });
+  if (!plan) {
+    return false;
+  }
+  const dropSet = new Set(plan.drop);
+  const truncateSet = new Set(plan.truncate);
+  const rebuilt: VertexAnthropicMessage[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    if (dropSet.has(i)) {
+      continue;
+    }
+    const message = messages[i];
+    if (truncateSet.has(i) && Array.isArray(message.content)) {
+      rebuilt.push({
+        ...message,
+        content: message.content.map((block) => {
+          if (block.type !== "tool_result") {
+            return block;
+          }
+          const text =
+            typeof block.content === "string"
+              ? block.content
+              : (JSON.stringify(block.content) ?? "");
+          return { ...block, content: previewAnthropicToolResultText(text) };
+        }),
+      });
+      continue;
+    }
+    rebuilt.push(message);
+  }
+  if (dropSet.size > 0) {
+    let noteIndex = rebuilt.findIndex(
+      (m) =>
+        Array.isArray(m.content) &&
+        m.content.some(
+          (b) => b.type === "tool_use" || b.type === "tool_result",
+        ),
+    );
+    if (noteIndex < 0) {
+      noteIndex = Math.min(1, rebuilt.length);
+    }
+    rebuilt.splice(noteIndex, 0, {
+      role: "user",
+      content: [{ type: "text", text: ANTHROPIC_ELISION_NOTE }],
+    });
+  }
+  messages.length = 0;
+  messages.push(...rebuilt);
+  return true;
+}
+
+/**
+ * Fold one Vertex Gemini step's stream into the shape the loop engine reports.
+ *
+ * Lifted from the inline drain in executeNativeGemini3Stream so the loop can
+ * later be handed to createGeminiLoopAdapter as `collectStep`. Vertex does not
+ * share googleNativeGemini3's collector: it reads parts straight off each
+ * candidate — avoiding the SDK warning that `chunk.text` raises when
+ * thoughtSignature or functionCall parts are present — and that behaviour is
+ * characterized.
+ *
+ * `onUsageDelta` fires PER CHUNK and is not an optimisation to fold away. The
+ * drain updates the turn totals incrementally so they are correct at every
+ * point mid-stream: a step killed by an abort, the turn deadline or the stall
+ * watchdog still bills the tokens it already reported. Returning a step total
+ * for the caller to add would be arithmetically identical and operationally
+ * wrong, because a killed step never returns.
+ */
+async function collectVertexStreamChunks(
+  stream: AsyncIterable<{
+    functionCalls?: NativeFunctionCall[];
+    [key: string]: unknown;
+  }>,
+  channel: { push(chunk: { content: string }): void },
+  hooks: {
+    onProgress?: () => void;
+    onUsage?: (inputTokens: number, outputTokens: number) => void;
+    onUsageDelta?: (counter: VertexUsageCounter, delta: number) => void;
+  } = {},
+): Promise<CollectedChunkResult> {
+  const rawResponseParts: unknown[] = [];
+  const stepFunctionCalls: NativeFunctionCall[] = [];
+  let lastFinishReason: string | undefined;
+  let stepInputTokens = 0;
+  let stepOutputTokens = 0;
+  let stepCacheReadTokens = 0;
+  let stepReasoningTokens = 0;
+
+  for await (const chunk of stream) {
+    hooks.onProgress?.();
+    // Extract raw parts from candidates FIRST
+    // This avoids using chunk.text which triggers SDK warning when
+    // non-text parts (thoughtSignature, functionCall) are present
+    const chunkRecord = chunk as Record<string, unknown>;
+    const candidates = chunkRecord.candidates as
+      | Array<Record<string, unknown>>
+      | undefined;
+    const firstCandidate = candidates?.[0];
+    // Capture the SDK finish reason (Bug 2: previously dropped). Last
+    // non-empty value across chunks wins.
+    const chunkFinishReason = firstCandidate?.finishReason;
+    if (typeof chunkFinishReason === "string" && chunkFinishReason) {
+      lastFinishReason = chunkFinishReason;
+    }
+    const chunkContent = firstCandidate?.content as
+      | Record<string, unknown>
+      | undefined;
+    if (chunkContent && Array.isArray(chunkContent.parts)) {
+      for (const part of chunkContent.parts as Array<Record<string, unknown>>) {
+        rawResponseParts.push(part);
+        if (typeof part.text === "string" && part.text.length > 0) {
+          channel.push({ content: part.text });
+        }
+      }
+    }
+    if (chunk.functionCalls) {
+      stepFunctionCalls.push(...chunk.functionCalls);
+    }
+
+    // Extract usage metadata from chunk
+    // promptTokenCount is typically in the final chunk, candidatesTokenCount accumulates
+    const usageMetadata = chunkRecord.usageMetadata as
+      | {
+          promptTokenCount?: number;
+          candidatesTokenCount?: number;
+          cachedContentTokenCount?: number;
+          thoughtsTokenCount?: number;
+          totalTokenCount?: number;
+        }
+      | undefined;
+    if (usageMetadata) {
+      // Take the latest promptTokenCount (usually only in final chunk)
+      if (
+        usageMetadata.promptTokenCount !== undefined &&
+        usageMetadata.promptTokenCount > 0
+      ) {
+        hooks.onUsageDelta?.(
+          "input",
+          usageMetadata.promptTokenCount - stepInputTokens,
+        );
+        stepInputTokens = usageMetadata.promptTokenCount;
+        // Feed the context guard the REAL prompt size of this call.
+        hooks.onUsage?.(
+          usageMetadata.promptTokenCount,
+          usageMetadata.candidatesTokenCount ?? 0,
+        );
+        // cachedContentTokenCount is OVERLAPPING (a subset already inside
+        // promptTokenCount). Clamp to the prompt count so an uncached
+        // step reports 0 instead of a stale cached value.
+        const chunkCacheReadTokens = Math.min(
+          usageMetadata.cachedContentTokenCount ?? 0,
+          usageMetadata.promptTokenCount,
+        );
+        hooks.onUsageDelta?.(
+          "cacheRead",
+          chunkCacheReadTokens - stepCacheReadTokens,
+        );
+        stepCacheReadTokens = chunkCacheReadTokens;
+      }
+      // Take the latest candidatesTokenCount (accumulates through chunks)
+      if (
+        usageMetadata.candidatesTokenCount !== undefined &&
+        usageMetadata.candidatesTokenCount > 0
+      ) {
+        hooks.onUsageDelta?.(
+          "output",
+          usageMetadata.candidatesTokenCount - stepOutputTokens,
+        );
+        stepOutputTokens = usageMetadata.candidatesTokenCount;
+      }
+      // thoughtsTokenCount (thinking tokens, billed at the output
+      // rate) is NOT part of candidatesTokenCount — Gemini reports
+      // totalTokenCount = prompt + candidates + thoughts.
+      if (
+        usageMetadata.thoughtsTokenCount !== undefined &&
+        usageMetadata.thoughtsTokenCount > 0
+      ) {
+        hooks.onUsageDelta?.(
+          "reasoning",
+          usageMetadata.thoughtsTokenCount - stepReasoningTokens,
+        );
+        stepReasoningTokens = usageMetadata.thoughtsTokenCount;
+      }
+    }
+  }
+
+  return {
+    rawResponseParts,
+    stepFunctionCalls,
+    ...(lastFinishReason ? { finishReason: lastFinishReason } : {}),
+    inputTokens: stepInputTokens,
+    outputTokens: stepOutputTokens,
+    ...(stepCacheReadTokens ? { cacheReadTokens: stepCacheReadTokens } : {}),
+    ...(stepReasoningTokens ? { reasoningTokens: stepReasoningTokens } : {}),
+  };
+}
+
+/**
+ * The answer text of an unforced finalization reply. Text that leads into a
+ * further tool call is preamble, not an answer, so a reply still asking for a
+ * tool yields none.
+ */
+function finalizationAnswerText(
+  content: VertexAnthropicContentBlock[],
+): string {
+  if (content.some((block) => block.type === "tool_use")) {
+    return "";
+  }
+  return content
+    .filter(
+      (block): block is { type: "text"; text: string } => block.type === "text",
+    )
+    .map((b) => b.text)
+    .join("");
+}
+
+export class GoogleVertexProvider extends BaseProvider {
+  private projectId: string;
+  private location: string;
+  /**
+   * Vertex AI Express Mode credentials.
+   *
+   * Vertex supports two authentication modes. The long-standing one pairs a
+   * project and location with Application Default Credentials, which makes
+   * the SDK mint an OAuth token through google-auth-library before every
+   * request. Express Mode instead authenticates with an API key alone.
+   *
+   * Express is used only when an apiKey is supplied WITHOUT an explicit
+   * project or location, so existing ADC callers — including those already
+   * passing an apiKey alongside a project — keep exactly the behaviour they
+   * have today.
+   */
+  private expressApiKey?: string;
+  /**
+   * Optional endpoint override, mirroring AI Studio's
+   * `credentials.googleAiStudio.baseURL`: per-request credential first, then
+   * the environment, then unset so the SDK applies its own default. Blank
+   * values count as unset so an empty override cannot clobber that default.
+   */
+  private baseURL?: string;
+  private registeredTools: Map<
+    string,
+    {
+      description: string;
+      parameters: ZodType<unknown>;
+      execute: (params: Record<string, unknown>) => Promise<unknown>;
+    }
+  > = new Map();
+  private toolContext: Record<string, unknown> = {};
+
+  // Memory-managed cache for model configuration lookups to avoid repeated calls
+  // Uses WeakMap for automatic cleanup and bounded LRU for recently used models
+  private static modelConfigCache: Map<string, unknown> = new Map();
+  private static modelConfigCacheTime = 0;
+  private static readonly CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+  private static readonly MAX_CACHE_SIZE = 50; // Prevent memory leaks by limiting cache size
+
+  // Memory-managed cache for maxTokens handling decisions to optimize streaming performance
+  private static maxTokensCache: Map<string, boolean> = new Map();
+  private static maxTokensCacheTime = 0;
+
+  constructor(
+    modelName?: string,
+    _providerName?: string,
+    sdk?: unknown,
+    region?: string,
+    credentials?: Record<string, unknown>,
+  ) {
+    super(modelName, "vertex" as AIProviderName, sdk as NeuroLink | undefined);
+
+    // Apply per-request credentials if provided
+    if (credentials) {
+      if (credentials.projectId) {
+        process.env.GOOGLE_CLOUD_PROJECT = String(credentials.projectId);
+      }
+      if (credentials.location) {
+        process.env.GOOGLE_CLOUD_LOCATION = String(credentials.location);
+      }
+      if (credentials.apiKey) {
+        process.env.GOOGLE_API_KEY = String(credentials.apiKey);
+        // Express Mode only when the caller gave a key and NOTHING else to
+        // authenticate with. An apiKey passed next to a project is the
+        // pre-existing combination and must keep resolving through ADC.
+        if (!credentials.projectId && !credentials.location) {
+          this.expressApiKey = String(credentials.apiKey);
+        }
+      }
+      if (credentials.baseURL) {
+        this.baseURL = String(credentials.baseURL);
+      }
+    }
+
+    // Express Mode authenticates with the key alone, so neither the ADC
+    // credential check nor project resolution applies. Both THROW when
+    // nothing is configured, which would fail an apiKey-only request before
+    // the Express client is ever built — and would do so only on machines
+    // without an ambient project, which is exactly where Express is the point.
+    const usingExpress = Boolean(this.resolveExpressApiKey());
+
+    if (!usingExpress) {
+      // Validate Google Cloud credentials - now using consolidated utility
+      if (!hasGoogleCredentials()) {
+        validateApiKey(createGoogleAuthConfig());
+      }
+    }
+
+    // Initialize Google Cloud configuration
+    this.projectId =
+      (credentials?.projectId as string) ||
+      (usingExpress ? "" : getVertexProjectId());
+    this.location =
+      region || (credentials?.location as string) || getVertexLocation();
+
+    logger.debug("[GoogleVertexProvider] Constructor initialized", {
+      regionParam: region,
+      resolvedLocation: this.location,
+      projectId: this.projectId,
+    });
+
+    logger.debug("Google Vertex AI BaseProvider v2 initialized", {
+      modelName: this.modelName,
+      projectId: this.projectId,
+      location: this.location,
+      provider: this.providerName,
+    });
+  }
+
+  protected getProviderName(): AIProviderName {
+    return "vertex" as AIProviderName;
+  }
+
+  protected getDefaultModel(): string {
+    return getDefaultVertexModel();
+  }
+
+  /**
+   * Returns the Vercel AI SDK model instance for Google Vertex
+   * Creates fresh model instances for each request
+   */
+  protected async getAISDKModel(): Promise<LanguageModel> {
+    // This method is no longer used - we route ALL models directly to native SDKs
+    // in executeStream and generate methods. Throwing an error to catch any
+    // unexpected code paths that might try to use the old Vercel AI SDK approach.
+    throw new NeuroLinkError({
+      code: ERROR_CODES.INVALID_CONFIGURATION,
+      message:
+        "GoogleVertexProvider no longer uses @ai-sdk/google-vertex. All models use native SDKs: @google/genai for Gemini, @anthropic-ai/vertex-sdk for Claude.",
+      category: ErrorCategory.CONFIGURATION,
+      severity: ErrorSeverity.CRITICAL,
+      retriable: false,
+      context: { provider: this.providerName, model: this.modelName },
+    });
+  }
+
+  // executeGenerate removed - BaseProvider handles all generation with tools
+
+  /**
+   * Validate stream options
+   */
+  private validateStreamOptionsOnly(options: StreamOptions): void {
+    this.validateStreamOptions(options);
+  }
+
+  /**
+   * Preprocess file input before routing to the native SDKs.
+   *
+   * BaseProvider runs this via `buildMultimodalMessagesArray`, but Vertex
+   * overrides both `generate()` and `executeStream()` to reach the native
+   * @google/genai / @anthropic-ai/vertex-sdk clients directly, so neither
+   * inherits it. Without this the file content never reaches the model and
+   * the reply is an entirely plausible "no document is attached" — a silent
+   * wrong answer rather than an error.
+   *
+   * #1258: only `generate()` used to call this, so the same document that
+   * `generate()` read back correctly came back as "no documents attached"
+   * through `stream()`. Sharing one method is what keeps the two paths from
+   * drifting apart again.
+   *
+   * #1259: the alias fold has to happen *before* the `files` check, or
+   * requests carrying only `audioFiles`/`videoFiles` look empty here and skip
+   * preprocessing entirely.
+   */
+  private async preprocessNativeFileInput(
+    options: TextGenerationOptions | StreamOptions,
+  ): Promise<void> {
+    if (options.input) {
+      mergeMediaFileAliases(options.input);
+    }
+    if (options.input?.files?.length) {
+      try {
+        // Mutates options.input.text / .images / .pdfFiles in place.
+        await processUnifiedFilesArray(
+          options as Parameters<typeof processUnifiedFilesArray>[0],
+          100 * 1024 * 1024,
+          this.providerName,
+        );
+      } catch (fileError) {
+        logger.warn(
+          `[GoogleVertex] processUnifiedFilesArray threw, continuing without file content: ${fileError instanceof Error ? fileError.message : String(fileError)}`,
+        );
+      }
+    }
+    // Runs even without input.files: a caller can populate input.images
+    // directly, and this native path never reaches the shared multimodal
+    // builder that would otherwise normalize the formats.
+    await normalizeVisionImageFormats(options.input);
+  }
+
+  protected async executeStream(
+    options: StreamOptions,
+    _analysisSchema?: ZodType<unknown> | Schema<unknown>,
+  ): Promise<StreamResult> {
+    // ALL models now use native SDKs - no more @ai-sdk/google-vertex dependency
+    const modelName =
+      options.model || this.modelName || getDefaultVertexModel();
+
+    // Wrap the native stream path in a `neurolink.provider.stream` span so
+    // the test:tracing observability harness sees the same span hierarchy
+    // it sees for AI Studio. BaseProvider.stream does NOT emit this span
+    // for any provider — each native provider has to add it itself.
+    return withClientStreamSpan(
+      {
+        name: "provider.stream",
+        tracer: tracers.provider,
+        detached: true,
+        rootWhenOrphaned: true,
+        attributes: {
+          [ATTR.NL_MODEL]: modelName,
+          [ATTR.NL_PROVIDER]: this.providerName,
+        },
+      },
+      async () => {
+        const streamStartTime = Date.now();
+
+        // Tool filter (a0269210): trust options.tools — caller (BaseProvider.stream)
+        // already merged MCP/built-in tools and applied any enabledToolNames filter.
+        const optionTools = options.tools || {};
+
+        // #1258: stream() must run the same file preprocessing generate()
+        // does, or attached files are dropped on this path alone.
+        await this.preprocessNativeFileInput(options);
+
+        // Emit a `neurolink.message.build` span for the native stream path
+        // so observability tooling sees the same hierarchy it sees on
+        // Pipeline A. Without this, test:tracing's "Message Build Span"
+        // assertion has to skip on every native-Vertex stream.
+        const processedOptions = await withSpan(
+          {
+            name: "message.build",
+            tracer: tracers.provider,
+            attributes: {
+              [ATTR.NL_PROVIDER]: this.providerName,
+              "message.count": 1,
+              "message.build.count": 1,
+              "message.build.path": "vertex.native.stream",
+            },
+          },
+          async () => this.processCSVFilesForNativeSDK(options),
+        );
+
+        // Pass through to native SDK path
+        const mergedOptions = {
+          ...processedOptions,
+          tools: optionTools,
+        };
+
+        // Captured up-front (mirrors generate()'s inputPrompt) so the
+        // failure branch below can label a `generation:end` it emits before
+        // any content exists.
+        const inputPrompt =
+          (mergedOptions.input as { text?: string } | undefined)?.text ||
+          (mergedOptions as { prompt?: string }).prompt ||
+          "";
+
+        try {
+          // Route Claude models to native Anthropic SDK
+          let result: StreamResult;
+          if (isAnthropicModel(modelName)) {
+            logger.info(
+              "[GoogleVertex] Routing Claude model to native @anthropic-ai/vertex-sdk",
+              {
+                model: modelName,
+                totalToolCount: Object.keys(optionTools).length,
+              },
+            );
+            result = await this.runNativeStreamWithMiddleware(
+              mergedOptions,
+              modelName,
+              (effectiveOptions) =>
+                this.executeNativeAnthropicStream(effectiveOptions),
+            );
+          } else {
+            // ALL Gemini models use native @google/genai SDK
+            logger.info(
+              "[GoogleVertex] Routing Gemini model to native @google/genai",
+              {
+                model: modelName,
+                totalToolCount: Object.keys(optionTools).length,
+              },
+            );
+            result = await this.runNativeStreamWithMiddleware(
+              mergedOptions,
+              modelName,
+              (effectiveOptions) =>
+                this.executeNativeGemini3Stream(effectiveOptions),
+            );
+          }
+          // Wrap the result's async iterable to fire onChunk / onFinish
+          // lifecycle callbacks. Pipeline A gets these via the AI SDK
+          // wrapStream middleware; the native path has to fire them here.
+          const wrappedResult = this.wrapStreamResultWithLifecycle(
+            options,
+            result,
+            streamStartTime,
+          );
+          this.emitStreamEnd(
+            modelName,
+            streamStartTime,
+            true,
+            undefined,
+            result.finishReason,
+          );
+          return wrappedResult;
+        } catch (error) {
+          this.fireGenerateOnError(options, error, streamStartTime);
+          this.emitStreamEnd(modelName, streamStartTime, false, error);
+          // Unlike Google AI Studio's native stream, Vertex's turn loop is
+          // awaited to completion INSIDE executeNativeGemini3Stream /
+          // executeNativeAnthropicStream before this method ever returns a
+          // StreamResult — a first-call failure (e.g. a 500 on the initial
+          // request) rejects here, before the generic per-stream dedup
+          // machinery in NeuroLink.stream() (which only wraps an already
+          // -returned stream) ever runs. Without this call a failed Vertex
+          // stream reported zero `generation:end` events instead of one:
+          // `emitStreamEnd` above only ever emits `stream:end`, a different
+          // event Pipeline B and analytics don't listen for.
+          this.emitGenerationEnd(
+            modelName,
+            null,
+            streamStartTime,
+            false,
+            error,
+            inputPrompt,
+          );
+          throw error;
+        }
+      },
+      (r) => r.stream,
+      // Preserve live getters (finishReason/structuredOutput/…) that the
+      // spread would otherwise snapshot before the background loop resolves.
+      (r, wrapped) =>
+        this.preserveStreamResultAccessors(r, { ...r, stream: wrapped }),
+    );
+  }
+
+  /**
+   * Emit `stream:end` so the Pipeline B observability listener creates a
+   * `model.generation` span for native Vertex stream traffic. Mirrors
+   * `emitGenerationEnd` (used by `generate()`).
+   */
+  private emitStreamEnd(
+    modelName: string,
+    startTime: number,
+    success: boolean,
+    error?: unknown,
+    resolvedFinishReason?: string,
+  ): void {
+    const emitter = this.neurolink?.getEventEmitter();
+    if (!emitter) {
+      return;
+    }
+    emitter.emit("stream:end", {
+      provider: this.providerName,
+      responseTime: Date.now() - startTime,
+      timestamp: Date.now(),
+      result: {
+        content: "",
+        usage: { input: 0, output: 0, total: 0 },
+        model: modelName,
+        provider: this.providerName,
+        finishReason: success ? (resolvedFinishReason ?? "stop") : "error",
+      },
+      success,
+      ...(error
+        ? { error: error instanceof Error ? error.message : String(error) }
+        : {}),
+    });
+  }
+
+  /**
+   * Create @google/genai client configured for Vertex AI
+   */
+  private async createVertexGenAIClient(
+    regionOverride?: string,
+  ): Promise<GenAIClient> {
+    const expressApiKey = this.resolveExpressApiKey();
+    // Resolved only on the ADC path, and from the per-instance projectId the
+    // constructor already settled (credentials.projectId if supplied, else
+    // the same ambient getVertexProjectId() fallback) — not re-read from
+    // ambient env here, or a per-request projectId override would be built
+    // into the client with the wrong project while call sites elsewhere
+    // (generateContent's `project:` param) correctly used this.projectId.
+    const project = expressApiKey ? "" : this.projectId;
+    const location = regionOverride || this.location || getVertexLocation();
+
+    const mod: unknown = await import("@google/genai");
+    const ctor = (mod as Record<string, unknown>).GoogleGenAI as unknown;
+    if (!ctor) {
+      throw new NeuroLinkError({
+        code: ERROR_CODES.INVALID_CONFIGURATION,
+        message: "@google/genai does not export GoogleGenAI",
+        category: ErrorCategory.CONFIGURATION,
+        severity: ErrorSeverity.CRITICAL,
+        retriable: false,
+        context: { module: "@google/genai", expectedExport: "GoogleGenAI" },
+      });
+    }
+
+    const Ctor = ctor as GoogleGenAIClass;
+
+    const baseUrl = this.resolveBaseURL();
+    const httpOptions = {
+      // The endpoint override and, when a proxy is configured, the
+      // proxy-aware fetch the SDK sends its requests through.
+      //
+      // baseUrl is only set when resolved: the SDK falls back to its own
+      // default whenever httpOptions.baseUrl is undefined, so omitting the key
+      // and passing undefined behave identically.
+      ...(baseUrl ? { baseUrl } : {}),
+      ...googleSdkProxyHttpOptions(),
+    };
+
+    if (expressApiKey) {
+      // Express Mode: an API key replaces project/location entirely. Passing
+      // them alongside the key would defeat it — the SDK prefers
+      // project/location and falls back to ADC, which is the very thing
+      // Express exists to avoid.
+      return new Ctor({
+        vertexai: true,
+        apiKey: expressApiKey,
+        httpOptions,
+      });
+    }
+
+    // Project/location mode, authenticating through ADC.
+    return new Ctor({
+      vertexai: true,
+      project,
+      location,
+      httpOptions,
+    });
+  }
+
+  /** Endpoint override: credential, then environment, then unset. */
+  private resolveBaseURL(): string | undefined {
+    const resolved =
+      this.baseURL?.trim() || process.env.GOOGLE_VERTEX_BASE_URL?.trim();
+    return resolved && resolved.length > 0 ? resolved : undefined;
+  }
+
+  /**
+   * Express Mode key, if this provider should use it.
+   *
+   * Deliberately NOT read from GOOGLE_API_KEY: that variable is already set
+   * by callers who also configure a project, and treating it as an Express
+   * opt-in would silently switch their authentication mode. Express is opted
+   * into per request, or through GOOGLE_VERTEX_API_KEY which exists only for
+   * this purpose.
+   */
+  private resolveExpressApiKey(): string | undefined {
+    // A per-request key already carries its own guard: it is only recorded
+    // when the caller supplied no project and no location.
+    const fromCredentials = this.expressApiKey?.trim();
+    if (fromCredentials) {
+      return fromCredentials;
+    }
+    const fromEnv = process.env.GOOGLE_VERTEX_API_KEY?.trim();
+    if (!fromEnv) {
+      return undefined;
+    }
+    // The environment key gets the same guard. A process that configures a
+    // project has an ADC setup, and letting an ambient key silently switch it
+    // to Express would change how that process authenticates.
+    const projectConfigured = [
+      "GOOGLE_CLOUD_PROJECT_ID",
+      "VERTEX_PROJECT_ID",
+      "GOOGLE_VERTEX_PROJECT",
+      "GOOGLE_CLOUD_PROJECT",
+    ].some((name) => (process.env[name] ?? "").trim().length > 0);
+    return projectConfigured ? undefined : fromEnv;
+  }
+
+  /**
+   * Convert one AI-SDK tool into an Anthropic (Claude-on-Vertex) tool
+   * declaration. Single source for the pre-loop snapshot AND the mid-turn
+   * discovery refresh — Anthropic validates input_schema as JSON Schema
+   * draft 2020-12 and rejects OpenAPI-3 dialect (`nullable: true`), so this
+   * uses the default JSON Schema target, matching the direct anthropic
+   * provider. The Gemini paths keep "openApi3".
+   */
+  private buildAnthropicToolDeclaration(
+    name: string,
+    tool: Tool,
+  ): VertexAnthropicTool {
+    const anthropicTool: VertexAnthropicTool = {
+      name,
+      description: tool.description || `Tool: ${name}`,
+      input_schema: {
+        type: "object",
+      },
+    };
+
+    // Access legacy `parameters` (AI SDK v3/v4) or current `inputSchema` (v6)
+    const legacyTool = tool as ToolWithLegacyParams;
+    const toolParams = legacyTool.parameters || tool.inputSchema;
+    if (toolParams) {
+      const jsonSchema = convertZodToJsonSchema(
+        toolParams as ZodUnknownSchema,
+      ) as Record<string, unknown>;
+      const inlined = inlineJsonSchema(jsonSchema);
+      anthropicTool.input_schema = {
+        type: "object",
+        properties: (inlined.properties as Record<string, unknown>) || {},
+        required: (inlined.required as string[]) || [],
+      };
+    }
+    return anthropicTool;
+  }
+
+  /**
+   * Mid-turn tool sync for the Claude-on-Vertex loops. Claude only calls tools
+   * present in the request's `tools` array, so without this per-step refresh
+   * a tool discovered via search_tools is unreachable for the rest of the
+   * turn. Mutates the array in place (requestParams holds it by reference).
+   */
+  private refreshAnthropicToolDeclarations(
+    liveTools: Record<string, Tool> | undefined,
+    declarations: VertexAnthropicTool[] | undefined,
+    executeMap: DedupExecuteMap,
+    failedTools: Map<string, { count: number; lastError: string }>,
+  ): void {
+    if (!liveTools || !declarations) {
+      return;
+    }
+    const declared = new Set(declarations.map((d) => d.name));
+    for (const [name, tool] of Object.entries(liveTools)) {
+      if (declared.has(name)) {
+        continue;
+      }
+      declarations.push(this.buildAnthropicToolDeclaration(name, tool));
+      if (tool.execute) {
+        executeMap.set(name, tool.execute);
+      }
+      failedTools.delete(name);
+      logger.info(
+        `[GoogleVertex] Tool "${name}" hydrated mid-turn via discovery — added to Anthropic declarations.`,
+      );
+    }
+  }
+
+  /**
+   * Dispatch-miss recovery for the Claude-on-Vertex loops.
+   */
+  private resolveAnthropicToolOnMiss(
+    name: string,
+    liveTools: Record<string, Tool> | undefined,
+    declarations: VertexAnthropicTool[] | undefined,
+    executeMap: DedupExecuteMap,
+    failedTools: Map<string, { count: number; lastError: string }>,
+  ): Tool["execute"] | undefined {
+    if (!declarations) {
+      return undefined;
+    }
+    const tool = resolveLiveTool(liveTools, name);
+    if (!tool?.execute) {
+      return undefined;
+    }
+    if (!declarations.some((d) => d.name === name)) {
+      declarations.push(this.buildAnthropicToolDeclaration(name, tool));
+    }
+    executeMap.set(name, tool.execute);
+    failedTools.delete(name);
+    logger.info(
+      `[GoogleVertex] Tool "${name}" resolved mid-turn via discovery — executing.`,
+    );
+    return executeMap.get(name);
+  }
+
+  /**
+   * Build the synthetic `final_result` tool used to force structured output
+   * on Claude-on-Vertex. Anthropic has no native responseSchema, so a schema
+   * is instead enforced by requiring the model to call this tool with
+   * matching arguments. Single source for the non-streaming and streaming
+   * paths — both previously built this object independently from their own
+   * schema variable, byte-identical apart from that variable's name.
+   */
+  private buildFinalResultTool(schema: ZodUnknownSchema): VertexAnthropicTool {
+    const schemaAsJson = convertZodToJsonSchema(schema) as Record<
+      string,
+      unknown
+    >;
+    const inlinedSchema = inlineJsonSchema(schemaAsJson);
+    if (inlinedSchema.$schema) {
+      delete inlinedSchema.$schema;
+    }
+    const typedSchema = ensureNestedSchemaTypes(inlinedSchema);
+    return {
+      name: "final_result",
+      description:
+        "Return the final structured result. You MUST call this tool when you have gathered all information and are ready to provide the final answer. The arguments should contain the structured data matching the expected schema.",
+      input_schema: {
+        type: "object",
+        properties:
+          (typedSchema.properties as Record<string, unknown>) || typedSchema,
+        required: (typedSchema.required as string[]) || [],
+      },
+    };
+  }
+
+  /**
+   * Execute stream using native @google/genai SDK for Gemini 3 models on Vertex AI
+   * This bypasses @ai-sdk/google-vertex to properly handle thought_signature
+   */
+  private async executeNativeGemini3Stream(
+    options: StreamOptions,
+  ): Promise<StreamResult> {
+    const modelName =
+      options.model || this.modelName || getDefaultVertexModel();
+    const effectiveLocation = resolveVertexRegionForModel(
+      modelName,
+      options.region,
+    );
+    const client = await this.createVertexGenAIClient(effectiveLocation);
+
+    logger.debug("[GoogleVertex] Using native @google/genai for Gemini 3", {
+      model: modelName,
+      hasTools: !!options.tools && Object.keys(options.tools).length > 0,
+      project: this.projectId,
+      location: effectiveLocation,
+    });
+
+    // Build contents from input with multimodal support
+    const contents: Array<{
+      role: string;
+      parts: VertexNativePart[];
+    }> = [];
+
+    // Build user message parts - start with text.
+    // `options.input.text` is `string | undefined` in strict mode; the
+    // VertexNativePart `text` field requires `string`, so coerce to "" if
+    // unset (the multimodal-only path still appends other parts below).
+    const userParts: VertexNativePart[] = [{ text: options.input.text ?? "" }];
+
+    // Add PDF files as inlineData parts if present
+    // Cast input to access multimodal properties that may exist at runtime
+    const multimodalInput = options.input as {
+      text: string;
+      pdfFiles?: Array<Buffer | string>;
+      images?: Array<Buffer | string | ImageWithAltText>;
+      nativeAudioFiles?: MultimodalAudioEntry[];
+      nativeVideoFiles?: MultimodalVideoEntry[];
+    };
+
+    if (multimodalInput?.pdfFiles && multimodalInput.pdfFiles.length > 0) {
+      logger.debug(
+        `[GoogleVertex] Processing ${multimodalInput.pdfFiles.length} PDF file(s) for native stream`,
+      );
+
+      for (const pdfFile of multimodalInput.pdfFiles) {
+        let pdfBuffer: Buffer;
+
+        if (typeof pdfFile === "string") {
+          // Check if it's a file path
+          if (fs.existsSync(pdfFile)) {
+            pdfBuffer = fs.readFileSync(pdfFile);
+          } else {
+            // Assume it's already base64 encoded
+            pdfBuffer = Buffer.from(pdfFile, "base64");
+          }
+        } else {
+          pdfBuffer = pdfFile;
+        }
+
+        // Convert to base64 for the native SDK
+        const base64Data = pdfBuffer.toString("base64");
+        userParts.push({
+          inlineData: {
+            mimeType: "application/pdf",
+            data: base64Data,
+          },
+        });
+      }
+    }
+
+    await appendNativeAudioParts(
+      userParts,
+      multimodalInput?.nativeAudioFiles,
+      "[GoogleVertex]",
+    );
+
+    // Add images as inlineData parts if present
+    if (multimodalInput?.images && multimodalInput.images.length > 0) {
+      logger.debug(
+        `[GoogleVertex] Processing ${multimodalInput.images.length} image(s) for native stream`,
+      );
+
+      for (const rawImage of multimodalInput.images) {
+        // `input.images` accepts `{ data, altText }` as a documented public
+        // shape, but this loop only ever handled Buffer | string — a wrapper
+        // fell through to the "assume raw bytes" branch and base64-encoded the
+        // OBJECT, sending the literal "[object Object]" to Vertex. Unwrap once,
+        // here, so every branch below sees the payload it expects.
+        const image = unwrapImagePayload(rawImage);
+        let imageBuffer: Buffer;
+        let mimeType = "image/jpeg"; // Default
+
+        if (typeof image === "string") {
+          if (fs.existsSync(image)) {
+            imageBuffer = fs.readFileSync(image);
+            // Detect mime type from extension
+            // Registry lookup rather than a png/gif/webp switch defaulting to
+            // JPEG: that default labelled a .heic/.bmp/.tiff/.avif reference
+            // image as image/jpeg, which is simply untrue and is what Vertex
+            // then rejected. The registry answers "application/octet-stream"
+            // for a missing or unregistered extension though, and Vertex
+            // rejects a non-image media type just as firmly — so fall back to
+            // the bytes, which are already in hand, rather than sending either
+            // a guess or a non-image type.
+            const byExtension = getMimeTypeForExtension(image);
+            mimeType = byExtension.startsWith("image/")
+              ? byExtension
+              : this.detectImageType(imageBuffer);
+          } else if (image.startsWith("data:")) {
+            // Handle data URL
+            const matches = image.match(/^data:([^;]+);base64,(.+)$/);
+            if (matches) {
+              mimeType = matches[1];
+              imageBuffer = Buffer.from(matches[2], "base64");
+            } else {
+              continue; // Skip invalid data URL
+            }
+          } else if (
+            image.startsWith("http://") ||
+            image.startsWith("https://")
+          ) {
+            // Image URL — fetch and base64-encode. Without this, the URL
+            // string falls through to the "assume base64" branch below
+            // and Vertex returns "Provided image is not valid".
+            try {
+              const response = await fetch(image);
+              if (!response.ok) {
+                // The URL may be presigned or carry credentials in its query
+                // string, and wrapper URLs now reach this branch too.
+                logger.warn(
+                  `[GoogleVertex] Image fetch failed: ${response.status} ${response.statusText}, skipping`,
+                  { url: redactUrlForError(image) },
+                );
+                continue;
+              }
+              const arrayBuffer = await response.arrayBuffer();
+              imageBuffer = Buffer.from(arrayBuffer);
+              const headerMime = response.headers.get("content-type");
+              if (headerMime && headerMime.startsWith("image/")) {
+                mimeType = headerMime.split(";")[0];
+              }
+            } catch (fetchError) {
+              logger.warn(
+                `[GoogleVertex] Image URL fetch threw, skipping: ${fetchError instanceof Error ? fetchError.message : String(fetchError)}`,
+                { url: redactUrlForError(image) },
+              );
+              continue;
+            }
+          } else {
+            // Assume base64 string
+            imageBuffer = Buffer.from(image, "base64");
+            // Sniff the real format from magic bytes — bare base64 carries no
+            // mime hint, and leaving the image/jpeg default makes Anthropic
+            // reject PNG/GIF/WebP with a media-type mismatch 400.
+            mimeType = this.detectImageType(imageBuffer);
+          }
+        } else {
+          imageBuffer = image;
+          // Buffer input (e.g. Slack/REST uploads) carries no mime hint; sniff
+          // it instead of defaulting to image/jpeg (mislabels PNG -> 400).
+          mimeType = this.detectImageType(imageBuffer);
+        }
+
+        const base64Data = imageBuffer.toString("base64");
+        userParts.push({
+          inlineData: {
+            mimeType,
+            data: base64Data,
+          },
+        });
+      }
+    }
+
+    // Video last, after images: `appendNativeVideoParts` seeds its
+    // request-wide byte budget from whatever `inlineData` parts already sit
+    // in `userParts`, so the images above must be pushed before it runs or
+    // their bytes are invisible to the ceiling check that follows.
+    await appendNativeVideoParts(
+      userParts,
+      multimodalInput?.nativeVideoFiles,
+      "vertex",
+      modelName,
+      "[GoogleVertex]",
+    );
+
+    // Prepend prior conversation turns before the current user message so
+    // multi-turn callers (memory, loop REPL, agent flows) actually carry
+    // context. Without this, the native Vertex Gemini stream rebuilt the
+    // contents from only the current input on every call.
+    prependConversationMessages(
+      contents as Array<{ role: string; parts: unknown[] }>,
+      options.conversationMessages,
+    );
+
+    contents.push({
+      role: "user",
+      parts: userParts,
+    });
+
+    // Convert Vercel AI SDK tools to @google/genai FunctionDeclarations
+    let tools:
+      | Array<{ functionDeclarations: VertexGenaiFunctionDeclaration[] }>
+      | undefined;
+    const executeMap = new DedupExecuteMap();
+    let declarations: NativeToolDeclarationsResult | undefined;
+
+    if (
+      options.tools &&
+      Object.keys(options.tools).length > 0 &&
+      !options.disableTools
+    ) {
+      const declared = toNativeToolDeclarations(
+        options.tools,
+        "functionDeclarations",
+      );
+      // Kept, not discarded: the shared adapter needs originalNameMap to
+      // translate sanitized wire names back, and buildDedupedEngineTools
+      // reads executeMap through it — which is the DedupExecuteMap that makes
+      // an identical repeated call answer from cache instead of re-running.
+      declarations = declared;
+      tools = declared.toolsConfig;
+      for (const [name, execute] of declared.executeMap) {
+        executeMap.set(name, execute);
+      }
+
+      logger.debug("[GoogleVertex] Converted tools for native SDK", {
+        toolCount: declared.toolsConfig[0].functionDeclarations.length,
+        toolNames: declared.toolsConfig[0].functionDeclarations.map(
+          (t) => t.name,
+        ),
+      });
+    }
+
+    // Check if we need to use the final_result tool pattern for structured output with tools
+    // When both schema AND tools are present, we add final_result as a tool
+    const streamOptions = options as TextGenerationOptions;
+    let useFinalResultTool = false;
+    if (streamOptions.schema && tools) {
+      useFinalResultTool = true;
+
+      // Convert schema to JSON schema format
+      const schemaAsJson = convertZodToJsonSchema(
+        streamOptions.schema as ZodUnknownSchema,
+        "openApi3",
+      ) as Record<string, unknown>;
+      const inlinedSchema = inlineJsonSchema(schemaAsJson);
+      if (inlinedSchema.$schema) {
+        delete inlinedSchema.$schema;
+      }
+      const typedSchema = ensureNestedSchemaTypes(inlinedSchema);
+
+      // Add final_result tool to the existing function declarations
+      const existingDeclarations = tools[0]?.functionDeclarations || [];
+      existingDeclarations.push({
+        name: "final_result",
+        description:
+          "Return the final structured result. You MUST call this tool when you have gathered all information and are ready to provide the final answer. The arguments should contain the structured data matching the expected schema.",
+        parametersJsonSchema: typedSchema,
+      });
+      tools = [{ functionDeclarations: existingDeclarations }];
+
+      logger.debug(
+        "[GoogleVertex] Added final_result tool for structured output with tools (stream)",
+        {
+          schemaKeys: Object.keys(typedSchema),
+          totalTools: existingDeclarations.length,
+        },
+      );
+    }
+
+    // Build config. Registry-driven sampling strip applied for uniformity
+    // with every other provider path (inert for current Gemini models).
+    const geminiSampling = resolveSamplingParams(
+      this.providerName,
+      modelName,
+      {
+        temperature: options.temperature ?? 1.0, // Gemini 3 requires 1.0 for tool calling
+        ...(options.topP !== undefined && { topP: options.topP }),
+      },
+      "vertex.gemini",
+    );
+    const config: Record<string, unknown> = {
+      ...(geminiSampling.temperature !== undefined && {
+        temperature: geminiSampling.temperature,
+      }),
+      maxOutputTokens: options.maxTokens,
+    };
+
+    // Cap maxOutputTokens for models with restricted output token limits (32768)
+    // This applies to Gemini 3 models and image generation models (gemini-2.5-flash-image, gemini-3-pro-image-preview)
+    if (hasRestrictedOutputLimit(modelName)) {
+      if (
+        config.maxOutputTokens &&
+        (config.maxOutputTokens as number) > RESTRICTED_OUTPUT_TOKEN_LIMIT
+      ) {
+        logger.warn(
+          `[GoogleVertex] Capping maxOutputTokens from ${config.maxOutputTokens} to ${RESTRICTED_OUTPUT_TOKEN_LIMIT} for ${modelName}`,
+        );
+        config.maxOutputTokens = RESTRICTED_OUTPUT_TOKEN_LIMIT;
+      }
+      // If maxOutputTokens is undefined, set a safe default
+      if (!config.maxOutputTokens) {
+        config.maxOutputTokens = RESTRICTED_OUTPUT_TOKEN_LIMIT;
+      }
+    }
+
+    // Add topP, topK, stopSequences if provided
+    if (geminiSampling.topP !== undefined) {
+      config.topP = geminiSampling.topP;
+    }
+    if (options.topK !== undefined) {
+      config.topK = options.topK;
+    }
+    if (options.stopSequences && options.stopSequences.length > 0) {
+      config.stopSequences = options.stopSequences;
+    }
+
+    if (tools) {
+      config.tools = tools;
+    }
+
+    // Build system prompt, adding final_result instruction if needed
+    let effectiveSystemPrompt = options.systemPrompt || "";
+    if (useFinalResultTool) {
+      const finalResultInstruction =
+        "\n\nIMPORTANT: When you have gathered all necessary information and are ready to provide your final answer, you MUST call the 'final_result' tool with the structured data. Do not return the final answer as plain text - always use the final_result tool.";
+      effectiveSystemPrompt = effectiveSystemPrompt + finalResultInstruction;
+    }
+
+    if (effectiveSystemPrompt) {
+      config.systemInstruction = effectiveSystemPrompt;
+    }
+
+    // Add thinking config. Gemini 3 takes `thinkingLevel` directly; Gemini
+    // 2.5 rejects that field and needs a translated `thinkingBudget` instead
+    // — createNativeThinkingConfig picks the wire shape from modelName.
+    const nativeThinkingConfig = createNativeThinkingConfig(
+      options.thinkingConfig,
+      modelName,
+    );
+    if (nativeThinkingConfig) {
+      config.thinkingConfig = nativeThinkingConfig;
+    }
+
+    // Add JSON output format support for native SDK stream
+    // CRITICAL: Google Gemini API does NOT allow combining responseMimeType with function calling.
+    // Error: "Function calling with a response mime type: 'application/json' is unsupported"
+    // Additionally, responseSchema REQUIRES responseMimeType: "application/json" - they cannot be used separately.
+    // Error without it: "Response_schema with a response mime type 'text/plain' is unsupported"
+    // Therefore: When tools are present, we cannot use EITHER responseMimeType OR responseSchema.
+    // When using final_result tool pattern, we skip this entirely as schema is enforced via tool.
+    if (
+      (streamOptions.output?.format === "json" || streamOptions.schema) &&
+      !useFinalResultTool
+    ) {
+      // Only set responseMimeType AND responseSchema when NOT using tools
+      // Both must be set together, and neither can be used with function calling
+      if (!tools) {
+        config.responseMimeType = "application/json";
+
+        // Convert schema to JSON schema format for the native SDK
+        if (streamOptions.schema) {
+          const rawSchema = convertZodToJsonSchema(
+            streamOptions.schema as ZodUnknownSchema,
+            "openApi3",
+          ) as Record<string, unknown>;
+          const inlinedSchema = inlineJsonSchema(rawSchema);
+          // Remove $schema if present - @google/genai doesn't need it
+          if (inlinedSchema.$schema) {
+            delete inlinedSchema.$schema;
+          }
+          // CRITICAL: Google Vertex AI requires ALL nested schemas to have a type field
+          // ensureNestedSchemaTypes recursively adds missing type fields
+          // Note: convertZodToJsonSchema now uses openApi3 target which produces nullable: true
+          const typedSchema = ensureNestedSchemaTypes(inlinedSchema);
+          // Sanitize the same way tool schemas are (see tool path above):
+          // Vertex's responseSchema validator rejects extension keywords such
+          // as `errorMessage` (from convertZodToJsonSchema's errorMessages
+          // option) and `additionalProperties`. Without this a user schema with
+          // a `.regex(.., { message })` field 400s the whole structured-output
+          // request and the recovery loop retries the same poisoned payload.
+          stripAdditionalPropertiesDeep(typedSchema);
+          config.responseSchema = typedSchema;
+
+          logger.debug(
+            "[GoogleVertex] Added responseSchema for JSON output (stream)",
+            {
+              schemaKeys: Object.keys(typedSchema),
+            },
+          );
+        }
+      }
+    }
+
+    const startTime = Date.now();
+    // Ensure maxSteps is a valid positive integer to prevent infinite loops
+    const rawMaxSteps = options.maxSteps || DEFAULT_MAX_STEPS;
+    const maxSteps =
+      Number.isFinite(rawMaxSteps) && rawMaxSteps > 0
+        ? Math.min(Math.floor(rawMaxSteps), 100) // Cap at 100 for safety
+        : Math.min(DEFAULT_MAX_STEPS, 100);
+    // Widened per-turn copy: the agentic loop appends functionCall /
+    // functionResponse parts on top of the plain text/inlineData parts the
+    // initial contents carry.
+    const currentContents: Array<{
+      role: string;
+      parts: VertexNativeLoopPart[];
+    }> = [...contents];
+    let finalText = "";
+    // Last SDK finish reason seen across steps (Bug 2: previously never read,
+    // so callers fell back to "unknown"). Last non-empty value wins — the
+    // terminal chunk is authoritative.
+    let lastFinishReason: string | undefined;
+    const allToolCalls: Array<{
+      toolName: string;
+      args: Record<string, unknown>;
+    }> = [];
+    // Mirrors the generate-path shape so StreamResult.toolExecutions can be
+    // populated (parity with AI-SDK-driven providers) and so the storage
+    // hook can persist actual tool outputs rather than the placeholder
+    // "success" string used by flushPendingToolData's default fallback.
+    const toolExecutions: Array<{
+      name: string;
+      input: Record<string, unknown>;
+      output: unknown;
+    }> = [];
+
+    // Track structured output from final_result tool (when using final_result pattern)
+    let finalResultStructuredOutput: Record<string, unknown> | undefined;
+
+    // In-loop context guard: stop calling tools when the accumulated
+    // conversation approaches the model's context window instead of stepping
+    // into a provider "prompt too long" rejection mid-loop.
+    const contextGuard = createContextGuard(
+      getContextWindowSize("vertex", modelName),
+    );
+    let hitContextLimit = false;
+
+    // Track token usage across all steps. Every loop step is a separate
+    // billed API call, so per-step usage is folded into these turn totals
+    // after each step's chunk drain — assigning them directly from chunk
+    // metadata would record only the last step of a multi-step tool loop.
+    let totalInputTokens = 0;
+    let totalOutputTokens = 0;
+    let totalCacheReadTokens = 0;
+    let totalReasoningTokens = 0;
+
+    // Track text parts as they arrive from the SDK so the returned async
+    // iterable yields multiple chunks instead of a single buffered chunk.
+    // The CLI's chunk-count smoke test asserts > 1 stream chunks for any
+    // non-trivial response — collecting everything into `finalText` and
+    // yielding it once breaks that signal even though the underlying
+    // network stream is genuinely incremental.
+    const incrementalTextChunks: string[] = [];
+
+    // Abort scaffolding (mirrors executeNativeAnthropicStream). The native
+    // Gemini SDK cancels via config.abortSignal, so drive an internal
+    // AbortController: the caller's signal and the turn clock's watchdogs
+    // (whole-turn deadline + optional stall detector) all trip it, and every
+    // request/tool-exec receives effectiveSignal.
+    const streamTimeoutMs =
+      parseTimeout(options.timeout) ?? DEFAULT_GEMINI_STREAM_TIMEOUT_MS;
+    const toolExecTimeoutMs = resolveToolTimeoutMs(options.toolTimeoutMs);
+    const effectiveTurnDeadlineMs = options.turnTimeoutMs ?? streamTimeoutMs;
+    const internalAbort = new AbortController();
+    const onCallerAbort = () => internalAbort.abort();
+    options.abortSignal?.addEventListener("abort", onCallerAbort);
+    const turnClock = createTurnClock({
+      turnTimeoutMs: options.turnTimeoutMs,
+      // Preserve the pre-existing defensive whole-turn bound when the caller
+      // sets no explicit turn budget — a turn must never hang forever.
+      defaultTurnTimeoutMs: streamTimeoutMs,
+      stallTimeoutMs: options.stallTimeoutMs,
+      wrapupTimeLeadMs: options.wrapupTimeLeadMs,
+      onDeadline: (kind) => {
+        logger.warn(
+          kind === "timeout"
+            ? `[GoogleVertex] Native Gemini turn exceeded its ${effectiveTurnDeadlineMs}ms time budget — aborting`
+            : `[GoogleVertex] Native Gemini turn made no progress for ${options.stallTimeoutMs}ms — aborting`,
+        );
+        internalAbort.abort();
+      },
+    });
+    const effectiveSignal = internalAbort.signal;
+    if (options.abortSignal?.aborted) {
+      internalAbort.abort();
+    }
+    let wasAborted = false;
+
+    // Step-cap flags declared in the outer scope so the terminal block (also
+    // inside the try) and the finishReason mapping (after the finally) can
+    // both read them.
+    let hitStepLimit = false;
+    let synthesizedFinalAnswer = false;
+    // How many steps the ENGINE actually took, reported back from the per-step
+    // hook. The terminal block compares it against maxSteps, and counting hook
+    // invocations instead would drift by the number of malformed retries.
+    let stepsTaken = 0;
+
+    try {
+      // Agentic loop for tool calling
+      // The turn runs on the shared engine. The step cap, tool dispatch, the
+      // failure breaker, per-step usage accumulation, the single malformed
+      // retry and the pre-first-chunk provider retry all live there now; what
+      // stays here is everything the engine has no opinion about — the turn
+      // clock, the context guard, conversation-memory storage, the wrap-up
+      // nudge, and the terminal block below.
+      const engineAdapter = createGeminiLoopAdapter({
+        providerLabel: "GoogleVertex",
+        provider: this.providerName,
+        maxSteps,
+        // Ported verbatim: the same DEFAULT_TOOL_MAX_RETRIES threshold, plus
+        // the two rules this loop has always had and the engine did not.
+        toolFailureBreaker: {
+          maxRetries: DEFAULT_TOOL_MAX_RETRIES,
+          // Strikes are CONSECUTIVE here: a clean result clears the count, so
+          // an argument-dependent soft error cannot accumulate its way to
+          // disabling a tool that works.
+          consecutive: true,
+          // A result that reports failure without throwing — an MCP isError
+          // payload, a proxy-blocked call resolving with { error } — counts
+          // toward the breaker exactly as a throw does.
+          classifyResultFailure: (output) =>
+            extractToolFailureText(output) ?? undefined,
+        },
+        liveTools: options.tools ?? {},
+        // A tool hydrated mid-turn gets the SAME bound, abort race and stall
+        // ping as one declared up front — see guardToolExecutor.
+        toolGuards: {
+          toolTimeoutMs: toolExecTimeoutMs,
+          abortSignal: effectiveSignal,
+          onProgress: () => turnClock.noteProgress(),
+        },
+        ...(declarations ? { declarations } : {}),
+        ...(useFinalResultTool
+          ? {
+              finalResultToolName: "final_result",
+              onTerminalResult: (text) => {
+                try {
+                  finalResultStructuredOutput = JSON.parse(text) as Record<
+                    string,
+                    unknown
+                  >;
+                } catch {
+                  /* the caller's coercion layer repairs a partial payload */
+                }
+              },
+            }
+          : {}),
+        enableMalformedRetry: true,
+        buildMalformedRetryNote: (conversation, retriedStep) => {
+          this.emitTurnEvent({
+            phase: "malformed-retry",
+            step: retriedStep + 1,
+            maxSteps,
+          });
+          return [
+            ...conversation,
+            {
+              role: "user",
+              parts: [
+                {
+                  text:
+                    "Your previous function call was malformed and could not " +
+                    "be parsed. Re-issue it as a single valid function call, " +
+                    "or answer in plain text.",
+                },
+              ],
+            },
+          ];
+        },
+        // The turn clock's per-chunk ping and the context guard's per-step
+        // prompt size both ride the drain, which is why this loop keeps its
+        // own collector rather than the adapter's default.
+        collectStep: (stream, channel) =>
+          collectVertexStreamChunks(
+            stream as AsyncIterable<{
+              functionCalls?: NativeFunctionCall[];
+              [key: string]: unknown;
+            }>,
+            channel,
+            {
+              onProgress: () => turnClock.noteProgress(),
+              onUsage: (input, output) => contextGuard.noteUsage(input, output),
+              onUsageDelta: (counter, delta) => {
+                if (counter === "input") {
+                  totalInputTokens += delta;
+                } else if (counter === "output") {
+                  totalOutputTokens += delta;
+                } else if (counter === "cacheRead") {
+                  totalCacheReadTokens += delta;
+                } else {
+                  totalReasoningTokens += delta;
+                }
+              },
+            },
+          ),
+        planReclaim: (conversation) => {
+          if (!contextGuard.shouldStop()) {
+            return undefined;
+          }
+          // Try to RECLAIM budget and keep going before falling back to the
+          // historic stop-only behaviour. Ending the turn early is safe but
+          // throws away work the model was mid-way through; dropping the
+          // oldest complete tool exchanges usually buys enough room to finish.
+          const working = [...conversation] as Array<{
+            role: string;
+            parts: VertexNativeLoopPart[];
+          }>;
+          if (
+            reclaimVertexLoopContext(
+              working,
+              modelName,
+              contextGuard.projectedNextPromptTokens,
+            )
+          ) {
+            contextGuard.resetAfterReclaim();
+            return { conversation: working };
+          }
+          hitContextLimit = true;
+          logger.warn(
+            `[GoogleVertex] Gemini turn stopped by the context guard: ` +
+              `projected prompt ~${contextGuard.projectedNextPromptTokens} tokens ` +
+              `>= threshold ${contextGuard.thresholdTokens} — synthesizing a final answer.`,
+          );
+          return { stop: true };
+        },
+        buildRequest: (conversation) => ({
+          model: modelName,
+          contents: conversation,
+          config: { ...config, ...(tools ? { tools } : {}) },
+        }),
+        sendStep: async (request, signal) => {
+          turnClock.noteProgress();
+          const built = request as {
+            model: string;
+            contents: Array<{ role: string; parts: unknown[] }>;
+            config?: Record<string, unknown>;
+          };
+          return client.models.generateContentStream({
+            model: built.model,
+            contents: built.contents,
+            config: { ...(built.config ?? {}), abortSignal: signal },
+          }) as Promise<
+            AsyncIterable<{
+              functionCalls?: NativeFunctionCall[];
+              [key: string]: unknown;
+            }>
+          >;
+        },
+      });
+
+      // Wrapped rather than configured: these fire once PER STEP, and
+      // buildToolResultMessages is the only hook that runs per step with
+      // exactly that step's results. Reading them off the turn's final result
+      // would batch every step into one late write and lose the per-step
+      // thought signature.
+      const adapter: typeof engineAdapter = {
+        ...engineAdapter,
+        // Counted HERE, not in buildToolResultMessages: this runs once per
+        // step exactly as the old `step++` at the top of the loop did,
+        // malformed retries included. Counting in the tool-result hook would
+        // skip the final text-only step and quietly report one step fewer in
+        // `stepsUsed`, which is a public field on the result.
+        buildStepRequest: (conversation, step) => {
+          stepsTaken = step + 1;
+          return engineAdapter.buildStepRequest(conversation, step);
+        },
+        buildToolResultMessages: (
+          conversation,
+          stepResult,
+          toolResults,
+          engineStep,
+        ) => {
+          const next = engineAdapter.buildToolResultMessages(
+            conversation,
+            stepResult,
+            toolResults,
+            engineStep,
+          );
+          // Time-budget wrap-up nudge (twin of the Anthropic loops' soft step
+          // nudge): with the turn deadline approaching, tell the model to
+          // consolidate. Rides as a trailing text part on the tool-response
+          // user turn.
+          if (turnClock.shouldNudgeWrapup()) {
+            const last = next[next.length - 1];
+            if (last && Array.isArray(last.parts)) {
+              last.parts.push({
+                text: buildWrapupNudgeText(useFinalResultTool),
+              });
+            }
+          }
+          // Persist this step's tool calls/results into conversation memory.
+          // Without this, tool_call / tool_result rows never reach Redis and
+          // the chat-history UI loses every tool invocation. `thoughtSignature`
+          // rides as a sibling on the first call of the step — Gemini 3 needs
+          // it to match thinking patterns when the conversation is replayed.
+          const stepThoughtSig = extractThoughtSignature(
+            stepResult.raw.rawResponseParts,
+          );
+          withTimeout(
+            this.handleToolExecutionStorage(
+              toolResults.map((result, index) => ({
+                toolName: result.name,
+                args: result.args,
+                ...(index === 0 && stepThoughtSig
+                  ? { thoughtSignature: stepThoughtSig }
+                  : {}),
+                stepIndex: engineStep + 1,
+              })),
+              toolResults.map((result) => ({
+                toolName: result.name,
+                output: result.output,
+                stepIndex: engineStep + 1,
+              })),
+              options,
+              new Date(),
+            ),
+            TOOL_STORAGE_TIMEOUT_MS,
+            "tool storage write timed out",
+          ).catch((error: unknown) => {
+            logger.warn(
+              "[GoogleVertex] Failed to store native Gemini stream tool executions",
+              {
+                error: error instanceof Error ? error.message : String(error),
+              },
+            );
+          });
+          // Project this step's growth for the context guard: the appended
+          // tool results ride the next prompt (Gemini reports usage per call,
+          // but only for content it has already seen).
+          try {
+            const appended = next[next.length - 1];
+            contextGuard.noteAppendedChars(
+              JSON.stringify(appended?.parts ?? []).length,
+            );
+          } catch {
+            /* estimation is best-effort — never break the loop */
+          }
+          return next;
+        },
+      };
+
+      const { stream: engineStream, resultPromise } = runAgenticLoop(
+        adapter,
+        // A concrete parts array widens to the engine's `unknown[]` on its
+        // own; only the direction back needs an assertion.
+        currentContents as GeminiTurnContent[],
+        {
+          tools: buildDedupedEngineTools(declarations, options.tools, {
+            toolTimeoutMs: toolExecTimeoutMs,
+            abortSignal: effectiveSignal,
+            onProgress: () => turnClock.noteProgress(),
+          }),
+          abortSignal: effectiveSignal,
+          // The engine bounds every tool call itself. Passing the value this
+          // loop already gave `buildDedupedEngineTools` keeps the engine's
+          // backstop from being tighter than what the caller asked for.
+          toolTimeoutMs: toolExecTimeoutMs,
+        },
+      );
+
+      // Collected, NOT forwarded to the consumer here. This loop replays the
+      // gathered text after the turn rather than streaming it live, and a
+      // characterization case pins exactly that — pushing to the consumer
+      // channel from inside the pump would make the turn stream live and break
+      // it.
+      const pump = (async () => {
+        for await (const chunk of engineStream) {
+          if (chunk.content) {
+            incrementalTextChunks.push(chunk.content);
+          }
+        }
+      })();
+
+      let engineResult;
+      let turnFailure: unknown;
+      try {
+        engineResult = await resultPromise;
+      } catch (error) {
+        turnFailure = error;
+      }
+      // Drained unconditionally and tolerantly. When the turn ends by abort the
+      // channel rejects too, and re-awaiting a settled rejection here would
+      // rethrow the very error the branch below has already decided to absorb —
+      // which is what turned both turn-clock cases into failures instead of
+      // clean deadline exits.
+      await drainDetachedPump(pump, "GoogleVertex");
+      if (turnFailure !== undefined) {
+        // A mid-drain abort surfaces as an AbortError. End gracefully into the
+        // terminal block instead of re-throwing — a re-throw would route the
+        // caller's abort into a second unbounded fallback stream().
+        if (effectiveSignal.aborted || isAbortError(turnFailure)) {
+          wasAborted = true;
+        } else {
+          logger.error("[GoogleVertex] Native SDK error", turnFailure);
+          throw this.handleProviderError(turnFailure);
+        }
+      }
+
+      if (engineResult) {
+        finalText = engineResult.text;
+        lastFinishReason = engineResult.rawStopReason ?? lastFinishReason;
+        for (const call of engineResult.toolCalls) {
+          allToolCalls.push({ toolName: call.name, args: call.args });
+        }
+        for (const execution of engineResult.toolExecutions) {
+          toolExecutions.push({
+            name: execution.name,
+            input: execution.input,
+            output: execution.output,
+          });
+        }
+        // Replace in place: `currentContents` is a const the terminal block
+        // and the synth call both read.
+        currentContents.length = 0;
+        currentContents.push(
+          ...(engineResult.conversation as Array<{
+            role: string;
+            parts: VertexNativeLoopPart[];
+          }>),
+        );
+      }
+      if (effectiveSignal.aborted) {
+        wasAborted = true;
+      }
+
+      // Handle maxSteps termination / abort — the loop exited because the step
+      // cap was reached (or the turn was aborted) while the model was still
+      // calling tools. Surface a real answer instead of the canned placeholder
+      // (Bug 1) and a meaningful finishReason (Bug 2).
+      if (
+        !finalText &&
+        (stepsTaken >= maxSteps || wasAborted || hitContextLimit)
+      ) {
+        hitStepLimit = stepsTaken >= maxSteps && !wasAborted;
+        const toolCallCount = allToolCalls.filter(
+          (tc) => tc.toolName !== "final_result",
+        ).length;
+        // The consumer receives text via `incrementalTextChunks`; any text the
+        // model emitted across steps is already preserved there. Only produce a
+        // terminal message when NOTHING was produced (the pure-functionCall /
+        // abort case that otherwise surfaces the placeholder). When chunks
+        // exist, leave `finalText` empty so `textPartsToYield` keeps replaying
+        // the gathered chunks instead of collapsing to a single one.
+        if (incrementalTextChunks.length > 0) {
+          logger.warn(
+            hitContextLimit
+              ? `[GoogleVertex] Tool call loop stopped by the context guard; ` +
+                  `returning text already gathered from prior steps.`
+              : `[GoogleVertex] Tool call loop terminated after reaching maxSteps (${maxSteps}); ` +
+                  `returning text already gathered from prior steps.`,
+          );
+        } else if (wasAborted) {
+          // Turn ended on a time condition or caller abort — skip synth
+          // entirely so it can never add +300s after a blown budget, and
+          // deliver exactly one HONEST terminal chunk matching the actual
+          // exit cause (never the step-cap text — a killed healthy turn must
+          // not claim it "reached the step limit").
+          logger.warn(
+            `[GoogleVertex] Tool call loop ended mid-turn ` +
+              `(${turnClock.timedOut ? "turn time limit" : turnClock.stalled ? "stall watchdog" : "caller abort"}); ` +
+              `returning an honest terminal message.`,
+          );
+          finalText = this.buildLoopExitMessage({
+            turnClock,
+            wasAborted,
+            stallTimeoutMs: options.stallTimeoutMs,
+            maxSteps,
+            toolCallCount,
+          });
+        } else {
+          logger.warn(
+            hitContextLimit
+              ? `[GoogleVertex] Tool call loop stopped by the context guard ` +
+                  `with no text; synthesizing a final answer with tools disabled.`
+              : `[GoogleVertex] Tool call loop terminated after reaching maxSteps (${maxSteps}) ` +
+                  `with no text; synthesizing a final answer with tools disabled.`,
+          );
+          // synth self-bounds its connect+drain via withTimeout(timeoutMs) and
+          // never throws (returns empty on timeout/error), so it needs no outer
+          // withTimeout wrapper — see synthesizeFinalAnswerWithoutTools.
+          const synth = await this.synthesizeFinalAnswerWithoutTools(
+            client,
+            modelName,
+            config,
+            currentContents,
+            useFinalResultTool,
+            parseTimeout(options.timeout) ?? DEFAULT_GEMINI_STREAM_TIMEOUT_MS,
+            effectiveSignal,
+          );
+          if (synth.text) {
+            synthesizedFinalAnswer = true;
+            finalText = synth.text;
+            incrementalTextChunks.push(synth.text);
+            totalInputTokens += synth.inputTokens;
+            totalOutputTokens += synth.outputTokens;
+            totalReasoningTokens += synth.reasoningTokens ?? 0;
+            if (synth.finishReason) {
+              lastFinishReason = synth.finishReason;
+            }
+          } else {
+            finalText = hitContextLimit
+              ? buildContextCapMessage(toolCallCount)
+              : buildToolLoopCapMessage(maxSteps, toolCallCount);
+          }
+        }
+      }
+    } finally {
+      turnClock.dispose();
+      options.abortSignal?.removeEventListener("abort", onCallerAbort);
+    }
+
+    // Unified finish reason: a step-cap exhaustion that did NOT end in a clean
+    // synthesized answer is reported as "tool-calls" (the model still wanted
+    // tools) — NOT "length", which neurolink.ts treats as token truncation
+    // (jsonTruncated + WARNING span). A clean completion maps from the SDK
+    // finish reason.
+    const resolvedFinishReason =
+      hitStepLimit && !synthesizedFinalAnswer
+        ? "tool-calls"
+        : mapGeminiFinishReason(lastFinishReason);
+
+    // Turn-exit discriminator, independent of the provider-shaped
+    // finishReason — consumers branch on this instead of sniffing strings.
+    const stopReason = resolveTurnStopReason({
+      timedOut: turnClock.timedOut,
+      stalled: turnClock.stalled,
+      wasAborted,
+      cappedWithoutAnswer: hitStepLimit && !synthesizedFinalAnswer,
+      contextCappedWithoutAnswer: hitContextLimit && !synthesizedFinalAnswer,
+      finishReason: resolvedFinishReason,
+    });
+    if (stopReason !== "completed") {
+      this.emitTurnEvent({
+        phase: stopReason,
+        step: stepsTaken,
+        maxSteps,
+        toolCallCount: allToolCalls.filter(
+          (tc) => tc.toolName !== "final_result",
+        ).length,
+        elapsedMs: turnClock.elapsedMs(),
+      });
+    }
+
+    const responseTime = Date.now() - startTime;
+
+    // Yield each text part separately so the CLI receives multiple stream
+    // chunks instead of a single coalesced buffer. The SDK already gave us
+    // the chunks during the for-await loop above; we just preserved them
+    // in `incrementalTextChunks` instead of collapsing into `finalText`.
+    // For final_result structured output, we yield the JSON-serialized
+    // value as a single chunk because that's the contract callers expect.
+    const textPartsToYield = finalResultStructuredOutput
+      ? [finalText]
+      : incrementalTextChunks.length > 0
+        ? incrementalTextChunks
+        : [finalText];
+
+    async function* createTextStream(): AsyncIterable<{ content: string }> {
+      for (const part of textPartsToYield) {
+        if (part.length > 0) {
+          yield { content: part };
+        }
+      }
+    }
+
+    // Filter out final_result from tool calls as it's an internal pattern
+    const externalToolCalls = allToolCalls.filter(
+      (tc) => tc.toolName !== "final_result",
+    );
+    const externalToolExecutions = toolExecutions.filter(
+      (te) => te.name !== "final_result",
+    );
+
+    // Gemini promptTokenCount is OVERLAPPING (already includes
+    // cachedContentTokenCount). Subtract once so the cached portion is billed at
+    // the cheaper cacheRead rate without double-counting; total is conserved.
+    const adjustedInputTokens = Math.max(
+      0,
+      totalInputTokens - totalCacheReadTokens,
+    );
+    const result: StreamResult = {
+      stream: createTextStream(),
+      provider: this.providerName,
+      model: modelName,
+      finishReason: resolvedFinishReason,
+      stopReason,
+      rawFinishReason: lastFinishReason,
+      usage: {
+        input: adjustedInputTokens,
+        // Thinking tokens are billed at the output rate but Gemini does NOT
+        // include them in candidatesTokenCount (totalTokenCount = prompt +
+        // candidates + thoughts), so they are folded into `output` — that is
+        // what calculateCost bills at the output rate — with `reasoning`
+        // reporting the thinking subset.
+        output: totalOutputTokens + totalReasoningTokens,
+        total:
+          adjustedInputTokens +
+          totalCacheReadTokens +
+          totalOutputTokens +
+          totalReasoningTokens,
+        ...(totalCacheReadTokens > 0 && {
+          cacheReadTokens: totalCacheReadTokens,
+        }),
+        ...(totalReasoningTokens > 0 && {
+          reasoning: totalReasoningTokens,
+        }),
+      },
+      toolCalls: externalToolCalls.map((tc) => ({
+        toolName: tc.toolName,
+        args: tc.args,
+      })),
+      // Surface tools-used + execution summary so `hasToolActivity` in
+      // conversationMemory.ts evaluates true for tool-only stream turns
+      // (assistant text empty but tools ran) and downstream consumers see
+      // the same shape AI-SDK-driven providers expose.
+      toolsUsed: externalToolCalls.map((tc) => tc.toolName),
+      // transformToolExecutions' record shape (name/input/output/duration) is
+      // what downstream consumers read at runtime; it shares no required
+      // members with the declared ToolExecutionSummary element type, so the
+      // assertion carries both shapes instead of erasing the real one.
+      toolExecutions: transformToolExecutions(
+        externalToolExecutions,
+      ) as ReturnType<typeof transformToolExecutions> &
+        NonNullable<StreamResult["toolExecutions"]>,
+      metadata: {
+        streamId: `native-vertex-${Date.now()}`,
+        startTime,
+        responseTime,
+        totalToolExecutions: externalToolCalls.length,
+        stopReason,
+        rawFinishReason: lastFinishReason,
+        stepsUsed: stepsTaken,
+      },
+    };
+
+    // Add structured output if final_result tool was used
+    if (finalResultStructuredOutput) {
+      (
+        result as StreamResult & { structuredOutput?: unknown }
+      ).structuredOutput = finalResultStructuredOutput;
+    }
+
+    return result;
+  }
+
+  /**
+   * Resolve the text a native Vertex *generate* call actually sends, for
+   * both `executeNativeGemini3Generate` and `executeNativeAnthropicGenerate`.
+   *
+   * The baseline here is the same `input.text || prompt || "Please
+   * respond."` chain both call sites have always used — `input.text` wins
+   * when set because the file preprocessors (`processUnifiedFilesArray`,
+   * `processCSVFilesForNativeSDK`) append attached-file content to it while
+   * `options.prompt` stays the pre-attachment snapshot; `prompt` is the
+   * fallback for the legacy prompt-only `generateText()` convention, which
+   * never sets `input` at all; the literal is the last resort when neither
+   * is set.
+   *
+   * That `||` chain alone has a gap model middleware falls into:
+   * `applyTurnParamsRewrite` writes every rewritten turn back onto
+   * `options.input.text`, including an *emptied* one (a redaction). `||`
+   * treats that empty string exactly like an unset `input.text` and falls
+   * through to `options.prompt` — which middleware never touched, since it
+   * is a plain snapshot taken before middleware ran — so a redaction a
+   * middleware applied is silently discarded and the ORIGINAL text still
+   * reaches Vertex.
+   *
+   * The fix is narrow: when `input.text` is *set* (not undefined) and
+   * differs from `prompt`, something deliberately changed it since the
+   * snapshot was taken — a middleware rewrite, or a file preprocessor's
+   * attachment-content append — and that divergence itself is the signal to
+   * trust `input.text` outright, empty string included. When the two agree
+   * (the untouched, no-middleware case, including the STT-silence
+   * `input.text === prompt === ""` placeholder) there is no divergence to
+   * trust, so the original fallback chain still applies unchanged.
+   */
+  private resolveNativeGenerateText(options: TextGenerationOptions): string {
+    if (
+      options.input?.text !== undefined &&
+      options.input.text !== options.prompt
+    ) {
+      return options.input.text;
+    }
+    return options.input?.text || options.prompt || "Please respond.";
+  }
+
+  /**
+   * Execute generate using native @google/genai SDK for Gemini 3 models on Vertex AI
+   * This bypasses @ai-sdk/google-vertex to properly handle thought_signature
+   */
+  private async executeNativeGemini3Generate(
+    options: TextGenerationOptions,
+  ): Promise<EnhancedGenerateResult> {
+    const modelName =
+      options.model || this.modelName || getDefaultVertexModel();
+    const effectiveLocation = resolveVertexRegionForModel(
+      modelName,
+      options.region,
+    );
+    const client = await this.createVertexGenAIClient(effectiveLocation);
+
+    logger.debug(
+      "[GoogleVertex] Using native @google/genai for Gemini 3 generate",
+      {
+        model: modelName,
+        project: this.projectId,
+        location: effectiveLocation,
+      },
+    );
+
+    // Build contents from input with multimodal support
+    // Prioritize input.text over prompt since processCSVFilesForNativeSDK modifies input.text with CSV data
+    // (see resolveNativeGenerateText for the full precedence + middleware-redaction rationale)
+    const inputText = this.resolveNativeGenerateText(options);
+
+    const contents: Array<{
+      role: string;
+      parts: VertexNativePart[];
+    }> = [];
+
+    // Build user message parts - start with text
+    const userParts: VertexNativePart[] = [{ text: inputText }];
+
+    // Add PDF files as inlineData parts if present
+    // Cast input to access multimodal properties that may exist at runtime
+    const multimodalInput = options.input as
+      | {
+          text?: string;
+          pdfFiles?: Array<Buffer | string>;
+          images?: Array<Buffer | string | ImageWithAltText>;
+          nativeAudioFiles?: MultimodalAudioEntry[];
+          nativeVideoFiles?: MultimodalVideoEntry[];
+        }
+      | undefined;
+
+    if (multimodalInput?.pdfFiles && multimodalInput.pdfFiles.length > 0) {
+      logger.debug(
+        `[GoogleVertex] Processing ${multimodalInput.pdfFiles.length} PDF file(s) for native generate`,
+      );
+
+      for (const pdfFile of multimodalInput.pdfFiles) {
+        let pdfBuffer: Buffer;
+
+        if (typeof pdfFile === "string") {
+          // Check if it's a file path
+          if (fs.existsSync(pdfFile)) {
+            pdfBuffer = fs.readFileSync(pdfFile);
+          } else {
+            // Assume it's already base64 encoded
+            pdfBuffer = Buffer.from(pdfFile, "base64");
+          }
+        } else {
+          pdfBuffer = pdfFile;
+        }
+
+        // Convert to base64 for the native SDK
+        const base64Data = pdfBuffer.toString("base64");
+        userParts.push({
+          inlineData: {
+            mimeType: "application/pdf",
+            data: base64Data,
+          },
+        });
+      }
+    }
+
+    await appendNativeAudioParts(
+      userParts,
+      multimodalInput?.nativeAudioFiles,
+      "[GoogleVertex]",
+    );
+
+    // Add images as inlineData parts if present
+    if (multimodalInput?.images && multimodalInput.images.length > 0) {
+      logger.debug(
+        `[GoogleVertex] Processing ${multimodalInput.images.length} image(s) for native generate`,
+      );
+
+      for (const rawImage of multimodalInput.images) {
+        // `input.images` accepts `{ data, altText }` as a documented public
+        // shape, but this loop only ever handled Buffer | string — a wrapper
+        // fell through to the "assume raw bytes" branch and base64-encoded the
+        // OBJECT, sending the literal "[object Object]" to Vertex. Unwrap once,
+        // here, so every branch below sees the payload it expects.
+        const image = unwrapImagePayload(rawImage);
+        let imageBuffer: Buffer;
+        let mimeType = "image/jpeg"; // Default
+
+        if (typeof image === "string") {
+          if (fs.existsSync(image)) {
+            imageBuffer = fs.readFileSync(image);
+            // Detect mime type from extension
+            // Registry lookup rather than a png/gif/webp switch defaulting to
+            // JPEG: that default labelled a .heic/.bmp/.tiff/.avif reference
+            // image as image/jpeg, which is simply untrue and is what Vertex
+            // then rejected. The registry answers "application/octet-stream"
+            // for a missing or unregistered extension though, and Vertex
+            // rejects a non-image media type just as firmly — so fall back to
+            // the bytes, which are already in hand, rather than sending either
+            // a guess or a non-image type.
+            const byExtension = getMimeTypeForExtension(image);
+            mimeType = byExtension.startsWith("image/")
+              ? byExtension
+              : this.detectImageType(imageBuffer);
+          } else if (image.startsWith("data:")) {
+            // Handle data URL
+            const matches = image.match(/^data:([^;]+);base64,(.+)$/);
+            if (matches) {
+              mimeType = matches[1];
+              imageBuffer = Buffer.from(matches[2], "base64");
+            } else {
+              continue; // Skip invalid data URL
+            }
+          } else if (
+            image.startsWith("http://") ||
+            image.startsWith("https://")
+          ) {
+            // Image URL — fetch and base64-encode. Without this, the URL
+            // string falls through to the "assume base64" branch below
+            // and Vertex returns "Provided image is not valid".
+            try {
+              const response = await fetch(image);
+              if (!response.ok) {
+                // The URL may be presigned or carry credentials in its query
+                // string, and wrapper URLs now reach this branch too.
+                logger.warn(
+                  `[GoogleVertex] Image fetch failed: ${response.status} ${response.statusText}, skipping`,
+                  { url: redactUrlForError(image) },
+                );
+                continue;
+              }
+              const arrayBuffer = await response.arrayBuffer();
+              imageBuffer = Buffer.from(arrayBuffer);
+              const headerMime = response.headers.get("content-type");
+              if (headerMime && headerMime.startsWith("image/")) {
+                mimeType = headerMime.split(";")[0];
+              }
+            } catch (fetchError) {
+              logger.warn(
+                `[GoogleVertex] Image URL fetch threw, skipping: ${fetchError instanceof Error ? fetchError.message : String(fetchError)}`,
+                { url: redactUrlForError(image) },
+              );
+              continue;
+            }
+          } else {
+            // Assume base64 string
+            imageBuffer = Buffer.from(image, "base64");
+            // Sniff the real format from magic bytes — bare base64 carries no
+            // mime hint, and leaving the image/jpeg default makes Anthropic
+            // reject PNG/GIF/WebP with a media-type mismatch 400.
+            mimeType = this.detectImageType(imageBuffer);
+          }
+        } else {
+          imageBuffer = image;
+          // Buffer input (e.g. Slack/REST uploads) carries no mime hint; sniff
+          // it instead of defaulting to image/jpeg (mislabels PNG -> 400).
+          mimeType = this.detectImageType(imageBuffer);
+        }
+
+        const base64Data = imageBuffer.toString("base64");
+        userParts.push({
+          inlineData: {
+            mimeType,
+            data: base64Data,
+          },
+        });
+      }
+    }
+
+    // Video last, after images: `appendNativeVideoParts` seeds its
+    // request-wide byte budget from whatever `inlineData` parts already sit
+    // in `userParts`, so the images above must be pushed before it runs or
+    // their bytes are invisible to the ceiling check that follows.
+    await appendNativeVideoParts(
+      userParts,
+      multimodalInput?.nativeVideoFiles,
+      "vertex",
+      modelName,
+      "[GoogleVertex]",
+    );
+
+    // Prepend prior conversation turns before the current user message so
+    // multi-turn callers (memory, loop REPL, agent flows) carry context
+    // into native Vertex Gemini generate. Without this, every call started
+    // fresh from the current input alone.
+    prependConversationMessages(
+      contents as Array<{ role: string; parts: unknown[] }>,
+      options.conversationMessages,
+    );
+
+    contents.push({
+      role: "user",
+      parts: userParts,
+    });
+
+    // Tool filter (a0269210): trust options.tools — already merged + filtered
+    // upstream. Defensive guard on disableTools matches the AI Studio path
+    // and protects callers that bypass BaseProvider.generate() (which is
+    // exactly what this method is doing).
+    const combinedTools = !options.disableTools ? options.tools || {} : {};
+
+    // Convert Vercel AI SDK tools to @google/genai FunctionDeclarations
+    let tools:
+      | Array<{ functionDeclarations: VertexGenaiFunctionDeclaration[] }>
+      | undefined;
+    const executeMap = new DedupExecuteMap();
+    let declarations: NativeToolDeclarationsResult | undefined;
+
+    if (Object.keys(combinedTools).length > 0) {
+      const declared = toNativeToolDeclarations(
+        combinedTools,
+        "functionDeclarations",
+      );
+      // Kept for the shared adapter: originalNameMap for name translation,
+      // executeMap for the per-turn dedup wrapper.
+      declarations = declared;
+      tools = declared.toolsConfig;
+      for (const [name, execute] of declared.executeMap) {
+        executeMap.set(name, execute);
+      }
+
+      logger.debug("[GoogleVertex] Converted tools for native SDK generate", {
+        toolCount: declared.toolsConfig[0].functionDeclarations.length,
+        toolNames: declared.toolsConfig[0].functionDeclarations.map(
+          (t) => t.name,
+        ),
+      });
+    }
+
+    // Check if we need to use the final_result tool pattern for structured output with tools
+    // When both schema AND tools are present, we add final_result as a tool
+    let useFinalResultTool = false;
+    if (options.schema && tools) {
+      useFinalResultTool = true;
+
+      // Convert schema to JSON schema format
+      const schemaAsJson = convertZodToJsonSchema(
+        options.schema as ZodUnknownSchema,
+        "openApi3",
+      ) as Record<string, unknown>;
+      const inlinedSchema = inlineJsonSchema(schemaAsJson);
+      if (inlinedSchema.$schema) {
+        delete inlinedSchema.$schema;
+      }
+      const typedSchema = ensureNestedSchemaTypes(inlinedSchema);
+
+      // Add final_result tool to the existing function declarations
+      const existingDeclarations = tools[0]?.functionDeclarations || [];
+      existingDeclarations.push({
+        name: "final_result",
+        description:
+          "Return the final structured result. You MUST call this tool when you have gathered all information and are ready to provide the final answer. The arguments should contain the structured data matching the expected schema.",
+        parametersJsonSchema: typedSchema,
+      });
+      tools = [{ functionDeclarations: existingDeclarations }];
+
+      logger.debug(
+        "[GoogleVertex] Added final_result tool for structured output with tools (generate)",
+        {
+          schemaKeys: Object.keys(typedSchema),
+          totalTools: existingDeclarations.length,
+        },
+      );
+    }
+
+    // Build config. Registry-driven sampling strip applied for uniformity
+    // with every other provider path (inert for current Gemini models).
+    const geminiSampling = resolveSamplingParams(
+      this.providerName,
+      modelName,
+      {
+        temperature: options.temperature ?? 1.0, // Gemini 3 requires 1.0 for tool calling
+        ...(options.topP !== undefined && { topP: options.topP }),
+      },
+      "vertex.gemini",
+    );
+    const config: Record<string, unknown> = {
+      ...(geminiSampling.temperature !== undefined && {
+        temperature: geminiSampling.temperature,
+      }),
+      maxOutputTokens: options.maxTokens,
+    };
+
+    // Cap maxOutputTokens for models with restricted output token limits (32768)
+    // This applies to Gemini 3 models and image generation models (gemini-2.5-flash-image, gemini-3-pro-image-preview)
+    if (hasRestrictedOutputLimit(modelName)) {
+      if (
+        config.maxOutputTokens &&
+        (config.maxOutputTokens as number) > RESTRICTED_OUTPUT_TOKEN_LIMIT
+      ) {
+        logger.warn(
+          `[GoogleVertex] Capping maxOutputTokens from ${config.maxOutputTokens} to ${RESTRICTED_OUTPUT_TOKEN_LIMIT} for ${modelName}`,
+        );
+        config.maxOutputTokens = RESTRICTED_OUTPUT_TOKEN_LIMIT;
+      }
+      // If maxOutputTokens is undefined, set a safe default
+      if (!config.maxOutputTokens) {
+        config.maxOutputTokens = RESTRICTED_OUTPUT_TOKEN_LIMIT;
+      }
+    }
+
+    // Add topP, topK, stopSequences if provided
+    if (geminiSampling.topP !== undefined) {
+      config.topP = geminiSampling.topP;
+    }
+    if (options.topK !== undefined) {
+      config.topK = options.topK;
+    }
+    if (options.stopSequences && options.stopSequences.length > 0) {
+      config.stopSequences = options.stopSequences;
+    }
+
+    if (tools) {
+      config.tools = tools;
+    }
+
+    // Build system prompt, adding final_result instruction if needed
+    let effectiveSystemPrompt = options.systemPrompt || "";
+    if (useFinalResultTool) {
+      const finalResultInstruction =
+        "\n\nIMPORTANT: When you have gathered all necessary information and are ready to provide your final answer, you MUST call the 'final_result' tool with the structured data. Do not return the final answer as plain text - always use the final_result tool.";
+      effectiveSystemPrompt = effectiveSystemPrompt + finalResultInstruction;
+    }
+
+    if (effectiveSystemPrompt) {
+      config.systemInstruction = effectiveSystemPrompt;
+    }
+
+    // Add thinking config. Gemini 3 takes `thinkingLevel` directly; Gemini
+    // 2.5 rejects that field and needs a translated `thinkingBudget` instead
+    // — createNativeThinkingConfig picks the wire shape from modelName.
+    const nativeThinkingConfig2 = createNativeThinkingConfig(
+      options.thinkingConfig,
+      modelName,
+    );
+    if (nativeThinkingConfig2) {
+      config.thinkingConfig = nativeThinkingConfig2;
+    }
+
+    // Add JSON output format support for native SDK generate (matching stream implementation)
+    // CRITICAL: Google Gemini API does NOT allow combining responseMimeType with function calling.
+    // Error: "Function calling with a response mime type: 'application/json' is unsupported"
+    // Additionally, responseSchema REQUIRES responseMimeType: "application/json" - they cannot be used separately.
+    // Error without it: "Response_schema with a response mime type 'text/plain' is unsupported"
+    // Therefore: When tools are present, we cannot use EITHER responseMimeType OR responseSchema.
+    // When using final_result tool pattern, we skip this entirely as schema is enforced via tool.
+    if (
+      (options.output?.format === "json" || options.schema) &&
+      !useFinalResultTool
+    ) {
+      // Only set responseMimeType AND responseSchema when NOT using tools
+      // Both must be set together, and neither can be used with function calling
+      if (!tools) {
+        config.responseMimeType = "application/json";
+
+        // Convert schema to JSON schema format for the native SDK
+        if (options.schema) {
+          const rawSchema = convertZodToJsonSchema(
+            options.schema as ZodUnknownSchema,
+            "openApi3",
+          ) as Record<string, unknown>;
+          const inlinedSchema = inlineJsonSchema(rawSchema);
+          // Remove $schema if present - @google/genai doesn't need it
+          if (inlinedSchema.$schema) {
+            delete inlinedSchema.$schema;
+          }
+          // CRITICAL: Google Vertex AI requires ALL nested schemas to have a type field
+          // ensureNestedSchemaTypes recursively adds missing type fields
+          // Note: convertZodToJsonSchema now uses openApi3 target which produces nullable: true
+          const typedSchema = ensureNestedSchemaTypes(inlinedSchema);
+          // Sanitize the same way tool schemas are (see tool path above):
+          // Vertex's responseSchema validator rejects extension keywords such
+          // as `errorMessage` (from convertZodToJsonSchema's errorMessages
+          // option) and `additionalProperties`. Without this a user schema with
+          // a `.regex(.., { message })` field 400s the whole structured-output
+          // request and the recovery loop retries the same poisoned payload.
+          stripAdditionalPropertiesDeep(typedSchema);
+          config.responseSchema = typedSchema;
+
+          logger.debug(
+            "[GoogleVertex] Added responseSchema for JSON output (generate)",
+            {
+              schemaKeys: Object.keys(typedSchema),
+            },
+          );
+        }
+      }
+    }
+
+    const startTime = Date.now();
+    // Ensure maxSteps is a valid positive integer to prevent infinite loops
+    const rawMaxSteps = options.maxSteps || DEFAULT_MAX_STEPS;
+    const maxSteps =
+      Number.isFinite(rawMaxSteps) && rawMaxSteps > 0
+        ? Math.min(Math.floor(rawMaxSteps), 100) // Cap at 100 for safety
+        : Math.min(DEFAULT_MAX_STEPS, 100);
+    // Widened per-turn copy: the agentic loop appends functionCall /
+    // functionResponse parts on top of the plain text/inlineData parts the
+    // initial contents carry.
+    const currentContents: Array<{
+      role: string;
+      parts: VertexNativeLoopPart[];
+    }> = [...contents];
+    let finalText = "";
+    // Cross-step text accumulation + last SDK finish reason, so the
+    // maxSteps-exhaustion exit can surface real gathered text (Bug 1) and a
+    // meaningful finishReason (Bug 2) instead of a placeholder / "unknown".
+    const accumulatedText = "";
+    let lastFinishReason: string | undefined;
+    const allToolCalls: Array<{
+      toolCallId: string;
+      toolName: string;
+      args: Record<string, unknown>;
+    }> = [];
+    const toolExecutions: Array<{
+      name: string;
+      input: Record<string, unknown>;
+      output: unknown;
+    }> = [];
+
+    // Track structured output from final_result tool (when using final_result pattern)
+    let finalResultStructuredOutput: Record<string, unknown> | undefined;
+
+    // In-loop context guard: stop calling tools when the accumulated
+    // conversation approaches the model's context window instead of stepping
+    // into a provider "prompt too long" rejection mid-loop.
+    const contextGuard = createContextGuard(
+      getContextWindowSize("vertex", modelName),
+    );
+    let hitContextLimit = false;
+
+    // Track token usage across all steps. Every loop step is a separate
+    // billed API call, so per-step usage is folded into these turn totals
+    // after each step's chunk drain — assigning them directly from chunk
+    // metadata would record only the last step of a multi-step tool loop.
+    let totalInputTokens = 0;
+    let totalOutputTokens = 0;
+    let totalCacheReadTokens = 0;
+    let totalReasoningTokens = 0;
+
+    // Abort scaffolding (mirrors executeNativeAnthropicStream). The native
+    // Gemini SDK cancels via config.abortSignal, so drive an internal
+    // AbortController: the caller's signal and the turn clock's watchdogs
+    // (whole-turn deadline + optional stall detector) all trip it, and every
+    // request/tool-exec receives effectiveSignal.
+    const streamTimeoutMs =
+      parseTimeout(options.timeout) ?? DEFAULT_GEMINI_STREAM_TIMEOUT_MS;
+    const toolExecTimeoutMs = resolveToolTimeoutMs(options.toolTimeoutMs);
+    const effectiveTurnDeadlineMs = options.turnTimeoutMs ?? streamTimeoutMs;
+    const internalAbort = new AbortController();
+    const onCallerAbort = () => internalAbort.abort();
+    options.abortSignal?.addEventListener("abort", onCallerAbort);
+    const turnClock = createTurnClock({
+      turnTimeoutMs: options.turnTimeoutMs,
+      // Preserve the pre-existing defensive whole-turn bound when the caller
+      // sets no explicit turn budget — a turn must never hang forever.
+      defaultTurnTimeoutMs: streamTimeoutMs,
+      stallTimeoutMs: options.stallTimeoutMs,
+      wrapupTimeLeadMs: options.wrapupTimeLeadMs,
+      onDeadline: (kind) => {
+        logger.warn(
+          kind === "timeout"
+            ? `[GoogleVertex] Native Gemini turn exceeded its ${effectiveTurnDeadlineMs}ms time budget — aborting`
+            : `[GoogleVertex] Native Gemini turn made no progress for ${options.stallTimeoutMs}ms — aborting`,
+        );
+        internalAbort.abort();
+      },
+    });
+    const effectiveSignal = internalAbort.signal;
+    if (options.abortSignal?.aborted) {
+      internalAbort.abort();
+    }
+    let wasAborted = false;
+
+    // Step-cap flags declared in the outer scope so the terminal block (also
+    // inside the try) and the finishReason mapping (after the finally) can
+    // both read them.
+    let hitStepLimit = false;
+    let synthesizedFinalAnswer = false;
+    // Steps the ENGINE took, reported back from the per-step hook; counting
+    // hook invocations would drift by the number of malformed retries.
+    let stepsTaken = 0;
+
+    try {
+      // Agentic loop for tool calling
+      // The turn runs on the shared engine. The step cap, tool dispatch, the
+      // failure breaker, per-step usage accumulation, the single malformed
+      // retry and the pre-first-chunk provider retry all live there now; what
+      // stays here is everything the engine has no opinion about — the turn
+      // clock, the context guard, conversation-memory storage, the wrap-up
+      // nudge, and the terminal block below.
+      const engineAdapter = createGeminiLoopAdapter({
+        providerLabel: "GoogleVertex",
+        provider: this.providerName,
+        maxSteps,
+        // Ported verbatim: the same DEFAULT_TOOL_MAX_RETRIES threshold, plus
+        // the two rules this loop has always had and the engine did not.
+        toolFailureBreaker: {
+          maxRetries: DEFAULT_TOOL_MAX_RETRIES,
+          // Strikes are CONSECUTIVE here: a clean result clears the count, so
+          // an argument-dependent soft error cannot accumulate its way to
+          // disabling a tool that works.
+          consecutive: true,
+          // A result that reports failure without throwing — an MCP isError
+          // payload, a proxy-blocked call resolving with { error } — counts
+          // toward the breaker exactly as a throw does.
+          classifyResultFailure: (output) =>
+            extractToolFailureText(output) ?? undefined,
+        },
+        liveTools: options.tools ?? {},
+        // A tool hydrated mid-turn gets the SAME bound, abort race and stall
+        // ping as one declared up front — see guardToolExecutor.
+        toolGuards: {
+          toolTimeoutMs: toolExecTimeoutMs,
+          abortSignal: effectiveSignal,
+          onProgress: () => turnClock.noteProgress(),
+        },
+        ...(declarations ? { declarations } : {}),
+        ...(useFinalResultTool
+          ? {
+              finalResultToolName: "final_result",
+              onTerminalResult: (text) => {
+                try {
+                  finalResultStructuredOutput = JSON.parse(text) as Record<
+                    string,
+                    unknown
+                  >;
+                } catch {
+                  /* the caller's coercion layer repairs a partial payload */
+                }
+              },
+            }
+          : {}),
+        enableMalformedRetry: true,
+        buildMalformedRetryNote: (conversation, retriedStep) => {
+          this.emitTurnEvent({
+            phase: "malformed-retry",
+            step: retriedStep + 1,
+            maxSteps,
+          });
+          return [
+            ...conversation,
+            {
+              role: "user",
+              parts: [
+                {
+                  text:
+                    "Your previous function call was malformed and could not " +
+                    "be parsed. Re-issue it as a single valid function call, " +
+                    "or answer in plain text.",
+                },
+              ],
+            },
+          ];
+        },
+        // The turn clock's per-chunk ping and the context guard's per-step
+        // prompt size both ride the drain, which is why this loop keeps its
+        // own collector rather than the adapter's default.
+        collectStep: (stream, channel) =>
+          collectVertexStreamChunks(
+            stream as AsyncIterable<{
+              functionCalls?: NativeFunctionCall[];
+              [key: string]: unknown;
+            }>,
+            channel,
+            {
+              onProgress: () => turnClock.noteProgress(),
+              onUsage: (input, output) => contextGuard.noteUsage(input, output),
+              onUsageDelta: (counter, delta) => {
+                if (counter === "input") {
+                  totalInputTokens += delta;
+                } else if (counter === "output") {
+                  totalOutputTokens += delta;
+                } else if (counter === "cacheRead") {
+                  totalCacheReadTokens += delta;
+                } else {
+                  totalReasoningTokens += delta;
+                }
+              },
+            },
+          ),
+        planReclaim: (conversation) => {
+          if (!contextGuard.shouldStop()) {
+            return undefined;
+          }
+          // Try to RECLAIM budget and keep going before falling back to the
+          // historic stop-only behaviour. Ending the turn early is safe but
+          // throws away work the model was mid-way through; dropping the
+          // oldest complete tool exchanges usually buys enough room to finish.
+          const working = [...conversation] as Array<{
+            role: string;
+            parts: VertexNativeLoopPart[];
+          }>;
+          if (
+            reclaimVertexLoopContext(
+              working,
+              modelName,
+              contextGuard.projectedNextPromptTokens,
+            )
+          ) {
+            contextGuard.resetAfterReclaim();
+            return { conversation: working };
+          }
+          hitContextLimit = true;
+          logger.warn(
+            `[GoogleVertex] Gemini turn stopped by the context guard: ` +
+              `projected prompt ~${contextGuard.projectedNextPromptTokens} tokens ` +
+              `>= threshold ${contextGuard.thresholdTokens} — synthesizing a final answer.`,
+          );
+          return { stop: true };
+        },
+        buildRequest: (conversation) => ({
+          model: modelName,
+          contents: conversation,
+          config: { ...config, ...(tools ? { tools } : {}) },
+        }),
+        sendStep: async (request, signal) => {
+          turnClock.noteProgress();
+          const built = request as {
+            model: string;
+            contents: Array<{ role: string; parts: unknown[] }>;
+            config?: Record<string, unknown>;
+          };
+          return client.models.generateContentStream({
+            model: built.model,
+            contents: built.contents,
+            config: { ...(built.config ?? {}), abortSignal: signal },
+          }) as Promise<
+            AsyncIterable<{
+              functionCalls?: NativeFunctionCall[];
+              [key: string]: unknown;
+            }>
+          >;
+        },
+      });
+
+      // Wrapped rather than configured: these fire once PER STEP, and
+      // buildToolResultMessages is the only hook that runs per step with
+      // exactly that step's results. Reading them off the turn's final result
+      // would batch every step into one late write and lose the per-step
+      // thought signature.
+      const adapter: typeof engineAdapter = {
+        ...engineAdapter,
+        // Counted HERE, not in buildToolResultMessages: this runs once per
+        // step exactly as the old `step++` at the top of the loop did,
+        // malformed retries included. Counting in the tool-result hook would
+        // skip the final text-only step and quietly report one step fewer in
+        // `stepsUsed`, which is a public field on the result.
+        buildStepRequest: (conversation, step) => {
+          stepsTaken = step + 1;
+          return engineAdapter.buildStepRequest(conversation, step);
+        },
+        buildToolResultMessages: (
+          conversation,
+          stepResult,
+          toolResults,
+          engineStep,
+        ) => {
+          const next = engineAdapter.buildToolResultMessages(
+            conversation,
+            stepResult,
+            toolResults,
+            engineStep,
+          );
+          // Time-budget wrap-up nudge (twin of the Anthropic loops' soft step
+          // nudge): with the turn deadline approaching, tell the model to
+          // consolidate. Rides as a trailing text part on the tool-response
+          // user turn.
+          if (turnClock.shouldNudgeWrapup()) {
+            const last = next[next.length - 1];
+            if (last && Array.isArray(last.parts)) {
+              last.parts.push({
+                text: buildWrapupNudgeText(useFinalResultTool),
+              });
+            }
+          }
+          // Persist this step's tool calls/results into conversation memory.
+          // Without this, tool_call / tool_result rows never reach Redis and
+          // the chat-history UI loses every tool invocation. `thoughtSignature`
+          // rides as a sibling on the first call of the step — Gemini 3 needs
+          // it to match thinking patterns when the conversation is replayed.
+          const stepThoughtSig = extractThoughtSignature(
+            stepResult.raw.rawResponseParts,
+          );
+          withTimeout(
+            this.handleToolExecutionStorage(
+              toolResults.map((result, index) => ({
+                toolName: result.name,
+                args: result.args,
+                ...(index === 0 && stepThoughtSig
+                  ? { thoughtSignature: stepThoughtSig }
+                  : {}),
+                stepIndex: engineStep + 1,
+              })),
+              toolResults.map((result) => ({
+                toolName: result.name,
+                output: result.output,
+                stepIndex: engineStep + 1,
+              })),
+              options,
+              new Date(),
+            ),
+            TOOL_STORAGE_TIMEOUT_MS,
+            "tool storage write timed out",
+          ).catch((error: unknown) => {
+            logger.warn(
+              "[GoogleVertex] Failed to store native Gemini stream tool executions",
+              {
+                error: error instanceof Error ? error.message : String(error),
+              },
+            );
+          });
+          // Project this step's growth for the context guard: the appended
+          // tool results ride the next prompt (Gemini reports usage per call,
+          // but only for content it has already seen).
+          try {
+            const appended = next[next.length - 1];
+            contextGuard.noteAppendedChars(
+              JSON.stringify(appended?.parts ?? []).length,
+            );
+          } catch {
+            /* estimation is best-effort — never break the loop */
+          }
+          return next;
+        },
+      };
+
+      const { stream: engineStream, resultPromise } = runAgenticLoop(
+        adapter,
+        // A concrete parts array widens to the engine's `unknown[]` on its
+        // own; only the direction back needs an assertion.
+        currentContents as GeminiTurnContent[],
+        {
+          tools: buildDedupedEngineTools(declarations, options.tools, {
+            toolTimeoutMs: toolExecTimeoutMs,
+            abortSignal: effectiveSignal,
+            onProgress: () => turnClock.noteProgress(),
+          }),
+          abortSignal: effectiveSignal,
+          // The engine bounds every tool call itself. Passing the value this
+          // loop already gave `buildDedupedEngineTools` keeps the engine's
+          // backstop from being tighter than what the caller asked for.
+          toolTimeoutMs: toolExecTimeoutMs,
+        },
+      );
+
+      // generate() returns one result rather than streaming, so the engine's
+      // chunks are drained and discarded — the answer comes off the turn's
+      // result. The drain still has to happen: leaving the channel unread
+      // would stall the engine once its buffer fills.
+      const pump = (async () => {
+        for await (const chunk of engineStream) {
+          void chunk;
+        }
+      })();
+
+      let engineResult;
+      try {
+        engineResult = await resultPromise;
+      } catch (error) {
+        await drainDetachedPump(pump, "GoogleVertex");
+        // A mid-drain abort surfaces as an AbortError. End gracefully into the
+        // terminal block instead of re-throwing — a re-throw would route the
+        // caller's abort into a second unbounded fallback stream().
+        if (effectiveSignal.aborted || isAbortError(error)) {
+          wasAborted = true;
+        } else {
+          logger.error("[GoogleVertex] Native SDK error", error);
+          throw this.handleProviderError(error);
+        }
+      }
+      await pump;
+
+      if (engineResult) {
+        finalText = engineResult.text;
+        lastFinishReason = engineResult.rawStopReason ?? lastFinishReason;
+        for (const call of engineResult.toolCalls) {
+          allToolCalls.push({
+            toolCallId: call.id,
+            toolName: call.name,
+            args: call.args,
+          });
+        }
+        for (const execution of engineResult.toolExecutions) {
+          toolExecutions.push({
+            name: execution.name,
+            input: execution.input,
+            output: execution.output,
+          });
+        }
+        // Replace in place: `currentContents` is a const the terminal block
+        // and the synth call both read.
+        currentContents.length = 0;
+        currentContents.push(
+          ...(engineResult.conversation as Array<{
+            role: string;
+            parts: VertexNativeLoopPart[];
+          }>),
+        );
+      }
+      if (effectiveSignal.aborted) {
+        wasAborted = true;
+      }
+
+      // Handle maxSteps termination / abort — the loop exited because the step
+      // cap was reached (or the turn was aborted) while the model was still
+      // calling tools. Surface a real answer instead of the canned placeholder
+      // (Bug 1) and a meaningful finishReason (Bug 2).
+      if (
+        !finalText &&
+        (stepsTaken >= maxSteps || wasAborted || hitContextLimit)
+      ) {
+        hitStepLimit = stepsTaken >= maxSteps && !wasAborted;
+        const toolCallCount = allToolCalls.filter(
+          (tc) => tc.toolName !== "final_result",
+        ).length;
+        if (accumulatedText) {
+          // Prefer the prose the model already produced across steps.
+          logger.warn(
+            hitContextLimit
+              ? `[GoogleVertex] Generate tool call loop stopped by the context guard; ` +
+                  `returning text already gathered from prior steps.`
+              : `[GoogleVertex] Generate tool call loop terminated after reaching maxSteps (${maxSteps}); ` +
+                  `returning text already gathered from prior steps.`,
+          );
+          finalText = accumulatedText;
+        } else if (wasAborted) {
+          // Turn ended on a time condition or caller abort — skip synth
+          // entirely so it can never add +300s after a blown budget, and
+          // answer with an HONEST message matching the actual exit cause
+          // (never the step-cap text).
+          logger.warn(
+            `[GoogleVertex] Generate tool call loop ended mid-turn ` +
+              `(${turnClock.timedOut ? "turn time limit" : turnClock.stalled ? "stall watchdog" : "caller abort"}); ` +
+              `returning an honest terminal message.`,
+          );
+          finalText = this.buildLoopExitMessage({
+            turnClock,
+            wasAborted,
+            stallTimeoutMs: options.stallTimeoutMs,
+            maxSteps,
+            toolCallCount,
+          });
+        } else {
+          // Pure functionCall turns leave no text — make one tools-disabled call
+          // so the model answers from the gathered tool results instead of the
+          // canned placeholder.
+          logger.warn(
+            hitContextLimit
+              ? `[GoogleVertex] Generate tool call loop stopped by the context guard ` +
+                  `with no text; synthesizing a final answer with tools disabled.`
+              : `[GoogleVertex] Generate tool call loop terminated after reaching maxSteps (${maxSteps}) ` +
+                  `with no text; synthesizing a final answer with tools disabled.`,
+          );
+          // synth self-bounds its connect+drain via withTimeout(timeoutMs) and
+          // never throws (returns empty on timeout/error), so it needs no outer
+          // withTimeout wrapper — see synthesizeFinalAnswerWithoutTools.
+          const synth = await this.synthesizeFinalAnswerWithoutTools(
+            client,
+            modelName,
+            config,
+            currentContents,
+            useFinalResultTool,
+            parseTimeout(options.timeout) ?? DEFAULT_GEMINI_STREAM_TIMEOUT_MS,
+            effectiveSignal,
+          );
+          if (synth.text) {
+            synthesizedFinalAnswer = true;
+            finalText = synth.text;
+            totalInputTokens += synth.inputTokens;
+            totalOutputTokens += synth.outputTokens;
+            totalReasoningTokens += synth.reasoningTokens ?? 0;
+            if (synth.finishReason) {
+              lastFinishReason = synth.finishReason;
+            }
+          } else {
+            finalText = hitContextLimit
+              ? buildContextCapMessage(toolCallCount)
+              : buildToolLoopCapMessage(maxSteps, toolCallCount);
+          }
+        }
+      }
+    } finally {
+      turnClock.dispose();
+      options.abortSignal?.removeEventListener("abort", onCallerAbort);
+    }
+
+    // Unified finish reason: a step-cap exhaustion that did NOT end in a clean
+    // synthesized answer is reported as "tool-calls" (the model still wanted
+    // tools) — NOT "length", which neurolink.ts treats as token truncation
+    // (jsonTruncated + WARNING span). A clean completion maps from the SDK
+    // finish reason.
+    const resolvedFinishReason =
+      hitStepLimit && !synthesizedFinalAnswer
+        ? "tool-calls"
+        : mapGeminiFinishReason(lastFinishReason);
+
+    // Turn-exit discriminator, independent of the provider-shaped
+    // finishReason — consumers branch on this instead of sniffing strings.
+    const stopReason = resolveTurnStopReason({
+      timedOut: turnClock.timedOut,
+      stalled: turnClock.stalled,
+      wasAborted,
+      cappedWithoutAnswer: hitStepLimit && !synthesizedFinalAnswer,
+      contextCappedWithoutAnswer: hitContextLimit && !synthesizedFinalAnswer,
+      finishReason: resolvedFinishReason,
+    });
+    if (stopReason !== "completed") {
+      this.emitTurnEvent({
+        phase: stopReason,
+        step: stepsTaken,
+        maxSteps,
+        toolCallCount: allToolCalls.filter(
+          (tc) => tc.toolName !== "final_result",
+        ).length,
+        elapsedMs: turnClock.elapsedMs(),
+      });
+    }
+
+    const responseTime = Date.now() - startTime;
+
+    // Filter out final_result from tool calls and executions as it's an internal pattern
+    const externalToolCalls = allToolCalls.filter(
+      (tc) => tc.toolName !== "final_result",
+    );
+    const externalToolExecutions = toolExecutions.filter(
+      (te) => te.name !== "final_result",
+    );
+
+    // Build EnhancedGenerateResult
+    // Gemini promptTokenCount is OVERLAPPING (already includes
+    // cachedContentTokenCount). Subtract once so the cached portion is billed at
+    // the cheaper cacheRead rate without double-counting; total is conserved.
+    const adjustedInputTokens = Math.max(
+      0,
+      totalInputTokens - totalCacheReadTokens,
+    );
+    const result: EnhancedGenerateResult = {
+      content: finalText,
+      provider: this.providerName,
+      model: modelName,
+      finishReason: resolvedFinishReason,
+      stopReason,
+      rawFinishReason: lastFinishReason,
+      stepsUsed: stepsTaken,
+      usage: {
+        input: adjustedInputTokens,
+        // Thinking tokens are billed at the output rate but Gemini does NOT
+        // include them in candidatesTokenCount (totalTokenCount = prompt +
+        // candidates + thoughts), so they are folded into `output` — that is
+        // what calculateCost bills at the output rate — with `reasoning`
+        // reporting the thinking subset.
+        output: totalOutputTokens + totalReasoningTokens,
+        total:
+          adjustedInputTokens +
+          totalCacheReadTokens +
+          totalOutputTokens +
+          totalReasoningTokens,
+        ...(totalCacheReadTokens > 0 && {
+          cacheReadTokens: totalCacheReadTokens,
+        }),
+        ...(totalReasoningTokens > 0 && {
+          reasoning: totalReasoningTokens,
+        }),
+      },
+      ...(totalReasoningTokens > 0 && {
+        reasoningTokens: totalReasoningTokens,
+      }),
+      responseTime,
+      // The complete attempted-call record (name/args/id), independent of
+      // toolsUsed's success-only names — mirrors the native Anthropic direct
+      // / OpenAI-compatible / SageMaker paths (toolCallsFromSummaries) and
+      // the working Gemini-on-Vertex STREAM path just above. Previously
+      // absent here, so a tool the loop ran internally never reached the
+      // caller's result.toolCalls even though toolsUsed/toolExecutions did.
+      toolCalls: externalToolCalls.map((tc) => ({
+        toolCallId: tc.toolCallId,
+        toolName: tc.toolName,
+        args: tc.args,
+      })),
+      toolsUsed: externalToolCalls.map((tc) => tc.toolName),
+      toolExecutions: resolveToolExecutionRecords(
+        options,
+        externalToolExecutions,
+      ),
+      enhancedWithTools: externalToolCalls.length > 0,
+    };
+
+    // Add structured output if final_result tool was used
+    if (finalResultStructuredOutput) {
+      (
+        result as EnhancedGenerateResult & { structuredOutput?: unknown }
+      ).structuredOutput = finalResultStructuredOutput;
+    }
+
+    // Route through enhanceResult so analytics/evaluation/tracing get the
+    // same treatment as the BaseProvider.generate() path. Without this,
+    // enableAnalytics / enableEvaluation are silently ignored on the native
+    // Vertex Gemini generate path.
+    return this.enhanceResult(result, options, startTime);
+  }
+
+  /**
+   * One-shot, tools-disabled model call used when a native Gemini agentic loop
+   * is force-terminated by the step cap with no text produced. Lets the model
+   * synthesize a final answer from the function results already in `contents`
+   * instead of returning a canned placeholder (Bug 1, part b).
+   *
+   * Tools are disabled by OMITTING `config.tools` — the codebase's established
+   * mechanism. `@google/genai`'s `FunctionCallingConfigMode.NONE` is documented
+   * as equivalent to passing no function declarations, and `functionCallingConfig`
+   * is not used anywhere in this codebase. When the structured-output
+   * (`final_result`) pattern was active, a trailing instruction countermands the
+   * earlier "you MUST call final_result" directive so the model answers in plain
+   * text. Never throws — returns empty text so the caller falls back to the
+   * graceful cap message (buildToolLoopCapMessage), guaranteeing no new failure
+   * path.
+   */
+  // eslint-disable-next-line max-params -- trailing optional abortSignal keeps the positional call sites stable
+  private async synthesizeFinalAnswerWithoutTools(
+    client: GenAIClient,
+    modelName: string,
+    config: Record<string, unknown>,
+    contents: Array<{ role: string; parts: VertexNativeLoopPart[] }>,
+    useFinalResultTool: boolean,
+    timeoutMs: number,
+    abortSignal?: AbortSignal,
+  ): Promise<{
+    text: string;
+    finishReason?: string;
+    inputTokens: number;
+    outputTokens: number;
+    reasoningTokens: number;
+  }> {
+    // Already aborted — never issue the synth request (would add +300s after a
+    // blown budget). Return empty so the caller maps to the graceful message.
+    if (abortSignal?.aborted) {
+      return { text: "", inputTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+    }
+    try {
+      // Shallow clone so the loop's config is never mutated; dropping the
+      // top-level `tools` key is sufficient (nested thinkingConfig /
+      // systemInstruction are intentionally preserved). Fold in the abort
+      // signal so the synth request is cancellable too.
+      const synthConfig: Record<string, unknown> = {
+        ...config,
+        ...(abortSignal ? { abortSignal } : {}),
+      };
+      delete synthConfig.tools;
+      if (useFinalResultTool) {
+        const baseSystemInstruction =
+          typeof synthConfig.systemInstruction === "string"
+            ? synthConfig.systemInstruction
+            : "";
+        synthConfig.systemInstruction =
+          baseSystemInstruction +
+          "\n\nThe final_result tool is no longer available. Provide your " +
+          "final answer directly as plain text now, using the information " +
+          "gathered so far.";
+      }
+
+      // Bound the whole connect + drain with a timeout. The surrounding
+      // try/catch only catches throws, not hangs, so without this a stalled
+      // Vertex endpoint would hang the maxSteps recovery path indefinitely.
+      // On timeout withTimeout rejects (TimeoutError) and the catch below
+      // falls back to the placeholder — no new failure path is introduced.
+      return await withGeneration(
+        describeGeminiRequest(this.providerName, {
+          model: modelName,
+          contents,
+          config,
+        }),
+        async (span) => {
+          const synth = await withTimeout(
+            (async () => {
+              const stream = await client.models.generateContentStream({
+                model: modelName,
+                contents,
+                config: synthConfig,
+              });
+
+              const parts: unknown[] = [];
+              let finishReason: string | undefined;
+              let inputTokens = 0;
+              let outputTokens = 0;
+              let reasoningTokens = 0;
+              for await (const chunk of stream) {
+                const chunkRecord = chunk as Record<string, unknown>;
+                const candidates = chunkRecord.candidates as
+                  | Array<Record<string, unknown>>
+                  | undefined;
+                const firstCandidate = candidates?.[0];
+                const chunkFinishReason = firstCandidate?.finishReason;
+                if (
+                  typeof chunkFinishReason === "string" &&
+                  chunkFinishReason
+                ) {
+                  finishReason = chunkFinishReason;
+                }
+                const chunkContent = firstCandidate?.content as
+                  | Record<string, unknown>
+                  | undefined;
+                if (chunkContent && Array.isArray(chunkContent.parts)) {
+                  parts.push(...chunkContent.parts);
+                }
+                const usageMetadata = chunkRecord.usageMetadata as
+                  | {
+                      promptTokenCount?: number;
+                      candidatesTokenCount?: number;
+                      thoughtsTokenCount?: number;
+                    }
+                  | undefined;
+                if (usageMetadata) {
+                  if (
+                    usageMetadata.promptTokenCount !== undefined &&
+                    usageMetadata.promptTokenCount > 0
+                  ) {
+                    inputTokens = usageMetadata.promptTokenCount;
+                  }
+                  if (
+                    usageMetadata.candidatesTokenCount !== undefined &&
+                    usageMetadata.candidatesTokenCount > 0
+                  ) {
+                    outputTokens = usageMetadata.candidatesTokenCount;
+                  }
+                  if (
+                    usageMetadata.thoughtsTokenCount !== undefined &&
+                    usageMetadata.thoughtsTokenCount > 0
+                  ) {
+                    reasoningTokens = usageMetadata.thoughtsTokenCount;
+                  }
+                }
+              }
+
+              const text = parts
+                .filter(
+                  (part): part is { text: string } =>
+                    typeof (part as Record<string, unknown>).text === "string",
+                )
+                .map((part) => part.text)
+                .join("");
+
+              return {
+                text,
+                finishReason,
+                inputTokens,
+                outputTokens,
+                reasoningTokens,
+              };
+            })(),
+            timeoutMs,
+            "Gemini synthesis call timed out",
+          );
+          observeGeneration(span, {
+            provider: this.providerName,
+            model: modelName,
+            output: synth.text,
+            usage: {
+              inputTokens: synth.inputTokens,
+              outputTokens: synth.outputTokens,
+              reasoningTokens: synth.reasoningTokens,
+            },
+            finishReason: synth.finishReason,
+          });
+          return synth;
+        },
+      );
+    } catch (error) {
+      logger.warn(
+        "[GoogleVertex] Tools-disabled synthesis call failed; falling back to placeholder",
+        { error: error instanceof Error ? error.message : String(error) },
+      );
+      return { text: "", inputTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+    }
+  }
+
+  /**
+   * Create native AnthropicVertex client for Claude models
+   */
+  private async createAnthropicVertexClient(
+    timeoutMs?: number,
+  ): Promise<AnthropicVertexType> {
+    const mod = await getAnthropicVertexModule();
+    const expressApiKey = this.resolveExpressApiKey();
+    const directBaseURL =
+      this.baseURL?.trim() || process.env.GOOGLE_VERTEX_BASE_URL?.trim();
+    const settings = await createVertexAnthropicSettings(
+      this.location,
+      timeoutMs,
+      expressApiKey
+        ? {
+            apiKey: expressApiKey,
+            ...(this.projectId ? { projectId: this.projectId } : {}),
+          }
+        : undefined,
+      directBaseURL,
+    );
+    // One assertion, at the one place the shapes genuinely differ. The SDK
+    // declares `authClient` as its full `AuthClient` (24-plus members) while
+    // `prepareOptions()` only ever calls `getRequestHeaders()` and reads
+    // `projectId`. Naming the narrow surface in our own type and widening it
+    // here is the honest version of that gap; the alternative is standing up a
+    // real AuthClient to satisfy a contract the SDK does not exercise.
+    const client = new mod.AnthropicVertex(
+      settings as ConstructorParameters<typeof mod.AnthropicVertex>[0],
+    );
+    // The vertex SDK eagerly starts Google ADC resolution in its constructor
+    // (`this._authClientPromise = this._auth.getClient()`) and only awaits it
+    // per-request in `prepareOptions()`. A client that is constructed but never
+    // used — or built with misconfigured credentials — would otherwise leak
+    // that rejection as a process-level `unhandledRejection`. Attaching a
+    // handler here marks the promise as handled (so Node no longer reports it);
+    // it does not consume the rejection — the per-request `await` in
+    // `prepareOptions()` is a separate continuation and still surfaces auth
+    // errors to callers. `void` flags the returned promise as deliberately
+    // ignored (codebase convention for fire-and-forget).
+    //
+    // `_authClientPromise` is a private SDK internal, so it is reached via
+    // runtime narrowing (`in` + `instanceof`) rather than a type assertion.
+    const clientInternals: object = client;
+    if ("_authClientPromise" in clientInternals) {
+      const authClientPromise = clientInternals._authClientPromise;
+      if (authClientPromise instanceof Promise) {
+        void authClientPromise.catch(() => {
+          // Intentionally ignored — see above.
+        });
+      }
+    }
+    return client;
+  }
+
+  /**
+   * Execute stream using native @anthropic-ai/vertex-sdk for Claude models on Vertex AI
+   * This bypasses @ai-sdk/google-vertex completely and uses Anthropic's native SDK
+   */
+
+  /**
+   * Extended thinking for Claude-on-Vertex.
+   *
+   * The direct Anthropic provider has always translated `thinkingConfig` into
+   * the Messages API's `thinking` field (anthropic/client.ts). This path never
+   * did — it built the request without one — so `thinkingConfig` was accepted
+   * and silently ignored here: no error, `usage.reasoning` 0, no reasoning
+   * content. Measured against the raw @anthropic-ai/vertex-sdk with the same
+   * project, region, credentials and model, `thinking` is supported and
+   * returns a real thinking block, so the capability was ours to send.
+   *
+   * `thinkingLevel` is deliberately not mapped to a budget: the option's
+   * contract reserves `budgetTokens` for Anthropic models and `thinkingLevel`
+   * for Gemini 3, and inventing a conversion here would be guessing at the
+   * caller's intent.
+   *
+   * The budget must leave room inside `max_tokens` for an answer, so it is
+   * clamped below the ceiling rather than passed through — an over-large
+   * budget is a 400 from the API.
+   *
+   * `forcesToolChoice` (schema mode on a model that accepts a forced choice)
+   * pairs with a forced `tool_choice:{type:"any"}` in the request built right
+   * after this call — Anthropic hard-rejects `thinking` combined with a `tool_choice`
+   * that forces tool use: a live 400, "Thinking may not be enabled when
+   * tool_choice forces tool use." So `thinking` is omitted entirely in that
+   * mode, preserving the prior (pre-thinking-fix) behaviour of silently
+   * ignoring `thinkingConfig` for schema calls instead of hard-failing them —
+   * mirrors the same guard already applied to the OAuth proxy path in
+   * `src/lib/proxy/oauthFetch.ts` (`delete parsed.thinking` when
+   * `tool_choice.type` is `"any"` or `"tool"`). The step/context-cap
+   * finalization backstop reuses this same omission for free since it spreads
+   * `...requestParams`. `tool_choice:{type:"none"}` (the separate
+   * tools-disabled backstop, used only outside schema mode) does not force
+   * tool use — it forces the opposite — so it is not gated here, consistent
+   * with oauthFetch.ts leaving `"none"` alone too.
+   */
+  private buildClaudeThinkingParam(
+    // Structural, not TextGenerationOptions: the streaming caller passes
+    // StreamOptions, and only these two fields are read.
+    options: { thinkingConfig?: { enabled?: boolean; budgetTokens?: number } },
+    maxTokens: number,
+    forcesToolChoice: boolean,
+  ): { type: "enabled"; budget_tokens: number } | undefined {
+    if (forcesToolChoice) {
+      if (options.thinkingConfig?.enabled) {
+        logger.debug(
+          "[GoogleVertex] Omitting thinking: schema mode forces tool_choice:any, which Anthropic rejects alongside thinking",
+        );
+      }
+      return undefined;
+    }
+    const budget = options.thinkingConfig?.budgetTokens;
+    if (!options.thinkingConfig?.enabled || !budget) {
+      return undefined;
+    }
+    // Two independent floors, checked explicitly rather than folded into one
+    // Math.max/min expression: Anthropic's own 1024 minimum on budget_tokens,
+    // and this function's 1024-token reservation for the answer that follows
+    // thinking. When maxTokens leaves no room for both — 1025..2047 is the
+    // narrow band where that happens — there is no valid budget, so thinking
+    // is omitted rather than silently coerced to exactly 1024 regardless of
+    // what the caller asked for.
+    if (maxTokens <= 1024) {
+      return undefined;
+    }
+    const clamped = Math.min(budget, maxTokens - 1024);
+    if (clamped < 1024) {
+      return undefined;
+    }
+    return { type: "enabled" as const, budget_tokens: clamped };
+  }
+
+  private async executeNativeAnthropicStream(
+    options: StreamOptions,
+  ): Promise<StreamResult> {
+    const modelName = toVertexAnthropicModelId(
+      options.model || this.modelName || "claude-sonnet-4-5@20250929",
+    );
+    const startTime = Date.now();
+    const streamTimeoutMs = parseTimeout(options.timeout) ?? 300_000;
+    const client = await this.createAnthropicVertexClient(streamTimeoutMs);
+
+    logger.debug(
+      "[GoogleVertex] Using native @anthropic-ai/vertex-sdk for Claude stream",
+      {
+        model: modelName,
+        project: this.projectId,
+        location: this.location,
+      },
+    );
+
+    // Build messages from input
+    const messages: VertexAnthropicMessage[] = [];
+
+    // Replay conversationMessages (with tool turns), else the legacy text-only conversationHistory.
+    if (
+      options.conversationMessages &&
+      options.conversationMessages.length > 0
+    ) {
+      messages.push(
+        ...buildAnthropicHistoryMessages(options.conversationMessages),
+      );
+    } else if (
+      options.conversationHistory &&
+      options.conversationHistory.length > 0
+    ) {
+      for (const msg of options.conversationHistory) {
+        if (msg.role === "user" || msg.role === "assistant") {
+          messages.push({
+            role: msg.role,
+            content: stringifyContentSafe(msg.content),
+          });
+        }
+      }
+    }
+
+    // Add current user input with multimodal support
+    // Cast input to access multimodal properties that may exist at runtime
+    const multimodalInput = options.input as {
+      text: string;
+      pdfFiles?: Array<Buffer | string>;
+      images?: Array<Buffer | string | ImageWithAltText>;
+    };
+
+    // Build content parts for the user message
+    const userContentParts: Array<
+      | { type: "text"; text: string }
+      | {
+          type: "image";
+          source: { type: "base64"; media_type: string; data: string };
+        }
+      | {
+          type: "document";
+          source: { type: "base64"; media_type: string; data: string };
+        }
+    > = [];
+
+    // Add PDF files as document parts if present
+    if (multimodalInput?.pdfFiles && multimodalInput.pdfFiles.length > 0) {
+      logger.debug(
+        `[GoogleVertex] Processing ${multimodalInput.pdfFiles.length} PDF file(s) for native Anthropic stream`,
+      );
+
+      for (const pdfFile of multimodalInput.pdfFiles) {
+        let pdfBuffer: Buffer;
+
+        if (typeof pdfFile === "string") {
+          // Check if it's a file path
+          if (fs.existsSync(pdfFile)) {
+            pdfBuffer = fs.readFileSync(pdfFile);
+          } else {
+            // Assume it's already base64 encoded
+            pdfBuffer = Buffer.from(pdfFile, "base64");
+          }
+        } else {
+          pdfBuffer = pdfFile;
+        }
+
+        // Convert to base64 for Anthropic's document format
+        const base64Data = pdfBuffer.toString("base64");
+        userContentParts.push({
+          type: "document",
+          source: {
+            type: "base64",
+            media_type: "application/pdf",
+            data: base64Data,
+          },
+        });
+      }
+    }
+
+    // Add images as image parts if present
+    if (multimodalInput?.images && multimodalInput.images.length > 0) {
+      logger.debug(
+        `[GoogleVertex] Processing ${multimodalInput.images.length} image(s) for native Anthropic stream`,
+      );
+
+      for (const rawImage of multimodalInput.images) {
+        // `input.images` accepts `{ data, altText }` as a documented public
+        // shape, but this loop only ever handled Buffer | string — a wrapper
+        // fell through to the "assume raw bytes" branch and base64-encoded the
+        // OBJECT, sending the literal "[object Object]" to Vertex. Unwrap once,
+        // here, so every branch below sees the payload it expects.
+        const image = unwrapImagePayload(rawImage);
+        let imageBuffer: Buffer;
+        let mimeType = "image/jpeg"; // Default
+
+        if (typeof image === "string") {
+          if (fs.existsSync(image)) {
+            imageBuffer = fs.readFileSync(image);
+            // Detect mime type from extension
+            // Registry lookup rather than a png/gif/webp switch defaulting to
+            // JPEG: that default labelled a .heic/.bmp/.tiff/.avif reference
+            // image as image/jpeg, which is simply untrue and is what Vertex
+            // then rejected. The registry answers "application/octet-stream"
+            // for a missing or unregistered extension though, and Vertex
+            // rejects a non-image media type just as firmly — so fall back to
+            // the bytes, which are already in hand, rather than sending either
+            // a guess or a non-image type.
+            const byExtension = getMimeTypeForExtension(image);
+            mimeType = byExtension.startsWith("image/")
+              ? byExtension
+              : this.detectImageType(imageBuffer);
+          } else if (image.startsWith("data:")) {
+            // Handle data URL
+            const matches = image.match(/^data:([^;]+);base64,(.+)$/);
+            if (matches) {
+              mimeType = matches[1];
+              imageBuffer = Buffer.from(matches[2], "base64");
+            } else {
+              continue; // Skip invalid data URL
+            }
+          } else if (
+            image.startsWith("http://") ||
+            image.startsWith("https://")
+          ) {
+            // Image URL — fetch and base64-encode. Without this, the URL
+            // string falls through to the "assume base64" branch below
+            // and Vertex returns "Provided image is not valid".
+            try {
+              const response = await fetch(image);
+              if (!response.ok) {
+                // The URL may be presigned or carry credentials in its query
+                // string, and wrapper URLs now reach this branch too.
+                logger.warn(
+                  `[GoogleVertex] Image fetch failed: ${response.status} ${response.statusText}, skipping`,
+                  { url: redactUrlForError(image) },
+                );
+                continue;
+              }
+              const arrayBuffer = await response.arrayBuffer();
+              imageBuffer = Buffer.from(arrayBuffer);
+              const headerMime = response.headers.get("content-type");
+              if (headerMime && headerMime.startsWith("image/")) {
+                mimeType = headerMime.split(";")[0];
+              }
+            } catch (fetchError) {
+              logger.warn(
+                `[GoogleVertex] Image URL fetch threw, skipping: ${fetchError instanceof Error ? fetchError.message : String(fetchError)}`,
+                { url: redactUrlForError(image) },
+              );
+              continue;
+            }
+          } else {
+            // Assume base64 string
+            imageBuffer = Buffer.from(image, "base64");
+            // Sniff the real format from magic bytes — bare base64 carries no
+            // mime hint, and leaving the image/jpeg default makes Anthropic
+            // reject PNG/GIF/WebP with a media-type mismatch 400.
+            mimeType = this.detectImageType(imageBuffer);
+          }
+        } else {
+          imageBuffer = image;
+          // Buffer input (e.g. Slack/REST uploads) carries no mime hint; sniff
+          // it instead of defaulting to image/jpeg (mislabels PNG -> 400).
+          mimeType = this.detectImageType(imageBuffer);
+        }
+
+        const base64Data = imageBuffer.toString("base64");
+        userContentParts.push({
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: mimeType,
+            data: base64Data,
+          },
+        });
+      }
+    }
+
+    // Always add the text content
+    userContentParts.push({
+      type: "text",
+      text: multimodalInput.text,
+    });
+
+    // Append the live user turn (merges into a trailing user turn if present).
+    appendUserMessage(
+      messages,
+      userContentParts.length === 1 && userContentParts[0].type === "text"
+        ? multimodalInput.text
+        : userContentParts,
+    );
+
+    // Convert tools to Anthropic format if present
+    let tools: VertexAnthropicTool[] | undefined;
+    const executeMap = new DedupExecuteMap();
+
+    if (
+      options.tools &&
+      Object.keys(options.tools).length > 0 &&
+      !options.disableTools
+    ) {
+      tools = [];
+
+      for (const [name, tool] of Object.entries(options.tools)) {
+        tools.push(this.buildAnthropicToolDeclaration(name, tool));
+        if (tool.execute) {
+          executeMap.set(name, tool.execute);
+        }
+      }
+
+      logger.debug("[GoogleVertex] Converted tools for native Anthropic SDK", {
+        toolCount: tools.length,
+        toolNames: tools.map((t) => t.name),
+      });
+    }
+
+    // Handle JSON schema support via final_result tool pattern
+    // Anthropic doesn't have native responseSchema, so we add a final_result tool
+    const streamOptions = options as StreamOptions & {
+      schema?: ZodUnknownSchema;
+    };
+    let useFinalResultTool = false;
+    let schemaSystemPromptSuffix = "";
+
+    if (streamOptions.schema) {
+      useFinalResultTool = true;
+
+      // Create final_result tool
+      const finalResultTool = this.buildFinalResultTool(streamOptions.schema);
+
+      // Add to tools array or create new array
+      if (!tools) {
+        tools = [];
+      }
+      tools.push(finalResultTool);
+
+      // Add instruction to system prompt
+      schemaSystemPromptSuffix =
+        "\n\nIMPORTANT: You MUST call the 'final_result' tool to return your response in the required structured format. Do not respond with plain text - always use the final_result tool.";
+
+      logger.debug(
+        "[GoogleVertex] Added final_result tool for Anthropic structured output (stream)",
+        {
+          schemaKeys: Object.keys(
+            finalResultTool.input_schema.properties ?? {},
+          ),
+          totalTools: tools.length,
+        },
+      );
+    }
+
+    // Build request options
+    const systemPromptWithSchema = options.systemPrompt
+      ? options.systemPrompt + schemaSystemPromptSuffix
+      : schemaSystemPromptSuffix
+        ? schemaSystemPromptSuffix.trim()
+        : undefined;
+
+    // Registry-driven strip: Sonnet 5 / Opus 4.7+ / Fable 5 on Vertex reject
+    // sampling params. Applied here so every rebuild that spreads
+    // `...requestParams` (forced finalization, tools-off backstop) inherits
+    // the strip automatically.
+    const streamSampling = resolveSamplingParams(
+      this.providerName,
+      modelName,
+      {
+        ...(options.temperature !== undefined && {
+          temperature: options.temperature,
+        }),
+        ...(options.topP !== undefined && { topP: options.topP }),
+      },
+      "vertex.anthropic.stream",
+    );
+
+    const streamMaxTokens = resolveClaudeMaxTokens(
+      modelName,
+      options.maxTokens,
+    );
+    // Claude 5.5 / 5.1 400 on a forced tool_choice; schema mode leaves them on
+    // auto, steered by the final_result instruction already in the prompt.
+    const forceFinalResult =
+      useFinalResultTool && modelSupportsForcedToolChoice(modelName);
+    const streamThinking = this.buildClaudeThinkingParam(
+      options,
+      streamMaxTokens,
+      forceFinalResult,
+    );
+
+    const requestParams: Parameters<typeof client.messages.stream>[0] = {
+      model: modelName,
+      // Default to the model's real output ceiling (e.g. 64K for Sonnet 4.x)
+      // instead of the legacy 4096, which silently truncated large structured
+      // responses mid-JSON. resolveClaudeMaxTokens also clamps over-large
+      // caller values so the native Vertex path never 400s.
+      max_tokens: streamMaxTokens,
+      ...(streamThinking && { thinking: streamThinking }),
+      messages: messages as Parameters<
+        typeof client.messages.stream
+      >[0]["messages"],
+      ...(tools && tools.length > 0 && { tools }),
+      ...(forceFinalResult && { tool_choice: { type: "any" as const } }),
+      ...(systemPromptWithSchema && { system: systemPromptWithSchema }),
+      ...(streamSampling.temperature !== undefined && {
+        temperature: streamSampling.temperature,
+      }),
+      ...(streamSampling.topP !== undefined && {
+        top_p: streamSampling.topP,
+      }),
+      ...(options.stopSequences &&
+        options.stopSequences.length > 0 && {
+          stop_sequences: options.stopSequences,
+        }),
+    };
+
+    // ── Real-time streaming via stream.on('text', ...) ────────────────────
+    //
+    // The Anthropic SDK exposes per-delta streaming through `stream.on('text', listener)`:
+    // each content_block_delta SSE event fires the listener synchronously
+    // with that token's text — typically ~10 chars per delta, ~26ms apart
+    // on Claude Haiku. Awaiting `stream.finalMessage()` here would buffer
+    // the entire response before yielding anything; the listener pattern
+    // keeps the wire and the consumer in lockstep instead.
+    //
+    // Structure: push-channel + background agentic loop, returning the
+    // StreamResult immediately so callers can iterate `channel.iterable`
+    // while generation is still in progress. Mirrors the executeStream
+    // pattern in googleAiStudio.ts.
+
+    const maxSteps = options.maxSteps || DEFAULT_MAX_STEPS;
+    // Reserve the LAST step of the budget for a forced final_result call when
+    // structured output is active — see the generate twin for the full
+    // rationale (tool_choice:"any" makes the text exit unreachable, so an
+    // un-reserved budget deadlocks into an empty stream).
+    const agenticStepBudget = useFinalResultTool
+      ? Math.max(maxSteps - 1, 0)
+      : maxSteps;
+    const allToolCalls: Array<{
+      toolName: string;
+      args: Record<string, unknown>;
+    }> = [];
+    const toolExecutions: Array<{
+      name: string;
+      input: Record<string, unknown>;
+      output: unknown;
+    }> = [];
+
+    const channel = createStreamChannel<{
+      content: string;
+      reasoning?: string;
+    }>();
+
+    // Mutable holders the StreamResult references. Background loop updates
+    // these as state progresses; consumer reads them after iterating the
+    // stream to completion (channel.close() is called AFTER mutations).
+    const usage: {
+      input: number;
+      output: number;
+      total: number;
+      cacheReadTokens?: number;
+      cacheCreationTokens?: number;
+      // A SUBSET already included in `output` (Anthropic bills thinking
+      // tokens as part of output_tokens), so this is additive reporting
+      // only — never folded into output/total.
+      reasoning?: number;
+    } = { input: 0, output: 0, total: 0 };
+    const metadata: {
+      streamId: string;
+      startTime: number;
+      responseTime: number;
+      totalToolExecutions: number;
+      // Mirrors finishReasonRef — set on metadata too because wrapper spreads
+      // ({ ...result }) snapshot the top-level getter to undefined before the
+      // background loop resolves, while the metadata object reference survives.
+      finishReason?: string;
+      // Same mutable-reference contract for the turn-exit discriminator, the
+      // raw provider stop reason, and the step count.
+      stopReason?: GenerateStopReason;
+      rawFinishReason?: string;
+      stepsUsed?: number;
+    } = {
+      streamId: `native-anthropic-vertex-${Date.now()}`,
+      startTime,
+      responseTime: 0,
+      totalToolExecutions: 0,
+    };
+    const toolsUsedRef: string[] = [];
+    const structuredOutputRef: { value?: Record<string, unknown> } = {};
+    // Resolved after the background loop finishes; the StreamResult exposes it
+    // via a getter (consumers read it after draining the stream), mirroring
+    // the Gemini stream path's finishReason field.
+    const finishReasonRef: { value?: string } = {};
+    const stopReasonRef: { value?: GenerateStopReason } = {};
+    const rawFinishReasonRef: { value?: string } = {};
+
+    // Langfuse/OTel: the native SDK bypasses the Vercel AI SDK's
+    // experimental_telemetry, so emit spans manually — one turn span, one
+    // generation span per API call, one tool span per execution — all carrying
+    // the langfuse.* observation attributes ExporterSpanProcessor exports.
+    // Usage lives ONLY on the generation spans (Langfuse sums usage across
+    // observations for trace totals, so repeating it on the turn double-counts).
+    const offeredToolNames = (tools ?? []).map(
+      (anthropicTool) => anthropicTool.name,
+    );
+    const turnInputAttribute = spanModelRequestAttribute({
+      system: systemPromptWithSchema,
+      messages: sanitizeAnthropicMessagesForTrace(messages),
+    });
+    const turnSpan = tracers.provider.startSpan("anthropic.vertex.stream", {
+      kind: SpanKind.CLIENT,
+      attributes: {
+        [ATTR.NL_MODEL]: modelName,
+        [ATTR.NL_PROVIDER]: this.providerName,
+        [ATTR.NL_TOOL_COUNT]: offeredToolNames.length,
+      },
+    });
+    observe(turnSpan, "span", {
+      input: turnInputAttribute,
+      metadata: {
+        toolsOffered: offeredToolNames,
+        toolCount: offeredToolNames.length,
+        maxSteps,
+        structuredOutput: useFinalResultTool,
+      },
+    });
+    const turnContext = otelTrace.setSpan(otelContext.active(), turnSpan);
+    let aggregatedTurnText = "";
+    // Count of characters ALREADY delivered to the consumer via live text
+    // deltas. aggregatedTurnText only reflects completed finalMessage()
+    // responses, so an aborted mid-answer call would otherwise look "empty"
+    // to the terminal handling even though the consumer saw partial prose.
+    let liveTextPushedLength = 0;
+    // Anthropic prompt-cache token accounting, aggregated across loop steps.
+    const turnCacheUsage = {
+      read: 0,
+      creation: 0,
+      creation5m: 0,
+      creation1h: 0,
+    };
+
+    // Track the active Anthropic stream so aborts can cancel it mid-flight
+    // (pre-rewrite code had no abort handling — fixed for free).
+    let activeStream:
+      | Awaited<ReturnType<typeof client.messages.stream>>
+      | undefined;
+    const abortHandler = () => {
+      try {
+        activeStream?.controller.abort();
+      } catch {
+        /* ignore — stream may already be finalized */
+      }
+    };
+    // Internal abort fan-in: the caller's signal and the turn clock's
+    // watchdogs (whole-turn deadline + optional stall detector) all trip it;
+    // it cancels the in-flight SDK stream and is the signal tool executions
+    // receive.
+    const internalAbort = new AbortController();
+    internalAbort.signal.addEventListener("abort", abortHandler);
+    const onCallerAbort = () => internalAbort.abort();
+    options.abortSignal?.addEventListener("abort", onCallerAbort);
+    if (options.abortSignal?.aborted) {
+      internalAbort.abort();
+    }
+    const toolExecTimeoutMs = resolveToolTimeoutMs(options.toolTimeoutMs);
+    const effectiveTurnDeadlineMs = options.turnTimeoutMs ?? streamTimeoutMs;
+    // Whole-turn deadline + optional stall watchdog. When the caller sets no
+    // explicit turn budget, keep the pre-existing defensive bound
+    // (options.timeout, else 5 min) so a stalled Vertex/Anthropic endpoint
+    // can't hang forever.
+    const turnClock = createTurnClock({
+      turnTimeoutMs: options.turnTimeoutMs,
+      defaultTurnTimeoutMs: streamTimeoutMs,
+      stallTimeoutMs: options.stallTimeoutMs,
+      wrapupTimeLeadMs: options.wrapupTimeLeadMs,
+      onDeadline: (kind) => {
+        logger.warn(
+          kind === "timeout"
+            ? `[GoogleVertex] Anthropic stream turn exceeded its ${effectiveTurnDeadlineMs}ms time budget — aborting`
+            : `[GoogleVertex] Anthropic stream turn made no progress for ${options.stallTimeoutMs}ms — aborting`,
+        );
+        internalAbort.abort();
+      },
+    });
+
+    const loopPromise = (async () => {
+      let step = 0;
+      const currentMessages = [...messages];
+      // Step-cap / abort bookkeeping (mirrors the generate twin): read by the
+      // terminal recovery block after the loop and by the finishReason
+      // mapping written into finishReasonRef.
+      let wasAborted = false;
+      let hitStepLimit = false;
+      let hitContextLimit = false;
+      let synthesizedFinalAnswer = false;
+      let modelFinished = false;
+      let lastStopReason: string | null | undefined;
+      // In-loop context guard + consecutive-failure breaker — same rationale
+      // as the generate twin (see executeNativeAnthropicGenerate).
+      const contextGuard = createContextGuard(
+        getContextWindowSize("vertex", modelName),
+      );
+      const failedTools = new Map<
+        string,
+        { count: number; lastError: string }
+      >();
+
+      try {
+        // Executors handed to the engine, taken through the turn's
+        // DedupExecuteMap so an identical repeated call is answered from the
+        // per-turn cache rather than run again (BZ-3327). `.get()` returns the
+        // wrapper; iterating the map yields the raw functions, which is why the
+        // record is built by name rather than from entries.
+        const engineTools: NonNullable<AgenticLoopOptions["tools"]> = {};
+        for (const toolName of executeMap.keys()) {
+          const wrapped = executeMap.get(toolName);
+          if (!wrapped) {
+            continue;
+          }
+          engineTools[toolName] = {
+            // Guarded exactly as the hand-rolled loop guarded it: a per-tool
+            // bound so a wedged tool costs ONE STEP rather than the whole turn,
+            // raced against the turn's abort so a deadline is observed at once
+            // instead of after the tool settles, and a stall-clock ping either
+            // side so a slow-but-healthy tool is not read as a stalled turn.
+            execute: guardToolExecutor(toolName, wrapped, {
+              toolTimeoutMs: toolExecTimeoutMs,
+              abortSignal: internalAbort.signal,
+              onProgress: () => turnClock.noteProgress(),
+            }),
+          };
+        }
+
+        // maxSteps is agenticStepBudget, NOT maxSteps: when structured output is
+        // active the last slot is reserved for the forced final_result call, and
+        // the engine must never spend it.
+        // The type argument is explicit: without it TMessage infers as the SDK's
+        // MessageParam and every hook here is typed against the wrong shape.
+        const baseAdapter = createAnthropicLoopAdapter<VertexAnthropicMessage>({
+          client,
+          provider: this.providerName,
+          maxSteps: agenticStepBudget,
+          toolsRecord: options.tools ?? {},
+          // Set here and NOT for native Anthropic: these loops have always had
+          // the consecutive-failure strike breaker, and native Anthropic has
+          // never had one. Giving it one under cover of a shared refactor would
+          // be a behaviour change, not a migration.
+          toolFailureBreaker: {
+            maxRetries: DEFAULT_TOOL_MAX_RETRIES,
+            // MCP failures are RETURNED, not thrown. Counting only throws lets
+            // the model grind on a blocked tool for the whole step budget.
+            classifyResultFailure: (output) =>
+              extractToolFailureText(output) ?? undefined,
+          },
+          buildParams: (conversation) => {
+            // Mid-turn discovery sync: Claude only calls tools declared in the
+            // request, so tools hydrated by search_tools last step have to be
+            // advertised now. `tools` is held by reference in requestParams.
+            this.refreshAnthropicToolDeclarations(
+              options.tools,
+              tools,
+              executeMap,
+              failedTools,
+            );
+            // Vertex has no automatic prompt caching — explicit cache_control
+            // breakpoints (system, tools, rolling history) keep the conversation
+            // prefix cached across turns instead of re-billed as fresh input.
+            // Re-applied per step: the stable prefix stays byte-identical for a
+            // consistent cache key while the rolling breakpoint follows the tail.
+            const cached = applyVertexAnthropicCacheBreakpoints({
+              system: systemPromptWithSchema,
+              tools,
+              messages: conversation,
+            });
+            // `stream` is dropped from the spread: requestParams is typed for
+            // messages.stream so it carries an optional stream flag, and
+            // executeStep sets that itself. Passing it through would type this
+            // return as the streaming variant for a field the adapter owns.
+            const {
+              stream: _ignoredStreamFlag,
+              output_config: _ignoredOutputConfig,
+              ...baseParams
+            } = requestParams;
+            void _ignoredStreamFlag;
+            // output_config differs between the two param types as well — the
+            // streaming variant allows null where the non-streaming one does
+            // not. Nothing here sets it, so it is dropped rather than widened.
+            void _ignoredOutputConfig;
+            return {
+              ...baseParams,
+              ...(cached.system !== undefined && {
+                system: cached.system as Parameters<
+                  typeof client.messages.stream
+                >[0]["system"],
+              }),
+              ...(cached.tools &&
+                cached.tools.length > 0 && {
+                  tools: cached.tools as Parameters<
+                    typeof client.messages.stream
+                  >[0]["tools"],
+                }),
+              messages: cached.messages as Parameters<
+                typeof client.messages.stream
+              >[0]["messages"],
+            };
+          },
+          planReclaim: (conversation) => {
+            if (!contextGuard.shouldStop()) {
+              return undefined;
+            }
+            // Reclaim and continue where possible: ending the turn early is safe
+            // but throws away work the model was mid-way through.
+            const working = [...conversation];
+            if (
+              reclaimVertexAnthropicContext(
+                working,
+                modelName,
+                contextGuard.projectedNextPromptTokens,
+              )
+            ) {
+              contextGuard.resetAfterReclaim();
+              return { conversation: working };
+            }
+            hitContextLimit = true;
+            logger.warn(
+              `[GoogleVertex] Native Anthropic turn stopped by the context guard: ` +
+                `projected prompt ~${contextGuard.projectedNextPromptTokens} tokens ` +
+                `>= threshold ${contextGuard.thresholdTokens} — forcing finalization.`,
+            );
+            return undefined;
+          },
+          noteObservedPromptTokens: (tokens) => {
+            contextGuard.noteUsage(tokens, 0);
+          },
+          ...(useFinalResultTool
+            ? {
+                finalResultToolName: "final_result",
+                onTerminalResult: (text: string) => {
+                  // The engine ends the turn on a terminal call and hands back
+                  // the payload as text; this loop also streams it, so the push
+                  // stays here rather than in the adapter.
+                  try {
+                    structuredOutputRef.value = JSON.parse(text) as Record<
+                      string,
+                      unknown
+                    >;
+                  } catch {
+                    /* the caller's coercion layer repairs a partial payload */
+                  }
+                  channel.push({ content: text });
+                  liveTextPushedLength += text.length;
+                  logger.debug(
+                    "[GoogleVertex] Extracted structured output from final_result tool (stream)",
+                    { chars: text.length },
+                  );
+                },
+              }
+            : {}),
+        });
+
+        const adapter: typeof baseAdapter = {
+          ...baseAdapter,
+          buildStepRequest: (conversation, engineStep) => {
+            step = engineStep + 1;
+            turnClock.noteProgress();
+            return baseAdapter.buildStepRequest(conversation, engineStep);
+          },
+          // The provider's own miss handler, not the adapter's. The adapter
+          // resolves a deferred tool and hands back its RAW executor; this one
+          // also DECLARES the tool so Claude can call it on later steps, and
+          // registers it in the turn's DedupExecuteMap so a repeat with
+          // identical arguments is served from cache. Without the declaration a
+          // hydrated tool works exactly once and is then invisible again.
+          resolveToolOnMiss: (name) => {
+            const hydrated = this.resolveAnthropicToolOnMiss(
+              name,
+              options.tools,
+              tools,
+              executeMap,
+              failedTools,
+            );
+            if (!hydrated) {
+              return undefined;
+            }
+            return {
+              execute: guardToolExecutor(name, hydrated, {
+                toolTimeoutMs: toolExecTimeoutMs,
+                abortSignal: internalAbort.signal,
+                onProgress: () => turnClock.noteProgress(),
+              }),
+            };
+          },
+          executeStep: async (request, stepChannel, signal) => {
+            const result = await baseAdapter.executeStep(
+              request,
+              {
+                push: (chunk) => {
+                  turnClock.noteProgress();
+                  stepChannel.push(chunk);
+                },
+              },
+              signal,
+            );
+            turnCacheUsage.read += result.usage.cacheReadTokens ?? 0;
+            turnCacheUsage.creation += result.usage.cacheWriteTokens ?? 0;
+            turnCacheUsage.creation5m += result.usage.cacheWrite5mTokens ?? 0;
+            turnCacheUsage.creation1h += result.usage.cacheWrite1hTokens ?? 0;
+            return result;
+          },
+          buildToolResultMessages: (
+            conversation,
+            stepResult,
+            toolResults,
+            engineStep,
+          ) => {
+            for (const result of toolResults) {
+              allToolCalls.push({ toolName: result.name, args: result.args });
+              toolsUsedRef.push(result.name);
+              toolExecutions.push({
+                name: result.name,
+                input: result.args,
+                output: result.output,
+              });
+            }
+            metadata.totalToolExecutions += toolResults.length;
+            const next = baseAdapter.buildToolResultMessages(
+              conversation,
+              stepResult,
+              toolResults,
+              engineStep,
+            );
+            // Time-budget wrap-up nudge: with the turn deadline approaching,
+            // tell the model to consolidate. Rides as a trailing text block on
+            // the tool_result user turn.
+            if (turnClock.shouldNudgeWrapup()) {
+              const last = next[next.length - 1];
+              if (last && Array.isArray(last.content)) {
+                last.content.push({
+                  type: "text",
+                  text: buildWrapupNudgeText(useFinalResultTool),
+                });
+              }
+            }
+            // Tool activity reaches conversation memory per step, not batched at
+            // the end: tools that DID complete in a step later aborted are real
+            // side effects and belong in the chat history.
+            withTimeout(
+              this.handleToolExecutionStorage(
+                toolResults.map((result) => ({
+                  toolName: result.name,
+                  args: result.args,
+                  stepIndex: engineStep + 1,
+                })),
+                toolResults.map((result) => ({
+                  toolName: result.name,
+                  output: result.output,
+                  stepIndex: engineStep + 1,
+                })),
+                options,
+                new Date(),
+              ),
+              TOOL_STORAGE_TIMEOUT_MS,
+              "tool storage write timed out",
+            ).catch((error: unknown) => {
+              logger.warn(
+                "[GoogleVertex] Failed to store native Anthropic stream tool executions",
+                {
+                  error: error instanceof Error ? error.message : String(error),
+                },
+              );
+            });
+            // Project this step's growth for the context guard: everything just
+            // appended rides the next prompt.
+            try {
+              const appended = next[next.length - 1];
+              contextGuard.noteAppendedChars(
+                JSON.stringify(appended?.content ?? []).length,
+              );
+            } catch {
+              /* estimation is best-effort — never break the loop */
+            }
+            return next;
+          },
+        };
+
+        const { stream: engineStream, resultPromise } = otelContext.with(
+          turnContext,
+          () =>
+            runAgenticLoop(adapter, currentMessages.slice(), {
+              tools: engineTools,
+              abortSignal: internalAbort.signal,
+              span: turnSpan,
+              // Same value `guardToolExecutor` already received above, so the
+              // engine's own per-tool bound cannot undercut it.
+              toolTimeoutMs: toolExecTimeoutMs,
+            }),
+        );
+
+        const pump = (async () => {
+          for await (const chunk of engineStream) {
+            if (chunk.reasoning) {
+              channel.push({ content: "", reasoning: chunk.reasoning });
+            }
+            if (chunk.content) {
+              channel.push({ content: chunk.content });
+              liveTextPushedLength += chunk.content.length;
+              aggregatedTurnText += chunk.content;
+            }
+          }
+        })();
+
+        let engineResult;
+        let turnFailure: unknown;
+        try {
+          engineResult = await resultPromise;
+        } catch (error) {
+          turnFailure = error;
+        }
+        // Drained tolerantly and exactly once: when a turn ends by abort the
+        // channel rejects too, and re-awaiting a settled rejection would rethrow
+        // the error the branch below has already decided to absorb.
+        await drainDetachedPump(pump, "GoogleVertex");
+        if (turnFailure !== undefined) {
+          if (internalAbort.signal.aborted || isAbortError(turnFailure)) {
+            wasAborted = true;
+          } else {
+            throw turnFailure;
+          }
+        }
+
+        if (engineResult) {
+          usage.input += engineResult.usage.inputTokens;
+          usage.output += engineResult.usage.outputTokens;
+          // A SUBSET already included in outputTokens above — added here
+          // only for observability, never folded into input/output/total.
+          if (engineResult.usage.reasoningTokens) {
+            usage.reasoning =
+              (usage.reasoning ?? 0) + engineResult.usage.reasoningTokens;
+          }
+          finishReasonRef.value =
+            engineResult.rawStopReason ?? finishReasonRef.value;
+          // NOT `toolCalls.length === 0`: that array accumulates across the
+          // WHOLE turn, so a turn that called a tool in step 1 and answered
+          // with text in step 2 would look unfinished and fall into terminal
+          // handling. The finish reason is the per-turn signal — the engine
+          // reports "tool-calls" only when the cap was hit with tools still
+          // pending. That signal is not enough on its own, though: Anthropic
+          // reports stop_reason "tool_use" — which maps to finishReason
+          // "tool-calls" — for ANY tool_use block, including a genuine
+          // terminal `final_result` call. Without the third clause, a turn
+          // that called a real tool earlier (toolCalls.length > 0) and then
+          // legitimately finished via final_result reads as unfinished and
+          // falls into the terminal-handling block below, which forces a
+          // redundant second final_result call and pushes its JSON onto the
+          // stream a second time.
+          modelFinished =
+            engineResult.toolCalls.length === 0 ||
+            engineResult.finishReason !== "tool-calls" ||
+            (useFinalResultTool && structuredOutputRef.value !== undefined);
+          // Replace in place: the terminal block and the finalization call both
+          // read `currentMessages`.
+          currentMessages.length = 0;
+          currentMessages.push(
+            ...(engineResult.conversation as typeof currentMessages),
+          );
+        }
+        if (internalAbort.signal.aborted) {
+          wasAborted = true;
+        }
+
+        // Terminal handling — the loop exited without a model-initiated
+        // finish (step budget exhausted, or the turn was aborted). Never end
+        // the stream empty: force the reserved final_result step on
+        // structured-output turns, synthesize a plain-text answer on tool
+        // turns, or push one graceful cap chunk. Mirrors the generate twin
+        // and the Gemini paths (ed289b7 / PR #1123). The finalization and
+        // backstop calls emit no per-call generation span (matching the
+        // Gemini synthesizeFinalAnswerWithoutTools precedent); their tokens
+        // still land in `usage` and the turn-span metadata.
+        if (!modelFinished) {
+          // An abort that landed during the FINAL budgeted step's tool
+          // execution leaves wasAborted=false (no loop-entry check runs after
+          // a budget exit) — re-check before issuing any terminal model call.
+          if (internalAbort.signal.aborted) {
+            wasAborted = true;
+          }
+          const externalToolCallCount = allToolCalls.filter(
+            (tc) => tc.toolName !== "final_result",
+          ).length;
+          // Clamp the terminal calls' max_tokens so prompt + output stays
+          // inside the model window: pre-4.5 Claude models 400 on
+          // input + max_tokens > window, which would defeat the very
+          // synthesis these calls exist for on context-capped turns. Only
+          // bites when the prompt is near the window (min() is a no-op on
+          // ordinary step-cap turns).
+          const terminalMaxTokens = Math.max(
+            1024,
+            Math.min(
+              requestParams.max_tokens,
+              getContextWindowSize("vertex", modelName) -
+                contextGuard.projectedNextPromptTokens -
+                4_000,
+            ),
+          );
+          if (wasAborted) {
+            // Budget already blown — never issue another model call. Deliver
+            // exactly one HONEST terminal chunk matching the actual exit
+            // cause (time limit / stall / caller abort — never the step-cap
+            // text) if nothing reached the consumer (live deltas already
+            // delivered count as "something reached").
+            logger.warn(
+              `[GoogleVertex] Native Anthropic stream loop ended mid-turn ` +
+                `(${turnClock.timedOut ? "turn time limit" : turnClock.stalled ? "stall watchdog" : "caller abort"}); ` +
+                `returning an honest terminal message.`,
+            );
+            if (
+              aggregatedTurnText.length === 0 &&
+              liveTextPushedLength === 0 &&
+              !structuredOutputRef.value
+            ) {
+              const exitMessage = this.buildLoopExitMessage({
+                turnClock,
+                wasAborted,
+                stallTimeoutMs: options.stallTimeoutMs,
+                maxSteps,
+                toolCallCount: externalToolCallCount,
+              });
+              channel.push({ content: exitMessage });
+              aggregatedTurnText = exitMessage;
+            }
+          } else if (useFinalResultTool) {
+            if (!hitContextLimit) {
+              hitStepLimit = true;
+            }
+            logger.warn(
+              hitContextLimit
+                ? `[GoogleVertex] Native Anthropic stream loop stopped by the context guard without final_result; forcing a finalization call.`
+                : `[GoogleVertex] Native Anthropic stream loop reached maxSteps (${maxSteps}) without final_result; forcing a finalization call.`,
+            );
+            try {
+              // Reserved finalization step: identical request except
+              // tool_choice pins final_result — Anthropic guarantees a
+              // final_result tool_use. Cache treatment is byte-identical to
+              // loop steps. No text listener: forced tool calls stream no
+              // text deltas, and the structured JSON is pushed once below.
+              const cachedFinal = applyVertexAnthropicCacheBreakpoints({
+                system: systemPromptWithSchema,
+                tools,
+                messages: currentMessages,
+              });
+              const response = await this.withClaudeGeneration(
+                {
+                  stepNumber: maxSteps + 1,
+                  model: requestParams.model,
+                  maxTokens: terminalMaxTokens,
+                  temperature: requestParams.temperature,
+                  topP: requestParams.top_p,
+                  system: cachedFinal.system,
+                  messages: cachedFinal.messages,
+                },
+                async () => {
+                  const finalizationStream = await client.messages.stream({
+                    ...requestParams,
+                    max_tokens: terminalMaxTokens,
+                    // Resized, not inherited: terminalMaxTokens can sit below the
+                    // budget requestParams' thinking was sized for.
+                    thinking: this.buildClaudeThinkingParam(
+                      options,
+                      terminalMaxTokens,
+                      forceFinalResult,
+                    ),
+                    ...(forceFinalResult && {
+                      tool_choice: {
+                        type: "tool" as const,
+                        name: "final_result",
+                      },
+                    }),
+                    ...(cachedFinal.system !== undefined && {
+                      system: cachedFinal.system as Parameters<
+                        typeof client.messages.stream
+                      >[0]["system"],
+                    }),
+                    ...(cachedFinal.tools &&
+                      cachedFinal.tools.length > 0 && {
+                        tools: cachedFinal.tools as Parameters<
+                          typeof client.messages.stream
+                        >[0]["tools"],
+                      }),
+                    messages: cachedFinal.messages as Parameters<
+                      typeof client.messages.stream
+                    >[0]["messages"],
+                  });
+                  // Mid-flight aborts are covered by the shared abortHandler via
+                  // activeStream; already-fired aborts were handled by the
+                  // terminal-entry re-check above.
+                  activeStream = finalizationStream;
+                  const message = await finalizationStream.finalMessage();
+                  activeStream = undefined;
+                  return message;
+                },
+              );
+              usage.input += response.usage?.input_tokens || 0;
+              usage.output += response.usage?.output_tokens || 0;
+              turnCacheUsage.read +=
+                response.usage?.cache_read_input_tokens ?? 0;
+              turnCacheUsage.creation +=
+                response.usage?.cache_creation_input_tokens ?? 0;
+              turnCacheUsage.creation5m +=
+                response.usage?.cache_creation?.ephemeral_5m_input_tokens ?? 0;
+              turnCacheUsage.creation1h +=
+                response.usage?.cache_creation?.ephemeral_1h_input_tokens ?? 0;
+              // Total counts cache reads/writes — input_tokens is only the
+              // uncached remainder.
+              usage.total =
+                usage.input +
+                usage.output +
+                turnCacheUsage.read +
+                turnCacheUsage.creation;
+              lastStopReason = response.stop_reason;
+              const forcedFinalResult = (
+                response.content as VertexAnthropicContentBlock[]
+              ).find(
+                (
+                  block,
+                ): block is {
+                  type: "tool_use";
+                  id: string;
+                  name: string;
+                  input: Record<string, unknown>;
+                } => block.type === "tool_use" && block.name === "final_result",
+              );
+              if (forcedFinalResult) {
+                structuredOutputRef.value = forcedFinalResult.input;
+                channel.push({
+                  content: JSON.stringify(forcedFinalResult.input),
+                });
+                synthesizedFinalAnswer = true;
+                logger.debug(
+                  "[GoogleVertex] Forced finalization returned structured output (stream)",
+                  { keys: Object.keys(forcedFinalResult.input) },
+                );
+              } else {
+                // Unforced (the model refuses a forced choice), the call may
+                // answer in text instead; keep that answer over a cap notice.
+                const finalizationText = forceFinalResult
+                  ? ""
+                  : finalizationAnswerText(
+                      response.content as VertexAnthropicContentBlock[],
+                    );
+                if (finalizationText) {
+                  synthesizedFinalAnswer = true;
+                  channel.push({ content: finalizationText });
+                  aggregatedTurnText += finalizationText;
+                } else {
+                  const capMessage = hitContextLimit
+                    ? buildContextCapMessage(externalToolCallCount)
+                    : buildToolLoopCapMessage(maxSteps, externalToolCallCount);
+                  channel.push({ content: capMessage });
+                  aggregatedTurnText += capMessage;
+                }
+              }
+            } catch (error) {
+              activeStream = undefined;
+              // An aborted finalization is a cancellation (caller abort or a
+              // turn-clock watchdog), not a step-cap turn — keep finishReason
+              // mapping from lastStopReason and pick the exit message by the
+              // actual cause.
+              if (internalAbort.signal.aborted || isAbortError(error)) {
+                hitStepLimit = false;
+                wasAborted = true;
+              }
+              logger.warn(
+                "[GoogleVertex] Forced finalization call failed; falling back to a terminal message",
+                {
+                  error: error instanceof Error ? error.message : String(error),
+                },
+              );
+              const exitMessage =
+                hitContextLimit && !wasAborted
+                  ? buildContextCapMessage(externalToolCallCount)
+                  : this.buildLoopExitMessage({
+                      turnClock,
+                      wasAborted,
+                      stallTimeoutMs: options.stallTimeoutMs,
+                      maxSteps,
+                      toolCallCount: externalToolCallCount,
+                    });
+              channel.push({ content: exitMessage });
+              aggregatedTurnText += exitMessage;
+            }
+          } else {
+            if (!hitContextLimit) {
+              hitStepLimit = true;
+            }
+            if (aggregatedTurnText.length === 0) {
+              // Pure tool-loop with no streamed text: one tools-disabled call
+              // so the model answers from the gathered tool results, pushed
+              // as a single chunk (matching the Gemini stream synth). NOTE:
+              // the tools array must stay in the request — Anthropic rejects
+              // histories containing tool_use/tool_result blocks without a
+              // tools param — so "tools disabled" is tool_choice:"none",
+              // which also keeps the cached tools prefix byte-identical.
+              logger.warn(
+                hitContextLimit
+                  ? `[GoogleVertex] Native Anthropic stream loop stopped by the context guard with no text; synthesizing a final answer with tools disabled.`
+                  : `[GoogleVertex] Native Anthropic stream loop reached maxSteps (${maxSteps}) with no text; synthesizing a final answer with tools disabled.`,
+              );
+              try {
+                const backstopSystem =
+                  (systemPromptWithSchema
+                    ? systemPromptWithSchema + "\n\n"
+                    : "") +
+                  "Tool calling is no longer available for this turn. " +
+                  "Provide your final answer directly as plain text now, " +
+                  "using the information gathered so far.";
+                const cachedBackstop = applyVertexAnthropicCacheBreakpoints({
+                  system: backstopSystem,
+                  tools,
+                  messages: currentMessages,
+                });
+                // budget_tokens must stay below max_tokens or Anthropic 400s
+                // the call; terminalMaxTokens can land far below the ceiling
+                // streamThinking was sized against (the context guard can
+                // shrink it well under the original request), so the budget
+                // is rebuilt for the shrunk limit rather than inherited
+                // through the spread below.
+                const backstopThinking = this.buildClaudeThinkingParam(
+                  options,
+                  terminalMaxTokens,
+                  false,
+                );
+                const response = await this.withClaudeGeneration(
+                  {
+                    stepNumber: maxSteps + 1,
+                    model: requestParams.model,
+                    maxTokens: terminalMaxTokens,
+                    temperature: requestParams.temperature,
+                    topP: requestParams.top_p,
+                    system: cachedBackstop.system,
+                    messages: cachedBackstop.messages,
+                  },
+                  async () => {
+                    const backstopStream = await client.messages.stream({
+                      ...requestParams,
+                      max_tokens: terminalMaxTokens,
+                      // Assigned outright, never a conditional spread: spreading
+                      // requestParams above may already carry a `thinking` sized
+                      // for the original max_tokens, and only adding a key when
+                      // backstopThinking is truthy would leave that stale value
+                      // in place instead of clearing it.
+                      thinking: backstopThinking,
+                      tool_choice: { type: "none" as const },
+                      system: cachedBackstop.system as Parameters<
+                        typeof client.messages.stream
+                      >[0]["system"],
+                      ...(cachedBackstop.tools &&
+                        cachedBackstop.tools.length > 0 && {
+                          tools: cachedBackstop.tools as Parameters<
+                            typeof client.messages.stream
+                          >[0]["tools"],
+                        }),
+                      messages: cachedBackstop.messages as Parameters<
+                        typeof client.messages.stream
+                      >[0]["messages"],
+                    });
+                    activeStream = backstopStream;
+                    const message = await backstopStream.finalMessage();
+                    activeStream = undefined;
+                    return message;
+                  },
+                );
+                usage.input += response.usage?.input_tokens || 0;
+                usage.output += response.usage?.output_tokens || 0;
+                turnCacheUsage.read +=
+                  response.usage?.cache_read_input_tokens ?? 0;
+                turnCacheUsage.creation +=
+                  response.usage?.cache_creation_input_tokens ?? 0;
+                turnCacheUsage.creation5m +=
+                  response.usage?.cache_creation?.ephemeral_5m_input_tokens ??
+                  0;
+                turnCacheUsage.creation1h +=
+                  response.usage?.cache_creation?.ephemeral_1h_input_tokens ??
+                  0;
+                // Total counts cache reads/writes — input_tokens is only the
+                // uncached remainder.
+                usage.total =
+                  usage.input +
+                  usage.output +
+                  turnCacheUsage.read +
+                  turnCacheUsage.creation;
+                // A SUBSET already included in usage.output above (Anthropic
+                // bills thinking as part of output_tokens) — additive only,
+                // matching the main loop's own usage.reasoning accumulation.
+                if (response.usage?.output_tokens_details?.thinking_tokens) {
+                  usage.reasoning =
+                    (usage.reasoning ?? 0) +
+                    response.usage.output_tokens_details.thinking_tokens;
+                }
+                lastStopReason = response.stop_reason;
+                // Extract<> rather than a hand-written object shape: the
+                // real SDK's ThinkingBlock also requires `signature`, which
+                // a literal `{ type: "thinking"; thinking: string }` predicate
+                // omits — TS then rejects the predicate as not assignable to
+                // ContentBlock. Extracting the union member sidesteps that
+                // without hard-coding its full shape here.
+                const backstopReasoning = response.content
+                  .filter(
+                    (
+                      block,
+                    ): block is Extract<
+                      (typeof response.content)[number],
+                      { type: "thinking" }
+                    > => block.type === "thinking",
+                  )
+                  .map((block) => block.thinking)
+                  .join("");
+                if (backstopReasoning) {
+                  channel.push({ content: "", reasoning: backstopReasoning });
+                }
+                const backstopText = (
+                  response.content as VertexAnthropicContentBlock[]
+                )
+                  .filter(
+                    (block): block is { type: "text"; text: string } =>
+                      block.type === "text",
+                  )
+                  .map((b) => b.text)
+                  .join("");
+                if (backstopText) {
+                  synthesizedFinalAnswer = true;
+                  channel.push({ content: backstopText });
+                  aggregatedTurnText = backstopText;
+                } else {
+                  const capMessage = hitContextLimit
+                    ? buildContextCapMessage(externalToolCallCount)
+                    : buildToolLoopCapMessage(maxSteps, externalToolCallCount);
+                  channel.push({ content: capMessage });
+                  aggregatedTurnText = capMessage;
+                }
+              } catch (error) {
+                activeStream = undefined;
+                // An aborted backstop is a cancellation (caller abort or a
+                // turn-clock watchdog), not a step-cap turn — keep
+                // finishReason mapping from lastStopReason and pick the exit
+                // message by the actual cause.
+                if (internalAbort.signal.aborted || isAbortError(error)) {
+                  hitStepLimit = false;
+                  wasAborted = true;
+                }
+                logger.warn(
+                  "[GoogleVertex] Tools-disabled backstop call failed; falling back to a terminal message",
+                  {
+                    error:
+                      error instanceof Error ? error.message : String(error),
+                  },
+                );
+                const exitMessage =
+                  hitContextLimit && !wasAborted
+                    ? buildContextCapMessage(externalToolCallCount)
+                    : this.buildLoopExitMessage({
+                        turnClock,
+                        wasAborted,
+                        stallTimeoutMs: options.stallTimeoutMs,
+                        maxSteps,
+                        toolCallCount: externalToolCallCount,
+                      });
+                channel.push({ content: exitMessage });
+                aggregatedTurnText = exitMessage;
+              }
+            }
+            // else: prose already streamed to the consumer across steps —
+            // add nothing; finishReason "tool-calls" flags the capped turn.
+          }
+        }
+
+        // Absolute backstop — never close the stream empty on a turn that
+        // ran tools (mirrors the generate twin's guard). Catches the
+        // model-finished-with-empty-content exit, which skips the terminal
+        // recovery above.
+        const deliveredNothing =
+          aggregatedTurnText.length === 0 &&
+          liveTextPushedLength === 0 &&
+          !structuredOutputRef.value;
+        const externalToolCallTotal = allToolCalls.filter(
+          (tc) => tc.toolName !== "final_result",
+        ).length;
+        if (deliveredNothing && externalToolCallTotal > 0) {
+          const exitMessage =
+            hitContextLimit && !wasAborted
+              ? buildContextCapMessage(externalToolCallTotal)
+              : this.buildLoopExitMessage({
+                  turnClock,
+                  wasAborted,
+                  stallTimeoutMs: options.stallTimeoutMs,
+                  maxSteps,
+                  toolCallCount: externalToolCallTotal,
+                });
+          channel.push({ content: exitMessage });
+          aggregatedTurnText = exitMessage;
+        }
+
+        // Honest finish reason (same mapping as the generate twin): "length"
+        // takes precedence, a capped turn without a clean/forced answer is
+        // "tool-calls", everything else is "stop". Mirrored onto metadata
+        // (a mutable reference) because wrapper spreads snapshot the
+        // top-level getter before this line runs.
+        finishReasonRef.value =
+          lastStopReason === "max_tokens"
+            ? "length"
+            : hitStepLimit && !synthesizedFinalAnswer
+              ? "tool-calls"
+              : "stop";
+        metadata.finishReason = finishReasonRef.value;
+
+        metadata.responseTime = Date.now() - startTime;
+        metadata.totalToolExecutions = allToolCalls.filter(
+          (tc) => tc.toolName !== "final_result",
+        ).length;
+
+        // Turn-exit discriminator + raw provider stop reason + step count —
+        // mirrored onto metadata (mutable reference) for wrapper spreads,
+        // like finishReason above.
+        const resolvedStopReason = resolveTurnStopReason({
+          timedOut: turnClock.timedOut,
+          stalled: turnClock.stalled,
+          wasAborted,
+          cappedWithoutAnswer: hitStepLimit && !synthesizedFinalAnswer,
+          contextCappedWithoutAnswer:
+            hitContextLimit && !synthesizedFinalAnswer,
+          finishReason: finishReasonRef.value,
+        });
+        stopReasonRef.value = resolvedStopReason;
+        rawFinishReasonRef.value = lastStopReason ?? undefined;
+        metadata.stopReason = resolvedStopReason;
+        metadata.rawFinishReason = rawFinishReasonRef.value;
+        metadata.stepsUsed = step;
+        if (resolvedStopReason !== "completed") {
+          this.emitTurnEvent({
+            phase: resolvedStopReason,
+            step,
+            maxSteps,
+            toolCallCount: metadata.totalToolExecutions,
+            elapsedMs: turnClock.elapsedMs(),
+          });
+        }
+
+        // Surface cache metrics once, after the agentic loop, from the
+        // cumulative turnCacheUsage running totals (accumulated via += on every
+        // step above). Assigned here — not per-iteration — so the final values
+        // are unambiguous: analytics sees caching is working and calculateCost
+        // can price the cache-read/write tiers instead of full input rate.
+        if (turnCacheUsage.read > 0) {
+          usage.cacheReadTokens = turnCacheUsage.read;
+        }
+        if (turnCacheUsage.creation > 0) {
+          usage.cacheCreationTokens = turnCacheUsage.creation;
+        }
+
+        observe(turnSpan, "span", {
+          output: {
+            text: aggregatedTurnText,
+            ...(structuredOutputRef.value
+              ? { structuredOutput: structuredOutputRef.value }
+              : {}),
+          },
+          // Turn usage is metadata-only (not usage_details) — see the note at the
+          // top of this method on why it must not contribute to the cost rollup.
+          metadata: {
+            toolsOffered: offeredToolNames,
+            toolCount: offeredToolNames.length,
+            maxSteps,
+            steps: step,
+            toolCallCount: metadata.totalToolExecutions,
+            toolsCalled: toolsUsedRef.filter((name) => name !== "final_result"),
+            structuredOutput: useFinalResultTool,
+            ...(stopReasonRef.value ? { stopReason: stopReasonRef.value } : {}),
+            usage: {
+              input: usage.input,
+              output: usage.output,
+              input_cached_tokens: turnCacheUsage.read,
+              input_cache_creation: turnCacheUsage.creation,
+              input_cache_creation_5m: turnCacheUsage.creation5m,
+              input_cache_creation_1h: turnCacheUsage.creation1h,
+            },
+          },
+        });
+        // How the turn ended, on the trace itself, so an evaluator can select
+        // only turns that finished ("completed") and skip capped, timed-out,
+        // aborted and failed ones. A trace holding several turns keeps the last
+        // one's; each turn's own is in its observation metadata above.
+        if (stopReasonRef.value) {
+          observeTrace(turnSpan, {
+            metadata: { stopReason: stopReasonRef.value },
+          });
+        }
+        turnSpan.setStatus({ code: SpanStatusCode.OK });
+        channel.close();
+      } catch (err) {
+        observe(turnSpan, "span", {
+          level: "ERROR",
+          statusMessage: err instanceof Error ? err.message : String(err),
+          metadata: {
+            toolsOffered: offeredToolNames,
+            toolCount: offeredToolNames.length,
+            maxSteps,
+            structuredOutput: useFinalResultTool,
+            stopReason: "provider-error",
+          },
+        });
+        observeTrace(turnSpan, { metadata: { stopReason: "provider-error" } });
+        turnSpan.setStatus({
+          code: SpanStatusCode.ERROR,
+          message: err instanceof Error ? err.message : String(err),
+        });
+        if (err instanceof Error) {
+          turnSpan.recordException(err);
+        }
+        logger.error("[GoogleVertex] Native Anthropic SDK stream error", err);
+        channel.error(this.handleProviderError(err));
+      } finally {
+        turnSpan.end();
+        options.abortSignal?.removeEventListener("abort", onCallerAbort);
+        internalAbort.signal.removeEventListener("abort", abortHandler);
+        turnClock.dispose();
+      }
+    })();
+    // Suppress unhandled-rejection: errors funnel through channel.error()
+    // and surface when the consumer iterates the stream.
+    loopPromise.catch(() => undefined);
+
+    // Return StreamResult IMMEDIATELY — caller's for-await can begin
+    // iterating channel.iterable while the background loop is still
+    // generating. usage / metadata / toolCalls / toolExecutions are mutable
+    // references that the loop fills in over time; the consumer reads them
+    // after iteration completes (after channel.close() has fired).
+    const result: StreamResult = {
+      stream: channel.iterable,
+      provider: this.providerName,
+      model: modelName,
+      usage,
+      metadata,
+    };
+
+    Object.defineProperty(result, "toolCalls", {
+      enumerable: true,
+      configurable: true,
+      get: () => allToolCalls.filter((tc) => tc.toolName !== "final_result"),
+    });
+    Object.defineProperty(result, "toolsUsed", {
+      enumerable: true,
+      configurable: true,
+      get: () => toolsUsedRef.filter((name) => name !== "final_result"),
+    });
+    Object.defineProperty(result, "toolExecutions", {
+      enumerable: true,
+      configurable: true,
+      get: () =>
+        transformToolExecutions(
+          toolExecutions.filter((te) => te.name !== "final_result"),
+        ),
+    });
+
+    Object.defineProperty(result, "structuredOutput", {
+      enumerable: true,
+      configurable: true,
+      get: () => structuredOutputRef.value,
+    });
+
+    // Resolved by the background loop right before channel.close(); consumers
+    // read it after draining the stream (same contract as usage/metadata).
+    Object.defineProperty(result, "finishReason", {
+      enumerable: true,
+      configurable: true,
+      get: () => finishReasonRef.value,
+    });
+    Object.defineProperty(result, "stopReason", {
+      enumerable: true,
+      configurable: true,
+      get: () => stopReasonRef.value,
+    });
+    Object.defineProperty(result, "rawFinishReason", {
+      enumerable: true,
+      configurable: true,
+      get: () => rawFinishReasonRef.value,
+    });
+
+    return result;
+  }
+
+  /**
+   * Execute generate using native @anthropic-ai/vertex-sdk for Claude models on Vertex AI
+   */
+  private async executeNativeAnthropicGenerate(
+    options: TextGenerationOptions,
+  ): Promise<EnhancedGenerateResult> {
+    const modelName = toVertexAnthropicModelId(
+      options.model || this.modelName || "claude-sonnet-4-5@20250929",
+    );
+    const startTime = Date.now();
+    const generateTimeoutMs = parseTimeout(options.timeout) ?? 300_000;
+    const client = await this.createAnthropicVertexClient(generateTimeoutMs);
+
+    logger.debug(
+      "[GoogleVertex] Using native @anthropic-ai/vertex-sdk for Claude generate",
+      {
+        model: modelName,
+        project: this.projectId,
+        location: this.location,
+      },
+    );
+
+    // Build messages from input
+    const messages: VertexAnthropicMessage[] = [];
+    // input.text FIRST — the file preprocessors (processUnifiedFilesArray,
+    // processCSVFilesForNativeSDK) append attached-file content to input.text,
+    // while options.prompt is snapshotted from the ORIGINAL input.text at
+    // baseOptions creation (neurolink.ts). With prompt-first precedence every
+    // attached file was silently dropped on the Claude generate path — the
+    // model answered "no file attached" to a request that carried one. The
+    // native Gemini path already reads input.text first for exactly this
+    // reason. (See resolveNativeGenerateText for the full precedence +
+    // middleware-redaction rationale.)
+    const inputText = this.resolveNativeGenerateText(options);
+
+    // Replay conversationMessages (with tool turns), else the legacy text-only conversationHistory.
+    if (
+      options.conversationMessages &&
+      options.conversationMessages.length > 0
+    ) {
+      messages.push(
+        ...buildAnthropicHistoryMessages(options.conversationMessages),
+      );
+    } else if (
+      options.conversationHistory &&
+      options.conversationHistory.length > 0
+    ) {
+      for (const msg of options.conversationHistory) {
+        if (msg.role === "user" || msg.role === "assistant") {
+          messages.push({
+            role: msg.role,
+            content: stringifyContentSafe(msg.content),
+          });
+        }
+      }
+    }
+
+    // Add current user input with multimodal support
+    // Cast input to access multimodal properties that may exist at runtime
+    const multimodalInput = options.input as
+      | {
+          text: string;
+          pdfFiles?: Array<Buffer | string>;
+          images?: Array<Buffer | string | ImageWithAltText>;
+        }
+      | undefined;
+
+    // Build content parts for the user message
+    const userContentParts: Array<
+      | { type: "text"; text: string }
+      | {
+          type: "image";
+          source: { type: "base64"; media_type: string; data: string };
+        }
+      | {
+          type: "document";
+          source: { type: "base64"; media_type: string; data: string };
+        }
+    > = [];
+
+    // Add PDF files as document parts if present
+    if (multimodalInput?.pdfFiles && multimodalInput.pdfFiles.length > 0) {
+      logger.debug(
+        `[GoogleVertex] Processing ${multimodalInput.pdfFiles.length} PDF file(s) for native Anthropic generate`,
+      );
+
+      for (const pdfFile of multimodalInput.pdfFiles) {
+        let pdfBuffer: Buffer;
+
+        if (typeof pdfFile === "string") {
+          // Check if it's a file path
+          if (fs.existsSync(pdfFile)) {
+            pdfBuffer = fs.readFileSync(pdfFile);
+          } else {
+            // Assume it's already base64 encoded
+            pdfBuffer = Buffer.from(pdfFile, "base64");
+          }
+        } else {
+          pdfBuffer = pdfFile;
+        }
+
+        // Convert to base64 for Anthropic's document format
+        const base64Data = pdfBuffer.toString("base64");
+        userContentParts.push({
+          type: "document",
+          source: {
+            type: "base64",
+            media_type: "application/pdf",
+            data: base64Data,
+          },
+        });
+      }
+    }
+
+    // Add images as image parts if present
+    if (multimodalInput?.images && multimodalInput.images.length > 0) {
+      logger.debug(
+        `[GoogleVertex] Processing ${multimodalInput.images.length} image(s) for native Anthropic generate`,
+      );
+
+      for (const rawImage of multimodalInput.images) {
+        // `input.images` accepts `{ data, altText }` as a documented public
+        // shape, but this loop only ever handled Buffer | string — a wrapper
+        // fell through to the "assume raw bytes" branch and base64-encoded the
+        // OBJECT, sending the literal "[object Object]" to Vertex. Unwrap once,
+        // here, so every branch below sees the payload it expects.
+        const image = unwrapImagePayload(rawImage);
+        let imageBuffer: Buffer;
+        let mimeType = "image/jpeg"; // Default
+
+        if (typeof image === "string") {
+          if (fs.existsSync(image)) {
+            imageBuffer = fs.readFileSync(image);
+            // Detect mime type from extension
+            // Registry lookup rather than a png/gif/webp switch defaulting to
+            // JPEG: that default labelled a .heic/.bmp/.tiff/.avif reference
+            // image as image/jpeg, which is simply untrue and is what Vertex
+            // then rejected. The registry answers "application/octet-stream"
+            // for a missing or unregistered extension though, and Vertex
+            // rejects a non-image media type just as firmly — so fall back to
+            // the bytes, which are already in hand, rather than sending either
+            // a guess or a non-image type.
+            const byExtension = getMimeTypeForExtension(image);
+            mimeType = byExtension.startsWith("image/")
+              ? byExtension
+              : this.detectImageType(imageBuffer);
+          } else if (image.startsWith("data:")) {
+            // Handle data URL
+            const matches = image.match(/^data:([^;]+);base64,(.+)$/);
+            if (matches) {
+              mimeType = matches[1];
+              imageBuffer = Buffer.from(matches[2], "base64");
+            } else {
+              continue; // Skip invalid data URL
+            }
+          } else if (
+            image.startsWith("http://") ||
+            image.startsWith("https://")
+          ) {
+            // Image URL — fetch and base64-encode. Without this, the URL
+            // string falls through to the "assume base64" branch below
+            // and Vertex returns "Provided image is not valid".
+            try {
+              const response = await fetch(image);
+              if (!response.ok) {
+                // The URL may be presigned or carry credentials in its query
+                // string, and wrapper URLs now reach this branch too.
+                logger.warn(
+                  `[GoogleVertex] Image fetch failed: ${response.status} ${response.statusText}, skipping`,
+                  { url: redactUrlForError(image) },
+                );
+                continue;
+              }
+              const arrayBuffer = await response.arrayBuffer();
+              imageBuffer = Buffer.from(arrayBuffer);
+              const headerMime = response.headers.get("content-type");
+              if (headerMime && headerMime.startsWith("image/")) {
+                mimeType = headerMime.split(";")[0];
+              }
+            } catch (fetchError) {
+              logger.warn(
+                `[GoogleVertex] Image URL fetch threw, skipping: ${fetchError instanceof Error ? fetchError.message : String(fetchError)}`,
+                { url: redactUrlForError(image) },
+              );
+              continue;
+            }
+          } else {
+            // Assume base64 string
+            imageBuffer = Buffer.from(image, "base64");
+            // Sniff the real format from magic bytes — bare base64 carries no
+            // mime hint, and leaving the image/jpeg default makes Anthropic
+            // reject PNG/GIF/WebP with a media-type mismatch 400.
+            mimeType = this.detectImageType(imageBuffer);
+          }
+        } else {
+          imageBuffer = image;
+          // Buffer input (e.g. Slack/REST uploads) carries no mime hint; sniff
+          // it instead of defaulting to image/jpeg (mislabels PNG -> 400).
+          mimeType = this.detectImageType(imageBuffer);
+        }
+
+        const base64Data = imageBuffer.toString("base64");
+        userContentParts.push({
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: mimeType,
+            data: base64Data,
+          },
+        });
+      }
+    }
+
+    // Always add the text content
+    userContentParts.push({
+      type: "text",
+      text: inputText,
+    });
+
+    // Append the live user turn (merges into a trailing user turn if present).
+    appendUserMessage(
+      messages,
+      userContentParts.length === 1 && userContentParts[0].type === "text"
+        ? inputText
+        : userContentParts,
+    );
+
+    // Convert tools to Anthropic format if present
+    let tools: VertexAnthropicTool[] | undefined;
+    const executeMap = new DedupExecuteMap();
+    const toolExecutions: Array<{
+      name: string;
+      input: Record<string, unknown>;
+      output: unknown;
+    }> = [];
+
+    // Defensive guard: Vertex generate() bypasses BaseProvider.generate(), so
+    // disableTools must be checked here before native tool declarations are
+    // ever sent to the Anthropic Vertex SDK.
+    if (
+      !options.disableTools &&
+      options.tools &&
+      Object.keys(options.tools).length > 0
+    ) {
+      tools = [];
+
+      for (const [name, tool] of Object.entries(options.tools)) {
+        tools.push(this.buildAnthropicToolDeclaration(name, tool));
+        if (tool.execute) {
+          executeMap.set(name, tool.execute);
+        }
+      }
+    }
+
+    // Handle JSON schema support via final_result tool pattern
+    // Anthropic doesn't have native responseSchema, so we add a final_result tool
+    let useFinalResultTool = false;
+    let schemaSystemPromptSuffix = "";
+
+    if (options.schema) {
+      useFinalResultTool = true;
+
+      // Create final_result tool
+      const finalResultTool = this.buildFinalResultTool(
+        options.schema as ZodUnknownSchema,
+      );
+
+      // Add to tools array or create new array
+      if (!tools) {
+        tools = [];
+      }
+      tools.push(finalResultTool);
+
+      // Add instruction to system prompt
+      schemaSystemPromptSuffix =
+        "\n\nIMPORTANT: You MUST call the 'final_result' tool to return your response in the required structured format. Do not respond with plain text - always use the final_result tool.";
+
+      logger.debug(
+        "[GoogleVertex] Added final_result tool for Anthropic structured output (generate)",
+        {
+          schemaKeys: Object.keys(
+            finalResultTool.input_schema.properties ?? {},
+          ),
+          totalTools: tools.length,
+        },
+      );
+    }
+
+    // Build request options
+    const systemPromptWithSchema = options.systemPrompt
+      ? options.systemPrompt + schemaSystemPromptSuffix
+      : schemaSystemPromptSuffix
+        ? schemaSystemPromptSuffix.trim()
+        : undefined;
+
+    // Registry-driven strip: Sonnet 5 / Opus 4.7+ / Fable 5 on Vertex reject
+    // sampling params. Applied at the requestParams build so the forced
+    // finalization and tools-off backstop rebuilds (`...requestParams`)
+    // inherit the strip automatically.
+    const generateSampling = resolveSamplingParams(
+      this.providerName,
+      modelName,
+      {
+        ...(options.temperature !== undefined && {
+          temperature: options.temperature,
+        }),
+        ...(options.topP !== undefined && { topP: options.topP }),
+      },
+      "vertex.anthropic.generate",
+    );
+
+    const generateMaxTokens = resolveClaudeMaxTokens(
+      modelName,
+      options.maxTokens,
+    );
+    // Claude 5.5 / 5.1 400 on a forced tool_choice; schema mode leaves them on
+    // auto, steered by the final_result instruction already in the prompt.
+    const forceFinalResult =
+      useFinalResultTool && modelSupportsForcedToolChoice(modelName);
+    const generateThinking = this.buildClaudeThinkingParam(
+      options,
+      generateMaxTokens,
+      forceFinalResult,
+    );
+
+    const requestParams = {
+      model: modelName,
+      // Default to the model's real output ceiling (see stream path note).
+      max_tokens: generateMaxTokens,
+      ...(generateThinking && { thinking: generateThinking }),
+      messages,
+      ...(tools && tools.length > 0 && { tools }),
+      ...(forceFinalResult && { tool_choice: { type: "any" as const } }),
+      ...(systemPromptWithSchema && { system: systemPromptWithSchema }),
+      ...(generateSampling.temperature !== undefined && {
+        temperature: generateSampling.temperature,
+      }),
+      ...(generateSampling.topP !== undefined && {
+        top_p: generateSampling.topP,
+      }),
+      ...(options.stopSequences &&
+        options.stopSequences.length > 0 && {
+          stop_sequences: options.stopSequences,
+        }),
+    };
+
+    // Handle tool calling loop with max steps
+    const maxSteps = options.maxSteps || DEFAULT_MAX_STEPS;
+    // Reserve the LAST step of the budget for a forced final_result call when
+    // structured output is active. tool_choice:"any" (set above) forces a tool
+    // call on every assistant turn, so the toolUseBlocks.length===0 text exit
+    // is structurally unreachable — without a reserved finalization step, a
+    // turn whose budget is consumed by other tool calls (runaway loop, or all
+    // tools failing) ends with content:"" and a masking finishReason "stop".
+    const agenticStepBudget = useFinalResultTool
+      ? Math.max(maxSteps - 1, 0)
+      : maxSteps;
+    let step = 0;
+    let finalText = "";
+    // Prose produced mid-loop alongside tool calls, accumulated across steps
+    // via appendStepText — surfaced if the step budget runs out (mirrors the
+    // Gemini paths' accumulatedText; last-step-only would drop earlier prose).
+    let accumulatedStepText = "";
+    let structuredOutput: Record<string, unknown> | undefined;
+    const allToolCalls: Array<{
+      toolCallId: string;
+      toolName: string;
+      args: Record<string, unknown>;
+    }> = [];
+    let totalInputTokens = 0;
+    let totalOutputTokens = 0;
+    // Cache metrics (Anthropic reports these separately from input_tokens, which
+    // is the uncached remainder). Surfaced on the result so analytics can see
+    // caching is working and calculateCost can price the ~0.1x cache-read /
+    // ~1.25x cache-write tiers instead of billing everything at full input rate.
+    let totalCacheReadTokens = 0;
+    let totalCacheCreationTokens = 0;
+    // A SUBSET already included in totalOutputTokens above (Anthropic bills
+    // thinking tokens as part of output_tokens) — reported separately for
+    // observability, never folded into the input/output/total rollup.
+    let totalReasoningTokens = 0;
+    // Reasoning text has no tool-triggered accumulation path the way
+    // `accumulatedStepText` does (buildToolResultMessages only fires for
+    // steps with tool calls), so it is captured directly from the engine's
+    // per-chunk stream below — otherwise a plain one-shot thinking answer
+    // never surfaces its reasoning text at all.
+    let accumulatedReasoningText = "";
+    // Track the final Anthropic stop_reason so we can surface finishReason
+    // (notably "length" on token truncation) — the legacy native path always
+    // reported "stop", hiding truncation from callers.
+    let lastStopReason: string | null | undefined;
+    // Step-cap / abort bookkeeping (mirrors the native Gemini loops): the
+    // terminal recovery block below and the finishReason mapping both read
+    // these to distinguish clean finishes, capped turns, and aborted turns.
+    let wasAborted = false;
+    let hitStepLimit = false;
+    let hitContextLimit = false;
+    let synthesizedFinalAnswer = false;
+    const modelFinished = false;
+    const currentMessages = [...messages];
+
+    // In-loop context guard: stop calling tools when the accumulated
+    // conversation approaches the model's real context window, instead of
+    // stepping into an Anthropic 400 "prompt is too long" at step N that
+    // destroys the whole turn's work (claude-sonnet-5 1,005,647-token RCA).
+    const contextGuard = createContextGuard(
+      getContextWindowSize("vertex", modelName),
+    );
+    // Consecutive-failure breaker (ports the Gemini loops' failedTools map):
+    // a tool that keeps failing — thrown errors, timeouts, or error-shaped
+    // results like mcp-proxy blocks — is short-circuited after
+    // DEFAULT_TOOL_MAX_RETRIES instead of being retried for the remaining
+    // step budget.
+    const failedTools = new Map<string, { count: number; lastError: string }>();
+
+    // Internal abort fan-in: the caller's signal and the turn clock's
+    // watchdogs all trip it; it rides every SDK request and tool execution.
+    const internalAbort = new AbortController();
+    const onCallerAbort = () => internalAbort.abort();
+    options.abortSignal?.addEventListener("abort", onCallerAbort);
+    if (options.abortSignal?.aborted) {
+      internalAbort.abort();
+    }
+    const toolExecTimeoutMs = resolveToolTimeoutMs(options.toolTimeoutMs);
+    // Whole-turn deadline + optional stall watchdog. NOTE: unlike the stream
+    // twin, this path historically had NO whole-turn bound (only the per-call
+    // withTimeout) — so no defensive default is introduced here: without an
+    // explicit turnTimeoutMs, long multi-step turns keep running as before.
+    const turnClock = createTurnClock({
+      turnTimeoutMs: options.turnTimeoutMs,
+      stallTimeoutMs: options.stallTimeoutMs,
+      wrapupTimeLeadMs: options.wrapupTimeLeadMs,
+      onDeadline: (kind) => {
+        logger.warn(
+          kind === "timeout"
+            ? `[GoogleVertex] Anthropic generate turn exceeded its ${options.turnTimeoutMs}ms time budget — aborting`
+            : `[GoogleVertex] Anthropic generate turn made no progress for ${options.stallTimeoutMs}ms — aborting`,
+        );
+        internalAbort.abort();
+      },
+    });
+    // No top-level try/finally wraps this loop (pre-existing shape); release
+    // watchdog timers + the caller-signal listener at both exits — the
+    // provider-error throw in the per-step catch and the normal return path.
+    const releaseTurnResources = () => {
+      turnClock.dispose();
+      options.abortSignal?.removeEventListener("abort", onCallerAbort);
+    };
+
+    // Executors handed to the engine, taken through the turn's
+    // DedupExecuteMap so an identical repeated call is answered from the
+    // per-turn cache rather than run again (BZ-3327), and guarded exactly as
+    // the hand-rolled loop guarded them: a per-tool bound so a wedged tool
+    // costs ONE STEP rather than the whole turn, raced against the turn's
+    // abort, and a stall-clock ping either side.
+    const engineTools: NonNullable<AgenticLoopOptions["tools"]> = {};
+    for (const toolName of executeMap.keys()) {
+      const wrapped = executeMap.get(toolName);
+      if (!wrapped) {
+        continue;
+      }
+      engineTools[toolName] = {
+        execute: guardToolExecutor(toolName, wrapped, {
+          toolTimeoutMs: toolExecTimeoutMs,
+          abortSignal: internalAbort.signal,
+          onProgress: () => turnClock.noteProgress(),
+        }),
+      };
+    }
+
+    // The turn runs on the shared engine, exactly as the streaming twin does.
+    // maxSteps is agenticStepBudget, not maxSteps: the last slot is reserved
+    // for the forced final_result call in the terminal block below, and the
+    // engine must never spend it.
+    const baseAdapter = createAnthropicLoopAdapter<VertexAnthropicMessage>({
+      client,
+      provider: this.providerName,
+      maxSteps: agenticStepBudget,
+      toolsRecord: options.tools ?? {},
+      toolFailureBreaker: {
+        maxRetries: DEFAULT_TOOL_MAX_RETRIES,
+        // MCP failures are RETURNED, not thrown. Counting only throws lets
+        // the model grind on a blocked tool for the whole step budget.
+        classifyResultFailure: (output) =>
+          extractToolFailureText(output) ?? undefined,
+      },
+      buildParams: (conversation) => {
+        // Mid-turn discovery sync — see the stream twin.
+        this.refreshAnthropicToolDeclarations(
+          options.tools,
+          tools,
+          executeMap,
+          failedTools,
+        );
+        const cached = applyVertexAnthropicCacheBreakpoints({
+          system: systemPromptWithSchema,
+          tools,
+          messages: conversation,
+        });
+        return {
+          ...requestParams,
+          ...(cached.system !== undefined && {
+            system: cached.system as Parameters<
+              typeof client.messages.create
+            >[0]["system"],
+          }),
+          ...(cached.tools &&
+            cached.tools.length > 0 && {
+              tools: cached.tools as Parameters<
+                typeof client.messages.create
+              >[0]["tools"],
+            }),
+          messages: cached.messages as Parameters<
+            typeof client.messages.create
+          >[0]["messages"],
+        };
+      },
+      planReclaim: (conversation) => {
+        if (!contextGuard.shouldStop()) {
+          return undefined;
+        }
+        const working = [...conversation];
+        if (
+          reclaimVertexAnthropicContext(
+            working,
+            modelName,
+            contextGuard.projectedNextPromptTokens,
+          )
+        ) {
+          contextGuard.resetAfterReclaim();
+          return { conversation: working };
+        }
+        hitContextLimit = true;
+        logger.warn(
+          `[GoogleVertex] Anthropic generate turn stopped by the context guard: ` +
+            `projected prompt ~${contextGuard.projectedNextPromptTokens} tokens ` +
+            `>= threshold ${contextGuard.thresholdTokens} — forcing finalization.`,
+        );
+        // STOP, not undefined: undefined means "nothing to reclaim, carry
+        // on", which is the opposite of what the guard just decided.
+        return { stop: true };
+      },
+      noteObservedPromptTokens: (tokens) => {
+        contextGuard.noteUsage(tokens, 0);
+      },
+      ...(useFinalResultTool
+        ? {
+            finalResultToolName: "final_result",
+            onTerminalResult: (text: string) => {
+              try {
+                structuredOutput = JSON.parse(text) as Record<string, unknown>;
+              } catch {
+                /* the caller's coercion layer repairs a partial payload */
+              }
+              logger.debug(
+                "[GoogleVertex] Extracted structured output from final_result tool (generate)",
+                { chars: text.length },
+              );
+            },
+          }
+        : {}),
+    });
+
+    const adapter: typeof baseAdapter = {
+      ...baseAdapter,
+      buildStepRequest: (conversation, engineStep) => {
+        step = engineStep + 1;
+        turnClock.noteProgress();
+        return baseAdapter.buildStepRequest(conversation, engineStep);
+      },
+      // The provider's own miss handler, not the adapter's. The adapter
+      // resolves a deferred tool and hands back its RAW executor; this one
+      // also DECLARES the tool so Claude can call it on later steps, and
+      // registers it in the turn's DedupExecuteMap so a repeat with
+      // identical arguments is served from cache. Without the declaration a
+      // hydrated tool works exactly once and is then invisible again.
+      resolveToolOnMiss: (name) => {
+        const hydrated = this.resolveAnthropicToolOnMiss(
+          name,
+          options.tools,
+          tools,
+          executeMap,
+          failedTools,
+        );
+        if (!hydrated) {
+          return undefined;
+        }
+        return {
+          execute: guardToolExecutor(name, hydrated, {
+            toolTimeoutMs: toolExecTimeoutMs,
+            abortSignal: internalAbort.signal,
+            onProgress: () => turnClock.noteProgress(),
+          }),
+        };
+      },
+      buildToolResultMessages: (
+        conversation,
+        stepResult,
+        toolResults,
+        engineStep,
+      ) => {
+        for (const result of toolResults) {
+          allToolCalls.push({
+            toolCallId: result.id,
+            toolName: result.name,
+            args: result.args,
+          });
+          // Recorded here as well: `toolExecutions` feeds
+          // resolveToolExecutionRecords and the result's own
+          // toolExecutions, and pushing only to allToolCalls left it empty
+          // for every generate turn.
+          toolExecutions.push({
+            name: result.name,
+            input: result.args,
+            output: result.output,
+          });
+        }
+        // Per STEP, with appendStepText's newline join — this hook runs once
+        // per step and `stepResult.text` is that step's whole text.
+        accumulatedStepText = appendStepText(
+          accumulatedStepText,
+          stepResult.text,
+        );
+        const next = baseAdapter.buildToolResultMessages(
+          conversation,
+          stepResult,
+          toolResults,
+          engineStep,
+        );
+        // Time-budget wrap-up nudge, as a trailing text block on the
+        // tool_result user turn.
+        if (turnClock.shouldNudgeWrapup()) {
+          const last = next[next.length - 1];
+          if (last && Array.isArray(last.content)) {
+            last.content.push({
+              type: "text",
+              text: buildWrapupNudgeText(useFinalResultTool),
+            });
+          }
+        }
+        // Per step, not batched at the end: tools that completed in a step
+        // later aborted are real side effects and belong in the history.
+        withTimeout(
+          this.handleToolExecutionStorage(
+            toolResults.map((result) => ({
+              toolName: result.name,
+              args: result.args,
+              stepIndex: engineStep + 1,
+            })),
+            toolResults.map((result) => ({
+              toolName: result.name,
+              output: result.output,
+              stepIndex: engineStep + 1,
+            })),
+            options,
+            new Date(),
+          ),
+          TOOL_STORAGE_TIMEOUT_MS,
+          "tool storage write timed out",
+        ).catch((error: unknown) => {
+          logger.warn(
+            "[GoogleVertex] Failed to store native Anthropic generate tool executions",
+            {
+              error: error instanceof Error ? error.message : String(error),
+            },
+          );
+        });
+        try {
+          const appended = next[next.length - 1];
+          contextGuard.noteAppendedChars(
+            JSON.stringify(appended?.content ?? []).length,
+          );
+        } catch {
+          /* estimation is best-effort — never break the loop */
+        }
+        return next;
+      },
+    };
+
+    const { stream: engineStream, resultPromise } = runAgenticLoop(
+      adapter,
+      currentMessages.slice(),
+      {
+        tools: engineTools,
+        abortSignal: internalAbort.signal,
+        // Same value `guardToolExecutor` already received above, so the
+        // engine's own per-tool bound cannot undercut it.
+        toolTimeoutMs: toolExecTimeoutMs,
+      },
+    );
+
+    // Text chunks are discarded here: generate() returns one result rather
+    // than streaming, and the per-step text is accumulated in
+    // buildToolResultMessages instead — appendStepText joins steps with a
+    // NEWLINE, which a chunk-by-chunk `+=` here would silently drop, running
+    // consecutive steps' text together. Reasoning has no such step-boundary
+    // hook (buildToolResultMessages only runs for steps WITH tool calls, so
+    // a plain one-shot thinking answer never reaches it), so it is captured
+    // directly off the chunk stream instead. The drain still has to happen
+    // regardless: leaving the channel unread stalls the engine once its
+    // buffer fills.
+    //
+    // The plain `+=` below is deliberate, not the same gap as the text path:
+    // each `chunk.reasoning` here is one `thinking_delta` from inside a
+    // single step (loopAdapter pushes one per delta, not one per step), so
+    // joining on a NEWLINE the way appendStepText does would insert a break
+    // before nearly every delta and fragment one coherent thinking block
+    // into one line per token. Concatenation across steps is a known,
+    // accepted blur — there is no per-step boundary on this channel to join
+    // on — while concatenation within a step is exactly what the API sent.
+    const pump = (async () => {
+      for await (const chunk of engineStream) {
+        if (chunk.reasoning) {
+          accumulatedReasoningText += chunk.reasoning;
+        }
+      }
+    })();
+
+    let engineResult;
+    let turnFailure: unknown;
+    try {
+      engineResult = await resultPromise;
+    } catch (error) {
+      turnFailure = error;
+    }
+    await drainDetachedPump(pump, "GoogleVertex");
+    if (turnFailure !== undefined) {
+      if (internalAbort.signal.aborted || isAbortError(turnFailure)) {
+        wasAborted = true;
+      } else {
+        logger.error("[GoogleVertex] Native Anthropic SDK generate error", {
+          error: turnFailure,
+          model: modelName,
+        });
+        throw this.handleProviderError(turnFailure);
+      }
+    }
+
+    if (engineResult) {
+      totalInputTokens += engineResult.usage.inputTokens;
+      totalOutputTokens += engineResult.usage.outputTokens;
+      totalCacheReadTokens += engineResult.usage.cacheReadTokens ?? 0;
+      totalCacheCreationTokens += engineResult.usage.cacheWriteTokens ?? 0;
+      totalReasoningTokens += engineResult.usage.reasoningTokens ?? 0;
+      lastStopReason = engineResult.rawStopReason ?? lastStopReason;
+      finalText = engineResult.text || finalText;
+      // Replace in place: the terminal block and the finalization call both
+      // read `currentMessages`.
+      currentMessages.length = 0;
+      currentMessages.push(
+        ...(engineResult.conversation as typeof currentMessages),
+      );
+    }
+    if (internalAbort.signal.aborted) {
+      wasAborted = true;
+    }
+
+    // Terminal handling — the loop exited without a model-initiated finish
+    // (step budget exhausted, or the turn was aborted). Never return "":
+    // force the reserved final_result step on structured-output turns,
+    // synthesize a plain-text answer on tool turns, or fall back to a
+    // graceful cap message. Mirrors the Gemini paths (ed289b7 / PR #1123).
+    if (!modelFinished && !finalText) {
+      // An abort that landed during the FINAL budgeted step's tool
+      // execution leaves wasAborted=false (no loop-entry check runs after a
+      // budget exit) — re-check before issuing any terminal model call.
+      if (internalAbort.signal.aborted) {
+        wasAborted = true;
+      }
+      const externalToolCallCount = allToolCalls.filter(
+        (tc) => tc.toolName !== "final_result",
+      ).length;
+      // Clamp the terminal calls' max_tokens so prompt + output stays inside
+      // the model window: pre-4.5 Claude models 400 on input + max_tokens >
+      // window, which would defeat the very synthesis these calls exist for
+      // on context-capped turns. Only bites when the prompt is near the
+      // window (min() is a no-op on ordinary step-cap turns).
+      const terminalMaxTokens = Math.max(
+        1024,
+        Math.min(
+          requestParams.max_tokens,
+          getContextWindowSize("vertex", modelName) -
+            contextGuard.projectedNextPromptTokens -
+            4_000,
+        ),
+      );
+      if (wasAborted) {
+        // Budget already blown — never issue another model call; prefer the
+        // prose the model already produced (mirrors the Gemini abort path),
+        // else answer with an HONEST message matching the actual exit cause
+        // (time limit / stall / caller abort — never the step-cap text).
+        // finishReason keeps mapping from lastStopReason (an aborted turn is
+        // not a step-cap turn).
+        logger.warn(
+          `[GoogleVertex] Native Anthropic generate loop ended mid-turn ` +
+            `(${turnClock.timedOut ? "turn time limit" : turnClock.stalled ? "stall watchdog" : "caller abort"}); ` +
+            `returning gathered text or an honest terminal message.`,
+        );
+        finalText =
+          accumulatedStepText ||
+          this.buildLoopExitMessage({
+            turnClock,
+            wasAborted,
+            stallTimeoutMs: options.stallTimeoutMs,
+            maxSteps,
+            toolCallCount: externalToolCallCount,
+          });
+      } else if (useFinalResultTool) {
+        if (!hitContextLimit) {
+          hitStepLimit = true;
+        }
+        logger.warn(
+          hitContextLimit
+            ? `[GoogleVertex] Native Anthropic generate loop stopped by the context guard without final_result; forcing a finalization call.`
+            : `[GoogleVertex] Native Anthropic generate loop reached maxSteps (${maxSteps}) without final_result; forcing a finalization call.`,
+        );
+        try {
+          // Reserved finalization step: identical request except tool_choice
+          // pins final_result, so Anthropic guarantees the response is a
+          // final_result tool_use. Cache treatment is byte-identical to loop
+          // steps (same applyVertexAnthropicCacheBreakpoints on the same
+          // stable system/tools prefix), so caching is unaffected.
+          const cachedFinal = applyVertexAnthropicCacheBreakpoints({
+            system: systemPromptWithSchema,
+            tools,
+            messages: currentMessages,
+          });
+          const response = await this.withClaudeGeneration(
+            {
+              stepNumber: maxSteps + 1,
+              model: requestParams.model,
+              maxTokens: terminalMaxTokens,
+              temperature: requestParams.temperature,
+              topP: requestParams.top_p,
+              system: cachedFinal.system,
+              messages: cachedFinal.messages,
+            },
+            () =>
+              withTimeout(
+                client.messages.create(
+                  {
+                    ...requestParams,
+                    max_tokens: terminalMaxTokens,
+                    // Resized, not inherited: terminalMaxTokens can sit below the
+                    // budget requestParams' thinking was sized for.
+                    thinking: this.buildClaudeThinkingParam(
+                      options,
+                      terminalMaxTokens,
+                      forceFinalResult,
+                    ),
+                    ...(forceFinalResult && {
+                      tool_choice: {
+                        type: "tool" as const,
+                        name: "final_result",
+                      },
+                    }),
+                    ...(cachedFinal.system !== undefined && {
+                      system: cachedFinal.system as Parameters<
+                        typeof client.messages.create
+                      >[0]["system"],
+                    }),
+                    ...(cachedFinal.tools &&
+                      cachedFinal.tools.length > 0 && {
+                        tools: cachedFinal.tools as Parameters<
+                          typeof client.messages.create
+                        >[0]["tools"],
+                      }),
+                    messages: cachedFinal.messages as Parameters<
+                      typeof client.messages.create
+                    >[0]["messages"],
+                  },
+                  { signal: internalAbort.signal },
+                ),
+                generateTimeoutMs,
+                "Anthropic finalization call timed out",
+              ),
+          );
+          totalInputTokens += response.usage?.input_tokens || 0;
+          totalOutputTokens += response.usage?.output_tokens || 0;
+          totalCacheReadTokens += response.usage?.cache_read_input_tokens || 0;
+          totalCacheCreationTokens +=
+            response.usage?.cache_creation_input_tokens || 0;
+          lastStopReason = response.stop_reason;
+          const forcedFinalResult = (
+            response.content as VertexAnthropicContentBlock[]
+          ).find(
+            (
+              block,
+            ): block is {
+              type: "tool_use";
+              id: string;
+              name: string;
+              input: Record<string, unknown>;
+            } => block.type === "tool_use" && block.name === "final_result",
+          );
+          if (forcedFinalResult) {
+            structuredOutput = forcedFinalResult.input;
+            finalText = JSON.stringify(structuredOutput);
+            synthesizedFinalAnswer = true;
+            logger.debug(
+              "[GoogleVertex] Forced finalization returned structured output (generate)",
+              { keys: Object.keys(structuredOutput) },
+            );
+          } else {
+            // Unforced (the model refuses a forced choice), the call may
+            // answer in text instead; keep that answer over a cap notice.
+            const finalizationText = forceFinalResult
+              ? ""
+              : finalizationAnswerText(
+                  response.content as VertexAnthropicContentBlock[],
+                );
+            if (finalizationText) {
+              finalText = finalizationText;
+              synthesizedFinalAnswer = true;
+            } else {
+              finalText = hitContextLimit
+                ? buildContextCapMessage(externalToolCallCount)
+                : buildToolLoopCapMessage(maxSteps, externalToolCallCount);
+            }
+          }
+        } catch (error) {
+          // An aborted finalization is a cancellation (caller abort or a
+          // turn-clock watchdog), not a step-cap turn — keep finishReason
+          // mapping from lastStopReason and pick the exit message by the
+          // actual cause.
+          if (internalAbort.signal.aborted || isAbortError(error)) {
+            hitStepLimit = false;
+            wasAborted = true;
+          }
+          logger.warn(
+            "[GoogleVertex] Forced finalization call failed; falling back to a terminal message",
+            { error: error instanceof Error ? error.message : String(error) },
+          );
+          finalText =
+            hitContextLimit && !wasAborted
+              ? buildContextCapMessage(externalToolCallCount)
+              : this.buildLoopExitMessage({
+                  turnClock,
+                  wasAborted,
+                  stallTimeoutMs: options.stallTimeoutMs,
+                  maxSteps,
+                  toolCallCount: externalToolCallCount,
+                });
+        }
+      } else {
+        if (!hitContextLimit) {
+          hitStepLimit = true;
+        }
+        if (accumulatedStepText) {
+          // Prefer the prose the model already produced across steps.
+          logger.warn(
+            hitContextLimit
+              ? `[GoogleVertex] Native Anthropic generate loop stopped by the context guard; returning text already gathered from prior steps.`
+              : `[GoogleVertex] Native Anthropic generate loop reached maxSteps (${maxSteps}); returning text already gathered from prior steps.`,
+          );
+          finalText = accumulatedStepText;
+        } else {
+          // Pure tool-loop with no text: one tools-disabled call so the model
+          // answers from the gathered tool results (Anthropic twin of the
+          // Gemini synthesizeFinalAnswerWithoutTools). NOTE: the tools array
+          // must stay in the request — Anthropic rejects requests whose
+          // history contains tool_use/tool_result blocks without a tools
+          // param — so "tools disabled" is expressed as tool_choice:"none",
+          // which also keeps the cached tools prefix byte-identical.
+          logger.warn(
+            hitContextLimit
+              ? `[GoogleVertex] Native Anthropic generate loop stopped by the context guard with no text; synthesizing a final answer with tools disabled.`
+              : `[GoogleVertex] Native Anthropic generate loop reached maxSteps (${maxSteps}) with no text; synthesizing a final answer with tools disabled.`,
+          );
+          try {
+            const backstopSystem =
+              (systemPromptWithSchema ? systemPromptWithSchema + "\n\n" : "") +
+              "Tool calling is no longer available for this turn. Provide " +
+              "your final answer directly as plain text now, using the " +
+              "information gathered so far.";
+            const cachedBackstop = applyVertexAnthropicCacheBreakpoints({
+              system: backstopSystem,
+              tools,
+              messages: currentMessages,
+            });
+            // budget_tokens must stay below max_tokens or Anthropic 400s the
+            // call; terminalMaxTokens can land far below the ceiling
+            // generateThinking was sized against (the context guard can
+            // shrink it well under the original request), so the budget is
+            // rebuilt for the shrunk limit rather than inherited through the
+            // spread below.
+            const backstopThinking = this.buildClaudeThinkingParam(
+              options,
+              terminalMaxTokens,
+              false,
+            );
+            const response = await this.withClaudeGeneration(
+              {
+                stepNumber: maxSteps + 1,
+                model: requestParams.model,
+                maxTokens: terminalMaxTokens,
+                temperature: requestParams.temperature,
+                topP: requestParams.top_p,
+                system: cachedBackstop.system,
+                messages: cachedBackstop.messages,
+              },
+              () =>
+                withTimeout(
+                  client.messages.create(
+                    {
+                      ...requestParams,
+                      max_tokens: terminalMaxTokens,
+                      // Assigned outright, never a conditional spread: spreading
+                      // requestParams above may already carry a `thinking` sized
+                      // for the original max_tokens, and only adding a key when
+                      // backstopThinking is truthy would leave that stale value
+                      // in place instead of clearing it.
+                      thinking: backstopThinking,
+                      tool_choice: { type: "none" as const },
+                      system: cachedBackstop.system as Parameters<
+                        typeof client.messages.create
+                      >[0]["system"],
+                      ...(cachedBackstop.tools &&
+                        cachedBackstop.tools.length > 0 && {
+                          tools: cachedBackstop.tools as Parameters<
+                            typeof client.messages.create
+                          >[0]["tools"],
+                        }),
+                      messages: cachedBackstop.messages as Parameters<
+                        typeof client.messages.create
+                      >[0]["messages"],
+                    },
+                    { signal: internalAbort.signal },
+                  ),
+                  generateTimeoutMs,
+                  "Anthropic backstop call timed out",
+                ),
+            );
+            totalInputTokens += response.usage?.input_tokens || 0;
+            totalOutputTokens += response.usage?.output_tokens || 0;
+            totalCacheReadTokens +=
+              response.usage?.cache_read_input_tokens || 0;
+            totalCacheCreationTokens +=
+              response.usage?.cache_creation_input_tokens || 0;
+            // A SUBSET already included in totalOutputTokens above
+            // (Anthropic bills thinking as part of output_tokens) —
+            // additive only, matching the main loop's own accumulation.
+            totalReasoningTokens +=
+              response.usage?.output_tokens_details?.thinking_tokens ?? 0;
+            lastStopReason = response.stop_reason;
+            // Extract<> rather than a hand-written object shape: the real
+            // SDK's ThinkingBlock also requires `signature`, which a literal
+            // `{ type: "thinking"; thinking: string }` predicate omits — TS
+            // then rejects the predicate as not assignable to ContentBlock.
+            // Extracting the union member sidesteps that without
+            // hard-coding its full shape here.
+            const backstopReasoning = response.content
+              .filter(
+                (
+                  block,
+                ): block is Extract<
+                  (typeof response.content)[number],
+                  { type: "thinking" }
+                > => block.type === "thinking",
+              )
+              .map((block) => block.thinking)
+              .join("");
+            if (backstopReasoning) {
+              accumulatedReasoningText += backstopReasoning;
+            }
+            const backstopText = (
+              response.content as VertexAnthropicContentBlock[]
+            )
+              .filter(
+                (block): block is { type: "text"; text: string } =>
+                  block.type === "text",
+              )
+              .map((b) => b.text)
+              .join("");
+            if (backstopText) {
+              synthesizedFinalAnswer = true;
+              finalText = backstopText;
+            } else {
+              finalText = hitContextLimit
+                ? buildContextCapMessage(externalToolCallCount)
+                : buildToolLoopCapMessage(maxSteps, externalToolCallCount);
+            }
+          } catch (error) {
+            // An aborted backstop is a cancellation (caller abort or a
+            // turn-clock watchdog), not a step-cap turn — keep finishReason
+            // mapping from lastStopReason and pick the exit message by the
+            // actual cause.
+            if (internalAbort.signal.aborted || isAbortError(error)) {
+              hitStepLimit = false;
+              wasAborted = true;
+            }
+            logger.warn(
+              "[GoogleVertex] Tools-disabled backstop call failed; falling back to a terminal message",
+              {
+                error: error instanceof Error ? error.message : String(error),
+              },
+            );
+            finalText =
+              hitContextLimit && !wasAborted
+                ? buildContextCapMessage(externalToolCallCount)
+                : this.buildLoopExitMessage({
+                    turnClock,
+                    wasAborted,
+                    stallTimeoutMs: options.stallTimeoutMs,
+                    maxSteps,
+                    toolCallCount: externalToolCallCount,
+                  });
+          }
+        }
+      }
+    }
+
+    releaseTurnResources();
+
+    const responseTime = Date.now() - startTime;
+    // Sourced from `engineResult.toolCalls` when the turn produced one, not
+    // the local `allToolCalls` (fed only by the `buildToolResultMessages`
+    // hook below). The engine's own accumulator is pushed to unconditionally
+    // per dispatched batch, before the abortedMidBatch check that skips
+    // `buildToolResultMessages` for that step — so a tool that finished
+    // executing in a batch cut short by an abort is present in
+    // `engineResult.toolCalls` but would otherwise never reach
+    // `allToolCalls`. `allToolCalls` remains the fallback for the rare case
+    // where `resultPromise` itself rejects and `engineResult` never resolves.
+    const engineToolCalls = engineResult
+      ? engineResult.toolCalls.map((call) => ({
+          toolCallId: call.id,
+          toolName: call.name,
+          args: call.args,
+        }))
+      : allToolCalls;
+    const externalToolCalls = engineToolCalls.filter(
+      (tc) => tc.toolName !== "final_result",
+    );
+    const externalToolExecutions = toolExecutions.filter(
+      (te) => te.name !== "final_result",
+    );
+
+    // Absolute backstop — no code path may surface empty content on a turn
+    // that ran tools (the consumer-facing "empty response" incident shape).
+    // Cause-aware: an aborted/timed-out turn gets the honest exit message,
+    // a genuine budget exhaustion gets the step-cap message.
+    if (!finalText && externalToolCalls.length > 0) {
+      finalText =
+        hitContextLimit && !wasAborted
+          ? buildContextCapMessage(externalToolCalls.length)
+          : this.buildLoopExitMessage({
+              turnClock,
+              wasAborted,
+              stallTimeoutMs: options.stallTimeoutMs,
+              maxSteps,
+              toolCallCount: externalToolCalls.length,
+            });
+    }
+
+    // Honest finish reason. "length" (token truncation) takes precedence; a
+    // step-cap exhaustion without a clean/forced answer surfaces as
+    // "tool-calls" (aligned with the Gemini paths, so consumers detect
+    // capped turns uniformly); everything else — including a successful
+    // forced finalization or backstop synthesis — is a normal "stop".
+    const resolvedFinishReason =
+      lastStopReason === "max_tokens"
+        ? "length"
+        : hitStepLimit && !synthesizedFinalAnswer
+          ? "tool-calls"
+          : "stop";
+    // Turn-exit discriminator, independent of the provider-shaped
+    // finishReason — consumers branch on this instead of sniffing strings.
+    const stopReason = resolveTurnStopReason({
+      timedOut: turnClock.timedOut,
+      stalled: turnClock.stalled,
+      wasAborted,
+      cappedWithoutAnswer: hitStepLimit && !synthesizedFinalAnswer,
+      contextCappedWithoutAnswer: hitContextLimit && !synthesizedFinalAnswer,
+      finishReason: resolvedFinishReason,
+    });
+    if (stopReason !== "completed") {
+      this.emitTurnEvent({
+        phase: stopReason,
+        step: step,
+        maxSteps,
+        toolCallCount: externalToolCalls.length,
+        elapsedMs: turnClock.elapsedMs(),
+      });
+    }
+
+    const result: EnhancedGenerateResult = {
+      content: finalText,
+      finishReason: resolvedFinishReason,
+      stopReason,
+      rawFinishReason: lastStopReason ?? undefined,
+      stepsUsed: step,
+      provider: this.providerName,
+      model: modelName,
+      usage: {
+        input: totalInputTokens,
+        output: totalOutputTokens,
+        // Anthropic's input_tokens is only the UNCACHED remainder; cache
+        // reads/writes are billed tokens reported separately, so the total
+        // must include them (matches proxyTracer + anthropic.ts).
+        total:
+          totalInputTokens +
+          totalOutputTokens +
+          totalCacheReadTokens +
+          totalCacheCreationTokens,
+        ...(totalCacheReadTokens > 0 && {
+          cacheReadTokens: totalCacheReadTokens,
+        }),
+        ...(totalCacheCreationTokens > 0 && {
+          cacheCreationTokens: totalCacheCreationTokens,
+        }),
+        // A SUBSET already included in `output` above (Anthropic bills
+        // thinking tokens as part of output_tokens) — reported additively,
+        // never folded into output/total.
+        ...(totalReasoningTokens > 0 && { reasoning: totalReasoningTokens }),
+      },
+      responseTime,
+      // The complete attempted-call record (name/args/id), independent of
+      // toolsUsed's success-only names — mirrors the native Anthropic direct
+      // / OpenAI-compatible / SageMaker paths (toolCallsFromSummaries) and
+      // the working Gemini-on-Vertex STREAM path. Previously absent here, so
+      // a tool the loop ran internally never reached the caller's
+      // result.toolCalls even though toolsUsed/toolExecutions did.
+      toolCalls: externalToolCalls.map((tc) => ({
+        toolCallId: tc.toolCallId,
+        toolName: tc.toolName,
+        args: tc.args,
+      })),
+      toolsUsed: externalToolCalls.map((tc) => tc.toolName),
+      toolExecutions: resolveToolExecutionRecords(
+        options,
+        externalToolExecutions,
+      ),
+      enhancedWithTools: externalToolCalls.length > 0,
+      ...(accumulatedReasoningText && { reasoning: accumulatedReasoningText }),
+      ...(totalReasoningTokens > 0 && {
+        reasoningTokens: totalReasoningTokens,
+      }),
+    };
+
+    // Route through enhanceResult so analytics/evaluation/tracing are picked
+    // up the same way the BaseProvider.generate() path picks them up. The
+    // native Anthropic-on-Vertex path bypasses BaseProvider.generate(), so
+    // enableAnalytics / enableEvaluation would otherwise be silently ignored.
+    return this.enhanceResult(result, options, startTime);
+  }
+
+  /**
+   * Process CSV files and append content to options.input.text
+   * This ensures CSV data is available in the prompt for native Gemini 3 SDK calls
+   * Returns a new options object with modified input (immutable pattern)
+   */
+  private async processCSVFilesForNativeSDK<
+    T extends TextGenerationOptions | StreamOptions,
+  >(options: T): Promise<T> {
+    const input = options.input as
+      | { text?: string; csvFiles?: Array<Buffer | string> }
+      | undefined;
+
+    if (!input?.csvFiles || input.csvFiles.length === 0) {
+      return options;
+    }
+
+    logger.info(
+      `[GoogleVertex] Processing ${input.csvFiles.length} CSV file(s) for native Gemini 3 SDK`,
+    );
+
+    let modifiedText = input.text || "";
+
+    for (let i = 0; i < input.csvFiles.length; i++) {
+      const csvFile = input.csvFiles[i];
+      try {
+        const result = await FileDetector.detectAndProcess(csvFile, {
+          allowedTypes: ["csv"],
+          csvOptions:
+            "csvOptions" in options
+              ? (options.csvOptions as Record<string, unknown>)
+              : undefined,
+        });
+
+        // Extract filename for display
+        const filename =
+          typeof csvFile === "string"
+            ? path.basename(csvFile)
+            : `csv_file_${i + 1}.csv`;
+
+        let csvSection = `\n\n## CSV Data from "${filename}":\n`;
+
+        // Add metadata if available
+        if (result.metadata) {
+          const meta = result.metadata as Record<string, unknown>;
+          if (meta.rowCount || meta.columnCount || meta.columnNames) {
+            csvSection += `**File Info:**\n`;
+            if (meta.rowCount) {
+              csvSection += `- Rows: ${meta.rowCount}\n`;
+            }
+            if (meta.columnCount) {
+              csvSection += `- Columns: ${meta.columnCount}\n`;
+            }
+            if (meta.columnNames && Array.isArray(meta.columnNames)) {
+              csvSection += `- Column Names: ${meta.columnNames.join(", ")}\n`;
+            }
+            csvSection += "\n";
+          }
+        }
+
+        // Add strong instructions to use the CSV data directly
+        csvSection += `\n**CRITICAL INSTRUCTION**: The complete CSV data is included below. You MUST use this data directly from this prompt.\n`;
+        csvSection += `DO NOT use any external tools (github, search_code, get_file_contents, etc.) to access this data.\n`;
+        csvSection += `The data you need is right here in this message - read it carefully and answer based on it.\n\n`;
+
+        csvSection += result.content;
+        // Prepend CSV to ensure data appears before user's question
+        modifiedText =
+          csvSection + "\n\n---\n\n**USER QUESTION:**\n" + modifiedText;
+
+        logger.info(`[GoogleVertex] ✅ Processed CSV: ${filename}`);
+      } catch (error) {
+        logger.error(
+          `[GoogleVertex] ❌ Failed to process CSV file ${i + 1}:`,
+          error,
+        );
+        const filename =
+          typeof csvFile === "string"
+            ? path.basename(csvFile)
+            : `csv_file_${i + 1}.csv`;
+        modifiedText += `\n\n## CSV Data Error: Failed to process "${filename}"\nReason: ${error instanceof Error ? error.message : "Unknown error"}`;
+      }
+    }
+
+    // Return new options with modified input (immutable pattern)
+    // Preserve the full type of options.input by spreading options.input directly
+    // CRITICAL FIX: Also update 'prompt' field since executeNativeAnthropicGenerate
+    // uses `options.prompt || options.input?.text` to build messages, and `prompt`
+    // is already set from neurolink.ts baseOptions creation. Without updating both,
+    // the CSV-enhanced text won't be sent to the model.
+    return {
+      ...options,
+      prompt: modifiedText,
+      input: { ...options.input, text: modifiedText },
+    } as T;
+  }
+
+  /**
+   * Override stream to handle image generation models
+   * Image models don't support streaming, so we fall back to generate
+   */
+  async stream(optionsOrPrompt: StreamOptions | string): Promise<StreamResult> {
+    // Normalize options
+    const options =
+      typeof optionsOrPrompt === "string"
+        ? { input: { text: optionsOrPrompt } }
+        : optionsOrPrompt;
+
+    const modelName =
+      options.model || this.modelName || getDefaultVertexModel();
+
+    // Image-generation requests can't stream — fall back to generate.
+    // Same single dispatch decision as generate(): resolveRequestKind
+    // keeps dual-mode models streaming text when the caller explicitly
+    // asked for a non-image output.format.
+    if (resolveRequestKind(options, modelName) === "image") {
+      logger.warn(
+        "[GoogleVertex] Image generation models don't support streaming, falling back to generate",
+        { model: modelName },
+      );
+
+      // Convert stream options to text generation options
+      const generateOptions: TextGenerationOptions = {
+        prompt: options.input?.text || "",
+        model: options.model,
+        temperature: options.temperature,
+        maxTokens: options.maxTokens,
+        input: options.input,
+      };
+
+      const result = await this.executeImageGeneration(generateOptions);
+
+      // Return a mock stream result for compatibility
+      const textContent = result?.content || "";
+      const imageOutput = result?.imageOutput;
+
+      return {
+        stream: (async function* () {
+          if (imageOutput) {
+            yield {
+              type: "image" as const,
+              imageOutput: {
+                base64: imageOutput.base64 || "",
+                ...(imageOutput.mimeType
+                  ? { mimeType: imageOutput.mimeType }
+                  : {}),
+              },
+            };
+          }
+          yield { content: textContent };
+        })(),
+        provider: this.providerName,
+        model: modelName,
+        usage: result?.usage,
+        finishReason: "stop",
+      };
+    }
+
+    // For non-image models, call the parent stream method
+    return super.stream(optionsOrPrompt);
+  }
+
+  private observeMediaGeneration(
+    model: string,
+    run: () => Promise<EnhancedGenerateResult | null>,
+  ): Promise<EnhancedGenerateResult | null> {
+    const call = { provider: this.providerName, model };
+    return withGeneration(call, async (span) => {
+      const result = await run();
+      observeGeneration(span, { ...call, usage: result?.usage });
+      return result;
+    });
+  }
+
+  /**
+   * Override generate to route ALL models to native SDKs
+   * No more @ai-sdk/google-vertex dependency
+   */
+  async generate(
+    optionsOrPrompt: TextGenerationOptions | string,
+  ): Promise<EnhancedGenerateResult | null> {
+    // Normalize options
+    const options =
+      typeof optionsOrPrompt === "string"
+        ? { prompt: optionsOrPrompt }
+        : optionsOrPrompt;
+
+    const modelName =
+      options.model || this.modelName || getDefaultVertexModel();
+
+    // Wrap the entire generate path in a `neurolink.provider.generate` span
+    // so observability tooling (test:tracing, Langfuse, OTEL collectors)
+    // sees the same span hierarchy that BaseProvider.generate would create.
+    // Vertex's generate() bypasses BaseProvider.generate entirely, so
+    // without this wrapping the provider span never gets emitted.
+    return withClientSpan(
+      {
+        name: "provider.generate",
+        tracer: tracers.provider,
+        detached: true,
+        rootWhenOrphaned: true,
+        attributes: {
+          [ATTR.NL_MODEL]: modelName,
+          [ATTR.NL_PROVIDER]: this.providerName,
+        },
+      },
+      async (generateSpan) => {
+        const generateStartTime = Date.now();
+        // Neither this span nor executeGeneration is an observation: the
+        // generation spans below carry the model call. Marked internal so no
+        // exporter of ours sends them as duplicates, except for the root a
+        // direct call opened for itself, which the loop hangs from.
+        if (!inTurnlessTree(generateSpan)) {
+          generateSpan.setAttribute(ATTR.NL_INTERNAL, true);
+        }
+
+        // One dispatch decision for the whole override: Vertex's generate()
+        // bypasses BaseProvider.generate(), so it re-runs the same
+        // resolveRequestKind() the core call sites use rather than keeping
+        // a hand-rolled copy of the precedence (which had drifted: tts
+        // checked before image, and a cruder case-insensitive startsWith
+        // image match without boundary awareness).
+        const requestKind = resolveRequestKind(options, modelName);
+
+        // Video-mode requests must route through BaseProvider's
+        // handleVideoGeneration (which loads the Veo 3 adapter). Vertex's
+        // native @google/genai path is text/image only — without this
+        // gate, video requests fall through to gemini-2.5-flash and the
+        // model politely declines ("I cannot create animations") instead
+        // of producing video bytes.
+        if (requestKind === "video") {
+          logger.info(
+            "[GoogleVertex] Routing video-mode generate to handleVideoGeneration",
+            { model: modelName },
+          );
+          const videoResult = await this.observeMediaGeneration(modelName, () =>
+            this.handleVideoGeneration(options, generateStartTime),
+          );
+          this.emitGenerationEnd(
+            modelName,
+            videoResult,
+            generateStartTime,
+            true,
+          );
+          return videoResult;
+        }
+
+        // TTS direct-synthesis mode: when caller passes `tts.enabled` without
+        // `tts.useAiResponse`, route to the shared `handleDirectTTSSynthesis`
+        // (synthesise the input text directly; no LLM call). BaseProvider's
+        // standard generate() does the same dispatch — we replicate it here
+        // because Vertex's override bypasses that path.
+        if (requestKind === "tts-direct") {
+          logger.info(
+            "[GoogleVertex] Routing TTS direct-synthesis to handleDirectTTSSynthesis",
+            { model: modelName },
+          );
+          const ttsResult = await this.handleDirectTTSSynthesis(
+            options,
+            generateStartTime,
+          );
+          this.emitGenerationEnd(modelName, ttsResult, generateStartTime, true);
+          return ttsResult;
+        }
+
+        // Image-generation models route to executeImageGeneration without
+        // tools. resolveRequestKind also carries the dual-mode exception:
+        // an explicit non-image output.format keeps models like
+        // gemini-3.1-flash-image-preview on the text path.
+        if (requestKind === "image") {
+          logger.info(
+            "[GoogleVertex] Routing image generation model to executeImageGeneration",
+            { model: modelName },
+          );
+          const imageResult = await this.observeMediaGeneration(modelName, () =>
+            this.executeImageGeneration(options),
+          );
+          this.emitGenerationEnd(
+            modelName,
+            imageResult,
+            generateStartTime,
+            true,
+          );
+          return imageResult;
+        }
+
+        // Merge registered (built-in / MCP) tools with caller-supplied
+        // tools. Vertex's generate() bypasses BaseProvider.generate(), so
+        // the BaseProvider tool-merge that normally pulls registered
+        // tools from the ToolsManager never runs here. Without this call,
+        // sdk.registerTool() entries silently never reach Gemini's
+        // function-calling path.
+        const baseTools = !options.disableTools
+          ? await this.getToolsForStream(options)
+          : {};
+
+        await this.preprocessNativeFileInput(options);
+
+        // Emit a `neurolink.message.build` span so observability tooling
+        // sees the message-construction phase even on the native (Pipeline B)
+        // Vertex path. Pipeline A normally produces this via MessageBuilder;
+        // the native path builds contents directly so we record an explicit
+        // span here. Without this the test:tracing "Message Build Span"
+        // assertion has to skip on every native-Vertex run.
+        const processedOptions = await withSpan(
+          {
+            name: "message.build",
+            tracer: tracers.provider,
+            attributes: {
+              [ATTR.NL_PROVIDER]: this.providerName,
+              "message.count": 1,
+              "message.build.count": 1,
+              "message.build.path": "vertex.native",
+            },
+          },
+          async () => this.processCSVFilesForNativeSDK(options),
+        );
+
+        const mergedOptions = {
+          ...processedOptions,
+          tools: baseTools,
+        };
+
+        // Capture the user's prompt up-front so the Pipeline B listener
+        // sets `input` on the model.generation span — without this the
+        // observability harness reports "input capture not working".
+        const inputPrompt =
+          (mergedOptions.input as { text?: string } | undefined)?.text ||
+          (mergedOptions as { prompt?: string }).prompt ||
+          "";
+
+        // A host exporter on the same provider reads the input and output of
+        // these two spans, so they follow the policy of a generation: masked,
+        // and left out when inputs (or all content) are not recorded. The
+        // input is set before the call so an error path still carries it.
+        const generationInputAttribute = recordsSpanInputs()
+          ? spanModelRequestAttribute({
+              ...(mergedOptions.systemPrompt
+                ? { system: mergedOptions.systemPrompt }
+                : {}),
+              prompt: inputPrompt,
+            })
+          : undefined;
+        if (generationInputAttribute !== undefined) {
+          generateSpan.setAttribute(
+            LangfuseOtelSpanAttributes.OBSERVATION_INPUT,
+            generationInputAttribute,
+          );
+        }
+
+        try {
+          let result: EnhancedGenerateResult;
+          // Wrap the actual native generate call in `neurolink.executeGeneration`
+          // so the observability span chain (tested by
+          // "Tracing: Generate Span Chain") sees a third inner span on the
+          // native @google/genai / @anthropic-ai/vertex-sdk path. This
+          // provider overrides generate(), so the span is added here.
+          result = await withSpan(
+            {
+              name: "executeGeneration",
+              tracer: tracers.provider,
+              detached: true,
+              attributes: {
+                [ATTR.NL_MODEL]: modelName,
+                [ATTR.NL_INTERNAL]: true,
+                path: isAnthropicModel(modelName)
+                  ? "native.anthropic"
+                  : "native.google-genai",
+                ...(generationInputAttribute !== undefined
+                  ? {
+                      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]:
+                        generationInputAttribute,
+                    }
+                  : {}),
+              },
+            },
+            async (executionSpan) => {
+              let nativeResult: EnhancedGenerateResult;
+              if (isAnthropicModel(modelName)) {
+                logger.info(
+                  "[GoogleVertex] Routing Claude generate to native @anthropic-ai/vertex-sdk",
+                  {
+                    model: modelName,
+                    totalToolCount: Object.keys(mergedOptions.tools).length,
+                  },
+                );
+                nativeResult = await this.runNativeGenerateWithMiddleware(
+                  mergedOptions,
+                  modelName,
+                  (effectiveOptions) =>
+                    this.executeNativeAnthropicGenerate(effectiveOptions),
+                );
+              } else {
+                logger.info(
+                  "[GoogleVertex] Routing Gemini generate to native @google/genai",
+                  {
+                    model: modelName,
+                    totalToolCount: Object.keys(mergedOptions.tools).length,
+                  },
+                );
+                nativeResult = await this.runNativeGenerateWithMiddleware(
+                  mergedOptions,
+                  modelName,
+                  (effectiveOptions) =>
+                    this.executeNativeGemini3GenerateWithSchemaFallback(
+                      effectiveOptions,
+                      modelName,
+                    ),
+                );
+              }
+              if (recordsSpanContent()) {
+                executionSpan.setAttribute(
+                  LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT,
+                  spanContentAttribute(nativeResult?.content ?? ""),
+                );
+              }
+              return nativeResult;
+            },
+          );
+          // Pipe through TTS-of-AI-response when caller asks for it. The
+          // shared `synthesizeAIResponseIfNeeded` no-ops when tts is not
+          // enabled / useAiResponse is false, so the cost is zero on
+          // non-TTS paths.
+          result = await this.synthesizeAIResponseIfNeeded(result, options);
+          if (recordsSpanContent()) {
+            generateSpan.setAttribute(
+              LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT,
+              spanContentAttribute(result?.content ?? ""),
+            );
+          }
+          // Fire onFinish lifecycle callback for the native generate path.
+          // Pipeline A providers get this for free via the AI SDK middleware
+          // wrapper (LifecycleMiddleware); native @google/genai bypasses
+          // that wrapper, so we have to invoke the callback ourselves.
+          this.fireGenerateOnFinish(options, result, generateStartTime);
+          this.emitGenerationEnd(
+            modelName,
+            result,
+            generateStartTime,
+            true,
+            undefined,
+            inputPrompt,
+          );
+          return result;
+        } catch (error) {
+          this.fireGenerateOnError(options, error, generateStartTime);
+          this.emitGenerationEnd(
+            modelName,
+            null,
+            generateStartTime,
+            false,
+            error,
+            inputPrompt,
+          );
+          throw error;
+        }
+      },
+    );
+  }
+
+  /**
+   * Invoke `options.onError` with the lifecycle payload shape consumers
+   * (and `test:middleware`) expect. Mirrors {@link fireGenerateOnFinish}.
+   */
+  private fireGenerateOnError(
+    options: TextGenerationOptions | StreamOptions,
+    error: unknown,
+    startTime: number,
+  ): void {
+    const onError = (options as { onError?: (payload: unknown) => unknown })
+      .onError;
+    if (typeof onError !== "function") {
+      return;
+    }
+    try {
+      const err = error instanceof Error ? error : new Error(String(error));
+      const callbackResult = onError({
+        error: err,
+        duration: Date.now() - startTime,
+        recoverable: false,
+      });
+      Promise.resolve(callbackResult).catch((e) =>
+        logger.warn(
+          `[GoogleVertex] onError callback rejected: ${e instanceof Error ? e.message : String(e)}`,
+        ),
+      );
+    } catch (e) {
+      logger.warn(
+        `[GoogleVertex] onError callback threw: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
+
+  /**
+   * Wrap a {@link StreamResult} so each text chunk drives `options.onChunk`
+   * and the final yield drives `options.onFinish`. Pipeline A providers get
+   * this for free via the AI SDK `wrapStream` middleware; native @google/genai
+   * bypasses that wrapper, so native consumers need their lifecycle
+   * callbacks invoked from here.
+   *
+   * `BaseProvider.stream()` always passes the result this method returns
+   * through `wrapStreamWithLifecycleCallbacks` afterwards too (that wrapper
+   * has "no early return when there are no callbacks" — see its own doc
+   * comment) — so unconditionally firing here double-fires onChunk/onFinish
+   * for every native Vertex stream. `isLifecycleStreamCallbacksOwnedByBaseProvider`
+   * reads the SAME nested lifecycle config off the SAME `options` object
+   * `wrapStreamWithLifecycleCallbacks` reads from (NeuroLink.applyStreamLifecycleMiddleware
+   * stamps it before either method runs), so both sites agree on which one
+   * actually fires without a second, Vertex-specific marker — and without
+   * relying on a Symbol on the `StreamResult` itself, which would not
+   * survive `withStreamModelFallback`'s rebuild of a plain forwarding object
+   * between this method and `wrapStreamWithLifecycleCallbacks`.
+   *
+   * onError is deliberately NOT gated by that marker — same precedent as
+   * `middleware/builtin/lifecycle.ts`'s `wrapStream` ("onError is NOT
+   * covered by this flag: it keeps its own, independent dedup via
+   * fireOnErrorOnce's shared fired-marker"). `fireOnErrorOnce` stamps the
+   * error so `BaseProvider`'s own catch (which checks
+   * `hasLifecycleErrorFired`) skips its own fire for the same failure.
+   */
+  private wrapStreamResultWithLifecycle(
+    options: StreamOptions,
+    result: StreamResult,
+    startTime: number,
+  ): StreamResult {
+    const onChunk = (
+      options as {
+        onChunk?: (payload: unknown) => unknown;
+      }
+    ).onChunk;
+    const onFinish = (options as { onFinish?: (payload: unknown) => unknown })
+      .onFinish;
+    // `StreamOptions.onError` is already properly typed as `OnErrorCallback`
+    // (unlike the two casts above, kept from before that field existed on
+    // the type) — read directly so `fireOnErrorOnce` below gets it without
+    // a cast.
+    const onError = options.onError;
+    if (
+      typeof onChunk !== "function" &&
+      typeof onFinish !== "function" &&
+      typeof onError !== "function"
+    ) {
+      return result;
+    }
+
+    const streamCallbacksOwnedByBaseProvider =
+      isLifecycleStreamCallbacksOwnedByBaseProvider(
+        getLifecycleMiddlewareConfig(options),
+      );
+
+    const originalIterable = result.stream;
+    let accumulated = "";
+    let sequence = 0;
+    const fireOnChunk = (payload: unknown) => {
+      if (typeof onChunk !== "function" || streamCallbacksOwnedByBaseProvider) {
+        return;
+      }
+      try {
+        const cbResult = onChunk(payload);
+        Promise.resolve(cbResult).catch((err) =>
+          logger.warn(
+            `[GoogleVertex] onChunk callback rejected: ${err instanceof Error ? err.message : String(err)}`,
+          ),
+        );
+      } catch (err) {
+        logger.warn(
+          `[GoogleVertex] onChunk callback threw: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    };
+    const fireOnFinish = (payload: unknown) => {
+      if (
+        typeof onFinish !== "function" ||
+        streamCallbacksOwnedByBaseProvider
+      ) {
+        return;
+      }
+      try {
+        const cbResult = onFinish(payload);
+        Promise.resolve(cbResult).catch((err) =>
+          logger.warn(
+            `[GoogleVertex] onFinish callback rejected: ${err instanceof Error ? err.message : String(err)}`,
+          ),
+        );
+      } catch (err) {
+        logger.warn(
+          `[GoogleVertex] onFinish callback threw: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    };
+
+    const wrappedIterable: AsyncIterable<{ content?: string }> = {
+      async *[Symbol.asyncIterator]() {
+        try {
+          for await (const chunk of originalIterable as AsyncIterable<{
+            content?: string;
+          }>) {
+            const text =
+              typeof chunk?.content === "string" ? chunk.content : "";
+            if (text) {
+              accumulated += text;
+              fireOnChunk({
+                type: "text-delta",
+                textDelta: text,
+                sequenceNumber: sequence++,
+              });
+            }
+            yield chunk;
+          }
+          fireOnFinish({
+            text: accumulated,
+            usage: result.usage
+              ? {
+                  promptTokens: (result.usage as { input?: number }).input ?? 0,
+                  completionTokens:
+                    (result.usage as { output?: number }).output ?? 0,
+                }
+              : undefined,
+            duration: Date.now() - startTime,
+            finishReason: result.finishReason || "stop",
+          });
+        } catch (err) {
+          const errInst = err instanceof Error ? err : new Error(String(err));
+          fireOnErrorOnce(onError, errInst, {
+            error: errInst,
+            duration: Date.now() - startTime,
+            recoverable: false,
+          });
+          // Rethrow the normalized `errInst` (not the raw `err`) so the
+          // fired-mark `fireOnErrorOnce` just stamped on it propagates to
+          // BaseProvider's own catch (`hasLifecycleErrorFired`), which
+          // would otherwise see an unstamped error and fire onError again
+          // for the same logical failure.
+          throw errInst;
+        }
+      },
+    };
+
+    return this.preserveStreamResultAccessors(result, {
+      ...result,
+      stream: wrappedIterable as StreamResult["stream"],
+    });
+  }
+
+  /**
+   * The text a native Vertex turn is built from before any model middleware
+   * rewrite — `options.input.text` when the caller set it (the normal
+   * `generate()`/`stream()` convention), else `options.prompt` (the legacy
+   * prompt-only `generateText()` convention, where `input` is never
+   * populated — see `generateTextInInstanceScope` in `src/lib/neurolink.ts`,
+   * which validates `options.prompt` and never touches `options.input`).
+   *
+   * `buildTurnPromptForMiddleware` and `applyTurnParamsRewrite` both read
+   * this so they agree on one baseline: the first so a prompt-only caller
+   * shows middleware its real text instead of an empty turn, the second so
+   * a middleware-rewritten turn is compared against what middleware actually
+   * started from — not a baseline that ignores `prompt` entirely, which
+   * would make a prompt-only call look "unedited" no matter what middleware
+   * did to it. `StreamOptions` carries no top-level `prompt` field, hence
+   * the `"prompt" in options` guard instead of a cast.
+   */
+  private vertexTurnBaselineText(
+    options: TextGenerationOptions | StreamOptions,
+  ): string {
+    if (options.input?.text !== undefined) {
+      return options.input.text;
+    }
+    return "prompt" in options && typeof options.prompt === "string"
+      ? options.prompt
+      : "";
+  }
+
+  /**
+   * Build the V3 entry-turn prompt middleware sees for a native call.
+   * Native Vertex loops build their own multi-turn conversation internally
+   * once they run — this is only the caller's system prompt + text input,
+   * the one turn middleware is given visibility into before that loop
+   * starts.
+   *
+   * The user turn is an array of text parts rather than a bare string. That
+   * is the V3 prompt shape, and prompt-editing middleware is written against
+   * it: one that spreads `content` into a longer array turns a string into
+   * one element per character, and one that calls `.map` / `.filter` on it
+   * throws. The AI Studio path already hands its middleware parts
+   * (`geminiContentsToV3Prompt`); this makes Vertex agree with it.
+   *
+   * The text itself comes from `vertexTurnBaselineText`, not
+   * `options.input?.text` alone — a prompt-only `generateText()` caller
+   * never sets `input`, and without the `options.prompt` fallback middleware
+   * would be shown an empty turn and have nothing of the caller's to inspect
+   * or build on.
+   */
+  private buildTurnPromptForMiddleware(
+    options: TextGenerationOptions | StreamOptions,
+  ): ModelMessage[] {
+    const prompt: ModelMessage[] = [];
+    if (options.systemPrompt) {
+      prompt.push({ role: "system", content: options.systemPrompt });
+    }
+    prompt.push({
+      role: "user",
+      content: [{ type: "text", text: this.vertexTurnBaselineText(options) }],
+    });
+    return prompt;
+  }
+
+  /** Sampling params a native call already honors, carried onto the V3 view. */
+  private buildTurnV3Params(
+    options: TextGenerationOptions | StreamOptions,
+    prompt: ModelMessage[],
+  ): LanguageModelV3CallOptions {
+    return {
+      prompt,
+      ...(options.maxTokens !== undefined
+        ? { maxOutputTokens: options.maxTokens }
+        : {}),
+      ...(options.temperature !== undefined
+        ? { temperature: options.temperature }
+        : {}),
+      ...(options.topP !== undefined ? { topP: options.topP } : {}),
+      ...(options.abortSignal !== undefined
+        ? { abortSignal: options.abortSignal }
+        : {}),
+    };
+  }
+
+  /**
+   * Read a middleware-transformed prompt back into the two things a native
+   * Vertex turn can carry: one system instruction and one user text.
+   *
+   * Every system message counts (joined with a blank line, the way
+   * `v3PromptToGeminiContents` joins them for AI Studio) and so does every
+   * user message, not just the last. A middleware that appends or prepends
+   * context leaves the caller's own text in the prompt beside it; reading
+   * only the last user message would send the addition without the question
+   * it was meant to qualify, or drop it and send the question bare. Text
+   * blocks — across messages and across the parts of one message — are joined
+   * with a blank line for the same reason: they are separate blocks, and
+   * gluing them runs the last word of one into the first of the next.
+   *
+   * `unmapped` counts what a native turn has no place for — non-text user
+   * parts (files, images) and assistant or tool messages — so the caller can
+   * say it was dropped rather than drop it silently.
+   */
+  private readTurnFromPrompt(prompt: LanguageModelV3CallOptions["prompt"]): {
+    systemPrompt: string | undefined;
+    text: string;
+    unmapped: number;
+  } {
+    const systemTexts = prompt.flatMap((message) =>
+      message.role === "system" ? [message.content] : [],
+    );
+    const userContents = prompt.flatMap((message) =>
+      message.role === "user" ? [message.content] : [],
+    );
+    const userTexts = userContents
+      .flatMap((content) =>
+        typeof content === "string"
+          ? [content]
+          : content.flatMap((part) =>
+              part.type === "text" ? [part.text] : [],
+            ),
+      )
+      .filter((text) => text.length > 0);
+    const unmappedParts = userContents.reduce(
+      (count, content) =>
+        typeof content === "string"
+          ? count
+          : count + content.filter((part) => part.type !== "text").length,
+      0,
+    );
+    const unmappedMessages = prompt.filter(
+      (message) => message.role !== "system" && message.role !== "user",
+    ).length;
+    return {
+      systemPrompt:
+        systemTexts.length > 0 ? systemTexts.join("\n\n") : undefined,
+      text: userTexts.join("\n\n"),
+      unmapped: unmappedParts + unmappedMessages,
+    };
+  }
+
+  /**
+   * Apply a middleware-transformed turn back onto the native call options.
+   *
+   * The system instruction and the user text are each written back only when
+   * they differ from what middleware actually started from — `systemPrompt`
+   * against `options.systemPrompt`, user text against
+   * `vertexTurnBaselineText(options)`, not `options.input?.text` alone — so a
+   * middleware that touches neither leaves both exactly as they were. An
+   * edit is honoured in every direction — a changed, added or removed system
+   * message, an appended or prepended user message, a user message emptied
+   * outright (a redaction) — because every native generate/stream executor
+   * resolves its wire text through `options.input.text` once this write-back
+   * has run (`resolveNativeGenerateText` on the generate paths, which
+   * special-cases exactly this divergence so an emptied `input.text` is not
+   * mistaken for an unset one and does not fall back to the stale
+   * `options.prompt` snapshot; a direct `options.input.text` read on the
+   * stream paths, which have no such fallback to fall into). Comparing
+   * against `options.input?.text` alone — ignoring `options.prompt` — would
+   * make a prompt-only `generateText()` caller's untouched turn look
+   * "changed" the first time middleware ran (nothing to compare `turn.text`
+   * against but `""`), writing the real prompt into `input.text` as a
+   * spurious edit on every such call even when no middleware did anything.
+   *
+   * Sampling params are written back the same way and can be removed as well
+   * as changed: a middleware that drops `temperature` or `topP` from the
+   * params must reach the wire as "not sent", not as the caller's original
+   * value kept because the key went missing.
+   *
+   * `tools` is offered to middleware read-only — a middleware that rewrites
+   * it gets a WARN rather than a silent drop, matching the OpenAI-compatible
+   * streaming path's contract: native tool wiring is derived independently
+   * of this V3 view, and re-deriving it here would diverge from it.
+   */
+  private applyTurnParamsRewrite<
+    T extends TextGenerationOptions | StreamOptions,
+  >(options: T, params: LanguageModelV3CallOptions): T {
+    if (params.tools !== undefined) {
+      logger.warn(
+        "[GoogleVertex] middleware rewrote 'tools' on the native path; tool rewrites are not applied to the native request — the original tool list was sent.",
+      );
+    }
+    const turn = this.readTurnFromPrompt(params.prompt);
+    if (turn.unmapped > 0) {
+      logger.warn(
+        `[GoogleVertex] middleware added ${turn.unmapped} prompt item(s) the native request cannot carry (non-text user parts, assistant or tool messages); only system and user text edits are applied — those items were not sent.`,
+      );
+    }
+    const maxTokens =
+      typeof params.maxOutputTokens === "number"
+        ? params.maxOutputTokens
+        : undefined;
+    const temperature =
+      typeof params.temperature === "number" ? params.temperature : undefined;
+    const topP = typeof params.topP === "number" ? params.topP : undefined;
+    return {
+      ...options,
+      ...(turn.systemPrompt !== (options.systemPrompt || undefined)
+        ? { systemPrompt: turn.systemPrompt }
+        : {}),
+      ...(turn.text !== this.vertexTurnBaselineText(options)
+        ? { input: { ...(options.input ?? {}), text: turn.text } }
+        : {}),
+      ...(maxTokens !== options.maxTokens ? { maxTokens } : {}),
+      ...(temperature !== options.temperature ? { temperature } : {}),
+      ...(topP !== options.topP ? { topP } : {}),
+    } as T;
+  }
+
+  /**
+   * Strip the lifecycle middleware from the options handed to
+   * `applyMiddlewareToModel` for a native Vertex call, when something else is
+   * already firing the same callbacks.
+   *
+   * NeuroLink's `applyGenerateLifecycleMiddleware` /
+   * `applyStreamLifecycleMiddleware` (neurolink.ts) mirror a caller's
+   * top-level `onFinish` / `onError` / `onChunk` into
+   * `options.middleware.middlewareConfig.lifecycle.config` — the exact same
+   * callback references — before this provider sees `options`. Left enabled,
+   * the built-in lifecycle middleware would fire them again from inside the
+   * bridge, and with malformed payloads: it reads the legacy `textDelta` chunk
+   * field and a bare `finishReason`, neither of which a V3 model produces.
+   *
+   * Who else fires them differs by path, so the exclusion does too:
+   *
+   * - generate: only `fireGenerateOnFinish` / `fireGenerateOnError`, which read
+   *   the TOP-LEVEL callbacks. The entry is stripped only when one is present.
+   *   A caller who configures `middlewareConfig.lifecycle` directly has no
+   *   other firer here, so that middleware applies exactly once, unmodified.
+   * - stream: `BaseProvider.stream()` wraps every stream in
+   *   `wrapStreamWithLifecycleCallbacks`, which fires whatever sits in
+   *   `lifecycle.config` however it got there — top-level shorthand or direct
+   *   config. The entry is stripped whenever it exists, or a direct-config
+   *   caller would get every callback twice (and `onChunk` a third time, for
+   *   the `finish` part the middleware also reports).
+   *
+   * Only the `lifecycle` entry is disabled, so every other configured
+   * middleware (guardrails, transformParams, custom hooks, analytics, ...)
+   * applies normally.
+   */
+  private excludeAutoLifecycleMiddleware<
+    T extends TextGenerationOptions | StreamOptions,
+  >(options: T, path: "generate" | "stream"): T {
+    const opts = options as T & {
+      onFinish?: unknown;
+      onError?: unknown;
+      onChunk?: unknown;
+      middleware?: MiddlewareFactoryOptions;
+    };
+    const firedElsewhere =
+      path === "stream" || !!(opts.onFinish || opts.onError || opts.onChunk);
+    if (!firedElsewhere) {
+      return options;
+    }
+    const lifecycle = opts.middleware?.middlewareConfig?.lifecycle;
+    if (!lifecycle) {
+      return options;
+    }
+    return {
+      ...options,
+      middleware: {
+        ...opts.middleware,
+        middlewareConfig: {
+          ...opts.middleware?.middlewareConfig,
+          lifecycle: { ...lifecycle, enabled: false },
+        },
+      },
+    } as T;
+  }
+
+  /**
+   * Run the native Gemini generate loop and, when Vertex rejects an
+   * over-constrained `responseSchema`, retry once without it.
+   *
+   * The retry sits inside the function `runNativeGenerateWithMiddleware` hands
+   * to the model bridge rather than around the bridge, because it is
+   * provider-internal recovery: model middleware must see one `doGenerate`
+   * that succeeds. Retrying outside would show every middleware the failed
+   * first call — the lifecycle middleware would report an `onError` for a
+   * request that then succeeded, and `transformParams` would run twice.
+   */
+  private async executeNativeGemini3GenerateWithSchemaFallback(
+    options: TextGenerationOptions,
+    modelName: string,
+  ): Promise<EnhancedGenerateResult> {
+    try {
+      return await this.executeNativeGemini3Generate(options);
+    } catch (nativeError) {
+      // Vertex rejects over-constrained responseSchemas with a
+      // deterministic 400 ("too many states" — constrained-decoding
+      // state explosion). Re-sending the same schema can never
+      // succeed, so retry ONCE with the schema dropped but JSON
+      // mode kept: output.format "json" still sets
+      // responseMimeType application/json on the no-tools path,
+      // so the model is forced to emit JSON — just without the
+      // offending schema constraints. The NeuroLink layer then
+      // coerces the JSON text into the caller's original schema
+      // (generate({schema}) guarantee holds).
+      const requestedStructured =
+        options.schema !== undefined || options.output?.format === "json";
+      // Tools present → the executor skips responseMimeType, so a
+      // schema-less retry would NOT actually run in JSON mode and
+      // the structured-output contract would silently degrade to
+      // prose. Only the no-tools case retries faithfully; with
+      // tools, surface the 400 to the caller instead.
+      const hasTools =
+        !options.disableTools && Object.keys(options.tools ?? {}).length > 0;
+      if (
+        requestedStructured &&
+        !hasTools &&
+        isSchemaComplexityError(nativeError)
+      ) {
+        logger.warn(
+          "[GoogleVertex] responseSchema too complex for constrained decoding — retrying native generate in schema-less JSON mode",
+          {
+            model: modelName,
+            error:
+              nativeError instanceof Error
+                ? nativeError.message
+                : String(nativeError),
+          },
+        );
+        return await this.executeNativeGemini3Generate({
+          ...options,
+          schema: undefined,
+          output: { format: "json" },
+        });
+      }
+      throw nativeError;
+    }
+  }
+
+  /**
+   * Apply the configured middleware chain around a native Vertex generate
+   * loop. `callNative` is `executeNativeAnthropicGenerate` or
+   * `executeNativeGemini3Generate` — a self-contained black box that runs
+   * its own multi-step tool loop and returns a fully-resolved
+   * `EnhancedGenerateResult`. Wrapping happens around that call, not inside
+   * it: `transformParams` can rewrite the entry turn before the loop starts,
+   * and `wrapGenerate` can observe the result or replace it outright (a
+   * guardrail that blocks the call entirely never reaches `callNative`, so
+   * `nativeResult` stays unset and a settled result is synthesized purely
+   * from what middleware produced, then run through `enhanceResult` like any
+   * other result so `enableAnalytics` / `enableEvaluation` still apply).
+   */
+  private async runNativeGenerateWithMiddleware(
+    options: TextGenerationOptions,
+    modelName: string,
+    callNative: (
+      effectiveOptions: TextGenerationOptions,
+    ) => Promise<EnhancedGenerateResult>,
+  ): Promise<EnhancedGenerateResult> {
+    const startedAt = Date.now();
+    const originalPrompt = this.buildTurnPromptForMiddleware(options);
+    const providerName = this.providerName;
+    let nativeResult: EnhancedGenerateResult | undefined;
+    const baseModel: LanguageModelV3 = {
+      specificationVersion: "v3",
+      provider: providerName,
+      modelId: modelName,
+      supportedUrls: {},
+      doGenerate: async (params) => {
+        const effectiveOptions = this.applyTurnParamsRewrite(options, params);
+        const result = await callNative(effectiveOptions);
+        nativeResult = result;
+        return {
+          content: [{ type: "text", text: result.content }],
+          finishReason: { unified: result.finishReason ?? "stop" },
+          usage: {
+            inputTokens: { total: result.usage?.input ?? 0 },
+            outputTokens: { total: result.usage?.output ?? 0 },
+          },
+        };
+      },
+      doStream: () => {
+        throw new Error(
+          "[GoogleVertex] doStream is not implemented on the native generate middleware model — this path only drives doGenerate.",
+        );
+      },
+    };
+
+    const modelResult = await this.applyMiddlewareToModel(
+      baseModel,
+      this.excludeAutoLifecycleMiddleware(options, "generate"),
+    );
+    if (typeof modelResult === "string") {
+      throw new Error(
+        "[GoogleVertex] Native generate model handle required for middleware",
+      );
+    }
+    const wrappedModel = modelResult;
+    const v3Params = this.buildTurnV3Params(options, originalPrompt);
+    const v3Result = await wrappedModel.doGenerate(v3Params);
+    const v3Text = v3Result.content
+      .map((part) => (part.type === "text" ? part.text : ""))
+      .join("");
+
+    if (nativeResult) {
+      // Reference/value equality against what the native call itself
+      // returned is the "nothing changed" signal — return the native result
+      // untouched (structuredData, toolCalls, analytics and all) rather than
+      // a reconstruction that would drop fields this function doesn't know
+      // about. Only a middleware that actually rewrote the text pays for a
+      // merged object.
+      return v3Text === nativeResult.content
+        ? nativeResult
+        : { ...nativeResult, content: v3Text };
+    }
+
+    // Guardrails (or any middleware) blocked the call before `doGenerate`
+    // ran — synthesize a settled result purely from the V3 response
+    // middleware produced, the same "no native call, no content" contract
+    // the OpenAI-compatible path's blocking case already proves out. The
+    // turn bookkeeping a real loop would have filled in takes short-circuit
+    // defaults, and `enhanceResult` runs on it as on every unblocked result:
+    // without it a blocked call silently loses `analytics` / `evaluation`
+    // that the same call would have carried had the guardrail let it through.
+    return this.enhanceResult(
+      {
+        content: v3Text,
+        provider: providerName,
+        model: modelName,
+        finishReason: v3Result.finishReason.unified,
+        usage: {
+          input: v3Result.usage.inputTokens.total ?? 0,
+          output: v3Result.usage.outputTokens.total ?? 0,
+          total:
+            (v3Result.usage.inputTokens.total ?? 0) +
+            (v3Result.usage.outputTokens.total ?? 0),
+        },
+        toolCalls: [],
+        stopReason: resolveTurnStopReason({
+          timedOut: false,
+          stalled: false,
+          wasAborted: false,
+          cappedWithoutAnswer: false,
+          finishReason: v3Result.finishReason.unified,
+        }),
+        stepsUsed: 0,
+        responseTime: Date.now() - startedAt,
+        toolsUsed: [],
+        toolExecutions: [],
+        enhancedWithTools: false,
+      },
+      options,
+      startedAt,
+    );
+  }
+
+  /**
+   * Apply the configured middleware chain around a native Vertex stream
+   * loop. `callNative` is `executeNativeAnthropicStream` or
+   * `executeNativeGemini3Stream`. Both are bridged through the same lazy V3
+   * `ReadableStream` (`nativeChunksToV3Stream` / `v3StreamToNativeChunks`)
+   * regardless of whether the underlying loop is genuinely live (Anthropic)
+   * or already fully resolved (Gemini3) by the time it returns — pulling one
+   * item at a time is correct for both, and never turns a live stream into
+   * collect-then-replay.
+   *
+   * A guardrail that blocks the call never invokes `doStream`, so
+   * `nativeResult` stays unset; a `StreamResult` is synthesized instead,
+   * with `usage` / `finishReason` resolving once the merged stream is fully
+   * drained (the same late-resolving-getter contract
+   * `preserveStreamResultAccessors` already exists for).
+   */
+  private async runNativeStreamWithMiddleware(
+    options: StreamOptions,
+    modelName: string,
+    callNative: (effectiveOptions: StreamOptions) => Promise<StreamResult>,
+  ): Promise<StreamResult> {
+    const originalPrompt = this.buildTurnPromptForMiddleware(options);
+    const providerName = this.providerName;
+    let nativeResult: StreamResult | undefined;
+    const baseModel: LanguageModelV3 = {
+      specificationVersion: "v3",
+      provider: providerName,
+      modelId: modelName,
+      supportedUrls: {},
+      doGenerate: () => {
+        throw new Error(
+          "[GoogleVertex] doGenerate is not implemented on the native stream middleware model — this path only drives doStream.",
+        );
+      },
+      doStream: async (params) => {
+        const effectiveOptions = this.applyTurnParamsRewrite(options, params);
+        const result = await callNative(effectiveOptions);
+        nativeResult = result;
+        return {
+          stream: nativeChunksToV3Stream(result.stream, () => ({
+            type: "finish",
+            finishReason: { unified: result.finishReason ?? "stop" },
+            usage: {
+              inputTokens: { total: result.usage?.input ?? 0 },
+              outputTokens: { total: result.usage?.output ?? 0 },
+            },
+          })),
+        };
+      },
+    };
+
+    const modelResult = await this.applyMiddlewareToModel(
+      baseModel,
+      this.excludeAutoLifecycleMiddleware(options, "stream"),
+    );
+    if (typeof modelResult === "string") {
+      throw new Error(
+        "[GoogleVertex] Native stream model handle required for middleware",
+      );
+    }
+    const wrappedModel = modelResult;
+    const v3Params = this.buildTurnV3Params(options, originalPrompt);
+    const { stream } = await wrappedModel.doStream(v3Params);
+
+    let finishPart:
+      | Extract<LanguageModelV3StreamPart, { type: "finish" }>
+      | undefined;
+    const mergedStream = v3StreamToNativeChunks(stream, (part) => {
+      finishPart = part;
+    });
+
+    if (nativeResult) {
+      const settled = nativeResult;
+      return this.preserveStreamResultAccessors(settled, {
+        ...settled,
+        stream: mergedStream,
+      });
+    }
+
+    // Guardrails (or any middleware) blocked the call before `doStream`
+    // ran — synthesize a settled StreamResult purely from the V3 stream
+    // middleware produced. `usage` / `finishReason` are getters so a
+    // consumer who reads them before draining `stream` doesn't just see a
+    // permanent snapshot of "nothing yet" — same contract the native
+    // Anthropic path's own getters already rely on.
+    const blockedResult: StreamResult = {
+      stream: mergedStream,
+      provider: providerName,
+      model: modelName,
+    };
+    Object.defineProperty(blockedResult, "usage", {
+      enumerable: true,
+      configurable: true,
+      get: (): TokenUsage | undefined =>
+        finishPart
+          ? {
+              input: finishPart.usage.inputTokens.total ?? 0,
+              output: finishPart.usage.outputTokens.total ?? 0,
+              total:
+                (finishPart.usage.inputTokens.total ?? 0) +
+                (finishPart.usage.outputTokens.total ?? 0),
+            }
+          : undefined,
+    });
+    Object.defineProperty(blockedResult, "finishReason", {
+      enumerable: true,
+      configurable: true,
+      get: (): string | undefined => finishPart?.finishReason.unified,
+    });
+    return blockedResult;
+  }
+
+  /**
+   * Re-apply getter-based accessor properties from a source StreamResult onto
+   * a wrapper copy. Wrapper spreads (`{ ...result }`) invoke and SNAPSHOT
+   * enumerable getters at wrap time — for background-loop streams (the native
+   * Anthropic path) that resolve finishReason / structuredOutput / toolCalls
+   * / usage only as the consumer drains, the snapshot is permanently
+   * undefined/empty. Copying the accessor descriptors keeps the wrapped
+   * result live. Results built from plain data properties (the buffered
+   * Gemini paths, and the native Anthropic stream's own `usage` — a mutable
+   * object reference rather than a getter, so a spread keeps its identity
+   * and later mutations stay visible) have no matching getter here and pass
+   * through untouched.
+   *
+   * The re-applied property also accepts a direct write: NeuroLink.stream()
+   * backstops a missing `usage` from analytics once the outer stream drains
+   * by assigning `mcpStreamOutcome.usage = resolvedUsage` on whatever result
+   * object it was handed. Copying the bare getter-only descriptor verbatim
+   * would turn that assignment into a TypeError ("Cannot set property usage
+   * of #<Object> which has only a getter"), so each re-applied accessor is
+   * rebuilt with a setter that remembers an override and prefers it over the
+   * live source getter once one has been written.
+   */
+  private preserveStreamResultAccessors(
+    source: StreamResult,
+    wrapped: StreamResult,
+  ): StreamResult {
+    for (const key of [
+      "finishReason",
+      "structuredOutput",
+      "toolCalls",
+      "toolsUsed",
+      "toolExecutions",
+      "usage",
+    ] as const) {
+      const descriptor = Object.getOwnPropertyDescriptor(source, key);
+      const liveGetter = descriptor?.get;
+      if (!liveGetter) {
+        continue;
+      }
+      let overridden = false;
+      let overrideValue: unknown;
+      Object.defineProperty(wrapped, key, {
+        configurable: true,
+        enumerable: descriptor.enumerable ?? true,
+        get: () => (overridden ? overrideValue : liveGetter.call(source)),
+        set: (value: unknown) => {
+          overridden = true;
+          overrideValue = value;
+        },
+      });
+    }
+    return wrapped;
+  }
+
+  private withClaudeGeneration<
+    T extends {
+      model?: string;
+      content: object[];
+      stop_reason?: string | null;
+      usage?: {
+        input_tokens?: number;
+        output_tokens?: number;
+        cache_read_input_tokens?: number | null;
+        cache_creation_input_tokens?: number | null;
+      };
+    },
+  >(
+    sent: {
+      stepNumber: number;
+      model: string;
+      maxTokens: number;
+      temperature?: number;
+      topP?: number;
+      system: SpanModelRequest["system"];
+      messages: Parameters<typeof sanitizeAnthropicMessagesForTrace>[0];
+    },
+    send: () => Promise<T>,
+  ): Promise<T> {
+    const call = { provider: this.providerName, model: sent.model };
+    return withStepSpan(sent.stepNumber, () =>
+      withGeneration(
+        {
+          ...call,
+          modelParameters: {
+            temperature: sent.temperature,
+            maxTokens: sent.maxTokens,
+            topP: sent.topP,
+          },
+          input: {
+            system: sent.system,
+            messages: sanitizeAnthropicMessagesForTrace(sent.messages),
+          },
+        },
+        async (span) => {
+          const response = await send();
+          observeGeneration(span, {
+            ...call,
+            responseModel: response.model,
+            output: response.content,
+            usage: {
+              inputTokens: response.usage?.input_tokens,
+              outputTokens: response.usage?.output_tokens,
+              cacheReadTokens:
+                response.usage?.cache_read_input_tokens ?? undefined,
+              cacheCreationTokens:
+                response.usage?.cache_creation_input_tokens ?? undefined,
+            },
+            finishReason: response.stop_reason ?? undefined,
+          });
+          return response;
+        },
+      ),
+    );
+  }
+
+  /**
+   * Emit `generation:end` so event listeners and the in-process metrics
+   * aggregator record the generation. Vertex bypasses the AI SDK (and
+   * therefore the experimental_telemetry plumbing), so nothing else emits it;
+   * the in-process store is never exported, and the Langfuse generation
+   * observations are the spans opened where each model call is made.
+   * Mirrors the Bedrock + Ollama pattern.
+   */
+  private emitGenerationEnd(
+    modelName: string,
+    result: EnhancedGenerateResult | null,
+    startTime: number,
+    success: boolean,
+    error?: unknown,
+    prompt?: string,
+  ): void {
+    const emitter = this.neurolink?.getEventEmitter();
+    if (!emitter) {
+      return;
+    }
+    const usage =
+      result?.usage && typeof result.usage === "object"
+        ? result.usage
+        : { input: 0, output: 0, total: 0 };
+    // Mark on the result so the SDK-level runStandardGenerateRequest knows
+    // this provider already emitted `generation:end` itself and skips its
+    // own duplicate emission. Without this flag the public event listener
+    // (and the observability test) would see two events per generate call.
+    if (result && typeof result === "object") {
+      (result as { _generationEndEmitted?: boolean })._generationEndEmitted =
+        true;
+    }
+    // The failure path has no result to carry that flag — `result` is null —
+    // so mark the error instead. Without this, `generateTextInternal`'s
+    // wrapProviderError (which replaces this error with a new one further up
+    // the stack) has nothing to copy forward, and emitGenerateErrorEvent goes
+    // on to emit its own `generation:end` for a failure this provider already
+    // reported — double-counting every failed native Vertex generate in
+    // analytics and as two Pipeline B spans. Same shape as the AI Studio
+    // (#1745) and Bedrock (#1762) fixes for the same gap.
+    if (!success && error && typeof error === "object") {
+      (error as { _generationEndEmitted?: boolean })._generationEndEmitted =
+        true;
+    }
+    emitter.emit("generation:end", {
+      provider: this.providerName,
+      responseTime: Date.now() - startTime,
+      timestamp: Date.now(),
+      // The Pipeline B listener reads `data.prompt` to populate the
+      // `input` attribute on the model.generation span; without it the
+      // Observability Spans regression check fails.
+      prompt: prompt || "",
+      result: {
+        content: result?.content || "",
+        usage,
+        model: modelName,
+        provider: this.providerName,
+        finishReason: success ? (result?.finishReason ?? "stop") : "error",
+      },
+      success,
+      ...(error
+        ? { error: error instanceof Error ? error.message : String(error) }
+        : {}),
+    });
+  }
+
+  /**
+   * Turn-clock-shaped adapter over the shared {@link buildLoopExitMessage}.
+   * Every call site in this file holds a clock, so the mapping lives here
+   * rather than at ten call sites; the decision itself is the shared one.
+   */
+  private buildLoopExitMessage(params: {
+    turnClock: { timedOut: boolean; stalled: boolean; elapsedMs(): number };
+    wasAborted: boolean;
+    stallTimeoutMs?: number;
+    maxSteps: number;
+    toolCallCount: number;
+  }): string {
+    return buildLoopExitMessage({
+      timedOut: params.turnClock.timedOut,
+      stalled: params.turnClock.stalled,
+      elapsedMs: params.turnClock.elapsedMs(),
+      wasAborted: params.wasAborted,
+      ...(params.stallTimeoutMs !== undefined
+        ? { stallTimeoutMs: params.stallTimeoutMs }
+        : {}),
+      maxSteps: params.maxSteps,
+      toolCallCount: params.toolCallCount,
+    });
+  }
+
+  protected formatProviderError(error: unknown): Error {
+    const errorRecord = error as UnknownRecord;
+    const statusCode =
+      typeof errorRecord?.status === "number"
+        ? errorRecord.status
+        : typeof errorRecord?.statusCode === "number"
+          ? errorRecord.statusCode
+          : undefined;
+
+    const rules: ProviderErrorRule[] = [
+      {
+        // Duck-typed on .name rather than `instanceof TimeoutError` —
+        // Vertex's own `withTimeout` (../../utils/async/index.js) throws a
+        // TimeoutError class distinct from the one classifyProviderError's
+        // built-in fast path checks (../../utils/timeout.js), so that fast
+        // path never fires for a real Vertex timeout. This rule preserves
+        // the pre-migration duck-typed match (both classes set
+        // `.name = "TimeoutError"`) and the original Vertex-specific
+        // message — see task-4-report.md for the full writeup.
+        match: (ctx) => ctx.errorName === "TimeoutError",
+        errorClass: NetworkError,
+        message:
+          "Google Vertex AI request timed out. Consider increasing timeout or using a lighter model.",
+      },
+      {
+        match: (ctx) =>
+          /PERMISSION_DENIED|UNAUTHENTICATED|Invalid API key/i.test(
+            ctx.message,
+          ) ||
+          statusCode === 401 ||
+          statusCode === 403,
+        errorClass: AuthenticationError,
+        message: () =>
+          `Google Vertex AI Permission Denied. Your Google Cloud credentials don't have permission to access Vertex AI. ` +
+          `Required Steps: 1. Ensure your service account has Vertex AI User role ` +
+          `2. Check if Vertex AI API is enabled in your project ` +
+          `3. Verify your project ID is correct ` +
+          `4. Confirm your location/region has Vertex AI available`,
+      },
+      {
+        match: (ctx) =>
+          /NOT_FOUND|model not found|Model not found/i.test(ctx.message) ||
+          statusCode === 404,
+        errorClass: InvalidModelError,
+        message: () => {
+          const modelSuggestions = this.getModelSuggestions(this.modelName);
+          return (
+            `Model '${this.modelName}' is not available in region ${this.location}. ` +
+            `Suggested alternatives: ${modelSuggestions}. ` +
+            `Troubleshooting: 1. Check model name spelling and format ` +
+            `2. Verify model is available in your region ` +
+            `3. Ensure your project has access to the model ` +
+            `4. For Claude models, enable Anthropic integration in Google Cloud Console`
+          );
+        },
+      },
+      {
+        // Rate limit / quota / capacity errors. Anthropic-on-Vertex capacity
+        // exhaustion surfaces as overloaded_error (HTTP 529) — same
+        // operational meaning as a 429, so classify it here instead of the
+        // generic 5xx branch below.
+        match: (ctx) =>
+          /QUOTA_EXCEEDED|RATE_LIMIT_EXCEEDED|rate limit/i.test(ctx.message) ||
+          messageNamesStatus(ctx.message, 429) ||
+          statusCode === 429 ||
+          statusCode === 529 ||
+          /overloaded/i.test(ctx.message),
+        errorClass: RateLimitError,
+        message: (ctx) => {
+          // Surface retry guidance when the SDK error carries it.
+          // @google/genai ApiError nests RetryInfo inside the JSON error
+          // body's details array, so fall back to scraping retryDelay out
+          // of the raw message.
+          const retryDelay =
+            typeof errorRecord?.retryDelay === "string"
+              ? errorRecord.retryDelay
+              : (/["']?retryDelay["']?\s*[:=]\s*["']?(\d+(?:\.\d+)?s)/.exec(
+                  ctx.message,
+                )?.[1] ?? undefined);
+          // Prefer the per-request context the native catches attach to the
+          // error (this.modelName can be stale when options.model overrides
+          // the instance default). Gemini models are force-routed to the
+          // "global" endpoint regardless of configured location — report
+          // the region the request actually hit.
+          const requestModel =
+            typeof errorRecord?.requestModel === "string"
+              ? errorRecord.requestModel
+              : this.modelName;
+          const effectiveRegion =
+            typeof errorRecord?.requestRegion === "string"
+              ? errorRecord.requestRegion
+              : resolveVertexRegionForModel(requestModel, this.location);
+          return (
+            `Google Vertex AI rate limit / shared-capacity exhausted (429 RESOURCE_EXHAUSTED / overloaded) ` +
+            `for model '${requestModel}' in region '${effectiveRegion}'.` +
+            (retryDelay
+              ? ` Upstream suggests retrying after ${retryDelay}.`
+              : "") +
+            ` Solutions: 1. Retry with backoff ` +
+            `2. Check your Vertex AI quotas in Google Cloud Console (shared-capacity 429s can occur below quota) ` +
+            `3. Try a different region or model ` +
+            `4. Request provisioned throughput for sustained load`
+          );
+        },
+      },
+      {
+        match: (ctx) =>
+          /ECONNRESET|ENOTFOUND|ETIMEDOUT|ECONNREFUSED|network|connection/i.test(
+            ctx.message,
+          ),
+        errorClass: NetworkError,
+        message: (ctx) => `Connection error: ${ctx.message}`,
+      },
+      {
+        match: (ctx) =>
+          /server error|Internal Server Error|INTERNAL|UNAVAILABLE/i.test(
+            ctx.message,
+          ) ||
+          [500, 502, 503, 504].some((code) =>
+            messageNamesStatus(ctx.message, code),
+          ) ||
+          (statusCode !== undefined && statusCode >= 500 && statusCode < 600),
+        errorClass: ProviderError,
+        message: (ctx) =>
+          `Google Vertex AI server error: ${ctx.message}. Please try again later.`,
+      },
+      {
+        match: (ctx) => /INVALID_ARGUMENT/i.test(ctx.message),
+        errorClass: ProviderError,
+        message: (ctx) =>
+          `Google Vertex AI Invalid Request: ${ctx.message}. ` +
+          `Check: 1. Request parameters are within model limits ` +
+          `2. Input text is properly formatted ` +
+          `3. Temperature and other settings are valid ` +
+          `4. Model supports your request type`,
+      },
+      {
+        match: () => true,
+        errorClass: ProviderError,
+        message: (ctx) => `Google Vertex AI error: ${ctx.message}`,
+      },
+    ];
+    return classifyProviderError(
+      error,
+      rules,
+      this.providerName,
+      this.modelName,
+    );
+  }
+
+  /**
+   * Memory-safe cache management for model configurations
+   * Implements LRU eviction to prevent memory leaks in long-running processes
+   */
+  private static evictLRUCacheEntries<K, V>(cache: Map<K, V>): void {
+    if (cache.size <= GoogleVertexProvider.MAX_CACHE_SIZE) {
+      return;
+    }
+
+    // Evict oldest entries (first entries in Map are oldest in insertion order)
+    const entriesToRemove =
+      cache.size - GoogleVertexProvider.MAX_CACHE_SIZE + 5; // Remove extra to avoid frequent evictions
+    let removed = 0;
+
+    for (const key of cache.keys()) {
+      if (removed >= entriesToRemove) {
+        break;
+      }
+      cache.delete(key);
+      removed++;
+    }
+
+    logger.debug("GoogleVertexProvider: Evicted LRU cache entries", {
+      entriesRemoved: removed,
+      currentCacheSize: cache.size,
+    });
+  }
+
+  /**
+   * Access and refresh cache entry (moves to end for LRU)
+   */
+  private static accessCacheEntry<K, V>(
+    cache: Map<K, V>,
+    key: K,
+  ): V | undefined {
+    const value = cache.get(key);
+    if (value !== undefined) {
+      // Move to end (most recently used)
+      cache.delete(key);
+      cache.set(key, value);
+    }
+    return value;
+  }
+
+  /**
+   * Memory-safe cached check for whether maxTokens should be set for the given model
+   * Optimized for streaming performance with LRU eviction to prevent memory leaks
+   */
+  private shouldSetMaxTokensCached(modelName: string): boolean {
+    const now = Date.now();
+
+    // Check if cache is valid (within 5 minutes)
+    if (
+      now - GoogleVertexProvider.maxTokensCacheTime >
+      GoogleVertexProvider.CACHE_DURATION
+    ) {
+      // Cache expired, refresh all cached results
+      GoogleVertexProvider.maxTokensCache.clear();
+      GoogleVertexProvider.maxTokensCacheTime = now;
+    }
+
+    // Check if we have cached result for this model (with LRU access)
+    const cachedResult = GoogleVertexProvider.accessCacheEntry(
+      GoogleVertexProvider.maxTokensCache,
+      modelName,
+    );
+    if (cachedResult !== undefined) {
+      return cachedResult;
+    }
+
+    // Calculate and cache the result with memory management
+    const shouldSet = !this.modelHasMaxTokensIssues(modelName);
+    GoogleVertexProvider.maxTokensCache.set(modelName, shouldSet);
+
+    // Prevent memory leaks by evicting old entries if cache grows too large
+    GoogleVertexProvider.evictLRUCacheEntries(
+      GoogleVertexProvider.maxTokensCache,
+    );
+
+    return shouldSet;
+  }
+
+  /**
+   * Memory-safe check if model has maxTokens issues using configuration-based approach
+   * This replaces hardcoded model-specific logic with configurable behavior
+   * Includes LRU caching to avoid repeated configuration lookups during streaming
+   */
+  private modelHasMaxTokensIssues(modelName: string): boolean {
+    const now = Date.now();
+    const cacheKey = "google-vertex-config";
+
+    // Check if cache is valid (within 5 minutes)
+    if (
+      now - GoogleVertexProvider.modelConfigCacheTime >
+      GoogleVertexProvider.CACHE_DURATION
+    ) {
+      // Cache expired, refresh it with memory management
+      GoogleVertexProvider.modelConfigCache.clear();
+      const config = ModelConfigurationManager.getInstance();
+      const vertexConfig = config.getProviderConfiguration("google-vertex");
+      GoogleVertexProvider.modelConfigCache.set(cacheKey, vertexConfig);
+      GoogleVertexProvider.modelConfigCacheTime = now;
+    }
+
+    // Access cached config with LRU behavior
+    const vertexConfig = GoogleVertexProvider.accessCacheEntry(
+      GoogleVertexProvider.modelConfigCache,
+      cacheKey,
+    ) as { modelBehavior?: { maxTokensIssues?: string[] } } | undefined;
+
+    // Check if model is in the list of models with maxTokens issues
+    const modelsWithIssues = vertexConfig?.modelBehavior?.maxTokensIssues || [
+      "gemini-2.5-flash",
+      "gemini-2.5-pro",
+    ];
+
+    return modelsWithIssues.some((problematicModel: string) =>
+      modelName.includes(problematicModel),
+    );
+  }
+
+  /**
+   * Check if Anthropic models are available
+   * @returns Promise<boolean> indicating if Anthropic support is available
+   */
+  async hasAnthropicSupport(): Promise<boolean> {
+    return hasAnthropicSupport();
+  }
+
+  /**
+   * Register a tool with the AI provider
+   * @param name The name of the tool
+   * @param schema The Zod schema defining the tool's parameters
+   * @param description A description of what the tool does
+   * @param handler The function to execute when the tool is called
+   */
+  registerTool(
+    name: string,
+    schema: ZodType<unknown>,
+    description: string,
+    handler: (params: Record<string, unknown>) => Promise<unknown>,
+  ): void {
+    const functionTag = "GoogleVertexProvider.registerTool";
+
+    try {
+      const tool = {
+        description,
+        parameters: schema,
+        execute: async (params: Record<string, unknown>) => {
+          try {
+            const contextEnrichedParams = {
+              ...params,
+              __context: this.toolContext,
+            };
+            return await handler(contextEnrichedParams);
+          } catch (error) {
+            logger.error(`${functionTag}: Tool execution error`, {
+              toolName: name,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            throw error;
+          }
+        },
+      };
+
+      this.registeredTools.set(name, tool);
+
+      logger.debug(`${functionTag}: Tool registered`, {
+        toolName: name,
+        modelName: this.modelName,
+      });
+    } catch (error) {
+      logger.error(`${functionTag}: Tool registration error`, {
+        toolName: name,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Set the context for tool execution
+   * @param context The context to use for tool execution
+   */
+  setToolContext(context: Record<string, unknown>): void {
+    this.toolContext = { ...this.toolContext, ...context };
+    logger.debug("GoogleVertexProvider.setToolContext: Tool context set", {
+      contextKeys: Object.keys(context),
+    });
+  }
+
+  /**
+   * Get the current tool execution context
+   * @returns The current tool execution context
+   */
+  getToolContext(): Record<string, unknown> {
+    return { ...this.toolContext };
+  }
+
+  /**
+   * Set the tool executor function for custom tool execution
+   * This method is called by BaseProvider.setupToolExecutor()
+   * @param executor Function to execute tools by name
+   */
+  setToolExecutor(
+    executor: (toolName: string, params: unknown) => Promise<unknown>,
+  ): void {
+    this.toolExecutor = executor;
+    logger.debug("GoogleVertexProvider.setToolExecutor: Tool executor set", {
+      hasExecutor: typeof executor === "function",
+    });
+  }
+
+  /**
+   * Clear all static caches - useful for testing and memory cleanup
+   * Public method to allow external cache management
+   */
+  static clearCaches(): void {
+    GoogleVertexProvider.modelConfigCache.clear();
+    GoogleVertexProvider.maxTokensCache.clear();
+    GoogleVertexProvider.modelConfigCacheTime = 0;
+    GoogleVertexProvider.maxTokensCacheTime = 0;
+
+    logger.debug("GoogleVertexProvider: All caches cleared", {
+      clearedAt: Date.now(),
+    });
+  }
+
+  /**
+   * Get cache statistics for monitoring and debugging
+   */
+  static getCacheStats(): {
+    modelConfigCacheSize: number;
+    maxTokensCacheSize: number;
+    maxCacheSize: number;
+    cacheAge: { modelConfig: number; maxTokens: number };
+  } {
+    const now = Date.now();
+    return {
+      modelConfigCacheSize: GoogleVertexProvider.modelConfigCache.size,
+      maxTokensCacheSize: GoogleVertexProvider.maxTokensCache.size,
+      maxCacheSize: GoogleVertexProvider.MAX_CACHE_SIZE,
+      cacheAge: {
+        modelConfig: now - GoogleVertexProvider.modelConfigCacheTime,
+        maxTokens: now - GoogleVertexProvider.maxTokensCacheTime,
+      },
+    };
+  }
+
+  /**
+   * Detect image MIME type from buffer
+   */
+  private detectImageType(buffer: Buffer): string {
+    return detectImageMimeType(buffer);
+  }
+
+  /**
+   * Estimate token count from text (simple character-based estimation)
+   */
+  private estimateTokenCount(text: string): number {
+    // Rough estimation: ~4 characters per token
+    return Math.ceil(text.length / 4);
+  }
+
+  /**
+   * Build image parts for multimodal content
+   */
+
+  /**
+   * Overrides the BaseProvider's image generation method to implement it for Vertex AI.
+   * Uses REST API approach with google-auth-library for authentication.
+   * Supports PDF input for image generation with gemini-3-pro-image-preview (Nano Banana Pro).
+   * @param options The generation options containing the prompt and optional PDF files.
+   * @returns A promise that resolves to the generation result, including the image data.
+   */
+  protected async executeImageGeneration(
+    options: TextGenerationOptions,
+  ): Promise<EnhancedGenerateResult> {
+    // Image-to-image generation takes reference images through the same
+    // `input.images` array, and both generate() and stream() route here BEFORE
+    // reaching preprocessNativeFileInput's normalization — so a reference photo
+    // in HEIC/BMP/AVIF would arrive at the API untranscoded. Normalizing at the
+    // top of this method covers every route in, rather than relying on each of
+    // the several call sites to remember. Idempotent, so an already-normalized
+    // request pays nothing.
+    await normalizeVisionImageFormats(options.input);
+
+    const prompt = options.prompt || options.input?.text || "";
+    const pdfFiles = options.input?.pdfFiles || [];
+    const inputImages = options.input?.images || [];
+    const hasPdfInput = pdfFiles.length > 0;
+    const hasImageInput = inputImages.length > 0;
+
+    // Validate that we have at least a prompt or PDF/image input
+    if (!prompt.trim() && !hasPdfInput && !hasImageInput) {
+      throw new ProviderError(
+        "Image generation requires either a prompt, PDF file, or image as input",
+        this.providerName,
+      );
+    }
+
+    // Select appropriate model - use gemini-3-pro-image-preview for PDF input
+    let imageModelName =
+      options.model || this.modelName || "gemini-3-pro-image-preview";
+
+    // If PDF files are provided, ensure we use a model that supports PDF input
+    if (hasPdfInput && !imageModelName.includes("gemini-3-pro-image")) {
+      imageModelName = "gemini-3-pro-image-preview";
+    }
+
+    // Determine location - some image models require 'global' location
+    // Check if the model is in GLOBAL_LOCATION_MODELS array (includes gemini-3-pro-image-preview, gemini-2.5-flash-image, etc.)
+    const imageLocation = process.env.GOOGLE_VERTEX_IMAGE_LOCATION || "global";
+    const requiresGlobalLocation = GLOBAL_LOCATION_MODELS.some(
+      (model) =>
+        imageModelName.includes(model) || model.includes(imageModelName),
+    );
+    const location = requiresGlobalLocation ? imageLocation : this.location;
+
+    const startTime = Date.now();
+
+    logger.info("🎨 Starting Vertex AI image generation (REST API)", {
+      model: imageModelName,
+      prompt: prompt.substring(0, 100),
+      provider: this.providerName,
+      projectId: this.projectId,
+      location: location,
+      hasPdfInput,
+      pdfCount: pdfFiles.length,
+      hasImageInput,
+      imageCount: inputImages.length,
+    });
+
+    try {
+      // Import google-auth-library dynamically
+      const { GoogleAuth } = await import("google-auth-library");
+
+      // Determine which credentials file to use
+      // Priority: GOOGLE_APPLICATION_CREDENTIALS_NEUROLINK > GOOGLE_APPLICATION_CREDENTIALS
+      const credentialsPath =
+        process.env.GOOGLE_APPLICATION_CREDENTIALS_NEUROLINK ||
+        process.env.GOOGLE_APPLICATION_CREDENTIALS;
+
+      // Initialize GoogleAuth with credentials
+      // Use keyFilename to explicitly specify the credentials file to avoid using wrong service account
+      const auth = new GoogleAuth({
+        ...(credentialsPath && { keyFilename: credentialsPath }),
+        scopes: ["https://www.googleapis.com/auth/cloud-platform"],
+      });
+
+      // Get access token
+      const client = await auth.getClient();
+      const accessToken = await client.getAccessToken();
+
+      if (!accessToken.token) {
+        throw new AuthenticationError(
+          "Failed to obtain access token from Google Auth",
+          this.providerName,
+        );
+      }
+
+      // Build parts array - supports text prompt and optional PDF files
+      const parts: Array<{
+        text?: string;
+        inlineData?: { mimeType: string; data: string };
+      }> = [];
+
+      // Add text prompt
+      if (prompt) {
+        parts.push({ text: prompt });
+      }
+
+      // Add PDF files as inline data (for gemini-3-pro-image-preview)
+      if (hasPdfInput) {
+        for (const pdfFile of pdfFiles) {
+          let pdfBase64: string;
+
+          if (Buffer.isBuffer(pdfFile)) {
+            pdfBase64 = pdfFile.toString("base64");
+          } else if (typeof pdfFile === "string") {
+            // Check if it's already base64 or a file path
+            // Supports absolute paths, Windows paths, and relative paths
+            const isFilePath =
+              pdfFile.startsWith("/") ||
+              /^[a-zA-Z]:\\/.test(pdfFile) ||
+              pdfFile.startsWith("./") ||
+              pdfFile.startsWith("../") ||
+              pdfFile.startsWith("..\\") ||
+              pdfFile.startsWith(".\\");
+            if (isFilePath) {
+              // Validate and normalize the path for security
+              const normalizedPath = path.resolve(pdfFile);
+              const cwd = process.cwd();
+
+              // Security: Ensure path is within current working directory
+              if (
+                !normalizedPath.startsWith(cwd + path.sep) &&
+                normalizedPath !== cwd
+              ) {
+                throw new ProviderError(
+                  `PDF file path must be within current directory for security`,
+                  this.providerName,
+                );
+              }
+
+              // Security: Validate file exists before reading
+              if (!fs.existsSync(normalizedPath)) {
+                throw new ProviderError(
+                  `PDF file not found: ${normalizedPath}`,
+                  this.providerName,
+                );
+              }
+
+              // Read the file
+              const pdfBuffer = fs.readFileSync(normalizedPath);
+              pdfBase64 = pdfBuffer.toString("base64");
+            } else {
+              // Assume it's already base64
+              pdfBase64 = pdfFile;
+            }
+          } else {
+            logger.warn("Invalid PDF file format, skipping", {
+              type: typeof pdfFile,
+            });
+            continue;
+          }
+          parts.push({
+            inlineData: {
+              mimeType: "application/pdf",
+              data: pdfBase64,
+            },
+          });
+          logger.debug("Added PDF file to request", {
+            dataLength: pdfBase64.length,
+          });
+        }
+      }
+
+      // Add images (including those converted from PDF by baseProvider)
+      // This handles the case where PDFs are converted to images for models that don't support native PDF
+      if (hasImageInput) {
+        for (let i = 0; i < inputImages.length; i++) {
+          // A fifth image loop that predates the four above and has the same
+          // blind spot: an ImageWithAltText wrapper matches neither the Buffer
+          // nor the string branch, so a wrapped reference image was silently
+          // skipped — including one this method had just transcoded.
+          const image = unwrapImagePayload(inputImages[i]);
+          let imageBase64: string;
+          let mimeType: string;
+
+          if (Buffer.isBuffer(image)) {
+            imageBase64 = image.toString("base64");
+            mimeType = this.detectImageType(image);
+          } else if (typeof image === "string") {
+            // Check if it's a file path or already base64
+            const isFilePath =
+              image.startsWith("/") ||
+              /^[a-zA-Z]:\\/.test(image) ||
+              image.startsWith("./") ||
+              image.startsWith("../") ||
+              image.startsWith("..\\") ||
+              image.startsWith(".\\");
+
+            if (isFilePath) {
+              // Read from file path
+              const normalizedPath = path.resolve(image);
+              if (!fs.existsSync(normalizedPath)) {
+                logger.warn(
+                  `Image file not found: ${normalizedPath}, skipping`,
+                );
+                continue;
+              }
+              const imageBuffer = fs.readFileSync(normalizedPath);
+              imageBase64 = imageBuffer.toString("base64");
+              mimeType = this.detectImageType(imageBuffer);
+            } else if (image.startsWith("data:")) {
+              // Data URL format: data:image/png;base64,<base64data>
+              const matches = image.match(/^data:([^;]+);base64,(.+)$/);
+              if (matches) {
+                mimeType = matches[1];
+                imageBase64 = matches[2];
+              } else {
+                logger.warn("Invalid data URL format, skipping image", {
+                  index: i,
+                });
+                continue;
+              }
+            } else if (
+              image.startsWith("http://") ||
+              image.startsWith("https://")
+            ) {
+              // Image URL — fetch the bytes and base64-encode them.
+              // Without this, the URL string itself ends up in
+              // inline_data.data and Vertex rejects with
+              // "Base64 decoding failed for <url>".
+              try {
+                const response = await fetch(image);
+                if (!response.ok) {
+                  logger.warn(
+                    `Image fetch failed: ${response.status} ${response.statusText}, skipping`,
+                    { url: redactUrlForError(image), index: i },
+                  );
+                  continue;
+                }
+                const arrayBuffer = await response.arrayBuffer();
+                const fetchedBuffer = Buffer.from(arrayBuffer);
+                imageBase64 = fetchedBuffer.toString("base64");
+                const headerMime = response.headers.get("content-type");
+                mimeType =
+                  headerMime && headerMime.startsWith("image/")
+                    ? headerMime.split(";")[0]
+                    : this.detectImageType(fetchedBuffer);
+              } catch (fetchError) {
+                logger.warn(
+                  `Image URL fetch threw, skipping: ${fetchError instanceof Error ? fetchError.message : String(fetchError)}`,
+                  { url: redactUrlForError(image), index: i },
+                );
+                continue;
+              }
+            } else {
+              // Assume it's already base64 encoded
+              imageBase64 = image;
+              // Try to detect type from base64 data
+              const decodedBuffer = Buffer.from(imageBase64, "base64");
+              mimeType = this.detectImageType(decodedBuffer);
+            }
+          } else {
+            logger.warn("Invalid image format, skipping", {
+              type: typeof image,
+              index: i,
+            });
+            continue;
+          }
+
+          parts.push({
+            inlineData: {
+              mimeType: mimeType,
+              data: imageBase64,
+            },
+          });
+
+          logger.debug("Added image to request", {
+            index: i,
+            mimeType,
+            dataLength: imageBase64.length,
+          });
+        }
+      }
+
+      // Build request body with CRITICAL response_modalities setting
+      const requestBody = {
+        contents: [
+          {
+            role: "user",
+            parts: parts,
+          },
+        ],
+        generation_config: {
+          response_modalities: ["TEXT", "IMAGE"], // CRITICAL for image generation
+          temperature: options.temperature || 0.7,
+          candidate_count: 1,
+        },
+      };
+
+      // Construct Vertex AI endpoint - use appropriate base URL for location
+      let url: string;
+      if (location === "global") {
+        // Global endpoint doesn't have region prefix
+        url = `https://aiplatform.googleapis.com/v1/projects/${this.projectId}/locations/global/publishers/google/models/${imageModelName}:generateContent`;
+      } else {
+        url = `https://${location}-aiplatform.googleapis.com/v1/projects/${this.projectId}/locations/${location}/publishers/google/models/${imageModelName}:generateContent`;
+      }
+
+      logger.debug("Making REST API call to Vertex AI", {
+        url,
+        model: imageModelName,
+        hasAccessToken: !!accessToken.token,
+      });
+
+      // Add timeout protection (120 seconds for image generation)
+      // Note: Using Promise.race instead of createTimeoutController because:
+      // 1. This is a one-off REST API call (not streaming) where fetch completion is atomic
+      // 2. AbortController mid-request cancellation isn't beneficial for image generation
+      //    since the server generates the full image before responding
+      // 3. The simpler Promise.race pattern is sufficient for this use case
+      const timeoutMs = 120000;
+
+      const fetchPromise = fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken.token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(requestBody),
+      });
+
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        setTimeout(() => {
+          reject(
+            new TimeoutError(
+              `Vertex AI image generation timed out after ${timeoutMs}ms`,
+              timeoutMs,
+            ),
+          );
+        }, timeoutMs);
+      });
+
+      const response = await Promise.race([fetchPromise, timeoutPromise]);
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new ProviderError(
+          `Vertex AI API error (${response.status}): ${errorText}`,
+          this.providerName,
+        );
+      }
+
+      const data = (await response.json()) as {
+        candidates?: Array<{
+          content?: {
+            parts?: Array<{
+              inlineData?: { data: string; mimeType?: string };
+              inline_data?: { data: string; mime_type?: string };
+              text?: string;
+            }>;
+          };
+        }>;
+      };
+
+      // Extract image from response (handle both inlineData and inline_data formats)
+      const candidate = data.candidates?.[0];
+      if (!candidate?.content?.parts) {
+        throw new ProviderError(
+          "No content parts in Vertex AI response",
+          this.providerName,
+        );
+      }
+
+      // Find image part (check both camelCase and snake_case)
+      const imagePart = candidate.content.parts.find(
+        (part) =>
+          (part.inlineData || part.inline_data) &&
+          ((part.inlineData && part.inlineData.mimeType) ||
+            (part.inline_data && part.inline_data.mime_type)) &&
+          ((part.inlineData &&
+            part.inlineData.mimeType?.startsWith("image/")) ||
+            (part.inline_data &&
+              part.inline_data.mime_type?.startsWith("image/"))),
+      );
+
+      if (!imagePart) {
+        // Dual-mode image models (gemini-3.1-flash-image-preview,
+        // gemini-2.5-flash-image, gemini-3-pro-image-preview) decide
+        // per-request whether to emit inlineData (image bytes) or text.
+        // For a text-only prompt the model legitimately answers with
+        // text parts and no image. Treat this as a normal text fallback
+        // instead of throwing — otherwise simple queries like "What is
+        // the capital of France?" against an image-capable model burn
+        // retries on a question the model already answered.
+        const textFallback = candidate.content.parts
+          .map((part) => part.text)
+          .filter((t): t is string => Boolean(t))
+          .join("");
+
+        if (textFallback) {
+          logger.info("[GoogleVertex] Image-gen route returned text fallback", {
+            model: imageModelName,
+            length: textFallback.length,
+          });
+          const textResult: EnhancedGenerateResult = {
+            content: textFallback,
+            provider: this.providerName,
+            model: imageModelName,
+            usage: {
+              input: this.estimateTokenCount(prompt),
+              output: this.estimateTokenCount(textFallback),
+              total:
+                this.estimateTokenCount(prompt) +
+                this.estimateTokenCount(textFallback),
+            },
+          };
+          return await this.enhanceResult(textResult, options, startTime);
+        }
+
+        throw new ProviderError(
+          `Image generation completed but no image data was returned. Model: ${imageModelName}`,
+          this.providerName,
+        );
+      }
+
+      // Extract image data (handle both formats)
+      const imageData =
+        imagePart.inlineData?.data || imagePart.inline_data?.data;
+      // The declared label and the display default are deliberately separate.
+      // `ImageGenService` trusts a string `mimeType` and skips sniffing, so
+      // stamping the `image/png` default onto `imageOutput` would relabel an
+      // unlabelled WebP as PNG — the exact defect this change fixes elsewhere.
+      const declaredMimeType =
+        imagePart.inlineData?.mimeType || imagePart.inline_data?.mime_type;
+      const mimeType = declaredMimeType || "image/png";
+
+      if (!imageData) {
+        throw new ProviderError(
+          "Image part found but no data available",
+          this.providerName,
+        );
+      }
+
+      logger.info("Image generation successful", {
+        model: imageModelName,
+        mimeType,
+        dataLength: imageData.length,
+        responseTime: Date.now() - startTime,
+      });
+
+      // Return result structure
+      const result: EnhancedGenerateResult = {
+        content: `Generated image using ${imageModelName} (${mimeType})`,
+        imageOutput: {
+          base64: imageData,
+          ...(declaredMimeType ? { mimeType: declaredMimeType } : {}),
+        },
+        provider: this.providerName,
+        model: imageModelName,
+        usage: {
+          input: this.estimateTokenCount(prompt),
+          output: 0,
+          total: this.estimateTokenCount(prompt),
+        },
+      };
+
+      return await this.enhanceResult(result, options, startTime);
+    } catch (error) {
+      logger.error("Image generation failed", {
+        error: error instanceof Error ? error.message : String(error),
+        model: imageModelName,
+        prompt: prompt.substring(0, 100),
+      });
+
+      throw this.handleProviderError(error);
+    }
+  }
+
+  /**
+   * Get model suggestions when a model is not found
+   */
+  /**
+   * Candidate model ids for a "model not available" error.
+   *
+   * This list is static. It cannot know what the caller's project and region
+   * actually serve, so it must not claim to: it previously announced
+   * "always available" and included the requested model itself, which
+   * produced errors that recommended the very id that had just failed —
+   * `gemini-3-pro-preview-11-2025` suggesting `gemini-3-pro-preview-11-2025`.
+   * The requested model is now filtered out, and the wording says these are
+   * ids to try rather than ids known to work.
+   */
+  private getModelSuggestions(requestedModel: string | undefined): string {
+    const availableModels = {
+      google: [
+        "gemini-3-pro-preview-11-2025",
+        "gemini-3-pro-latest",
+        "gemini-3-pro-preview",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.0-flash-001",
+        "gemini-2.0-flash-lite",
+      ],
+      claude: [
+        "claude-sonnet-4-5@20250929",
+        "claude-sonnet-4@20250514",
+        "claude-opus-4@20250514",
+        "claude-3-5-sonnet-20241022",
+        "claude-3-5-haiku-20241022",
+        "claude-3-sonnet-20240229",
+        "claude-3-haiku-20240307",
+        "claude-3-opus-20240229",
+      ],
+    };
+
+    // Never offer the id that just failed back to the caller. Compared by
+    // base id (before "@") so a versioned request (e.g. "gemini-2.5-pro@002")
+    // still excludes the unversioned list entry it failed against.
+    const requestedBase = (requestedModel ?? "").split("@")[0].toLowerCase();
+    const notRequested = (model: string): boolean =>
+      model.split("@")[0].toLowerCase() !== requestedBase;
+    const google = availableModels.google.filter(notRequested);
+    const claude = availableModels.claude.filter(notRequested);
+
+    let suggestions =
+      "\n🤖 Google Models (availability depends on your project and region):\n";
+    google.forEach((model) => {
+      suggestions += `  • ${model}\n`;
+    });
+
+    suggestions += "\n🧠 Claude Models (requires Anthropic integration):\n";
+    claude.forEach((model) => {
+      suggestions += `  • ${model}\n`;
+    });
+
+    // If the requested model looks like a Claude model, provide specific guidance.
+    // Worded without requestedModel so the just-failed id isn't echoed back here too.
+    if (requestedModel && requestedModel.toLowerCase().includes("claude")) {
+      suggestions +=
+        "\n💡 Tip: this model id appears to be a Claude model, which just failed.\n";
+      suggestions +=
+        "Ensure Anthropic integration is enabled in your Google Cloud project.\n";
+      suggestions += "Try another Claude model from the list above.";
+    }
+
+    return suggestions;
+  }
+
+  /**
+   * Generate an embedding for `text` using Vertex via @google/genai.
+   *
+   * Replaces the previous `@ai-sdk/google-vertex` text embedding model
+   * path. Without this, RAG indexing falls through to BaseProvider.embed()
+   * which throws "Embedding generation is not supported by the vertex
+   * provider", and `neurolink rag index --provider=vertex` fails even
+   * though the SDK conceptually supports it.
+   */
+  async embed(
+    input: string | EmbedInput,
+    modelName?: string,
+  ): Promise<number[]> {
+    if (typeof input !== "string" && input.image) {
+      throw new ProviderError(
+        `${this.providerName} does not support image embeddings; provide text input`,
+        this.providerName,
+      );
+    }
+
+    const text = typeof input === "string" ? input : (input.text ?? "");
+    const embeddingModelName =
+      modelName || this.getDefaultEmbeddingModel() || "text-embedding-004";
+
+    logger.debug("Generating embedding", {
+      provider: this.providerName,
+      model: embeddingModelName,
+      textLength: text.length,
+    });
+
+    try {
+      const effectiveLocation = resolveVertexRegionForModel(
+        embeddingModelName,
+        undefined,
+      );
+      const client = await this.createVertexGenAIClient(effectiveLocation);
+
+      const result = await client.models.embedContent({
+        model: embeddingModelName,
+        contents: [text],
+      });
+
+      const embedding = result.embeddings?.[0]?.values;
+      if (!embedding || embedding.length === 0) {
+        throw new ProviderError(
+          "No embedding returned from Vertex AI",
+          this.providerName,
+        );
+      }
+
+      logger.debug("Embedding generated successfully", {
+        provider: this.providerName,
+        model: embeddingModelName,
+        embeddingDimension: embedding.length,
+      });
+
+      return embedding;
+    } catch (error) {
+      logger.error("Embedding generation failed", {
+        error: error instanceof Error ? error.message : String(error),
+        model: embeddingModelName,
+        textLength: text.length,
+      });
+
+      throw this.handleProviderError(error);
+    }
+  }
+
+  /**
+   * Batch-embed an array of strings via Vertex @google/genai.
+   * Mirrors {@link embed} but returns one vector per input string.
+   */
+  async embedMany(texts: string[], modelName?: string): Promise<number[][]> {
+    const embeddingModelName =
+      modelName || this.getDefaultEmbeddingModel() || "text-embedding-004";
+
+    logger.debug("Generating batch embeddings", {
+      provider: this.providerName,
+      model: embeddingModelName,
+      count: texts.length,
+    });
+
+    let rows: Array<number[] | undefined>;
+    try {
+      const effectiveLocation = resolveVertexRegionForModel(
+        embeddingModelName,
+        undefined,
+      );
+      const client = await this.createVertexGenAIClient(effectiveLocation);
+
+      const result = await client.models.embedContent({
+        model: embeddingModelName,
+        contents: texts,
+      });
+
+      rows = (result.embeddings || []).map(
+        (e: { values?: number[] }) => e.values,
+      );
+    } catch (error) {
+      logger.error("Batch embedding generation failed", {
+        error: error instanceof Error ? error.message : String(error),
+        model: embeddingModelName,
+        count: texts.length,
+      });
+
+      throw this.handleProviderError(error);
+    }
+
+    // One vector per text, or fail: a dropped or empty row would pair later
+    // texts with the wrong vectors, or score 0 downstream. Checked after the
+    // try on purpose: inside it, handleProviderError would wrap this message
+    // in a second provider error and run it through its keyword rules.
+    if (rows.length !== texts.length) {
+      logger.error("Batch embedding returned the wrong number of vectors", {
+        model: embeddingModelName,
+        expected: texts.length,
+        received: rows.length,
+      });
+      throw new ProviderError(
+        `Embedding response held ${rows.length} vectors for ${texts.length} texts`,
+        this.providerName,
+      );
+    }
+
+    const embeddings = rows.map((values, index) => {
+      if (!values || values.length === 0) {
+        logger.error("Batch embedding returned no values", {
+          model: embeddingModelName,
+          index,
+        });
+        throw new ProviderError(
+          `Embedding for the text at index ${index} came back without values`,
+          this.providerName,
+        );
+      }
+      return values;
+    });
+
+    logger.debug("Batch embeddings generated successfully", {
+      provider: this.providerName,
+      model: embeddingModelName,
+      count: embeddings.length,
+      embeddingDimension: embeddings[0]?.length,
+    });
+
+    return embeddings;
+  }
+}
+
+export default GoogleVertexProvider;
+
+// Re-export for compatibility
+export { GoogleVertexProvider as GoogleVertexAI };

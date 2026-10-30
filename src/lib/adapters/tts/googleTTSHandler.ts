@@ -6,19 +6,29 @@
  * @module adapters/tts/googleTTSHandler
  * @see https://cloud.google.com/text-to-speech/docs
  */
-import { TextToSpeechClient } from "@google-cloud/text-to-speech";
+import type { TextToSpeechClient } from "@google-cloud/text-to-speech";
 import { TTSError, TTS_ERROR_CODES } from "../../utils/ttsProcessor.js";
-import type { TTSHandler } from "../../utils/ttsProcessor.js";
 import type {
-  Gender,
+  TTSGender,
   GoogleAudioEncoding,
+  GoogleStreamingAudioEncoding,
+  TTSAudioFormat,
+  TTSChunk,
   TTSOptions,
   TTSResult,
   TTSVoice,
-  VoiceType,
-} from "../../types/ttsTypes.js";
+  TTSVoiceType,
+  TTSHandler,
+} from "../../types/index.js";
 import { ErrorCategory, ErrorSeverity } from "../../constants/enums.js";
 import { logger } from "../../utils/logger.js";
+import { attachStreamCancel } from "../../utils/streamCancellation.js";
+import {
+  SpanSerializer,
+  SpanType,
+  SpanStatus,
+  getMetricsAggregator,
+} from "../../observability/index.js";
 
 export class GoogleTTSHandler implements TTSHandler {
   private client: TextToSpeechClient | null = null;
@@ -50,12 +60,11 @@ export class GoogleTTSHandler implements TTSHandler {
   public readonly maxTextLength: number =
     GoogleTTSHandler.DEFAULT_MAX_TEXT_LENGTH;
 
-  constructor(credentialsPath?: string) {
-    const path = credentialsPath ?? process.env.GOOGLE_APPLICATION_CREDENTIALS;
+  private readonly credentialsPath: string | undefined;
 
-    if (path) {
-      this.client = new TextToSpeechClient({ keyFilename: path });
-    }
+  constructor(credentialsPath?: string) {
+    this.credentialsPath =
+      credentialsPath ?? process.env.GOOGLE_APPLICATION_CREDENTIALS;
   }
 
   /**
@@ -64,7 +73,26 @@ export class GoogleTTSHandler implements TTSHandler {
    * @returns True if provider can generate TTS
    */
   isConfigured(): boolean {
-    return this.client !== null;
+    return this.credentialsPath !== undefined;
+  }
+
+  /**
+   * Lazily construct (and cache) the Google Cloud TTS client.
+   *
+   * `@google-cloud/text-to-speech` is an optional dependency: importing it
+   * only happens here, on first actual use, so a handler instance can be
+   * constructed (e.g. during auto-registration at module load) without the
+   * package being installed.
+   */
+  private async getClient(): Promise<TextToSpeechClient> {
+    if (!this.client) {
+      const { TextToSpeechClient } =
+        await import("@google-cloud/text-to-speech");
+      this.client = new TextToSpeechClient({
+        keyFilename: this.credentialsPath,
+      });
+    }
+    return this.client;
   }
 
   /**
@@ -77,7 +105,7 @@ export class GoogleTTSHandler implements TTSHandler {
    * @returns List of available voices
    */
   async getVoices(languageCode?: string): Promise<TTSVoice[]> {
-    if (!this.client) {
+    if (!this.isConfigured()) {
       throw new TTSError({
         code: TTS_ERROR_CODES.PROVIDER_NOT_CONFIGURED,
         message:
@@ -87,6 +115,16 @@ export class GoogleTTSHandler implements TTSHandler {
         retriable: false,
       });
     }
+    const client = await this.getClient();
+
+    const span = SpanSerializer.createSpan(
+      SpanType.TTS,
+      "tts.google.listVoices",
+      {
+        "tts.operation": "listVoices",
+        "tts.provider": "google",
+      },
+    );
 
     try {
       // Return cached voices if available, valid, and no language filter is specified
@@ -96,16 +134,20 @@ export class GoogleTTSHandler implements TTSHandler {
           GoogleTTSHandler.CACHE_TTL_MS &&
         !languageCode
       ) {
+        const endedSpan = SpanSerializer.endSpan(span, SpanStatus.OK);
+        getMetricsAggregator().recordSpan(endedSpan);
         return this.voicesCache.voices;
       }
 
       // Call Google Cloud listVoices API
-      const [response] = await this.client.listVoices(
+      const [response] = await client.listVoices(
         languageCode ? { languageCode } : {},
       );
 
       if (!response.voices || response.voices.length === 0) {
         logger.warn("Google Cloud TTS returned no voices");
+        const endedSpan = SpanSerializer.endSpan(span, SpanStatus.OK);
+        getMetricsAggregator().recordSpan(endedSpan);
         return [];
       }
 
@@ -131,8 +173,8 @@ export class GoogleTTSHandler implements TTSHandler {
 
         const voiceType = this.detectVoiceType(voiceName);
 
-        // Map Google's ssmlGender → internal Gender
-        const gender: Gender =
+        // Map Google's ssmlGender → internal TTSGender
+        const gender: TTSGender =
           voice.ssmlGender === "MALE"
             ? "male"
             : voice.ssmlGender === "FEMALE"
@@ -155,8 +197,17 @@ export class GoogleTTSHandler implements TTSHandler {
         this.voicesCache = { voices, timestamp: Date.now() };
       }
 
+      const endedSpan = SpanSerializer.endSpan(span, SpanStatus.OK);
+      getMetricsAggregator().recordSpan(endedSpan);
       return voices;
     } catch (err) {
+      // Record error span
+      const endedSpan = SpanSerializer.endSpan(
+        span,
+        SpanStatus.ERROR,
+        err instanceof Error ? err.message : "Unknown error",
+      );
+      getMetricsAggregator().recordSpan(endedSpan);
       // Log error but return empty array for graceful degradation
       const message = err instanceof Error ? err.message : "Unknown error";
       logger.error(`Failed to fetch Google TTS voices: ${message}`);
@@ -172,7 +223,7 @@ export class GoogleTTSHandler implements TTSHandler {
    * @returns Audio buffer with metadata
    */
   async synthesize(text: string, options: TTSOptions): Promise<TTSResult> {
-    if (!this.client) {
+    if (!this.isConfigured()) {
       throw new TTSError({
         code: TTS_ERROR_CODES.PROVIDER_NOT_CONFIGURED,
         message:
@@ -182,7 +233,19 @@ export class GoogleTTSHandler implements TTSHandler {
         retriable: false,
       });
     }
+    const client = await this.getClient();
 
+    const voiceId = options.voice ?? "en-US-Neural2-C";
+    const span = SpanSerializer.createSpan(
+      SpanType.TTS,
+      "tts.google.synthesize",
+      {
+        "tts.operation": "synthesize",
+        "tts.provider": "google",
+        "tts.voice": voiceId,
+        "tts.format": options.format ?? "mp3",
+      },
+    );
     const startTime = Date.now();
 
     try {
@@ -204,8 +267,6 @@ export class GoogleTTSHandler implements TTSHandler {
         });
       }
 
-      const voiceId = options.voice ?? "en-US-Neural2-C";
-
       const languageCode = this.extractLanguageCode(voiceId);
       const audioEncoding = this.mapFormat(options.format ?? "mp3");
 
@@ -223,7 +284,7 @@ export class GoogleTTSHandler implements TTSHandler {
         },
       };
 
-      const [response] = await this.client.synthesizeSpeech(request, {
+      const [response] = await client.synthesizeSpeech(request, {
         timeout: GoogleTTSHandler.DEFAULT_API_TIMEOUT_MS,
       });
 
@@ -258,6 +319,9 @@ export class GoogleTTSHandler implements TTSHandler {
 
       const latency = Date.now() - startTime;
 
+      const endedSpan = SpanSerializer.endSpan(span, SpanStatus.OK);
+      getMetricsAggregator().recordSpan(endedSpan);
+
       return {
         buffer,
         format: options.format ?? "mp3",
@@ -269,6 +333,13 @@ export class GoogleTTSHandler implements TTSHandler {
         },
       };
     } catch (err) {
+      const endedSpan = SpanSerializer.endSpan(
+        span,
+        SpanStatus.ERROR,
+        err instanceof Error ? err.message : String(err),
+      );
+      getMetricsAggregator().recordSpan(endedSpan);
+
       if (err instanceof TTSError) {
         throw err;
       }
@@ -285,6 +356,264 @@ export class GoogleTTSHandler implements TTSHandler {
         originalError: err instanceof Error ? err : undefined,
       });
     }
+  }
+
+  /**
+   * Voice names Google's streaming endpoint will synthesize.
+   *
+   * Streaming is not a property of the API, it is a property of the voice:
+   * every other family is rejected outright with `INVALID_ARGUMENT:
+   * Currently, only Chirp 3: HD voices are supported for streaming
+   * synthesis`. Measured against the live API — `Chirp3-HD` (en-US, en-GB and
+   * de-DE), `Chirp-HD` and `Journey` all stream; `Neural2` and `Studio` are
+   * refused. The locale prefix is required so a malformed name cannot reach
+   * the wire and fail a segment that the buffered path would have served.
+   */
+  private static readonly STREAMING_VOICE_PATTERN =
+    /^[a-z]{2,3}-[A-Z]{2}-(?:Chirp3-HD|Chirp-HD|Journey)-/;
+
+  /**
+   * Sample rate requested for streamed audio, in Hz.
+   *
+   * Reported on every chunk so a consumer can interpret headerless `PCM`
+   * bytes. Google honours the request — 16000 was measured returning
+   * proportionally fewer bytes for the same text — and 24000 matches what
+   * `getSampleRate()` reports for the buffered path.
+   */
+  private static readonly STREAMING_SAMPLE_RATE_HZ = 24000;
+
+  /**
+   * How long a stream may go without delivering a response before it is
+   * treated as stalled.
+   *
+   * Deliberately an *idle* bound rather than a bound on the whole call, which
+   * is what `DEFAULT_API_TIMEOUT_MS` gives `synthesize()`. Streaming produces
+   * audio at roughly playback speed, so a total bound would fail a long but
+   * perfectly healthy segment purely for being long.
+   */
+  private static readonly STREAMING_IDLE_TIMEOUT_MS = 30 * 1000;
+
+  /**
+   * Map a requested audio format to a streaming audio encoding, or
+   * `undefined` when streaming cannot produce it.
+   *
+   * Only formats with direct wire proof of incremental delivery appear here.
+   * `PCM` delivered 41 reads with the first at 697ms and the body complete at
+   * 6131ms; `OGG_OPUS` delivered 11 reads with the first at 443ms. `MP3` and
+   * `LINEAR16` — both valid for `synthesizeSpeech` — are rejected by the
+   * streaming endpoint as unsupported encodings, so `mp3` and `wav` take the
+   * buffered path. `mp3` being the default format is why a caller has to opt
+   * in to streaming by asking for one of these two.
+   */
+  private static mapStreamingFormat(
+    format: TTSAudioFormat,
+  ): GoogleStreamingAudioEncoding | undefined {
+    switch (format) {
+      case "pcm16":
+        return "PCM";
+      case "ogg":
+      case "opus":
+        return "OGG_OPUS";
+      default:
+        return undefined;
+    }
+  }
+
+  /**
+   * Coerce one streaming response into its audio payload, or `undefined` when
+   * it carries none.
+   *
+   * The generated response type says `audioContent` is `Uint8Array | string |
+   * null`, and which one arrives depends on how the transport was configured
+   * — so both are handled rather than trusted.
+   */
+  private static streamedAudio(response: unknown): Buffer | undefined {
+    if (response === null || typeof response !== "object") {
+      return undefined;
+    }
+    const audioContent = (response as { audioContent?: unknown }).audioContent;
+    if (audioContent instanceof Uint8Array) {
+      return audioContent.byteLength > 0
+        ? Buffer.from(
+            audioContent.buffer,
+            audioContent.byteOffset,
+            audioContent.byteLength,
+          )
+        : undefined;
+    }
+    if (typeof audioContent === "string" && audioContent.length > 0) {
+      const decoded = Buffer.from(audioContent, "base64");
+      return decoded.length > 0 ? decoded : undefined;
+    }
+    return undefined;
+  }
+
+  /**
+   * Stream one pre-validated segment's audio as Google produces it.
+   *
+   * Returns `undefined` — the contract's "not incrementally deliverable"
+   * signal — unless the voice and the format are both ones the streaming
+   * endpoint was measured to accept, and the text is not SSML.
+   * `StreamingSynthesisInput` has no `ssml` field at all, so markup that
+   * `synthesize()` would honour has to stay on the buffered path rather than
+   * be sent as literal text.
+   *
+   * Every non-empty response is yielded as it arrives and carries `isFinal:
+   * false`. `TTSProcessor` recomputes indexes, cumulative sizes and finality
+   * globally across segments and discards whatever a handler reports, so
+   * labelling the last response here would buy nothing and would cost a
+   * one-response lookahead.
+   */
+  synthesizeStream(
+    text: string,
+    options: TTSOptions = {},
+  ): AsyncIterable<TTSChunk> | undefined {
+    const voiceId = options.voice;
+    if (
+      voiceId === undefined ||
+      !GoogleTTSHandler.STREAMING_VOICE_PATTERN.test(voiceId)
+    ) {
+      return undefined;
+    }
+    const format = options.format ?? "mp3";
+    const audioEncoding = GoogleTTSHandler.mapStreamingFormat(format);
+    if (audioEncoding === undefined) {
+      return undefined;
+    }
+    if (text.trimStart().startsWith("<speak")) {
+      return undefined;
+    }
+
+    const languageCode = this.extractLanguageCode(voiceId);
+    const sampleRateHertz = GoogleTTSHandler.STREAMING_SAMPLE_RATE_HZ;
+    const handler = this;
+    // Typed off the client rather than named: Critical Rule 2 puts every type
+    // ALIAS in src/lib/types/, and a gax duplex handle that exists only for
+    // the cancel hook below does not belong in the public type surface.
+    let active:
+      | ReturnType<TextToSpeechClient["streamingSynthesize"]>
+      | undefined;
+    let cancelled = false;
+    let idleTimedOut = false;
+
+    const stream = (async function* (): AsyncGenerator<TTSChunk> {
+      const client = await handler.getClient();
+      // `getClient()` can span a dynamic import on a process's first call, a
+      // real gap the `attachStreamCancel` hook below can fire inside. Without
+      // this check, a cancellation that lands before `active` even exists
+      // (it is assigned two lines below) sets `cancelled` and calls
+      // `active?.cancel()` as a no-op, and the generator would carry on and
+      // open a duplex the caller already abandoned.
+      if (cancelled) {
+        return;
+      }
+      const startedAt = Date.now();
+      const duplex = client.streamingSynthesize();
+      active = duplex;
+      let idleTimer: ReturnType<typeof setTimeout> | undefined;
+      const armIdleTimer = (): void => {
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          idleTimedOut = true;
+          // `.cancel()`, not `.destroy()`: this object is a
+          // `gax.CancellableStream` wrapping a real gRPC duplex, and only
+          // `.cancel()` reaches `ClientDuplexStreamImpl.cancel()` ->
+          // `call.cancelWithStatus(CANCELLED, ...)`, which actually tells
+          // Google's server to stop. `.destroy()` only tears down the local
+          // Node stream — the server-side synthesis (and its billing) keeps
+          // running until the RPC's own ~5-minute deadline elapses on its
+          // own.
+          duplex.cancel();
+        }, GoogleTTSHandler.STREAMING_IDLE_TIMEOUT_MS);
+      };
+      let index = 0;
+      let cumulativeSize = 0;
+
+      try {
+        duplex.write({
+          streamingConfig: {
+            voice: { name: voiceId, languageCode },
+            streamingAudioConfig: {
+              audioEncoding,
+              sampleRateHertz,
+              speakingRate: options.speed ?? 1.0,
+            },
+          },
+        });
+        duplex.write({ input: { text } });
+        duplex.end();
+        armIdleTimer();
+
+        for await (const response of duplex as AsyncIterable<unknown>) {
+          // Clear rather than re-arm here: the bound is on time spent
+          // waiting for the SERVER, not on time spent suspended at the
+          // `yield` below waiting for THIS generator's own consumer. Arming
+          // unconditionally on every response (the prior behaviour) started
+          // the clock running before that suspension, so a consumer slower
+          // than STREAMING_IDLE_TIMEOUT_MS to pull the next chunk destroyed
+          // a healthy duplex and reported its own backpressure as a network
+          // stall. The timer is re-armed only once real waiting resumes:
+          // immediately, for an empty read that loops back to the next
+          // `duplex` response, or after the consumer has resumed us.
+          clearTimeout(idleTimer);
+          const data = GoogleTTSHandler.streamedAudio(response);
+          if (data === undefined) {
+            armIdleTimer();
+            continue;
+          }
+          cumulativeSize += data.length;
+          yield {
+            data,
+            format,
+            index: index++,
+            isFinal: false,
+            cumulativeSize,
+            voice: voiceId,
+            sampleRate: sampleRateHertz,
+          };
+          armIdleTimer();
+        }
+
+        logger.debug(
+          `[GoogleTTSHandler] Streamed ${cumulativeSize} bytes in ${Date.now() - startedAt}ms`,
+        );
+      } catch (err) {
+        if (cancelled) {
+          // The consumer stopped and the cancel hook destroyed the stream
+          // underneath an in-flight read. That is not a synthesis failure.
+          return;
+        }
+        if (err instanceof TTSError) {
+          throw err;
+        }
+        const message = err instanceof Error ? err.message : "Unknown error";
+        throw new TTSError({
+          code: TTS_ERROR_CODES.SYNTHESIS_FAILED,
+          message: idleTimedOut
+            ? `Google TTS streaming synthesis stalled for ${GoogleTTSHandler.STREAMING_IDLE_TIMEOUT_MS}ms`
+            : `Google TTS streaming synthesis failed: ${message}`,
+          category: idleTimedOut
+            ? ErrorCategory.NETWORK
+            : ErrorCategory.EXECUTION,
+          severity: ErrorSeverity.HIGH,
+          retriable: true,
+          context: { voice: voiceId, audioEncoding },
+          originalError: err instanceof Error ? err : undefined,
+        });
+      } finally {
+        clearTimeout(idleTimer);
+        active = undefined;
+        // Same reasoning as the idle timer above: `.cancel()` signals the
+        // server this call is done (a no-op on one that already finished
+        // normally), where `.destroy()` only ever tore down the local end.
+        duplex.cancel();
+      }
+    })();
+
+    return attachStreamCancel(stream, () => {
+      cancelled = true;
+      active?.cancel();
+    });
   }
 
   /**
@@ -328,6 +657,28 @@ export class GoogleTTSHandler implements TTSHandler {
       case "ogg":
       case "opus":
         return "OGG_OPUS";
+      case "pcm16":
+        // pcm16 is a real, supported format — just not on THIS (buffered)
+        // endpoint. Reaching this branch means `synthesizeStream()` already
+        // declined the request (wrong voice family, or SSML text, both of
+        // which return `undefined` silently), so a caller who picked a
+        // perfectly valid streaming voice/format pair but tripped the SSML
+        // gate would otherwise see the same generic "unsupported format" as
+        // someone who picked a fundamentally wrong combination. Naming the
+        // actual requirement here, once, is cheaper than threading the
+        // disqualifying reason back from `synthesizeStream()`.
+        throw new TTSError({
+          code: TTS_ERROR_CODES.INVALID_INPUT,
+          message:
+            "Google Cloud TTS's buffered synthesis does not support pcm16 output. " +
+            "pcm16 is only delivered via native streaming, which requires a " +
+            "Chirp3-HD, Chirp-HD, or Journey voice and plain (non-SSML) text — " +
+            "check that both conditions hold, or request a different format.",
+          category: ErrorCategory.VALIDATION,
+          severity: ErrorSeverity.MEDIUM,
+          retriable: false,
+          context: { format },
+        });
       default:
         throw new TTSError({
           code: TTS_ERROR_CODES.INVALID_INPUT,
@@ -356,7 +707,7 @@ export class GoogleTTSHandler implements TTSHandler {
    * detectVoiceType("en-US-Chirp-A") // returns "chirp"
    * detectVoiceType("en-US-Journey-D") // returns "unknown" (unrecognized type)
    */
-  private detectVoiceType(name: string): VoiceType {
+  private detectVoiceType(name: string): TTSVoiceType {
     const tokens = name.toLowerCase().split("-");
 
     if (tokens.some((t) => t.startsWith("chirp"))) {

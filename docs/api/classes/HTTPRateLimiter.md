@@ -1,12 +1,10 @@
-[**NeuroLink API Reference v8.32.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
 [NeuroLink API Reference](../README.md) / HTTPRateLimiter
 
 # Class: HTTPRateLimiter
-
-Defined in: [mcp/httpRateLimiter.ts:32](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/mcp/httpRateLimiter.ts#L32)
 
 HTTPRateLimiter
 Implements token bucket algorithm for rate limiting HTTP requests
@@ -22,15 +20,13 @@ The token bucket algorithm works as follows:
 
 ### Constructor
 
-> **new HTTPRateLimiter**(`config`): `HTTPRateLimiter`
-
-Defined in: [mcp/httpRateLimiter.ts:42](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/mcp/httpRateLimiter.ts#L42)
+> **new HTTPRateLimiter**(`config?`): `HTTPRateLimiter`
 
 #### Parameters
 
-##### config
+##### config?
 
-`Partial`\<[`RateLimitConfig`](../type-aliases/RateLimitConfig.md)\> = `{}`
+`Partial`\<[`TokenBucketRateLimitConfig`](../type-aliases/TokenBucketRateLimitConfig.md)\> = `{}`
 
 #### Returns
 
@@ -41,8 +37,6 @@ Defined in: [mcp/httpRateLimiter.ts:42](https://github.com/juspay/neurolink/blob
 ### acquire()
 
 > **acquire**(): `Promise`\<`void`\>
-
-Defined in: [mcp/httpRateLimiter.ts:89](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/mcp/httpRateLimiter.ts#L89)
 
 Acquire a token, waiting if necessary
 This is the primary method for rate-limited operations
@@ -63,8 +57,6 @@ Error if the wait queue is too long
 
 > **tryAcquire**(): `boolean`
 
-Defined in: [mcp/httpRateLimiter.ts:163](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/mcp/httpRateLimiter.ts#L163)
-
 Try to acquire a token without waiting
 
 #### Returns
@@ -78,8 +70,6 @@ true if a token was acquired, false otherwise
 ### handleRateLimitResponse()
 
 > **handleRateLimitResponse**(`headers`): `number`
-
-Defined in: [mcp/httpRateLimiter.ts:189](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/mcp/httpRateLimiter.ts#L189)
 
 Handle rate limit response headers from server
 Parses Retry-After header and returns wait time in milliseconds
@@ -104,8 +94,6 @@ Wait time in milliseconds, or 0 if no rate limit headers found
 
 > **getRemainingTokens**(): `number`
 
-Defined in: [mcp/httpRateLimiter.ts:252](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/mcp/httpRateLimiter.ts#L252)
-
 Get the number of remaining tokens
 
 #### Returns
@@ -120,8 +108,6 @@ Current number of available tokens
 
 > **reset**(): `void`
 
-Defined in: [mcp/httpRateLimiter.ts:261](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/mcp/httpRateLimiter.ts#L261)
-
 Reset the rate limiter to initial state
 Useful for testing or when server indicates rate limits have been reset
 
@@ -133,23 +119,19 @@ Useful for testing or when server indicates rate limits have been reset
 
 ### getStats()
 
-> **getStats**(): `RateLimiterStats`
-
-Defined in: [mcp/httpRateLimiter.ts:281](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/mcp/httpRateLimiter.ts#L281)
+> **getStats**(): [`RateLimiterStats`](../type-aliases/RateLimiterStats.md)
 
 Get current rate limiter statistics
 
 #### Returns
 
-`RateLimiterStats`
+[`RateLimiterStats`](../type-aliases/RateLimiterStats.md)
 
 ---
 
 ### updateConfig()
 
 > **updateConfig**(`config`): `void`
-
-Defined in: [mcp/httpRateLimiter.ts:296](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/mcp/httpRateLimiter.ts#L296)
 
 Update configuration dynamically
 Useful when server provides rate limit information
@@ -158,7 +140,7 @@ Useful when server provides rate limit information
 
 ##### config
 
-`Partial`\<[`RateLimitConfig`](../type-aliases/RateLimitConfig.md)\>
+`Partial`\<[`TokenBucketRateLimitConfig`](../type-aliases/TokenBucketRateLimitConfig.md)\>
 
 #### Returns
 
@@ -168,12 +150,10 @@ Useful when server provides rate limit information
 
 ### getConfig()
 
-> **getConfig**(): `Readonly`\<[`RateLimitConfig`](../type-aliases/RateLimitConfig.md)\>
-
-Defined in: [mcp/httpRateLimiter.ts:304](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/mcp/httpRateLimiter.ts#L304)
+> **getConfig**(): `Readonly`\<[`TokenBucketRateLimitConfig`](../type-aliases/TokenBucketRateLimitConfig.md)\>
 
 Get current configuration
 
 #### Returns
 
-`Readonly`\<[`RateLimitConfig`](../type-aliases/RateLimitConfig.md)\>
+`Readonly`\<[`TokenBucketRateLimitConfig`](../type-aliases/TokenBucketRateLimitConfig.md)\>

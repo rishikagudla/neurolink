@@ -14,35 +14,49 @@ import type { NeuroLink } from "../../neurolink.js";
 import { logger } from "../../utils/logger.js";
 import {
   AlreadyRunningError,
+  ServerAdapterError,
   ServerStartError,
   ServerStopError,
   wrapError,
 } from "../errors.js";
+import { withTimeout } from "../../utils/errorHandling.js";
 import { BaseServerAdapter } from "../abstract/baseServerAdapter.js";
 import type {
   MiddlewareDefinition,
   RouteDefinition,
   ServerAdapterConfig,
   ServerAdapterEvents,
+  ServerCarriedContext,
   ServerContext,
-} from "../types.js";
+  FastifyRateLimitContext,
+} from "../../types/index.js";
+import { resolveClientAddress } from "../utils/clientAddress.js";
+import { shapeRouteError } from "../utils/clientError.js";
+import { pathMatchesAny, stripQuery } from "../utils/pathMatch.js";
 import { isErrorResponse } from "../utils/validation.js";
+import {
+  isRawBodyContentType,
+  isWebResponse,
+  readWebResponse,
+} from "../utils/rawBody.js";
 
-/**
- * Rate limit context type for error response builder
- */
-type RateLimitContext = {
-  ttl: number;
-  ban?: boolean;
-};
+/** How long `listen()` may take; `config.timeout` is the per-request budget. */
+const STARTUP_TIMEOUT_MS = 30_000;
 
 /**
  * Fastify-specific server adapter
  * Provides high-performance HTTP server with schema validation
  */
 export class FastifyServerAdapter extends BaseServerAdapter {
-  private app!: FastifyInstance;
+  private app: FastifyInstance | null = null;
   private frameworkInitialized = false;
+  // The rate limiter counts nothing it cannot attribute, and says so once.
+  private warnedNoClientAddress = false;
+  // The shutdown drain's record for each in-flight request. Fastify takes
+  // `request.id` from the caller's X-Request-ID, so that id can repeat across
+  // overlapping requests: a record named after it would be shared, and the
+  // first request to finish would untrack the other.
+  private connectionIds = new WeakMap<FastifyRequest, string>();
 
   constructor(neurolink: NeuroLink, config: ServerAdapterConfig = {}) {
     super(neurolink, config);
@@ -66,7 +80,9 @@ export class FastifyServerAdapter extends BaseServerAdapter {
     }
 
     // Dynamic import to avoid loading if not used
-    const fastifyModule = await import("fastify");
+    const fastifyModule = await this.importFrameworkDependency<
+      typeof import("fastify")
+    >("fastify", "Fastify");
     const Fastify = fastifyModule.default;
 
     this.app = Fastify({
@@ -80,11 +96,38 @@ export class FastifyServerAdapter extends BaseServerAdapter {
       bodyLimit: this.parseBodyLimit(this.config.bodyParser.maxSize),
     });
 
+    // Uploads (multipart, octet-stream, audio/*) reach the route as bytes;
+    // without a parser Fastify refuses these content types with a 415.
+    if (this.config.bodyParser.enabled) {
+      this.app.addContentTypeParser(
+        /^\s*(multipart\/form-data|application\/octet-stream|audio\/)/i,
+        {
+          parseAs: "buffer",
+          bodyLimit: this.parseBodyLimit(this.config.bodyParser.rawMaxSize),
+        },
+        (request, body, done) => {
+          done(
+            null,
+            isRawBodyContentType(request.headers["content-type"])
+              ? body
+              : undefined,
+          );
+        },
+      );
+    }
+
     // Register CORS plugin if enabled
     if (this.config.cors.enabled) {
-      const corsModule = await import("@fastify/cors");
+      const corsModule = await this.importFrameworkDependency<
+        typeof import("@fastify/cors")
+      >("@fastify/cors", "Fastify");
       await this.app.register(corsModule.default, {
-        origin: this.config.cors.origins,
+        // A list is matched literally, so the default `["*"]` would match
+        // nothing; the wildcard has to be the string "*" (Koa handles it in
+        // its origin callback).
+        origin: this.config.cors.origins.includes("*")
+          ? "*"
+          : this.config.cors.origins,
         methods: this.config.cors.methods,
         allowedHeaders: this.config.cors.headers,
         credentials: this.config.cors.credentials,
@@ -94,23 +137,31 @@ export class FastifyServerAdapter extends BaseServerAdapter {
 
     // Register rate limiting plugin if enabled
     if (this.config.rateLimit.enabled) {
-      const rateLimitModule = await import("@fastify/rate-limit");
+      const rateLimitModule = await this.importFrameworkDependency<
+        typeof import("@fastify/rate-limit")
+      >("@fastify/rate-limit", "Fastify");
       const windowMs = this.config.rateLimit.windowMs;
       await this.app.register(rateLimitModule.default, {
         max: this.config.rateLimit.maxRequests,
         timeWindow: windowMs,
+        // The key is resolved here, from the TCP peer or, behind a declared
+        // proxy, the client it reports. A request with no attributable
+        // address passes rather than share a bucket.
+        keyGenerator: (request: FastifyRequest) =>
+          this.clientKeyFor(request) ?? "",
+        allowList: (request: FastifyRequest) =>
+          this.clientKeyFor(request) === undefined,
+        // The plugin throws what this builds, so the error handler below
+        // needs `statusCode` to answer 429; without it every exceeded limit
+        // was a 500.
         errorResponseBuilder: (
           _request: FastifyRequest,
-          context: RateLimitContext,
+          context: FastifyRateLimitContext,
         ) => ({
-          error: {
-            code: "RATE_LIMIT_EXCEEDED",
-            message: this.config.rateLimit.message,
-          },
-          metadata: {
-            retryAfter: Math.ceil(context.ttl / 1000),
-            timestamp: new Date().toISOString(),
-          },
+          statusCode: 429,
+          code: "RATE_LIMIT_EXCEEDED",
+          message: this.config.rateLimit.message,
+          retryAfter: Math.ceil(context.ttl / 1000),
         }),
       });
 
@@ -144,20 +195,46 @@ export class FastifyServerAdapter extends BaseServerAdapter {
       (error: FastifyError, request: FastifyRequest, reply: FastifyReply) => {
         const requestId = request.id;
 
-        logger.error("[FastifyAdapter] Request error", {
-          requestId,
-          error: error.message,
-          stack: error.stack,
-        });
+        this.logRequestError("FastifyAdapter", requestId, error);
 
-        this.emit("error", {
+        this.emitRequestError({
           requestId,
           error,
           timestamp: new Date(),
-        } satisfies ServerAdapterEvents["error"]);
+        });
 
         // Handle different error types
-        if (error.statusCode) {
+        if (error instanceof ServerAdapterError) {
+          reply.status(error.getHttpStatus()).send({
+            error: { code: error.code, message: error.message },
+            metadata: {
+              requestId,
+              timestamp: new Date().toISOString(),
+            },
+          });
+          return;
+        }
+
+        // An exceeded rate limit, thrown by @fastify/rate-limit as the object
+        // errorResponseBuilder built.
+        if (error.statusCode === 429) {
+          reply.status(429).send({
+            error: {
+              code: "RATE_LIMIT_EXCEEDED",
+              message: this.config.rateLimit.message,
+            },
+            metadata: {
+              requestId,
+              timestamp: new Date().toISOString(),
+              retryAfter: (error as { retryAfter?: number }).retryAfter,
+            },
+          });
+          return;
+        }
+
+        // Fastify's own client errors (an unparsable body, an unsupported
+        // media type) carry a message the client may see; a 5xx's does not.
+        if (error.statusCode && error.statusCode < 500) {
           reply.status(error.statusCode).send({
             error: {
               code: `HTTP_${error.statusCode}`,
@@ -203,6 +280,24 @@ export class FastifyServerAdapter extends BaseServerAdapter {
     this.frameworkInitialized = true;
   }
 
+  /** The address a request is counted against; `undefined` when there is none. */
+  private clientKeyFor(request: FastifyRequest): string | undefined {
+    const forwarded = request.headers["x-forwarded-for"];
+    const key = resolveClientAddress({
+      remoteAddress: request.socket?.remoteAddress ?? request.ip,
+      forwardedFor: Array.isArray(forwarded) ? forwarded.join(",") : forwarded,
+      trustProxy: this.config.rateLimit.trustProxy,
+      trustedProxies: this.config.rateLimit.trustedProxies,
+    });
+    if (key === undefined && !this.warnedNoClientAddress) {
+      this.warnedNoClientAddress = true;
+      logger.alwaysStderr(
+        "[FastifyAdapter] A request arrived with no peer address, so the rate limiter cannot count it; configure rateLimit.keyGenerator to limit by another key.",
+      );
+    }
+    return key;
+  }
+
   /**
    * Parse body limit string to number (bytes)
    */
@@ -231,8 +326,17 @@ export class FastifyServerAdapter extends BaseServerAdapter {
    * Override initialize to ensure async framework setup
    */
   public async initialize(): Promise<void> {
-    // Initialize Fastify asynchronously first
-    await this.initializeFrameworkAsync();
+    // Initialize Fastify asynchronously first. This runs before
+    // super.initialize()'s try/catch even starts, so a failure here (e.g. the
+    // "fastify" package is not installed) must be caught here too — otherwise
+    // it propagates with lifecycleState left at "uninitialized" instead of
+    // "error".
+    try {
+      await this.initializeFrameworkAsync();
+    } catch (error) {
+      this.lifecycleState = "error";
+      throw error;
+    }
 
     // Then call base class initialize
     await super.initialize();
@@ -242,6 +346,12 @@ export class FastifyServerAdapter extends BaseServerAdapter {
    * Register route with Fastify
    */
   protected registerFrameworkRoute(route: RouteDefinition): void {
+    if (!this.app) {
+      throw new Error(
+        "Fastify app not initialized. Call initialize() before registering routes.",
+      );
+    }
+
     const method = route.method.toUpperCase() as
       | "GET"
       | "POST"
@@ -249,6 +359,12 @@ export class FastifyServerAdapter extends BaseServerAdapter {
       | "DELETE"
       | "PATCH"
       | "OPTIONS";
+
+    // Fastify does not allow duplicate method+path registrations.
+    // Skip if route already exists (e.g., built-in health routes).
+    if (this.app.hasRoute({ method, url: route.path })) {
+      return;
+    }
 
     this.app.route({
       method,
@@ -261,20 +377,36 @@ export class FastifyServerAdapter extends BaseServerAdapter {
         const ctx = this.createContext({
           requestId,
           method: request.method,
-          path: request.url.split("?")[0], // Remove query string
+          path: stripQuery(request.url),
           headers: request.headers as Record<string, string>,
           query: request.query as Record<string, string>,
           params: request.params as Record<string, string>,
           body: request.body,
+          remoteAddress: request.socket?.remoteAddress ?? request.ip,
         });
 
         // Copy response headers from middleware (stored in request by middleware)
         const reqWithHeaders = request as FastifyRequest & {
           responseHeaders?: Record<string, string>;
+          carriedContext?: ServerCarriedContext;
         };
         if (reqWithHeaders.responseHeaders) {
           ctx.responseHeaders = { ...reqWithHeaders.responseHeaders };
         }
+        this.restoreCarriedContext(ctx, reqWithHeaders.carriedContext);
+
+        // The handler learns of a client that went away, and a request over
+        // `config.timeout` is answered 504 and its work aborted. Fastify used
+        // to apply that timeout only to its own listen().
+        const abort = this.attachRequestAbort(ctx, {
+          onClientClose: (listener) =>
+            request.raw.on("close", () => {
+              if (!reply.raw.writableFinished) {
+                listener();
+              }
+            }),
+          applyTimeout: !route.streaming?.enabled,
+        });
 
         // Emit request event
         this.emit("request", {
@@ -284,23 +416,73 @@ export class FastifyServerAdapter extends BaseServerAdapter {
           timestamp: new Date(),
         } satisfies ServerAdapterEvents["request"]);
 
-        // Handle streaming if configured
-        if (route.streaming?.enabled) {
-          return this.handleStreamingResponse(reply, ctx, route);
-        }
+        try {
+          // Handle streaming if configured
+          if (route.streaming?.enabled) {
+            return await this.handleStreamingResponse(reply, ctx, route);
+          }
 
-        // Execute handler
-        const result = await route.handler(ctx);
-        const duration = Date.now() - startTime;
+          // Execute handler
+          const result = abort.deadline
+            ? await Promise.race([route.handler(ctx), abort.deadline])
+            : await route.handler(ctx);
+          const duration = Date.now() - startTime;
 
-        // Check if result is an error response
-        if (isErrorResponse(result)) {
-          const statusCode = result.httpStatus ?? 500;
+          // A route that answers in its own wire format returns a web Response.
+          if (isWebResponse(result)) {
+            const raw = await readWebResponse(result);
+            this.emit("response", {
+              requestId,
+              statusCode: raw.status,
+              duration,
+              timestamp: new Date(),
+            } satisfies ServerAdapterEvents["response"]);
+            for (const [key, value] of Object.entries({
+              ...ctx.responseHeaders,
+              ...raw.headers,
+            })) {
+              reply.header(key, value);
+            }
+            reply.status(raw.status);
+            return reply.send(raw.body);
+          }
 
-          // Emit response event with error status
+          // Check if result is an error response
+          if (isErrorResponse(result)) {
+            const statusCode = result.httpStatus ?? 500;
+
+            // Emit response event with error status
+            this.emit("response", {
+              requestId,
+              statusCode,
+              duration,
+              timestamp: new Date(),
+            } satisfies ServerAdapterEvents["response"]);
+
+            // Apply response headers from middleware and handler
+            if (ctx.responseHeaders) {
+              for (const [key, value] of Object.entries(ctx.responseHeaders)) {
+                reply.header(key, value);
+              }
+            }
+
+            // Return error response with proper status code
+            reply.status(statusCode);
+            return {
+              error: result.error,
+              metadata: {
+                ...result.metadata,
+                requestId,
+                timestamp: new Date().toISOString(),
+                duration,
+              },
+            };
+          }
+
+          // Emit response event
           this.emit("response", {
             requestId,
-            statusCode,
+            statusCode: 200,
             duration,
             timestamp: new Date(),
           } satisfies ServerAdapterEvents["response"]);
@@ -312,43 +494,41 @@ export class FastifyServerAdapter extends BaseServerAdapter {
             }
           }
 
-          // Return error response with proper status code
-          reply.status(statusCode);
+          // Return formatted response
           return {
-            error: result.error,
+            data: result,
             metadata: {
-              ...result.metadata,
               requestId,
               timestamp: new Date().toISOString(),
               duration,
             },
           };
-        }
-
-        // Emit response event
-        this.emit("response", {
-          requestId,
-          statusCode: 200,
-          duration,
-          timestamp: new Date(),
-        } satisfies ServerAdapterEvents["response"]);
-
-        // Apply response headers from middleware and handler
-        if (ctx.responseHeaders) {
-          for (const [key, value] of Object.entries(ctx.responseHeaders)) {
-            reply.header(key, value);
-          }
-        }
-
-        // Return formatted response
-        return {
-          data: result,
-          metadata: {
+        } catch (error) {
+          // The exception's text stays in the log under this request id; the
+          // client gets a fixed message for its category.
+          const shaped = shapeRouteError("FastifyAdapter", requestId, error);
+          this.emitRequestError({
             requestId,
-            timestamp: new Date().toISOString(),
-            duration,
-          },
-        };
+            error: error instanceof Error ? error : new Error(String(error)),
+            timestamp: new Date(),
+          });
+          this.emit("response", {
+            requestId,
+            statusCode: shaped.status,
+            duration: Date.now() - startTime,
+            timestamp: new Date(),
+          } satisfies ServerAdapterEvents["response"]);
+          if (reply.sent || reply.raw.headersSent) {
+            return;
+          }
+          reply.status(shaped.status);
+          return {
+            error: { code: shaped.code, message: shaped.message },
+            metadata: { requestId, timestamp: new Date().toISOString() },
+          };
+        } finally {
+          abort.release();
+        }
       },
     });
   }
@@ -393,10 +573,14 @@ export class FastifyServerAdapter extends BaseServerAdapter {
       reply.raw.write(`data: \n\n`);
       reply.raw.end();
     } catch (error) {
+      const shaped = shapeRouteError("FastifyAdapter", ctx.requestId, error);
       reply.raw.write(`event: error\n`);
       reply.raw.write(
         `data: ${JSON.stringify({
-          error: error instanceof Error ? error.message : "Stream error",
+          error: shaped.message,
+          code: shaped.code,
+          status: shaped.status,
+          requestId: ctx.requestId,
         })}\n\n`,
       );
       reply.raw.end();
@@ -409,26 +593,34 @@ export class FastifyServerAdapter extends BaseServerAdapter {
   protected registerFrameworkMiddleware(
     middleware: MiddlewareDefinition,
   ): void {
+    if (!this.app) {
+      throw new Error(
+        "Fastify app not initialized. Call initialize() before registering middleware.",
+      );
+    }
+
     this.app.addHook(
       "preHandler",
       async (request: FastifyRequest, _reply: FastifyReply) => {
+        // Matched on the path alone, at segment boundaries: `request.url`
+        // carries the query string, so `/api/health?x` used to miss an
+        // exemption for `/api/health` and `/api/healthz` used to take it.
+        const requestPath = stripQuery(request.url);
+
         // Skip excluded paths
-        if (middleware.excludePaths?.some((p) => request.url.startsWith(p))) {
+        if (pathMatchesAny(requestPath, middleware.excludePaths)) {
           return;
         }
 
         // Check if path matches
-        const paths = middleware.paths || ["/"];
-        const matches = paths.some(
-          (p) => request.url.startsWith(p) || p === "*",
-        );
-        if (!matches) {
+        if (!pathMatchesAny(requestPath, middleware.paths || ["/"])) {
           return;
         }
 
         // Initialize response headers storage if not present
         const reqWithHeaders = request as FastifyRequest & {
           responseHeaders: Record<string, string>;
+          carriedContext?: ServerCarriedContext;
         };
         if (!reqWithHeaders.responseHeaders) {
           reqWithHeaders.responseHeaders = {};
@@ -438,18 +630,23 @@ export class FastifyServerAdapter extends BaseServerAdapter {
         const ctx = this.createContext({
           requestId: request.id,
           method: request.method,
-          path: request.url.split("?")[0],
+          path: requestPath,
           headers: request.headers as Record<string, string>,
           query: request.query as Record<string, string>,
           params: request.params as Record<string, string>,
           body: request.body,
+          remoteAddress: request.socket?.remoteAddress ?? request.ip,
         });
 
         // Copy existing response headers to context
         ctx.responseHeaders = { ...reqWithHeaders.responseHeaders };
+        this.restoreCarriedContext(ctx, reqWithHeaders.carriedContext);
 
         // Execute middleware
         await middleware.handler(ctx, async () => {
+          // What this middleware set (ctx.user included) is for the next
+          // middleware and the route handler, which build their own contexts.
+          reqWithHeaders.carriedContext = this.captureCarriedContext(ctx);
           // After middleware execution, merge response headers back to request
           if (ctx.responseHeaders) {
             Object.assign(reqWithHeaders.responseHeaders, ctx.responseHeaders);
@@ -475,63 +672,60 @@ export class FastifyServerAdapter extends BaseServerAdapter {
       throw new AlreadyRunningError(this.config.port, this.config.host);
     }
 
+    if (!this.app) {
+      throw new Error(
+        "Fastify app not initialized. Call initialize() before starting.",
+      );
+    }
+
+    // Capture non-null reference for use in closures below
+    const app = this.app;
+
     this.lifecycleState = "starting";
     const { port, host } = this.config;
-    const startupTimeout = this.config.timeout || 30000;
+    const startupTimeout = STARTUP_TIMEOUT_MS;
 
-    const startPromise = (async () => {
-      await this.app.listen({ port, host });
+    // Track connections via Fastify hooks (must be registered before listen)
+    app.addHook("onRequest", async (request: FastifyRequest) => {
+      const connectionId = `conn-${this.generateRequestId()}`;
+      this.connectionIds.set(request, connectionId);
+      this.trackConnection(connectionId, request.raw.socket, request.id);
+    });
+
+    app.addHook("onResponse", async (request: FastifyRequest) => {
+      const connectionId = this.connectionIds.get(request);
+      if (connectionId) {
+        this.untrackConnection(connectionId);
+      }
+    });
+
+    try {
+      await withTimeout(
+        app.listen({ port, host }),
+        startupTimeout,
+        new ServerStartError(
+          `Fastify server startup timed out after ${startupTimeout}ms`,
+          undefined,
+          port,
+          host,
+        ),
+      );
 
       this.isRunning = true;
       this.startTime = new Date();
       this.lifecycleState = "running";
 
-      // Track connections via Fastify hooks
-      this.app.addHook("onRequest", async (request: FastifyRequest) => {
-        const connectionId = `conn-${request.id}`;
-        this.trackConnection(connectionId, request.raw.socket, request.id);
-      });
-
-      this.app.addHook("onResponse", async (request: FastifyRequest) => {
-        const connectionId = `conn-${request.id}`;
-        this.untrackConnection(connectionId);
-      });
-
       logger.info(`[FastifyAdapter] Server started on ${host}:${port}`);
+      this.warnIfSensitiveRoutesUnauthenticated();
 
       this.emit("started", {
         port,
         host,
         timestamp: this.startTime,
       } satisfies ServerAdapterEvents["started"]);
-    })();
-
-    let startupTimer: NodeJS.Timeout | undefined;
-
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      startupTimer = setTimeout(() => {
-        this.lifecycleState = "error";
-        reject(
-          new ServerStartError(
-            `Fastify server startup timed out after ${startupTimeout}ms`,
-            undefined,
-            port,
-            host,
-          ),
-        );
-      }, startupTimeout);
-    });
-
-    try {
-      await Promise.race([startPromise, timeoutPromise]);
     } catch (error) {
       this.lifecycleState = "error";
       throw error;
-    } finally {
-      // Always clear the timeout to prevent memory leak
-      if (startupTimer) {
-        clearTimeout(startupTimer);
-      }
     }
   }
 
@@ -559,6 +753,7 @@ export class FastifyServerAdapter extends BaseServerAdapter {
       // Reset state for restart capability
       this.resetServerState();
       this.frameworkInitialized = false;
+      this.app = null;
     } catch (error) {
       const wrappedError = wrapError(error);
       throw new ServerStopError(wrappedError.message, wrappedError);
@@ -581,7 +776,14 @@ export class FastifyServerAdapter extends BaseServerAdapter {
    * Close the underlying server
    */
   protected async closeServer(): Promise<void> {
-    await this.app.close();
+    if (this.app) {
+      const closeTimeout = this.shutdownConfig.gracefulShutdownTimeoutMs;
+      await withTimeout(
+        this.app.close(),
+        closeTimeout,
+        new Error(`Fastify server close timed out after ${closeTimeout}ms`),
+      );
+    }
   }
 
   /**
@@ -593,7 +795,7 @@ export class FastifyServerAdapter extends BaseServerAdapter {
     });
 
     // Get the underlying server and destroy all sockets
-    const server = this.app.server;
+    const server = this.app?.server;
     if (server) {
       // Force close by destroying the server
       server.closeAllConnections?.();
@@ -605,7 +807,12 @@ export class FastifyServerAdapter extends BaseServerAdapter {
   /**
    * Get the Fastify instance
    */
-  public getFrameworkInstance(): FastifyInstance {
+  public getFrameworkInstance(): unknown {
     return this.app;
+  }
+
+  public override getNativeServer(): unknown {
+    // Fastify owns its http.Server and exposes it as `app.server`.
+    return this.app?.server;
   }
 }

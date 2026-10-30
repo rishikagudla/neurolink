@@ -3,16 +3,288 @@
  * Helper functions for Redis storage operations
  */
 
-import { createClient, type RedisClientOptions } from "redis";
-import { logger } from "./logger.js";
+import { randomUUID } from "crypto";
+import type { RedisClientOptions } from "redis";
 import type {
   ChatMessage,
-  RedisStorageConfig,
+  RedisClient,
   RedisConversationObject,
-} from "../types/conversation.js";
+  RedisStorageConfig,
+} from "../types/index.js";
+import { logger } from "./logger.js";
 
-// Redis client type
-type RedisClient = ReturnType<typeof createClient>;
+/**
+ * The user id a session created without a `userId` is stored under. It is
+ * refused as a caller's user id (`describeRedisIdProblem`), so no user can name
+ * the sessions stored under it.
+ */
+export const SESSION_ONLY_USER_ID = "session-only";
+const SESSION_ONLY_PREFIX = `${SESSION_ONLY_USER_ID}:`;
+
+/**
+ * Longest id that may become part of a key. Redis itself allows far more, but
+ * a session or user id past this length is not an id.
+ */
+const MAX_REDIS_ID_LENGTH = 512;
+
+/**
+ * Characters an id may not contain: `:` is the key-segment separator (so
+ * `user "a:b"` + session `"c"` would alias `user "a"` + session `"b:c"`), and
+ * `*`, `?`, `[` are glob metacharacters for SCAN/KEYS patterns; line breaks
+ * never belong in a key.
+ */
+const FORBIDDEN_REDIS_ID_CHARS = /[:*?[\r\n]/;
+// userId may carry ':' (multi-tenant ids such as `cust:merchant:shop` are established
+// usage); the key `${prefix}${userId}:${sessionId}` still splits unambiguously at the
+// last colon because sessionId may not contain one. Glob characters and line breaks
+// stay forbidden so an id can never widen a SCAN pattern or break a log line.
+const FORBIDDEN_REDIS_USER_ID_CHARS = /[*?[\r\n]/;
+
+/**
+ * Set `NEUROLINK_REDIS_ALLOW_LEGACY_IDS=1` to accept ids that fail the check
+ * with a warning instead of an error, for a deployment whose stored sessions
+ * already carry `:` in their ids and needs time to migrate.
+ */
+const ENV_ALLOW_LEGACY_IDS = "NEUROLINK_REDIS_ALLOW_LEGACY_IDS";
+
+/**
+ * Why an id is not usable as a key segment, or `null` when it is.
+ */
+export function describeRedisIdProblem(
+  value: string,
+  kind: "sessionId" | "userId" = "sessionId",
+): string | null {
+  if (value.length === 0) {
+    return "is empty";
+  }
+  if (value.length > MAX_REDIS_ID_LENGTH) {
+    return `is longer than ${MAX_REDIS_ID_LENGTH} characters`;
+  }
+  if (kind === "userId") {
+    if (FORBIDDEN_REDIS_USER_ID_CHARS.test(value)) {
+      return "contains a reserved character ('*', '?', '[' or a line break)";
+    }
+  } else if (FORBIDDEN_REDIS_ID_CHARS.test(value)) {
+    return "contains a reserved character (':', '*', '?', '[' or a line break)";
+  }
+  if (value === SESSION_ONLY_PREFIX.slice(0, -1)) {
+    return "is the reserved no-user namespace";
+  }
+  return null;
+}
+
+/**
+ * Refuse an id that would alias another key or break a SCAN pattern.
+ *
+ * @throws {Error} with `code: "INVALID_REDIS_ID"` unless the legacy switch is
+ *   set, in which case the problem is logged once per id shape and the id
+ *   is used as given.
+ */
+export function assertSafeRedisId(
+  value: string,
+  label: "sessionId" | "userId",
+): void {
+  const problem = describeRedisIdProblem(value, label);
+  if (problem === null) {
+    return;
+  }
+  const message = `[REDIS] ${label} ${problem}; it cannot be used in a Redis key`;
+  if (process.env[ENV_ALLOW_LEGACY_IDS] === "1") {
+    logger.warn(`${message} (allowed by ${ENV_ALLOW_LEGACY_IDS})`);
+    return;
+  }
+  const error = new Error(
+    `${message}. Set ${ENV_ALLOW_LEGACY_IDS}=1 to accept legacy ids while migrating.`,
+  );
+  (error as NodeJS.ErrnoException).code = "INVALID_REDIS_ID";
+  throw error;
+}
+
+/** Characters that end the authority (`user:pass@host:port`) of a URL in text. */
+const AUTHORITY_TERMINATORS = new Set(["/", "?", "#", " ", "\t", "\n", "\r"]);
+
+/**
+ * Redact the userinfo of every `scheme://user:pass@host` in `text`.
+ *
+ * Deliberately not a regex. `/:\/\/[^@]+@/` and its relatives backtrack
+ * quadratically on input with many `://` and no `@` (CodeQL
+ * js/polynomial-redos), and the URL here can come straight from a caller —
+ * `RedisStorageConfig.url` reaches this through `RedisArtifactStore` and the
+ * conversation memory manager. One forward pass, every character visited a
+ * bounded number of times.
+ *
+ * Redacts everything before the LAST `@` of the authority, so a password
+ * containing `@` is still hidden. A URL with only a user name is redacted
+ * too; the old regexes let that through.
+ */
+export function redactUrlCredentials(text: string): string {
+  let out = "";
+  let cursor = 0;
+  for (;;) {
+    const schemeEnd = text.indexOf("://", cursor);
+    if (schemeEnd === -1) {
+      return out + text.slice(cursor);
+    }
+    const authorityStart = schemeEnd + 3;
+    let authorityEnd = authorityStart;
+    let lastAt = -1;
+    while (authorityEnd < text.length) {
+      const ch = text[authorityEnd];
+      if (AUTHORITY_TERMINATORS.has(ch)) {
+        break;
+      }
+      if (ch === "@") {
+        lastAt = authorityEnd;
+      }
+      authorityEnd += 1;
+    }
+    if (lastAt === -1) {
+      out += text.slice(cursor, authorityEnd);
+      cursor = authorityEnd;
+    } else {
+      out += `${text.slice(cursor, authorityStart)}[redacted]@`;
+      cursor = lastAt + 1;
+    }
+  }
+}
+
+// Connection pool - keyed by host:port:db
+const connectionPool = new Map<
+  string,
+  { client: RedisClient; refCount: number }
+>();
+const pendingConnections = new Map<string, Promise<RedisClient>>();
+
+/**
+ * One pool key per distinct connection. Shared by acquire AND release: they
+ * used to compute it separately, and the release side never knew about the
+ * `url:` form, so a URL-configured client was acquired under one key and
+ * "released" under another that did not exist — its reference count never
+ * dropped and the connection outlived every owner. Credentials never appear
+ * in the key; it is logged.
+ */
+function poolKeyFor(config: Required<RedisStorageConfig>): string {
+  return config.url
+    ? `url:${redactUrlCredentials(config.url)}`
+    : `${config.host}:${config.port}:${config.db}:${config.password ? "auth" : "noauth"}`;
+}
+
+/**
+ * Get a pooled Redis connection. Multiple callers with the same host:port:db
+ * share a single connection, reducing connection count.
+ */
+export async function getPooledRedisClient(
+  config: Required<RedisStorageConfig>,
+): Promise<RedisClient> {
+  const key = poolKeyFor(config);
+  const existing = connectionPool.get(key);
+
+  if (existing && existing.client.isOpen) {
+    existing.refCount++;
+    logger.debug("[Redis] Reusing pooled connection", {
+      key,
+      refCount: existing.refCount,
+    });
+    return existing.client;
+  }
+
+  // Check pending BEFORE cleaning up stale entries to prevent TOCTOU race:
+  // Two callers seeing a stale entry could both skip this check and both
+  // attempt to create new connections if we cleaned up first.
+  const pending = pendingConnections.get(key);
+  if (pending) {
+    const client = await pending;
+    const entry = connectionPool.get(key);
+    if (entry) {
+      if (!entry.client.isOpen) {
+        // Client was closed while awaiting; clean up and create fresh
+        connectionPool.delete(key);
+        const freshClient = await createRedisClient(config);
+        connectionPool.set(key, { client: freshClient, refCount: 1 });
+        return freshClient;
+      }
+      entry.refCount++;
+    } else if (client.isOpen) {
+      // Entry was released while we awaited; re-register
+      connectionPool.set(key, { client, refCount: 1 });
+    } else {
+      // Client was closed while we awaited; create fresh connection
+      const freshClient = await createRedisClient(config);
+      connectionPool.set(key, { client: freshClient, refCount: 1 });
+      return freshClient;
+    }
+    return client;
+  }
+
+  // Clean up stale entry if exists (connection closed)
+  if (existing) {
+    connectionPool.delete(key);
+  }
+
+  // Create the promise and register it in pendingConnections atomically
+  // (synchronous) before any await, so concurrent callers will find it.
+  const connectPromise = createRedisClient(config);
+  pendingConnections.set(key, connectPromise);
+
+  try {
+    const client = await connectPromise;
+    connectionPool.set(key, { client, refCount: 1 });
+    logger.info("[Redis] Created pooled connection", { key, refCount: 1 });
+    return client;
+  } finally {
+    pendingConnections.delete(key);
+  }
+}
+
+/**
+ * Release a pooled Redis connection. Only closes when refCount reaches 0.
+ */
+export async function releasePooledRedisClient(
+  config: Required<RedisStorageConfig>,
+): Promise<void> {
+  const key = poolKeyFor(config);
+  const entry = connectionPool.get(key);
+
+  if (!entry) {
+    return;
+  }
+
+  entry.refCount--;
+  logger.debug("[Redis] Released pooled connection", {
+    key,
+    refCount: entry.refCount,
+  });
+
+  if (entry.refCount <= 0) {
+    try {
+      if (entry.client.isOpen) {
+        await entry.client.quit();
+      }
+    } catch (e) {
+      logger.warn("[Redis] Error closing pooled connection", {
+        key,
+        error: String(e),
+      });
+    }
+    connectionPool.delete(key);
+    logger.info("[Redis] Closed pooled connection", { key });
+  }
+}
+
+/**
+ * Get stats about the connection pool
+ */
+export function getPoolStats(): Array<{
+  key: string;
+  refCount: number;
+  isOpen: boolean;
+}> {
+  return Array.from(connectionPool.entries()).map(([key, entry]) => ({
+    key,
+    refCount: entry.refCount,
+    isOpen: entry.client.isOpen,
+  }));
+}
 
 /**
  * Creates a Redis client with the provided configuration
@@ -20,7 +292,8 @@ type RedisClient = ReturnType<typeof createClient>;
 export async function createRedisClient(
   config: Required<RedisStorageConfig>,
 ): Promise<RedisClient> {
-  const url = `redis://${config.host}:${config.port}/${config.db}`;
+  const url =
+    config.url || `redis://${config.host}:${config.port}/${config.db}`;
 
   // Create client options
   const clientOptions: RedisClientOptions = {
@@ -34,7 +307,7 @@ export async function createRedisClient(
         }
         const delay = Math.min(
           (config.connectionOptions?.retryDelayOnFailover || 100) *
-            Math.pow(2, retries),
+            2 ** retries,
           10000,
         );
         return delay;
@@ -42,18 +315,18 @@ export async function createRedisClient(
     },
   };
 
-  if (config.password) {
+  if (config.password && !config.url) {
     clientOptions.password = config.password;
   }
 
+  // Imported here, not at the top: the redis client is ~590 modules, a quarter
+  // of everything importing the SDK loaded, and most callers never connect.
+  const { createClient } = await import("redis");
   // Create client with secured options
   const client = createClient(clientOptions);
 
   client.on("error", (err: Error) => {
-    const sanitizedMessage = err.message.replace(
-      /redis:\/\/.*?@/g,
-      "redis://[redacted]@",
-    );
+    const sanitizedMessage = redactUrlCredentials(err.message);
     logger.error("Redis client error", { error: sanitizedMessage });
   });
 
@@ -84,7 +357,16 @@ export function getSessionKey(
   sessionId: string,
   userId?: string,
 ): string {
-  const key = `${config.keyPrefix}${userId || "randomUser"}:${sessionId}`;
+  assertSafeRedisId(sessionId, "sessionId");
+  if (userId !== undefined && userId !== "") {
+    assertSafeRedisId(userId, "userId");
+  }
+  if (!userId) {
+    logger.warn("[REDIS] getSessionKey called without userId", { sessionId });
+    return `${config.keyPrefix}${SESSION_ONLY_PREFIX}${sessionId}`;
+  }
+
+  const key = `${config.keyPrefix}${userId}:${sessionId}`;
 
   logger.debug("[redisUtils] Generated session key", {
     sessionId,
@@ -103,6 +385,7 @@ export function getUserSessionsKey(
   config: Required<RedisStorageConfig>,
   userId: string,
 ): string {
+  assertSafeRedisId(userId, "userId");
   return `${config.userSessionsKeyPrefix}${userId}`;
 }
 
@@ -126,11 +409,80 @@ export function serializeConversation(
   }
 }
 
+/** The exact role set `ChatMessage` allows. */
+const STORED_MESSAGE_ROLES: ReadonlySet<string> = new Set([
+  "user",
+  "assistant",
+  "system",
+  "tool_call",
+  "tool_result",
+]);
+
+function isStoredMessageRole(role: unknown): role is ChatMessage["role"] {
+  return typeof role === "string" && STORED_MESSAGE_ROLES.has(role);
+}
+
+/**
+ * True for a complete `ChatMessage` — `id` included, because callers keying
+ * summary pointers and condensation groups off it are entitled to find one.
+ */
+export function isStoredChatMessage(value: unknown): value is ChatMessage {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const candidate: Partial<ChatMessage> = value;
+  return (
+    typeof candidate.id === "string" &&
+    typeof candidate.content === "string" &&
+    isStoredMessageRole(candidate.role)
+  );
+}
+
+/**
+ * Coerce a stored entry into a complete `ChatMessage`, or `undefined` when its
+ * shape is unusable.
+ *
+ * Shared by BOTH read paths on purpose. Inline blobs have always been
+ * validated; once messages moved into the companion LIST the split read
+ * bypassed that check, so `null`, a number or a bare string survived
+ * `JSON.parse` and reached callers that dereference `.role`, `.content` and
+ * `.metadata`. The two storage formats must offer the same read guarantee.
+ *
+ * `id` is a separate matter: it is required on `ChatMessage`, but no read path
+ * has ever enforced it, so history written before it existed carries none.
+ * Rejecting those records would empty otherwise-healthy sessions, so a missing
+ * id is backfilled rather than fatal — prefixed, so a synthesized id is never
+ * mistaken for one an existing pointer could reference.
+ */
+export function normalizeStoredMessage(
+  value: unknown,
+): ChatMessage | undefined {
+  if (isStoredChatMessage(value)) {
+    return value;
+  }
+  if (typeof value !== "object" || value === null) {
+    return undefined;
+  }
+  const candidate: Partial<ChatMessage> = value;
+  if (
+    typeof candidate.content !== "string" ||
+    !isStoredMessageRole(candidate.role)
+  ) {
+    return undefined;
+  }
+  return {
+    ...candidate,
+    id: `legacy-${randomUUID()}`,
+    role: candidate.role,
+    content: candidate.content,
+  };
+}
+
 /**
  * Deserializes conversation object from Redis storage
  */
 export function deserializeConversation(
-  data: string | null,
+  data: string | Buffer | null,
 ): RedisConversationObject | null {
   if (!data) {
     return null;
@@ -138,7 +490,7 @@ export function deserializeConversation(
 
   try {
     // Parse as unknown first, then validate before casting
-    const parsedData = JSON.parse(data) as unknown;
+    const parsedData = JSON.parse(String(data)) as unknown;
 
     // Check if the parsed data is an object with required properties
     if (
@@ -176,22 +528,11 @@ export function deserializeConversation(
     }
 
     // Validate each message in the messages array
-    const isValidHistory = conversation.messages.every(
-      (m): m is ChatMessage =>
-        typeof m === "object" &&
-        m !== null &&
-        "role" in m &&
-        "content" in m &&
-        typeof m.role === "string" &&
-        typeof m.content === "string" &&
-        (m.role === "user" ||
-          m.role === "assistant" ||
-          m.role === "system" ||
-          m.role === "tool_call" ||
-          m.role === "tool_result"),
+    const normalizedMessages = conversation.messages.map(
+      normalizeStoredMessage,
     );
 
-    if (!isValidHistory) {
+    if (normalizedMessages.some((message) => message === undefined)) {
       logger.warn("[redisUtils] Invalid messages structure", {
         messageCount: conversation.messages.length,
         firstMessage:
@@ -201,6 +542,10 @@ export function deserializeConversation(
       });
       return null;
     }
+
+    conversation.messages = normalizedMessages.filter(
+      (message): message is ChatMessage => message !== undefined,
+    );
 
     logger.debug("[redisUtils] Conversation deserialized successfully", {
       sessionId: conversation.sessionId,
@@ -237,6 +582,49 @@ export async function isRedisHealthy(client: RedisClient): Promise<boolean> {
 }
 
 /**
+ * SET a string key together with its expiry, as a single command.
+ *
+ * A plain SET clears any TTL the key had, so SET followed by a separate
+ * EXPIRE leaves a window — and a dropped connection inside it — in which the
+ * key has no expiry at all and never ages out. A `ttlSeconds` of zero or less
+ * means "no expiry", exactly as the two-command form treated it.
+ */
+export async function setWithTtl(
+  client: RedisClient,
+  key: string,
+  value: string,
+  ttlSeconds: number,
+): Promise<void> {
+  if (ttlSeconds > 0) {
+    await client.set(key, value, {
+      expiration: { type: "EX", value: ttlSeconds },
+    });
+    return;
+  }
+  await client.set(key, value);
+}
+
+/**
+ * SADD a member and give the set its expiry in one MULTI/EXEC.
+ *
+ * SADD on a missing key creates it without a TTL, so a separate EXPIRE leaves
+ * the same unbounded-lifetime window as SET followed by EXPIRE. A
+ * `ttlSeconds` of zero or less adds the member and sets no expiry.
+ */
+export async function addToSetWithTtl(
+  client: RedisClient,
+  key: string,
+  member: string,
+  ttlSeconds: number,
+): Promise<void> {
+  if (ttlSeconds > 0) {
+    await client.multi().sAdd(key, member).expire(key, ttlSeconds).exec();
+    return;
+  }
+  await client.sAdd(key, member);
+}
+
+/**
  * Scan Redis keys matching a pattern without blocking the server
  * This is a non-blocking alternative to the KEYS command
  *
@@ -270,8 +658,8 @@ export async function scanKeys(
       });
 
       // Extract cursor and keys from result
-      cursor = result.cursor;
-      const keys = result.keys || [];
+      cursor = String(result.cursor);
+      const keys = (result.keys || []).map(String);
 
       // Add keys to result array
       allKeys.push(...keys);
@@ -317,11 +705,43 @@ export function getNormalizedConfig(
     "user:sessions:",
   );
 
+  let host = config.host || "localhost";
+  let port = config.port || 6379;
+  let username = config.username || "";
+  let password = config.password || "";
+  let db = config.db || 0;
+  let url = config.url;
+
+  if (url) {
+    try {
+      const parsedUrl = new URL(url);
+      host = parsedUrl.hostname;
+      port = parsedUrl.port ? parseInt(parsedUrl.port) : 6379;
+      username = parsedUrl.username || username;
+      password = parsedUrl.password || password;
+      db = parsedUrl.pathname
+        ? parseInt(parsedUrl.pathname.replace("/", "")) || 0
+        : 0;
+    } catch (e) {
+      const sanitizedUrl = redactUrlCredentials(url);
+      logger.warn(
+        "[redisUtils] Failed to parse Redis URL, falling back to component-based connection",
+        {
+          url: sanitizedUrl,
+          error: e instanceof Error ? e.message : String(e),
+        },
+      );
+      url = undefined;
+    }
+  }
+
   return {
-    host: config.host || "localhost",
-    port: config.port || 6379,
-    password: config.password || "",
-    db: config.db || 0,
+    url: url || "",
+    host,
+    port,
+    password,
+    username,
+    db,
     keyPrefix,
     userSessionsKeyPrefix:
       config.userSessionsKeyPrefix || defaultUserSessionsPrefix,
@@ -334,4 +754,100 @@ export function getNormalizedConfig(
       ...config.connectionOptions,
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Split message storage
+// ---------------------------------------------------------------------------
+
+/**
+ * Suffix of the companion LIST key holding a session's messages.
+ *
+ * Every `storeConversationTurn` used to re-serialize and SET the ENTIRE
+ * conversation, so per-turn write cost grew with history size. Measured
+ * against local Redis: 200 turns of 2KB messages stayed flat at 2ms, but 400
+ * turns of 20KB messages (~16MB blob) went 2ms -> 61ms, a 30x degradation on
+ * exactly the agentic tool-output profile. Splitting messages into an
+ * append-only LIST makes the per-turn write O(1) in conversation size.
+ */
+export const MESSAGES_KEY_SUFFIX = ":msgs";
+
+/**
+ * Marker on a stored blob meaning "messages live in the companion LIST".
+ * A blob WITHOUT it is a legacy record whose inline `messages` array is
+ * authoritative — it is read as-is and converted on its next write, which is
+ * what makes this migration backward compatible.
+ */
+export const MESSAGES_IN_LIST_MARKER = "__nlMessagesInList";
+
+/** Redis key holding a session's messages as an append-only LIST. */
+export function getSessionMessagesKey(
+  config: Required<RedisStorageConfig>,
+  sessionId: string,
+  userId?: string,
+): string {
+  return `${getSessionKey(config, sessionId, userId)}${MESSAGES_KEY_SUFFIX}`;
+}
+
+/**
+ * True for a companion messages LIST key.
+ *
+ * Scan-then-GET paths (`getStats`, session listing) match `${keyPrefix}*`, so
+ * they now also see these LIST keys — and `GET` on a LIST raises WRONGTYPE.
+ * They must filter with this, exactly as they already skip `:sessions` index
+ * keys.
+ */
+export function isSessionMessagesKey(key: string): boolean {
+  return key.endsWith(MESSAGES_KEY_SUFFIX);
+}
+
+/** Serialize the conversation WITHOUT its messages, flagged for split reads. */
+export function serializeConversationMetadata(
+  conversation: RedisConversationObject,
+): string {
+  return JSON.stringify({
+    ...conversation,
+    messages: [],
+    [MESSAGES_IN_LIST_MARKER]: true,
+  });
+}
+
+/** True when a deserialized blob's messages live in the companion LIST. */
+export function usesSplitMessageStorage(
+  conversation: RedisConversationObject | null | undefined,
+): boolean {
+  if (!conversation) {
+    return false;
+  }
+  const record: Record<string, unknown> = conversation;
+  return record[MESSAGES_IN_LIST_MARKER] === true;
+}
+
+/** Parse LRANGE entries, skipping any single entry that is not usable. */
+export function parseStoredMessages(entries: string[]): ChatMessage[] {
+  const messages: ChatMessage[] = [];
+  for (const entry of entries) {
+    try {
+      // `JSON.parse` succeeds for `null`, numbers and bare strings, so the
+      // catch below cannot filter them — the shape has to be checked.
+      const parsed: unknown = JSON.parse(entry);
+      const message = normalizeStoredMessage(parsed);
+      if (!message) {
+        logger.warn("[redisUtils] Skipping stored message with invalid shape");
+        continue;
+      }
+      messages.push(message);
+    } catch (error) {
+      // One corrupt entry must not destroy a whole session's history.
+      logger.warn("[redisUtils] Skipping unparseable stored message", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return messages;
+}
+
+/** Encode messages for RPUSH. */
+export function encodeStoredMessages(messages: ChatMessage[]): string[] {
+  return messages.map((message) => JSON.stringify(message));
 }

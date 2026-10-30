@@ -1,0 +1,252 @@
+{
+  "$schema": "./provider-catalog.schema.json",
+  "id": "mistral",
+  "displayName": "Mistral",
+  "aliases": [],
+  "tier": 2,
+  "wire": {
+    "baseURL": "https://api.mistral.ai/v1"
+  },
+  "models": {
+    "default": "mistral-small-2506",
+    "registryDefaultModel": "mistral-large-latest",
+    "fallbacks": ["mistral-small-2506", "mistral-medium-latest"],
+    "defaultContextWindow": 128000,
+    "defaultMaxOutputTokens": 4096,
+    "catalog": {
+      "mistral-large-latest": {
+        "contextWindow": 256000,
+        "vision": true,
+        "status": "production",
+        "description": "Mistral Large (Latest)"
+      },
+      "mistral-large-2512": {
+        "contextWindow": 256000,
+        "vision": true,
+        "status": "production",
+        "description": "Mistral Large 2512"
+      },
+      "mistral-medium-latest": {
+        "contextWindow": 128000,
+        "vision": true,
+        "status": "production",
+        "description": "Mistral Medium (Latest)"
+      },
+      "mistral-medium-2508": {
+        "vision": true,
+        "status": "production",
+        "description": "Mistral Medium 2508"
+      },
+      "mistral-small-latest": {
+        "contextWindow": 128000,
+        "vision": true,
+        "status": "production",
+        "description": "Mistral Small (Latest)"
+      },
+      "mistral-small-2506": {
+        "vision": true,
+        "status": "production",
+        "description": "Recommended - Mistral Small 2506"
+      },
+      "magistral-medium-latest": {
+        "contextWindow": 128000,
+        "vision": true,
+        "status": "production",
+        "description": "Magistral Medium (Reasoning)"
+      },
+      "magistral-small-latest": {
+        "vision": true,
+        "status": "production",
+        "description": "Magistral Small (Reasoning)"
+      },
+      "ministral-14b-2512": {
+        "enumMember": "MINISTRAL_14B_2512",
+        "vision": false,
+        "status": "production",
+        "description": "Ministral 14B (Edge)"
+      },
+      "ministral-8b-2512": {
+        "enumMember": "MINISTRAL_8B_2512",
+        "vision": false,
+        "status": "production",
+        "description": "Ministral 8B (Edge)"
+      },
+      "ministral-3b-2512": {
+        "enumMember": "MINISTRAL_3B_2512",
+        "vision": false,
+        "status": "production",
+        "description": "Ministral 3B (Edge)"
+      },
+      "codestral-latest": {
+        "contextWindow": 256000,
+        "vision": false,
+        "status": "production",
+        "description": "Codestral (Code Generation)"
+      },
+      "codestral-2508": {
+        "contextWindow": 256000,
+        "vision": false,
+        "status": "production",
+        "description": "Codestral 2508 (Code Generation)"
+      },
+      "codestral-embed": {
+        "vision": false,
+        "status": "production",
+        "description": "Codestral Embed"
+      },
+      "devstral-medium-latest": {
+        "vision": false,
+        "status": "production",
+        "description": "Devstral Medium (Software Development)"
+      },
+      "devstral-small-latest": {
+        "vision": false,
+        "status": "production",
+        "description": "Devstral Small (Software Development)"
+      },
+      "pixtral-large": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-08 — absent from Mistral's roster and rejected as an invalid model"
+      },
+      "pixtral-12b": {
+        "vision": true,
+        "status": "production",
+        "description": "Pixtral 12B — vision-capable; re-verified live 2026-08-30"
+      },
+      "voxtral-small-latest": {
+        "vision": false,
+        "status": "production",
+        "description": "Voxtral Small (Audio)"
+      },
+      "voxtral-mini-latest": {
+        "vision": false,
+        "status": "production",
+        "description": "Voxtral Mini (Audio)"
+      },
+      "devstral-2512": {
+        "enumMember": "DEVSTRAL_2",
+        "contextWindow": 256000,
+        "vision": false,
+        "status": "production",
+        "description": "Devstral 2 (December 2025)"
+      },
+      "devstral-small-2512": {
+        "enumMember": "DEVSTRAL_SMALL_2",
+        "contextWindow": 256000,
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-08 — absent from Mistral's roster and rejected as an invalid model"
+      },
+      "magistral-medium-2509": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-08 — absent from Mistral's roster and rejected as an invalid model"
+      },
+      "magistral-small-2509": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-08 — absent from Mistral's roster and rejected as an invalid model"
+      },
+      "voxtral-mini-2602": {
+        "enumMember": "VOXTRAL_MINI_TRANSCRIBE_2",
+        "vision": false,
+        "status": "production",
+        "description": "Voxtral Mini Transcribe 2 (February 2026)"
+      },
+      "mistral-ocr-2512": {
+        "enumMember": "MISTRAL_OCR_3",
+        "vision": false,
+        "status": "production",
+        "description": "Mistral OCR 3 (December 2025)"
+      },
+      "mistral-ocr-latest": {
+        "vision": false,
+        "status": "production",
+        "description": "Mistral OCR (Latest)"
+      },
+      "mistral-nemo": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-08 — absent from Mistral's roster and rejected as an invalid model"
+      },
+      "mistral-embed": {
+        "vision": false,
+        "status": "production",
+        "description": "Mistral Embed"
+      },
+      "mistral-moderation-latest": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-08 — absent from Mistral's roster and rejected as an invalid model"
+      },
+      "mistral-small-2603": {
+        "enumMember": "MISTRAL_SMALL_4",
+        "contextWindow": 256000,
+        "vision": true,
+        "status": "production",
+        "description": "Mistral Small 4 (June 2026)"
+      },
+      "mistral-small-creative": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-08 — absent from Mistral's roster and rejected as an invalid model"
+      }
+    },
+    "visionModel": "mistral-medium-latest",
+    "topModels": [
+      "mistral-large-latest",
+      "mistral-small-latest",
+      "codestral-latest",
+      "magistral-medium-latest",
+      "pixtral-12b"
+    ]
+  },
+  "capabilities": {
+    "text": true,
+    "streaming": true,
+    "tools": true,
+    "toolsWithStreaming": true,
+    "structuredOutput": true,
+    "structuredOutputWithTools": false,
+    "embeddings": false,
+    "thinking": false
+  },
+  "errorRules": [
+    {
+      "status": 401,
+      "pattern": "API_KEY_INVALID|Invalid API key|Unauthorized",
+      "class": "authentication",
+      "message": "Invalid Mistral API key. Please check your {apiKeyEnvVar} environment variable."
+    }
+  ],
+  "quirks": {
+    "registryDefaultIgnoresModelEnvVar": true
+  },
+  "timeouts": {
+    "generateMs": 45000,
+    "streamMs": 120000
+  },
+  "autoSelectPriority": 9,
+  "setup": {
+    "url": "https://console.mistral.ai/api-keys",
+    "apiKeyFormat": "^[A-Za-z0-9]{32}$",
+    "billingPolicy": "free-with-card",
+    "instructions": [
+      "1. Visit: https://console.mistral.ai/api-keys",
+      "2. Create or sign in to your account",
+      "3. Generate a new API key"
+    ]
+  },
+  "evidence": {
+    "rosterVerified": {
+      "date": "2026-08-30",
+      "method": "GET /models against the live account, cross-checked with a real chat call per id"
+    },
+    "liveMatrix": {
+      "date": "2026-08-30",
+      "result": "17 ids answer normally. A chat probe alone was not enough to judge the rest, because Mistral rejects every non-chat model with the same generic 'Invalid model' text: cross-referencing the roster shows mistral-embed, codestral-embed, mistral-ocr-latest, mistral-ocr-2512, voxtral-mini-latest and voxtral-mini-2602 are all still listed and alive — they are embedding, OCR and audio models that a chat endpoint is right to refuse — so they keep production status. An id is marked retired only when BOTH signals agree: absent from the roster AND rejected by a live chat call. pixtral-12b is the one id where they disagree — the roster omits it but a real call returns 200, so it was moved back to production, on the rule that a live 200 outranks a roster omission. mistral-large-latest and mistral-large-2512 answer 403 'not available in your subscription tier': a plan limit on this account, not a retirement, so they stay production. visionModel is pinned to mistral-medium-latest because the otherwise-first vision id, mistral-large-latest, is behind that plan gate. Combined tools plus response_format probes returned 429 twice, which is not successful capability evidence, so structuredOutputWithTools remains false pending a successful combined-request probe."
+    },
+    "addedInPR": "https://github.com/juspay/neurolink/pull/1587"
+  }
+}

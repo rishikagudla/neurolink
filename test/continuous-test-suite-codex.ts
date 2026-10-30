@@ -1,0 +1,5379 @@
+#!/usr/bin/env tsx
+
+/**
+ * Continuous Test Suite — Codex (ChatGPT) Pool Engine
+ *
+ * ## Determinism exception (CLAUDE.md rule 15)
+ *
+ * This suite imports `__testHooks` from `codexProxyRoutes`, plus the Codex OAuth
+ * and usage helpers, rather than driving a shipped surface. What determinism
+ * buys: these are table-driven decisions — which account sorts first, how a 429
+ * maps to a cooldown window, whether a refresh failure is permanent — and
+ * reproducing them end to end would mean provoking a specific sequence of 429s
+ * and token-endpoint failures across several real ChatGPT accounts, which
+ * cannot be arranged on demand. Getting the refresh classification wrong
+ * disables a working account and `auth cleanup` then deletes it, so it needs
+ * coverage that does not depend on a live backend.
+ *
+ * `__testHooks` is a test-only export in `src/` and should shrink as this logic
+ * gains a real surface.
+ *
+ * The Codex-outbound cache-preservation tests near the end of this file are
+ * under the same exception for a narrower reason: they drive
+ * `translateCodexRequestToClaude` and `applyClaudeRequestCacheBreakpoints` —
+ * pure translation/annotation functions — against fixed fixture bodies.
+ * Anthropic's prompt-cache byte-identity requirement needs two translations
+ * of the *same* conversation prefix to come out byte-for-byte equal; no live
+ * call can be made to hold a Codex CLI's request shape still across two
+ * turns on demand, and the two-turn fixture pair here exists specifically to
+ * exercise that determinism.
+ *
+ * The last two cases are *not* under the exception: they drive
+ * `node dist/cli/index.js` so the suite also proves the built package wires
+ * Codex up at all. Without them every case above could pass while the shipped
+ * CLI had no Codex surface. They run the CLI as a subprocess rather than
+ * importing `dist`, so the one-module-graph rule is not at risk.
+ *
+ * Covers: account ordering, 429 cooldown planning, upstream header
+ * construction, quota parsing, refresh-failure classification, and the built
+ * CLI's Codex auth surface.
+ *
+ * No API keys or external network. Local HTTP/IPC fixtures exercise socket
+ * backpressure, handoff recovery, and the real CLI status renderer. Recorded SSE
+ * drives early output, cancellation, terminal errors, usage, and tool limits.
+ * Fallback cases also drive the shipped Messages handler with a recorded Codex
+ * response: deterministic config reloads and captured outgoing JSON prove the
+ * requested effort survives the complete bridge without spending live quota.
+ * The isolation helper runs before proxy imports to protect operator state.
+ *
+ * Assertion messages deliberately never quote a payload: `defineSuite` treats a
+ * message matching `isExpectedProviderError()` as a SKIP, so an upstream-looking
+ * string in a failure message turns a real regression into a green run
+ * (see CLAUDE.md).
+ *
+ * Run with: npx tsx test/continuous-test-suite-codex.ts
+ */
+
+import "./helpers/proxyTestIsolation.js";
+import { mkdtempSync, rmSync, readFileSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { writeFileSync } from "node:fs";
+import {
+  decodeCodexAccessToken,
+  importCodexAuthFile,
+  isPermanentCodexRefreshFailure,
+  resolveCodexAccountId,
+} from "../src/lib/auth/codexOAuth.js";
+import {
+  codexRateLimitsToQuota,
+  fetchCodexAccountUsage,
+  parseCodexRateLimitHeaders,
+  resolveProxyStatusAccountIdentity,
+} from "../src/lib/proxy/codexAccountUsage.js";
+import {
+  CodexFallbackResponseError,
+  consumeCodexFallbackResponse,
+  createCodexFallbackStream,
+  convertClaudeRequestToCodex,
+  parseCodexFallbackSSE,
+} from "../src/lib/proxy/codexFallback.js";
+import { runWithShareContext } from "../src/lib/proxy/shareContext.js";
+import {
+  loadProxyConfig,
+  parseRoutingConfig,
+  validateProxyConfig,
+} from "../src/lib/proxy/proxyConfig.js";
+import { ProxyRuntimeConfigStore } from "../src/lib/proxy/runtimeConfig.js";
+import { logger } from "../src/lib/utils/logger.js";
+import { TokenStore, tokenStore } from "../src/lib/auth/tokenStore.js";
+import { setVertexAccessTokenProviderForTests } from "../src/lib/proxy/vertexAnthropicFallback.js";
+import {
+  __testHooks as claudeProxyTestHooks,
+  createClaudeProxyRoutes,
+} from "../src/lib/server/routes/claudeProxyRoutes.js";
+import {
+  __testHooks,
+  createCodexProxyRoutes,
+} from "../src/lib/server/routes/codexProxyRoutes.js";
+import {
+  classifyCodexOutboundFailure,
+  MAX_ENGINE_CROSSINGS,
+  parseCodexErrorCode,
+  parseCodexNativeRequest,
+  translateCodexRequestToClaude,
+} from "../src/lib/proxy/codexOutboundFallback.js";
+import {
+  ANTHROPIC_MAX_CACHE_BREAKPOINTS,
+  applyClaudeRequestCacheBreakpoints,
+  countAnthropicCacheMarkers,
+} from "../src/lib/utils/anthropicCacheBreakpoints.js";
+import {
+  ClaudeSystemPrefixShapeError,
+  assertClaudeMessagesAlternate,
+  assertClaudeSystemPrefixShape,
+  codexAnthropicAffinityKey,
+} from "../src/lib/proxy/codexOutboundCache.js";
+import type {
+  AccountCoolingReason,
+  ClaudeMessage,
+  ClaudeRequest,
+  ClaudeTextBlock,
+  CodexNativeRequest,
+  CodexRuntimeAccount,
+  CodexResponsesRequest,
+  ProxyShareRequestContext,
+  ServerContext,
+} from "../src/lib/types/index.js";
+import { assert, assertEqual, defineSuite, runCLI } from "./helpers/harness.js";
+
+const { test, runSuite } = defineSuite("Codex Pool Engine", {
+  offline: true,
+});
+
+/** Fixed clock so reset arithmetic is deterministic. */
+const NOW = 1_800_000_000_000;
+const NOW_SECONDS = Math.floor(NOW / 1000);
+const BORROWED_REQUEST_CONTEXT: ProxyShareRequestContext = {
+  grantId: "test-grant",
+  peerLabel: "test-peer",
+  level: "live",
+  gates: {},
+  ledger: "unlimited",
+};
+
+await test("absent and malformed Codex quota windows remain unknown", () => {
+  for (const limits of [
+    undefined,
+    {},
+    { primary: {} },
+    { primary: { used_percent: Number.NaN } },
+    { primary: { used_percent: -1 }, secondary: { used_percent: -20 } },
+  ]) {
+    const quota = codexRateLimitsToQuota(limits, NOW);
+    assertEqual(
+      quota.sessionStatus,
+      "unknown",
+      "missing session evidence became permission",
+    );
+    assertEqual(
+      quota.weeklyStatus,
+      "unknown",
+      "missing weekly evidence became permission",
+    );
+    assert(
+      quota.windows?.every((window) => window.status === "unknown") ?? true,
+      "a missing window measurement became available capacity",
+    );
+  }
+  const known = codexRateLimitsToQuota({ primary: { used_percent: 0 } }, NOW);
+  assertEqual(known.sessionStatus, "allowed", "an explicit zero was lost");
+  assertEqual(
+    known.weeklyStatus,
+    "unknown",
+    "a partial snapshot invented weekly evidence",
+  );
+});
+
+await test("Codex fallback preserves reasoning in buffered and streaming usage", async () => {
+  const sse = `event: response.completed\ndata: ${JSON.stringify({
+    type: "response.completed",
+    response: {
+      status: "completed",
+      output: [
+        { type: "message", content: [{ type: "output_text", text: "ok" }] },
+      ],
+      usage: {
+        input_tokens: 100,
+        output_tokens: 20,
+        input_tokens_details: { cached_tokens: 50 },
+        output_tokens_details: { reasoning_tokens: 15 },
+      },
+    },
+  })}\n\n`;
+  const buffered = parseCodexFallbackSSE(sse);
+  assertEqual(
+    buffered.usage?.reasoning,
+    15,
+    "buffered reasoning usage was lost",
+  );
+  assertEqual(buffered.usage?.total, 120, "reasoning was charged twice");
+  const bridge = await createCodexFallbackStream(
+    new Response(sse, { headers: { "content-type": "text/event-stream" } }),
+    "claude-test",
+  );
+  try {
+    let next = await bridge.frames.next();
+    while (!next.done) {
+      next = await bridge.frames.next();
+    }
+    assertEqual(
+      next.value.usage?.reasoning,
+      15,
+      "streaming reasoning usage was lost",
+    );
+    assertEqual(
+      next.value.usage?.total,
+      120,
+      "streaming reasoning was charged twice",
+    );
+  } finally {
+    await bridge.cancel();
+  }
+});
+
+await test("proxy spans count Codex cache and reasoning subsets exactly once", async () => {
+  const { NodeTracerProvider } = await import("@opentelemetry/sdk-trace-node");
+  const { InMemorySpanExporter, SimpleSpanProcessor } =
+    await import("@opentelemetry/sdk-trace-base");
+  const { trace } = await import("@opentelemetry/api");
+  const { ProxyTracer } = await import("../src/lib/proxy/proxyTracer.js");
+  const exporter = new InMemorySpanExporter();
+  const provider = new NodeTracerProvider({
+    spanProcessors: [new SimpleSpanProcessor(exporter)],
+  });
+  trace.disable();
+  provider.register();
+  try {
+    for (const billingProvider of ["openai", "anthropic"]) {
+      const tracer = ProxyTracer.startRequest({
+        requestId: `usage-${billingProvider}`,
+        method: "POST",
+        path: "/fixture",
+        model: billingProvider === "openai" ? "gpt-6-astra" : "claude-sonnet-5",
+        stream: true,
+        toolCount: 0,
+        provider: billingProvider,
+      });
+      tracer.setUsage({
+        inputIncludesCachedTokens: billingProvider === "openai",
+        inputTokens: 100,
+        outputTokens: 20,
+        cacheReadTokens: 50,
+        cacheCreationTokens: 10,
+        reasoningTokens: 15,
+      });
+      tracer.end(200, 1);
+    }
+    await provider.forceFlush();
+    const spans = exporter.getFinishedSpans();
+    assertEqual(
+      spans[0]?.attributes["ai.tokens.total"],
+      120,
+      "Codex subsets inflated total usage",
+    );
+    assertEqual(
+      spans[1]?.attributes["ai.tokens.total"],
+      180,
+      "Anthropic separate cache input was lost",
+    );
+    assertEqual(
+      spans[0]?.attributes["ai.tokens.reasoning"],
+      15,
+      "reasoning breakdown was lost",
+    );
+    for (const [index, span] of spans.entries()) {
+      const attrs = span.attributes;
+      assertEqual(
+        attrs["ai.tokens.input"],
+        index === 0 ? 40 : 100,
+        "custom input attribute still includes cache tokens",
+      );
+      assertEqual(
+        Number(attrs["ai.tokens.input"]) +
+          Number(attrs["ai.tokens.output"]) +
+          Number(attrs["ai.tokens.cache_read"]) +
+          Number(attrs["ai.tokens.cache_creation"]),
+        attrs["ai.tokens.total"],
+        "custom token buckets do not reconcile with the total",
+      );
+      assertEqual(
+        attrs["proxy.usage.input_tokens"],
+        index === 0 ? 100 : 160,
+        "standard input attribute lost cache-inclusive semantics",
+      );
+    }
+  } finally {
+    await provider.shutdown();
+    trace.disable();
+  }
+});
+
+await test("body-only Codex quota exhaustion retains reset evidence without guessing scope", () => {
+  const text = JSON.stringify({
+    error: { type: "usage_limit_reached", resets_at: NOW_SECONDS + 3 * 86400 },
+  });
+  const plan = __testHooks.planCodexCooldown(null, 0, NOW, text);
+  assertEqual(
+    plan.reason,
+    "unified",
+    "plan exhaustion became a burst throttle",
+  );
+  assertEqual(
+    plan.coolingUntil,
+    NOW + 15 * 60_000,
+    "ambiguous quota scope parked the whole account indefinitely",
+  );
+  const session = __testHooks.planCodexCooldown(
+    null,
+    0,
+    NOW,
+    JSON.stringify({
+      error: {
+        type: "usage_limit_reached",
+        limit_type: "primary",
+        resets_in_seconds: 7200,
+      },
+    }),
+  );
+  assertEqual(
+    session.reason,
+    "session",
+    "explicit short-window scope was lost",
+  );
+  assertEqual(
+    session.coolingUntil,
+    NOW + 7200_000,
+    "explicit window reset was lost",
+  );
+  const invalid = __testHooks.planCodexCooldown(null, 0, NOW, "{broken");
+  assertEqual(
+    invalid.reason,
+    "transient",
+    "malformed error invented quota evidence",
+  );
+});
+
+function account(
+  label: string,
+  over: Partial<CodexRuntimeAccount> = {},
+): CodexRuntimeAccount {
+  return {
+    key: `codex:${label}`,
+    label,
+    token: "t",
+    ...over,
+  } as CodexRuntimeAccount;
+}
+
+// ---------------------------------------------------------------------------
+// Status identity
+// ---------------------------------------------------------------------------
+
+await test("status keeps same-label Anthropic and Codex cooldowns separate", () => {
+  const label = "shared@example.com";
+  const anthropic = resolveProxyStatusAccountIdentity(label, "oauth");
+  const codex = resolveProxyStatusAccountIdentity(label, "codex-oauth");
+
+  assertEqual(
+    anthropic.key,
+    "anthropic:shared@example.com",
+    "Anthropic status must use the Anthropic account key",
+  );
+  assertEqual(
+    codex.key,
+    "codex:shared@example.com",
+    "Codex status must use the Codex account key",
+  );
+  assert(
+    anthropic.provider !== codex.provider && anthropic.key !== codex.key,
+    "a shared email must not share provider cooldown state",
+  );
+});
+
+await test("status treats Anthropic API-key accounts as Anthropic", () => {
+  const apiKey = resolveProxyStatusAccountIdentity("env", "api_key");
+  assertEqual(
+    apiKey.provider,
+    "anthropic",
+    "Anthropic API-key rows must retain their provider identity",
+  );
+  assertEqual(
+    apiKey.key,
+    "anthropic:env",
+    "Anthropic API-key rows must use the Anthropic cooldown key",
+  );
+});
+
+await test("borrowed Codex fallback hides lender attribution headers", () => {
+  const headers = runWithShareContext(BORROWED_REQUEST_CONTEXT, () =>
+    claudeProxyTestHooks.redactHeadersForBorrower({
+      "x-neurolink-account": "lender@example.com",
+      "x-neurolink-account-type": "codex-oauth",
+      "x-neurolink-pool-accounts": "3",
+      "x-neurolink-served-by": "codex",
+    }),
+  );
+
+  assertEqual(
+    headers["x-neurolink-account"],
+    undefined,
+    "borrowed fallback exposed the lender account label",
+  );
+  assertEqual(
+    headers["x-neurolink-account-type"],
+    undefined,
+    "borrowed fallback exposed the lender account type",
+  );
+  assertEqual(
+    headers["x-neurolink-pool-accounts"],
+    undefined,
+    "borrowed fallback exposed lender pool metadata",
+  );
+  assertEqual(
+    headers["x-neurolink-served-by"],
+    "codex",
+    "borrowed fallback hid provider attribution",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Ordering
+// ---------------------------------------------------------------------------
+
+await test("orderCodexAccounts puts cooling accounts last", () => {
+  const cooling = account("cooling", { coolingUntil: NOW + 60_000 });
+  const ready = account("ready", {
+    quota: { sessionUsed: 0.9 } as CodexRuntimeAccount["quota"],
+  });
+  const order = __testHooks
+    .orderCodexAccounts([cooling, ready], NOW)
+    .map((a) => a.label);
+  assertEqual(
+    order.join(","),
+    "ready,cooling",
+    "a cooling account must sort behind a usable one even at higher utilization",
+  );
+});
+
+await test("orderCodexAccounts probes an account with no quota first", () => {
+  // Ranking unknowns last starves them: never picked means never observed.
+  const known = account("known", {
+    quota: { sessionUsed: 0.1 } as CodexRuntimeAccount["quota"],
+  });
+  const unknown = account("unknown");
+  const order = __testHooks
+    .orderCodexAccounts([known, unknown], NOW)
+    .map((a) => a.label);
+  assertEqual(
+    order.join(","),
+    "unknown,known",
+    "an unobserved account must be probed ahead of a known one",
+  );
+});
+
+await test("orderCodexAccounts defers rejected quota without starving fresh accounts", () => {
+  const rejected = account("rejected", {
+    quota: codexRateLimitsToQuota(
+      { allowed: false, primary: { used_percent: 0 } },
+      NOW,
+    ),
+  });
+  const rejectedUnknown = account("rejected-unknown", {
+    quota: codexRateLimitsToQuota({ limit_reached: true }, NOW),
+  });
+  const usable = account("usable", {
+    quota: codexRateLimitsToQuota(
+      { allowed: true, primary: { used_percent: 60 } },
+      NOW,
+    ),
+  });
+  const fresh = account("fresh");
+  const cooling = account("cooling", { coolingUntil: NOW + 60_000 });
+  const ordered = __testHooks.orderCodexAccounts(
+    [rejected, usable, rejectedUnknown, fresh, cooling],
+    NOW,
+  );
+  assertEqual(
+    ordered.map((entry) => entry.label).join(","),
+    "fresh,usable,rejected-unknown,rejected,cooling",
+    "rejected quota outranked usable capacity or excluded recovery probes",
+  );
+});
+
+await test("orderCodexAccounts fills the least-used account first", () => {
+  const heavy = account("heavy", {
+    quota: { sessionUsed: 0.8 } as CodexRuntimeAccount["quota"],
+  });
+  const light = account("light", {
+    quota: { sessionUsed: 0.2 } as CodexRuntimeAccount["quota"],
+  });
+  const order = __testHooks
+    .orderCodexAccounts([heavy, light], NOW)
+    .map((a) => a.label);
+  assertEqual(
+    order.join(","),
+    "light,heavy",
+    "ordering must be least-used first",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Cooldown planning
+// ---------------------------------------------------------------------------
+
+await test("planCodexCooldown cools to the real reset for an exhausted window", () => {
+  const weeklyReset = NOW_SECONDS + 3 * 24 * 3600;
+  const weekly = __testHooks.planCodexCooldown(
+    {
+      sessionUsed: 0.2,
+      sessionStatus: "allowed",
+      sessionResetAt: 0,
+      weeklyUsed: 1,
+      weeklyStatus: "rejected",
+      weeklyResetAt: weeklyReset,
+      fallbackPercentage: 0,
+      overageStatus: "rejected",
+      lastUpdated: NOW,
+    },
+    0,
+    NOW,
+  );
+  assertEqual(
+    weekly.reason,
+    "weekly",
+    "an exhausted 7d window must cool weekly",
+  );
+  assertEqual(
+    weekly.coolingUntil,
+    weeklyReset * 1000,
+    "a weekly cooldown must end at the provider reset",
+  );
+});
+
+await test("planCodexCooldown falls back to transient without a usable reset", () => {
+  // A rejected window with no reset cannot be waited out precisely; the
+  // transient ceiling keeps the account out of rotation without stranding it.
+  const plan = __testHooks.planCodexCooldown(
+    {
+      sessionUsed: 1,
+      sessionStatus: "rejected",
+      sessionResetAt: 0,
+      weeklyUsed: 0,
+      weeklyStatus: "allowed",
+      weeklyResetAt: 0,
+      fallbackPercentage: 0,
+      overageStatus: "rejected",
+      lastUpdated: NOW,
+    },
+    0,
+    NOW,
+  );
+  assertEqual(
+    plan.reason,
+    "transient",
+    "a resetless rejection must be transient",
+  );
+  assert(
+    plan.coolingUntil > NOW && plan.coolingUntil <= NOW + 15 * 60 * 1000,
+    "a transient cooldown must stay within the 15 minute ceiling",
+  );
+});
+
+await test("planCodexCooldown clamps a retry-after beyond the ceiling", () => {
+  const plan = __testHooks.planCodexCooldown(null, 60 * 60 * 1000, NOW);
+  assertEqual(
+    plan.coolingUntil,
+    NOW + 15 * 60 * 1000,
+    "an hour-long retry-after must clamp to the transient ceiling",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Upstream headers
+// ---------------------------------------------------------------------------
+
+await test("buildCodexUpstreamHeaders replaces client credentials and forwards only protocol headers", () => {
+  const headers = __testHooks.buildCodexUpstreamHeaders(
+    {
+      authorization: "Bearer client-token",
+      "x-api-key": "client-key",
+      cookie: "session=1",
+      "chatgpt-account-id": "client-account",
+      "accept-encoding": "gzip",
+      "x-keep-me": "yes",
+      "X-Codex-Turn-Metadata": "turn-1",
+      session_id: "session-1",
+      conversation_id: "conversation-1",
+      "openai-beta": "responses=experimental",
+      "x-neurolink-share-token": "local-share-token",
+      "x-forwarded-for": "203.0.113.1",
+      traceparent: "local-trace",
+    },
+    account("a", { token: "pool-token", accountId: "pool-account" }),
+  );
+
+  assertEqual(
+    headers.authorization,
+    "Bearer pool-token",
+    "the pooled account's bearer must replace the caller's",
+  );
+  assertEqual(
+    headers["chatgpt-account-id"],
+    "pool-account",
+    "the account id must match the pooled bearer, not the caller's",
+  );
+  for (const blocked of [
+    "x-api-key",
+    "cookie",
+    "accept-encoding",
+    "x-keep-me",
+    "x-neurolink-share-token",
+    "x-forwarded-for",
+    "traceparent",
+  ]) {
+    assert(
+      headers[blocked] === undefined,
+      `header must not be forwarded upstream: ${blocked}`,
+    );
+  }
+  for (const [name, value] of Object.entries({
+    "x-codex-turn-metadata": "turn-1",
+    session_id: "session-1",
+    conversation_id: "conversation-1",
+    "openai-beta": "responses=experimental",
+  })) {
+    assertEqual(
+      headers[name],
+      value,
+      `protocol header must pass through: ${name}`,
+    );
+  }
+});
+
+await test("buildCodexUpstreamHeaders defaults identity headers only when absent", () => {
+  const supplied = __testHooks.buildCodexUpstreamHeaders(
+    {
+      "user-agent": "mine",
+      originator: "mine-too",
+      accept: "application/json",
+    },
+    account("a"),
+  );
+  assertEqual(supplied["user-agent"], "mine", "a supplied user-agent must win");
+  assertEqual(
+    supplied.originator,
+    "mine-too",
+    "a supplied originator must win",
+  );
+  assertEqual(
+    supplied.accept,
+    "application/json",
+    "a supplied accept must win",
+  );
+
+  const defaulted = __testHooks.buildCodexUpstreamHeaders({}, account("a"));
+  assert(
+    typeof defaulted["user-agent"] === "string" &&
+      defaulted["user-agent"].length > 0,
+    "a user-agent must be supplied when the caller omits one",
+  );
+  assertEqual(
+    defaulted.accept,
+    "text/event-stream",
+    "the streaming accept must be defaulted",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Quota parsing
+// ---------------------------------------------------------------------------
+
+await test("codexRateLimitsToQuota normalizes percentages and resets", () => {
+  const quota = codexRateLimitsToQuota(
+    {
+      primary: { used_percent: 40, resets_in_seconds: 3600 },
+      secondary: { used_percent: 100, resets_at: NOW_SECONDS + 86_400 },
+    },
+    NOW,
+  );
+  assertEqual(quota.sessionUsed, 0.4, "percentages must become 0-1 fractions");
+  assertEqual(
+    quota.sessionResetAt,
+    NOW_SECONDS + 3600,
+    "a relative reset must resolve against the clock",
+  );
+  assertEqual(
+    quota.weeklyStatus,
+    "rejected",
+    "a fully spent window must read as rejected",
+  );
+  assertEqual(quota.windows?.length, 2, "both windows must be captured");
+});
+
+await test("codexRateLimitsToQuota accepts reset_after as a relative reset", () => {
+  // Without this alias a cooldown loses the real reset and degrades to the
+  // transient ceiling, which is what re-hammers an exhausted account.
+  const quota = codexRateLimitsToQuota(
+    { primary: { used_percent: 100, reset_after: 1800 } },
+    NOW,
+  );
+  assertEqual(
+    quota.sessionResetAt,
+    NOW_SECONDS + 1800,
+    "reset_after must resolve to an absolute reset",
+  );
+});
+
+await test("Codex usage refresh follows the WHAM account protocol", async () => {
+  const token = fakeCodexJwt({ chatgpt_account_id: "acct-usage" });
+  const originalFetch = globalThis.fetch;
+  const beforeFetch = Math.floor(Date.now() / 1000);
+  let request: { url: string; init?: RequestInit } | undefined;
+  globalThis.fetch = (async (input, init) => {
+    request = { url: input.toString(), init };
+    return new Response(
+      JSON.stringify({
+        plan_type: "pro",
+        rate_limit: {
+          allowed: true,
+          limit_reached: false,
+          primary_window: { used_percent: 40, reset_after_seconds: 3600 },
+          secondary_window: { used_percent: 80, reset_at: NOW_SECONDS + 86400 },
+        },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  }) as typeof globalThis.fetch;
+  try {
+    const result = await fetchCodexAccountUsage({
+      key: "codex:usage@example.com",
+      label: "usage@example.com",
+      token,
+      type: "oauth",
+    });
+    assert(result.ok, "WHAM usage response was not accepted");
+    if (!result.ok) {
+      return;
+    }
+    assertEqual(result.quota.sessionUsed, 0.4, "primary usage was not parsed");
+    assert(
+      result.quota.sessionResetAt >= beforeFetch + 3599 &&
+        result.quota.sessionResetAt <= beforeFetch + 3601,
+      "reset_after_seconds was not resolved",
+    );
+    assertEqual(result.quota.weeklyUsed, 0.8, "secondary usage was not parsed");
+    assertEqual(
+      result.quota.weeklyResetAt,
+      NOW_SECONDS + 86400,
+      "reset_at was not preserved",
+    );
+    assertEqual(
+      request?.url,
+      "https://chatgpt.com/backend-api/wham/usage",
+      "usage refresh did not call the WHAM account endpoint",
+    );
+    const headers = new Headers(request?.init?.headers);
+    assertEqual(
+      headers.get("chatgpt-account-id"),
+      "acct-usage",
+      "account identity was omitted",
+    );
+    assertEqual(
+      headers.get("authorization"),
+      `Bearer ${token}`,
+      "usage refresh did not send its account bearer",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+await test("parseCodexRateLimitHeaders tolerates absent and malformed headers", () => {
+  assertEqual(
+    parseCodexRateLimitHeaders(new Headers(), NOW),
+    null,
+    "no rate-limit header must yield no quota",
+  );
+  assertEqual(
+    parseCodexRateLimitHeaders(
+      new Headers({ "x-codex-ratelimit": "{not json" }),
+      NOW,
+    ),
+    null,
+    "a malformed header must yield no quota rather than throwing",
+  );
+});
+
+await test("parseCodexRateLimitHeaders reads both the bare and enveloped shapes", () => {
+  const bare = parseCodexRateLimitHeaders(
+    new Headers({
+      "x-codex-ratelimit": JSON.stringify({
+        primary: { used_percent: 25 },
+      }),
+    }),
+    NOW,
+  );
+  assertEqual(bare?.sessionUsed, 0.25, "the bare rate-limit shape must parse");
+
+  const enveloped = parseCodexRateLimitHeaders(
+    new Headers({
+      "x-codex-active-limit": JSON.stringify({
+        rate_limits: { primary: { used_percent: 75 } },
+      }),
+    }),
+    NOW,
+  );
+  assertEqual(
+    enveloped?.sessionUsed,
+    0.75,
+    "the enveloped rate-limit shape must parse",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Refresh-failure classification
+// ---------------------------------------------------------------------------
+
+await test("only a rejected grant counts as a permanent refresh failure", () => {
+  // Getting this wrong disables a working account, and `auth cleanup` then
+  // deletes the credential — a network blip must never cost the user a login.
+  for (const status of [400, 401, 403]) {
+    assert(
+      isPermanentCodexRefreshFailure(Object.assign(new Error("x"), { status })),
+      `an authorization-server rejection must be permanent: ${status}`,
+    );
+  }
+  for (const status of [500, 502, 503, 504]) {
+    assert(
+      !isPermanentCodexRefreshFailure(
+        Object.assign(new Error("x"), { status }),
+      ),
+      `a server-side failure must not be permanent: ${status}`,
+    );
+  }
+  assert(
+    !isPermanentCodexRefreshFailure(new Error("network timeout")),
+    "an error carrying no status must not be permanent",
+  );
+  assert(
+    !isPermanentCodexRefreshFailure(undefined),
+    "a missing error must not be permanent",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Key-space consistency
+// ---------------------------------------------------------------------------
+
+await test("stored codex keys stay fully qualified and cannot collide", async () => {
+  // Cooldowns and quota live in stores shared with the Anthropic engine, keyed
+  // by account. If enumeration ever returned a bare label, a codex account and
+  // an anthropic account with the same name would read and write each other's
+  // state. Driven through a real TokenStore rather than a hand-built object, so
+  // a change in the enumeration path is actually caught.
+  const { TokenStore } = await import("../src/lib/auth/tokenStore.js");
+  const { CODEX_ACCOUNT_PREFIX } =
+    await import("../src/lib/proxy/codexAccountUsage.js");
+  const store = new TokenStore({
+    encryptionEnabled: false,
+    customStoragePath: join(
+      mkdtempSync(join(tmpdir(), "neurolink-codex-store-")),
+      "tokens.json",
+    ),
+  });
+  const tokens = {
+    accessToken: "a",
+    refreshToken: "r",
+    expiresAt: Date.now() + 3_600_000,
+    tokenType: "Bearer" as const,
+  };
+  await store.saveTokens("codex:alice", tokens);
+  await store.saveTokens("anthropic:alice", tokens);
+
+  const codexKeys = await store.listByPrefix(CODEX_ACCOUNT_PREFIX);
+  assertEqual(codexKeys.length, 1, "only the codex entry may match the prefix");
+  assertEqual(
+    codexKeys[0],
+    "codex:alice",
+    "enumeration must return the fully qualified key",
+  );
+  assertEqual(
+    codexKeys[0].slice(CODEX_ACCOUNT_PREFIX.length),
+    "alice",
+    "the display label is the key minus exactly its provider prefix",
+  );
+
+  const anthropicKeys = await store.listByPrefix("anthropic:");
+  assertEqual(
+    anthropicKeys.length,
+    1,
+    "the same bare label under another provider must stay separate",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Credential import and claim decoding
+// ---------------------------------------------------------------------------
+
+/** Build a JWT whose payload carries the OpenAI auth claim, unsigned. */
+function fakeCodexJwt(claim: Record<string, unknown>): string {
+  const b64 = (o: unknown): string =>
+    Buffer.from(JSON.stringify(o))
+      .toString("base64")
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+  return `${b64({ alg: "none" })}.${b64({
+    "https://api.openai.com/auth": claim,
+  })}.sig`;
+}
+
+await test("decodeCodexAccessToken reads the account id and plan from the claim", () => {
+  const token = fakeCodexJwt({
+    chatgpt_account_id: "acct-123",
+    chatgpt_plan_type: "plus",
+  });
+  const decoded = decodeCodexAccessToken(token);
+  assertEqual(decoded.accountId, "acct-123", "the account id must be decoded");
+  assertEqual(decoded.planType, "plus", "the plan type must be decoded");
+});
+
+await test("token decoding never throws on malformed input", () => {
+  // These values arrive from a file on disk, so a parse failure must degrade to
+  // "unknown" rather than take down the pool build that calls it per account.
+  for (const bad of ["", "not-a-jwt", "a.b", "a.!!!.c"]) {
+    const decoded = decodeCodexAccessToken(bad);
+    assert(
+      decoded.accountId === undefined || typeof decoded.accountId === "string",
+      "a malformed token must decode to a defined shape",
+    );
+  }
+  assertEqual(
+    resolveCodexAccountId("not-a-jwt"),
+    undefined,
+    "an unparseable token must resolve to no account id",
+  );
+  assertEqual(
+    resolveCodexAccountId("not-a-jwt", "explicit-id"),
+    "explicit-id",
+    "an explicitly supplied account id must win over decoding",
+  );
+});
+
+await test("importCodexAuthFile rejects credentials that cannot be pooled", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "neurolink-codex-auth-"));
+
+  const noTokens = join(dir, "no-tokens.json");
+  writeFileSync(noTokens, JSON.stringify({ auth_mode: "chatgpt" }));
+  let rejected = false;
+  try {
+    await importCodexAuthFile(noTokens);
+  } catch {
+    rejected = true;
+  }
+  assert(rejected, "a file with no access token must be rejected");
+
+  // An API-key login has no subscription to pool, so accepting it would put a
+  // credential in the pool that can never serve the subscription endpoint.
+  const apiKeyMode = join(dir, "apikey.json");
+  writeFileSync(
+    apiKeyMode,
+    JSON.stringify({
+      auth_mode: "apikey",
+      tokens: { access_token: fakeCodexJwt({ chatgpt_account_id: "a" }) },
+    }),
+  );
+  rejected = false;
+  try {
+    await importCodexAuthFile(apiKeyMode);
+  } catch {
+    rejected = true;
+  }
+  assert(rejected, "a non-chatgpt auth mode must be rejected");
+
+  const ok = join(dir, "ok.json");
+  writeFileSync(
+    ok,
+    JSON.stringify({
+      auth_mode: "chatgpt",
+      tokens: {
+        access_token: fakeCodexJwt({
+          chatgpt_account_id: "acct-9",
+          chatgpt_plan_type: "pro",
+        }),
+        refresh_token: "r",
+      },
+    }),
+  );
+  const credential = await importCodexAuthFile(ok);
+  assertEqual(
+    credential.accountId,
+    "acct-9",
+    "the account id must survive import",
+  );
+  assertEqual(credential.planType, "pro", "the plan type must survive import");
+});
+
+await test("a proactive refresh stays single-flight until the rotated token persists", async () => {
+  // OpenAI rotates the refresh token on every call. The second caller starts
+  // after the first has received its response but before the first write
+  // completes: releasing the lock early would call the authorization server
+  // again with r1, which is how a healthy account gets disabled.
+  const { TokenStore } = await import("../src/lib/auth/tokenStore.js");
+  const store = new TokenStore({
+    encryptionEnabled: false,
+    customStoragePath: join(
+      mkdtempSync(join(tmpdir(), "neurolink-codex-refresh-")),
+      "tokens.json",
+    ),
+  });
+  await store.saveTokens("codex:shared", {
+    accessToken: "old-access",
+    refreshToken: "r1",
+    expiresAt: Date.now() + 3_600_000,
+    tokenType: "Bearer",
+  });
+
+  let calls = 0;
+  let releaseRefresh: (() => void) | undefined;
+  const refreshReleased = new Promise<void>((resolve) => {
+    releaseRefresh = resolve;
+  });
+  let refreshStarted: (() => void) | undefined;
+  const refreshStartedPromise = new Promise<void>((resolve) => {
+    refreshStarted = resolve;
+  });
+  let releaseSave: (() => void) | undefined;
+  const saveReleased = new Promise<void>((resolve) => {
+    releaseSave = resolve;
+  });
+  let saveStarted: (() => void) | undefined;
+  const saveStartedPromise = new Promise<void>((resolve) => {
+    saveStarted = resolve;
+  });
+  const delayedStore = {
+    peekTokens: store.peekTokens.bind(store),
+    saveTokens: async (...args: Parameters<typeof store.saveTokens>) => {
+      saveStarted?.();
+      await saveReleased;
+      await store.saveTokens(...args);
+    },
+  };
+  const refresh = async () => {
+    calls += 1;
+    refreshStarted?.();
+    await refreshReleased;
+    return {
+      accessToken: fakeCodexJwt({}),
+      refreshToken: "r2",
+      expiresAt: Date.now() + 3_600_000,
+    };
+  };
+
+  const first = __testHooks.refreshCodexTokenOnceWithDependencies(
+    "codex:shared",
+    "r1",
+    delayedStore,
+    refresh,
+  );
+  await refreshStartedPromise;
+  releaseRefresh?.();
+  await saveStartedPromise;
+  const second = __testHooks.refreshCodexTokenOnceWithDependencies(
+    "codex:shared",
+    "r1",
+    delayedStore,
+    refresh,
+  );
+  assertEqual(
+    calls,
+    1,
+    "a caller during token persistence must share the original refresh",
+  );
+  releaseSave?.();
+
+  const results = await Promise.all([first, second]);
+  assert(
+    results.every((result) => result.refreshToken === "r2"),
+    "every caller must receive the same rotated token",
+  );
+  assertEqual(
+    (await store.peekTokens("codex:shared"))?.refreshToken,
+    "r2",
+    "the rotated token must persist before the single-flight lock releases",
+  );
+  assertEqual(
+    __testHooks.codexRefreshInFlightSize(),
+    0,
+    "the in-flight entry must be released after settling",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Shipped surface
+// ---------------------------------------------------------------------------
+//
+// The cases above drive helpers directly under the determinism exception, so
+// they would all still pass if the built package never wired Codex up. These
+// drive `node dist/cli/index.js` instead, which is the only thing that proves
+// the engine is reachable by a user.
+
+await test("the built CLI exposes codex as an auth provider", async () => {
+  const result = await runCLI(["auth", "--help"]);
+  assertEqual(result.exitCode, 0, "auth --help must succeed");
+  const output = `${result.stdout}${result.stderr}`;
+  assert(
+    output.includes("login <provider>"),
+    "auth --help must list the login subcommand",
+  );
+
+  // A provider the CLI does not accept fails validation; codex must not.
+  const home = mkdtempSync(join(tmpdir(), "neurolink-codex-cli-"));
+  const rejected = await runCLI(["auth", "login", "nosuchprovider"], {
+    env: { HOME: home, USERPROFILE: home },
+  });
+  assert(
+    rejected.exitCode !== 0,
+    "an unknown provider must be rejected by the built CLI",
+  );
+});
+
+await test("the built CLI enters the codex import path and reports the missing credential", async () => {
+  // An isolated HOME has no ~/.codex/auth.json, so the import path must fail
+  // fast with a diagnostic rather than prompting or hanging.
+  const home = mkdtempSync(join(tmpdir(), "neurolink-codex-cli-"));
+  const result = await runCLI(["auth", "login", "codex"], {
+    env: { HOME: home, USERPROFILE: home },
+    timeoutMs: 60_000,
+  });
+  const output = `${result.stdout}${result.stderr}`;
+
+  // Assert the Codex-specific diagnostic, not merely a non-zero exit mentioning
+  // "codex": an unregistered provider would fail with "unknown provider: codex"
+  // and satisfy a looser check while proving the opposite of what we want.
+  assert(
+    output.includes(".codex/auth.json"),
+    "the CLI must resolve the Codex credential path, proving it entered the import flow",
+  );
+  assert(
+    output.includes("Importing Codex"),
+    "the CLI must announce the Codex import step",
+  );
+  assert(
+    !/unknown provider|unsupported provider/i.test(output),
+    "codex must be a registered provider on the built CLI",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Codex SSE usage tap (issue #1369)
+//
+// The wire shape is verified against live traffic: the fixture case below
+// asserts against `test/fixtures/codex-response-usage.sse`, captured from a
+// real `codex exec` run through the proxy. These cases pin the parser's
+// contract on top of that: recognised shapes yield counts, unrecognised ones
+// yield null (never zero), and the tap never alters the bytes it relays.
+// ---------------------------------------------------------------------------
+
+await test("codex usage tap bounds a stream with no line breaks", async () => {
+  // A hung upstream, or a non-SSE body relayed by mistake, can send bytes
+  // forever without a newline. The tap keeps the unterminated tail so the next
+  // chunk can complete the line, so without a ceiling that buffer grows for the
+  // life of the request — in the hot path of a live relay.
+  const { createCodexUsageTap } =
+    await import("../src/lib/proxy/codexUsage.js");
+  const { stream, usage } = createCodexUsageTap();
+  const encoder = new TextEncoder();
+  const blob = encoder.encode("x".repeat(256 * 1024));
+
+  const writer = stream.writable.getWriter();
+  const reader = stream.readable.getReader();
+  let relayed = 0;
+  const drain = (async () => {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      relayed += value.byteLength;
+    }
+  })();
+  for (let i = 0; i < 12; i += 1) {
+    await writer.write(blob);
+  }
+  await writer.close();
+  await drain;
+
+  // Every byte still reaches the client — the tap must never hold one back.
+  assert(
+    relayed === blob.byteLength * 12,
+    "usage tap did not relay every byte of a line-break-free stream",
+  );
+  assert((await usage) === null, "usage tap invented a reading from noise");
+});
+
+await test("codex usage tap reads the documented response.completed shape", async () => {
+  const { scanCodexSSEForUsage } =
+    await import("../src/lib/proxy/codexUsage.js");
+  const usage = scanCodexSSEForUsage(
+    [
+      "event: response.output_text.delta",
+      'data: {"type":"response.output_text.delta","delta":"hi"}',
+      "",
+      "event: response.completed",
+      'data: {"type":"response.completed","response":{"usage":{"input_tokens":1200,"output_tokens":340,"input_tokens_details":{"cached_tokens":900},"output_tokens_details":{"reasoning_tokens":128}}}}',
+      "",
+    ].join("\n"),
+  );
+  assert(usage !== null, "usage was not recognised in the documented shape");
+  assertEqual(usage?.inputTokens, 1200, "input token count mismatch");
+  assertEqual(usage?.outputTokens, 340, "output token count mismatch");
+  assertEqual(usage?.cacheReadTokens, 900, "cache-read token count mismatch");
+  assertEqual(usage?.reasoningTokens, 128, "reasoning token count mismatch");
+});
+
+await test("codex usage tap reports null rather than zero when unrecognised", async () => {
+  const { scanCodexSSEForUsage } =
+    await import("../src/lib/proxy/codexUsage.js");
+  const noUsage = scanCodexSSEForUsage(
+    [
+      "event: response.output_text.delta",
+      'data: {"type":"response.output_text.delta","delta":"hi"}',
+      "data: [DONE]",
+      "",
+    ].join("\n"),
+  );
+  assert(
+    noUsage === null,
+    "a stream with no usage must report null, not a zeroed object",
+  );
+});
+
+await test("codex usage tap survives malformed and partial payloads", async () => {
+  const { scanCodexSSEForUsage } =
+    await import("../src/lib/proxy/codexUsage.js");
+  const usage = scanCodexSSEForUsage(
+    [
+      "data: {not json at all",
+      'data: {"type":"response.completed","response":{"usa',
+      'data: {"usage":{"prompt_tokens":10,"completion_tokens":5}}',
+      "",
+    ].join("\n"),
+  );
+  assert(usage !== null, "the alternate token spelling was not recognised");
+  assertEqual(usage?.inputTokens, 10, "prompt_tokens was not mapped to input");
+  assertEqual(
+    usage?.outputTokens,
+    5,
+    "completion_tokens was not mapped to output",
+  );
+});
+
+await test("codex usage tap relays every byte unchanged", async () => {
+  const { createCodexUsageTap } =
+    await import("../src/lib/proxy/codexUsage.js");
+  const payload =
+    'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":7,"output_tokens":3}}}\n\n';
+  const { stream, usage } = createCodexUsageTap();
+
+  const source = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const bytes = new TextEncoder().encode(payload);
+      // Split mid-event to prove the tap reassembles across chunk boundaries
+      // without withholding or reordering bytes.
+      controller.enqueue(bytes.slice(0, 40));
+      controller.enqueue(bytes.slice(40));
+      controller.close();
+    },
+  });
+
+  const relayed: Uint8Array[] = [];
+  const reader = source.pipeThrough(stream).getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    relayed.push(value);
+  }
+  const out = new TextDecoder().decode(
+    new Uint8Array(relayed.flatMap((c) => Array.from(c))),
+  );
+  assertEqual(out, payload, "relayed bytes differ from the upstream payload");
+
+  const seen = await usage;
+  assert(seen !== null, "usage was not recovered across the chunk split");
+  assertEqual(seen?.inputTokens, 7, "input token count mismatch after split");
+});
+
+await test("codex usage tap captures a raw sample when opted in", async () => {
+  const fsMod = await import("fs");
+  const osMod = await import("os");
+  const pathMod = await import("path");
+  const { createCodexUsageTap } =
+    await import("../src/lib/proxy/codexUsage.js");
+
+  const dir = fsMod.mkdtempSync(pathMod.join(osMod.tmpdir(), "codex-cap-"));
+  const target = pathMod.join(dir, "sample.sse");
+  const prev = process.env.NEUROLINK_PROXY_CODEX_CAPTURE;
+  try {
+    process.env.NEUROLINK_PROXY_CODEX_CAPTURE = target;
+    const payload =
+      'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":9,"output_tokens":4}}}\n\n';
+    const { stream, usage } = createCodexUsageTap();
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(payload));
+        controller.close();
+      },
+    });
+    const reader = source.pipeThrough(stream).getReader();
+    for (;;) {
+      const { done } = await reader.read();
+      if (done) {
+        break;
+      }
+    }
+    await usage;
+
+    assert(
+      fsMod.existsSync(target),
+      "capture file was not written when opted in",
+    );
+    const written = fsMod.readFileSync(target, "utf8");
+    assertEqual(
+      written,
+      payload,
+      "captured bytes differ from the relayed payload",
+    );
+  } finally {
+    if (prev === undefined) {
+      delete process.env.NEUROLINK_PROXY_CODEX_CAPTURE;
+    } else {
+      process.env.NEUROLINK_PROXY_CODEX_CAPTURE = prev;
+    }
+    fsMod.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("codex usage tap writes nothing when capture is not opted in", async () => {
+  const fsMod = await import("fs");
+  const osMod = await import("os");
+  const pathMod = await import("path");
+  const { createCodexUsageTap } =
+    await import("../src/lib/proxy/codexUsage.js");
+
+  const dir = fsMod.mkdtempSync(pathMod.join(osMod.tmpdir(), "codex-nocap-"));
+  const target = pathMod.join(dir, "sample.sse");
+  const prev = process.env.NEUROLINK_PROXY_CODEX_CAPTURE;
+  try {
+    delete process.env.NEUROLINK_PROXY_CODEX_CAPTURE;
+    const { stream, usage } = createCodexUsageTap();
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("data: {}\n\n"));
+        controller.close();
+      },
+    });
+    const reader = source.pipeThrough(stream).getReader();
+    for (;;) {
+      const { done } = await reader.read();
+      if (done) {
+        break;
+      }
+    }
+    await usage;
+    assert(
+      !fsMod.existsSync(target),
+      "capture file was created without the opt-in env var",
+    );
+  } finally {
+    if (prev !== undefined) {
+      process.env.NEUROLINK_PROXY_CODEX_CAPTURE = prev;
+    }
+    fsMod.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("codex usage tap settles its promise when the stream is aborted", async () => {
+  const { createCodexUsageTap } =
+    await import("../src/lib/proxy/codexUsage.js");
+  const { stream, usage } = createCodexUsageTap();
+
+  const source = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('data: {"partial":true}\n'));
+    },
+  });
+
+  const piped = source.pipeThrough(stream);
+  const reader = piped.getReader();
+  await reader.read();
+  // Client hangs up mid-response — the normal case for a proxy: timeouts and
+  // disconnects abort rather than close cleanly, so flush() never runs.
+  await reader.cancel(new Error("client disconnected")).catch(() => undefined);
+
+  const settled = await Promise.race([
+    usage.then(() => "settled"),
+    new Promise((resolve) => setTimeout(() => resolve("hung"), 2000)),
+  ]);
+  assertEqual(
+    settled,
+    "settled",
+    "usage promise did not settle after an aborted stream",
+  );
+});
+
+await test("codex usage tap parses a stream captured from real traffic", async () => {
+  const fsMod = await import("fs");
+  const { scanCodexSSEForUsage } =
+    await import("../src/lib/proxy/codexUsage.js");
+  // Captured from a real `codex exec` run through the proxy on 2026-08-21 and
+  // trimmed to the usage envelope. This is what promotes the parser from
+  // written-to-spec to verified.
+  const fixture = fsMod.readFileSync(
+    new URL("./fixtures/codex-response-usage.sse", import.meta.url),
+    "utf8",
+  );
+  const usage = scanCodexSSEForUsage(fixture);
+  assert(usage !== null, "usage was not recognised in real captured traffic");
+  assertEqual(usage?.inputTokens, 17339, "input token count mismatch");
+  assertEqual(usage?.outputTokens, 7, "output token count mismatch");
+  assertEqual(usage?.cacheReadTokens, 8576, "cache-read token count mismatch");
+  assertEqual(usage?.reasoningTokens, 0, "reasoning token count mismatch");
+});
+
+await test("codex usage tap records cache-creation tokens", async () => {
+  const { extractCodexUsage } = await import("../src/lib/proxy/codexUsage.js");
+  // Real streams carry input_tokens_details.cache_write_tokens alongside
+  // cached_tokens. Cache writes bill at a premium, so dropping them
+  // under-reports cost.
+  const usage = extractCodexUsage({
+    type: "response.completed",
+    response: {
+      usage: {
+        input_tokens: 100,
+        output_tokens: 10,
+        input_tokens_details: { cached_tokens: 40, cache_write_tokens: 25 },
+      },
+    },
+  });
+  assert(usage !== null, "usage was not recognised");
+  assertEqual(usage?.cacheCreationTokens, 25, "cache-creation tokens dropped");
+  assertEqual(usage?.cacheReadTokens, 40, "cache-read token count mismatch");
+});
+
+await test("an unreported Codex cache count is unknown, not a zero cache hit", async () => {
+  const { extractCodexUsage } = await import("../src/lib/proxy/codexUsage.js");
+  // Input, output and reasoning each distinguish "the provider said nothing"
+  // from "the provider said zero". Cache tokens did not, so a reply that
+  // omits input_tokens_details was booked as a total cache miss — which drags
+  // every measured cache rate down by however many such replies arrive.
+  const silent = extractCodexUsage({
+    type: "response.completed",
+    response: { usage: { input_tokens: 100, output_tokens: 10 } },
+  });
+  assert(silent !== null, "usage was not recognised");
+  assertEqual(
+    silent?.cacheReadTokensObserved,
+    false,
+    "a missing cache breakdown must not read as observed",
+  );
+  assertEqual(
+    silent?.cacheCreationTokensObserved,
+    false,
+    "a missing cache-write count must not read as observed",
+  );
+
+  // A provider that genuinely reports zero is a different fact, and stays one.
+  const reportedZero = extractCodexUsage({
+    type: "response.completed",
+    response: {
+      usage: {
+        input_tokens: 100,
+        output_tokens: 10,
+        input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 },
+      },
+    },
+  });
+  assertEqual(
+    reportedZero?.cacheReadTokensObserved,
+    true,
+    "a reported zero must stay observed",
+  );
+  assertEqual(reportedZero?.cacheReadTokens, 0, "reported zero must survive");
+
+  // One field present must not vouch for its absent sibling: nonNegativeInt
+  // floors the missing one to 0, which would otherwise be recorded as a real
+  // cache-write of zero.
+  const readOnly = extractCodexUsage({
+    type: "response.completed",
+    response: {
+      usage: {
+        input_tokens: 100,
+        output_tokens: 10,
+        input_tokens_details: { cached_tokens: 40 },
+      },
+    },
+  });
+  assertEqual(
+    readOnly?.cacheReadTokensObserved,
+    true,
+    "a present cached_tokens is observed",
+  );
+  assertEqual(
+    readOnly?.cacheCreationTokensObserved,
+    false,
+    "an absent cache_write_tokens must not ride in on its sibling",
+  );
+
+  // A value nonNegativeInt will floor to 0 is not an observation either —
+  // JSON 1e400 parses to Infinity, and a negative count is equally invalid.
+  for (const bad of [Number.POSITIVE_INFINITY, Number.NaN, -5]) {
+    const invalid = extractCodexUsage({
+      type: "response.completed",
+      response: {
+        usage: {
+          input_tokens: 100,
+          output_tokens: 10,
+          input_tokens_details: { cached_tokens: bad },
+        },
+      },
+    });
+    assertEqual(
+      invalid?.cacheReadTokensObserved,
+      false,
+      `a cached_tokens of ${String(bad)} must not read as observed`,
+    );
+    assertEqual(
+      invalid?.cacheReadTokens,
+      0,
+      `a cached_tokens of ${String(bad)} must floor to 0`,
+    );
+  }
+});
+
+await test("the fallback omits cache counts Codex never reported, like the native route", async () => {
+  // The flag is only worth setting if a consumer reads it. This is the one the
+  // Claude client actually sees: serializer.finish emits the usage block, and
+  // proxyTokenUsage floors an absent count to 0, so without gating here the
+  // fallback tells the client "0 cache reads" when Codex said nothing at all —
+  // indistinguishable from an observed cache miss.
+  const emit = async (usage: Record<string, unknown>): Promise<string> => {
+    const sse = `event: response.completed\ndata: ${JSON.stringify({
+      type: "response.completed",
+      response: {
+        status: "completed",
+        output: [
+          { type: "message", content: [{ type: "output_text", text: "ok" }] },
+        ],
+        usage,
+      },
+    })}\n\n`;
+    const bridge = await createCodexFallbackStream(
+      new Response(sse, { headers: { "content-type": "text/event-stream" } }),
+      "claude-test",
+    );
+    const frames: string[] = [];
+    try {
+      let next = await bridge.frames.next();
+      while (!next.done) {
+        frames.push(String(next.value));
+        next = await bridge.frames.next();
+      }
+    } finally {
+      await bridge.cancel();
+    }
+    return frames.join("");
+  };
+
+  const silent = await emit({ input_tokens: 100, output_tokens: 20 });
+  assert(
+    !silent.includes("cache_read_input_tokens"),
+    "an unreported cache read must not be emitted to the client as 0",
+  );
+  assert(
+    !silent.includes("cache_creation_input_tokens"),
+    "an unreported cache write must not be emitted to the client as 0",
+  );
+
+  // A reported count still reaches the client unchanged, including a real zero.
+  const reported = await emit({
+    input_tokens: 100,
+    output_tokens: 20,
+    input_tokens_details: { cached_tokens: 50, cache_write_tokens: 0 },
+  });
+  assert(
+    reported.includes('"cache_read_input_tokens":50'),
+    "a reported cache read must still be emitted",
+  );
+  assert(
+    reported.includes('"cache_creation_input_tokens":0'),
+    "a genuinely reported zero must still be emitted",
+  );
+});
+
+await test("codex capture holds its byte cap against a single oversized chunk", async () => {
+  // The capture is opt-in debugging that writes the assistant's real response
+  // to disk, so its cap is the thing keeping a long stream from filling an
+  // operator's filesystem. The guard only checked whether the cap had ALREADY
+  // been reached before appending a whole chunk, so one large chunk arriving
+  // just under the limit landed in full.
+  //
+  // One chunk, far larger than the cap, is the smallest case that
+  // distinguishes a per-write cap from a per-stream one.
+  const os = await import("node:os");
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "neurolink-capture-"));
+  const target = path.join(dir, "capture.sse");
+  const prior = process.env.NEUROLINK_PROXY_CODEX_CAPTURE;
+  process.env.NEUROLINK_PROXY_CODEX_CAPTURE = target;
+  try {
+    const { createCodexUsageTap } =
+      await import("../src/lib/proxy/codexUsage.js");
+    const { stream, usage } = createCodexUsageTap();
+    const huge = new Uint8Array(2 * 1024 * 1024).fill(120);
+    const readable = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(huge);
+        controller.close();
+      },
+    });
+    let relayed = 0;
+    const reader = readable.pipeThrough(stream).getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      relayed += value.byteLength;
+    }
+    await usage;
+    const size = fs.statSync(target).size;
+    console.log(
+      `    [diagnostic] capture cap: file=${size} relayed=${relayed}`,
+    );
+    assert(
+      size <= 256 * 1024,
+      `the capture file grew past its cap, reaching ${size} bytes`,
+    );
+    // The relay is the contract that must not bend: capping what is written to
+    // disk must never cost the client bytes.
+    assertEqual(
+      relayed,
+      huge.byteLength,
+      "capping the capture file also truncated the relayed stream",
+    );
+  } finally {
+    if (prior === undefined) {
+      delete process.env.NEUROLINK_PROXY_CODEX_CAPTURE;
+    } else {
+      process.env.NEUROLINK_PROXY_CODEX_CAPTURE = prior;
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Claude -> Codex fallback wire bridge
+// ---------------------------------------------------------------------------
+
+await test("Codex fallback config accepts effort aliases and rejects invalid values", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "codex-fallback-config-"));
+  const path = join(dir, "proxy.yaml");
+  try {
+    for (const key of ["reasoning-effort", "reasoningEffort"]) {
+      for (const effort of [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+      ]) {
+        writeFileSync(
+          path,
+          `routing:\n  fallback-chain:\n    - provider: codex\n      model: gpt-6-astra\n      ${key}: ${effort}\n`,
+        );
+        const config = await loadProxyConfig(path);
+        assertEqual(
+          config.routing?.fallbackChain?.[0].reasoningEffort,
+          effort,
+          "configured effort did not survive YAML parsing",
+        );
+      }
+      for (const effort of [
+        null,
+        "",
+        "extra-high",
+        "XHIGH",
+        1,
+        false,
+        {},
+        [],
+      ]) {
+        writeFileSync(
+          path,
+          JSON.stringify({
+            routing: {
+              fallbackChain: [
+                { provider: "codex", model: "gpt-6-astra", [key]: effort },
+              ],
+            },
+          }),
+        );
+        let rejected = false;
+        try {
+          await loadProxyConfig(path);
+        } catch {
+          rejected = true;
+        }
+        assert(rejected, "invalid effort was silently accepted");
+      }
+    }
+    writeFileSync(
+      path,
+      JSON.stringify({
+        routing: {
+          fallbackChain: [
+            {
+              provider: "openai",
+              model: "gpt-6-astra",
+              reasoningEffort: "xhigh",
+            },
+          ],
+        },
+      }),
+    );
+    let rejected = false;
+    try {
+      await loadProxyConfig(path);
+    } catch {
+      rejected = true;
+    }
+    assert(
+      rejected,
+      "effort was accepted by a fallback provider that cannot forward it",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("Claude fallback forwards effort through routing, reloads, and both response modes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "codex-fallback-routing-"));
+  const configPath = join(dir, "proxy.json");
+  const key = "codex:fallback-reasoning@example.test";
+  const originalFetch = globalThis.fetch;
+  const requests: CodexResponsesRequest[] = [];
+  // The primary Anthropic pool is tried before any configured fallback, and a
+  // credential reaches this process even when the shell sets none: loadProxyEnv
+  // reads the repo .env with `override: true`. This test is about the Codex
+  // leg, so the ambient key is withdrawn for its duration. Asserting a lone
+  // Codex upstream instead only held where no credential happened to exist,
+  // which is why this passed in CI and failed on a developer machine.
+  const ambientAnthropicKey = process.env.ANTHROPIC_API_KEY;
+  delete process.env.ANTHROPIC_API_KEY;
+  const writeConfig = (effort?: unknown) =>
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        routing: {
+          fallbackChain: [
+            {
+              provider: "codex",
+              model: "gpt-6-astra",
+              ...(effort !== undefined ? { "reasoning-effort": effort } : {}),
+            },
+          ],
+        },
+      }),
+    );
+  try {
+    await tokenStore.saveTokens(key, {
+      accessToken: "fallback-test-access",
+      refreshToken: "fallback-test-refresh",
+      expiresAt: Date.now() + 3_600_000,
+      tokenType: "Bearer",
+    });
+    globalThis.fetch = async (input, init) => {
+      assertEqual(
+        String(input),
+        "https://chatgpt.com/backend-api/codex/responses",
+        "fallback attempted an unexpected upstream",
+      );
+      requests.push(JSON.parse(String(init?.body)) as CodexResponsesRequest);
+      return new Response(
+        `event: response.completed\ndata: ${JSON.stringify({
+          type: "response.completed",
+          response: {
+            status: "completed",
+            output: [
+              {
+                type: "message",
+                content: [{ type: "output_text", text: "fallback-ok" }],
+              },
+            ],
+            usage: { input_tokens: 10, output_tokens: 2 },
+          },
+        })}\n\n`,
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    };
+    writeConfig();
+    const runtime = await ProxyRuntimeConfigStore.create({
+      configPath,
+      configRequired: true,
+      baseEnv: {},
+      passthrough: false,
+    });
+    const route = createClaudeProxyRoutes(
+      undefined,
+      "",
+      "fill-first",
+      false,
+      undefined,
+      {
+        runtimeConfigProvider: () => runtime.getSnapshot(),
+      },
+    ).routes.find(
+      (entry) => entry.method === "POST" && entry.path === "/v1/messages",
+    );
+    assert(route !== undefined, "Messages route was not registered");
+
+    const call = async (model: string, stream: boolean, effort?: string) => {
+      const before = requests.length;
+      const ctx = {
+        requestId: `fallback-reasoning-${before}`,
+        method: "POST",
+        path: "/v1/messages",
+        headers: {},
+        query: {},
+        params: {},
+        metadata: {},
+        responseHeaders: {},
+        timestamp: Date.now(),
+        neurolink: {},
+        toolRegistry: {},
+        body: {
+          model,
+          stream,
+          max_tokens: 64,
+          messages: [{ role: "user", content: "Reply briefly." }],
+          tools: [
+            { name: "probe", input_schema: { type: "object", properties: {} } },
+          ],
+          tool_choice: { type: "any" },
+        },
+      } as ServerContext;
+      const result = await route!.handler(ctx);
+      assertEqual(
+        requests.length,
+        before + 1,
+        "fallback did not make exactly one upstream call",
+      );
+      const sent = requests[before];
+      assertEqual(
+        sent.model,
+        "gpt-6-astra",
+        "fallback model changed in transit",
+      );
+      assertEqual(
+        sent.reasoning?.effort,
+        effort,
+        "fallback effort changed in transit",
+      );
+      assertEqual(
+        Object.hasOwn(sent, "reasoning"),
+        effort !== undefined,
+        "omitted effort must leave the upstream default untouched",
+      );
+      assertEqual(sent.store, false, "Codex storage contract changed");
+      assertEqual(sent.tools?.[0].name, "probe", "fallback tool was lost");
+      assertEqual(
+        sent.tool_choice,
+        "required",
+        "fallback tool choice was lost",
+      );
+      assertEqual(
+        ctx.responseHeaders?.["x-neurolink-served-by"],
+        "codex",
+        "fallback attribution was lost",
+      );
+      if (stream) {
+        let text = "";
+        for await (const frame of result as AsyncGenerator<string>) {
+          text += frame;
+        }
+        assert(
+          text.includes("fallback-ok") && text.includes("message_stop"),
+          "Claude stream did not complete",
+        );
+      } else {
+        const response = result as {
+          model: string;
+          content: Array<{ text: string }>;
+        };
+        assertEqual(
+          response.model,
+          model,
+          "fallback changed the client model identity",
+        );
+        assertEqual(
+          response.content[0].text,
+          "fallback-ok",
+          "fallback response was lost",
+        );
+      }
+    };
+    await call("claude-opus-4-6", false);
+    const oldSnapshot = runtime.getSnapshot();
+    writeConfig("xhigh");
+    await runtime.reload("manual");
+    const configured = runtime.getSnapshot();
+    assert(
+      configured.configHash !== oldSnapshot.configHash,
+      "effort-only reload did not change the config hash",
+    );
+    assertEqual(
+      oldSnapshot.modelRouter?.getFallbackChain()[0].reasoningEffort,
+      undefined,
+      "reload mutated an in-flight routing snapshot",
+    );
+    for (const model of [
+      "claude-opus-4-6",
+      "claude-sonnet-4-6",
+      "claude-haiku-4-5",
+      "claude-future-model",
+    ]) {
+      for (const stream of [false, true]) {
+        await call(model, stream, "xhigh");
+      }
+    }
+    writeConfig("extra-high");
+    await runtime.reload("manual");
+    assert(
+      runtime.getSnapshot() === configured,
+      "invalid reload replaced the working config",
+    );
+    assert(
+      Boolean(runtime.getStatus().lastReloadError),
+      "invalid reload was not reported",
+    );
+    await call("claude-opus-4-6", false, "xhigh");
+    writeConfig();
+    await runtime.reload("manual");
+    await call("claude-opus-4-6", true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (ambientAnthropicKey !== undefined) {
+      process.env.ANTHROPIC_API_KEY = ambientAnthropicKey;
+    }
+    await tokenStore.clearTokens(key);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("Claude fallback converts system, history, tools, and tool results", () => {
+  const request = convertClaudeRequestToCodex(
+    {
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 777,
+      system: [
+        { type: "text", text: "Follow the system policy." },
+        { type: "text", text: "Return concise answers." },
+      ],
+      temperature: 0.3,
+      top_p: 0.8,
+      messages: [
+        { role: "user", content: "Find the release status." },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "I will look it up." },
+            {
+              type: "tool_use",
+              id: "toolu_lookup",
+              name: "lookup_release",
+              input: { branch: "release" },
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_lookup",
+              content: "release is healthy",
+            },
+            { type: "text", text: "Summarize that result." },
+          ],
+        },
+      ],
+      tools: [
+        {
+          name: "lookup_release",
+          description: "Read release status.",
+          input_schema: {
+            type: "object",
+            properties: { branch: { type: "string" } },
+            required: ["branch"],
+          },
+        },
+      ],
+      tool_choice: { type: "tool", name: "lookup_release" },
+    },
+    "gpt-5.6-terra",
+  );
+
+  assertEqual(request.model, "gpt-5.6-terra", "fallback model was not used");
+  assertEqual(request.store, false, "Codex backend requires store=false");
+  assertEqual(request.stream, true, "fallback must buffer an SSE response");
+  assertEqual(
+    request.instructions,
+    "Follow the system policy.\n\nReturn concise answers.",
+    "system blocks were not preserved as Codex instructions",
+  );
+  assert(
+    !("max_output_tokens" in request),
+    "Anthropic max_tokens must not reach the Codex backend",
+  );
+  assert(
+    !("temperature" in request),
+    "Anthropic temperature must not reach the Codex backend",
+  );
+  assert(
+    !("top_p" in request),
+    "Anthropic top_p must not reach the Codex backend",
+  );
+  assertEqual(
+    JSON.stringify(request.tool_choice),
+    JSON.stringify({ type: "function", name: "lookup_release" }),
+    "named tool choice was not translated",
+  );
+  assertEqual(
+    request.tools?.[0]?.type,
+    "function",
+    "tool type was not translated",
+  );
+  assertEqual(
+    (request.tools?.[0]?.parameters.required as string[] | undefined)?.[0],
+    "branch",
+    "tool schema was not preserved",
+  );
+  assertEqual(request.input.length, 5, "conversation items were not preserved");
+  assertEqual(
+    (request.input[1] as { role?: string }).role,
+    "assistant",
+    "assistant history lost its role",
+  );
+  assertEqual(
+    (request.input[2] as { type?: string }).type,
+    "function_call",
+    "assistant tool use was not translated",
+  );
+  assertEqual(
+    (request.input[3] as { type?: string }).type,
+    "function_call_output",
+    "tool result was not translated",
+  );
+  assertEqual(
+    (request.input[3] as { call_id?: string }).call_id,
+    "toolu_lookup",
+    "tool result no longer matches the prior tool call",
+  );
+});
+
+await test("Claude fallback safely converts Claude Code tool additions", () => {
+  const addedTools = ["read_file", "write_file", "run_command"].map((name) => ({
+    type: "tool_addition" as const,
+    tool: {
+      name,
+      description: `Use ${name}.`,
+      input_schema: { type: "object", properties: {} },
+    },
+  }));
+  const request = convertClaudeRequestToCodex(
+    {
+      model: "claude-opus-5",
+      max_tokens: 1024,
+      system: "Follow the top-level policy.",
+      messages: [
+        { role: "user", content: "Start the task." },
+        { role: "assistant", content: "I will inspect it." },
+        { role: "user", content: "Continue." },
+        {
+          role: "system",
+          content: [
+            { type: "text", text: "Use newly available tools when needed." },
+            ...addedTools,
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Before." },
+            addedTools[0],
+            { type: "text", text: "After." },
+          ],
+        },
+      ],
+      tools: addedTools.map(({ tool }) => tool),
+    } as unknown as Parameters<typeof convertClaudeRequestToCodex>[0],
+    "gpt-5.6-terra",
+  );
+
+  assert(
+    !JSON.stringify(request.input).includes("null"),
+    "tool additions must not create null Codex content",
+  );
+  assertEqual(
+    request.instructions,
+    "Follow the top-level policy.\n\nUse newly available tools when needed.",
+    "inline system text was not preserved as Codex instructions",
+  );
+  assertEqual(
+    request.input.length,
+    4,
+    "inline system messages must not become Codex conversation items",
+  );
+  const finalContent = (
+    request.input[3] as { content?: Array<{ type?: string; text?: string }> }
+  ).content;
+  assertEqual(
+    finalContent?.length,
+    2,
+    "tool additions must be omitted without dropping adjacent text",
+  );
+  assertEqual(finalContent?.[0]?.text, "Before.", "leading text changed");
+  assertEqual(finalContent?.[1]?.text, "After.", "trailing text changed");
+  assertEqual(
+    request.tools?.length,
+    3,
+    "top-level tool definitions must remain available to Codex",
+  );
+});
+
+await test("Claude fallback maps automatic and required tool choices", () => {
+  const base = {
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 64,
+    messages: [{ role: "user" as const, content: "Use a tool." }],
+  };
+  const auto = convertClaudeRequestToCodex(
+    { ...base, tool_choice: { type: "auto" } },
+    "gpt-5.6-terra",
+  );
+  const required = convertClaudeRequestToCodex(
+    { ...base, tool_choice: { type: "any" } },
+    "gpt-5.6-terra",
+  );
+  const none = convertClaudeRequestToCodex(
+    { ...base, tool_choice: { type: "none" } },
+    "gpt-5.6-terra",
+  );
+  assertEqual(auto.tool_choice, "auto", "automatic tool choice changed");
+  assertEqual(
+    required.tool_choice,
+    "required",
+    "required tool choice was not translated",
+  );
+  assertEqual(none.tool_choice, "none", "disabled tool choice changed");
+});
+
+await test("Codex fallback parses text SSE and usage only after completion", () => {
+  const parsed = parseCodexFallbackSSE(
+    [
+      "event: response.output_text.delta",
+      'data: {"type":"response.output_text.delta","delta":"Hello "}',
+      "",
+      "event: response.output_text.delta",
+      'data: {"type":"response.output_text.delta","delta":"world"}',
+      "",
+      "event: response.completed",
+      'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":12,"output_tokens":5,"input_tokens_details":{"cached_tokens":3,"cache_write_tokens":2}}}}',
+      "",
+    ].join("\n"),
+  );
+  assertEqual(parsed.text, "Hello world", "text deltas were not joined");
+  assertEqual(parsed.finishReason, "end_turn", "text finish reason changed");
+  assertEqual(parsed.usage?.input, 7, "input usage was not read");
+  assertEqual(parsed.usage?.output, 5, "output usage was not read");
+  assertEqual(
+    parsed.usage?.cacheReadTokens,
+    3,
+    "cache-read usage was not read",
+  );
+  assertEqual(
+    parsed.usage?.cacheCreationTokens,
+    2,
+    "cache-creation usage was not read",
+  );
+});
+
+await test("Codex fallback ignores unrecognized SSE extension fields", () => {
+  const parsed = parseCodexFallbackSSE(
+    [
+      "event: response.output_text.delta",
+      "trace: upstream-extension",
+      "field-without-a-value",
+      'data: {"type":"response.output_text.delta","delta":"Hello"}',
+      "",
+      "event: response.completed",
+      'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}',
+      "",
+    ].join("\n"),
+  );
+  assertEqual(
+    parsed.text,
+    "Hello",
+    "extension fields discarded a valid response",
+  );
+});
+
+await test("Codex fallback parses completed function calls", () => {
+  const parsed = parseCodexFallbackSSE(
+    [
+      "event: response.output_item.done",
+      'data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_123","name":"lookup_release","arguments":"{\\"branch\\":\\"release\\"}"}}',
+      "",
+      "event: response.completed",
+      'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":9,"output_tokens":4}}}',
+      "",
+    ].join("\n"),
+  );
+  assertEqual(parsed.text, "", "tool-only response invented text");
+  assertEqual(parsed.finishReason, "tool_use", "tool finish reason changed");
+  assertEqual(parsed.toolCalls.length, 1, "function call was not captured");
+  assertEqual(
+    parsed.toolCalls[0]?.toolCallId,
+    "call_123",
+    "function call id was not preserved",
+  );
+  assertEqual(
+    parsed.toolCalls[0]?.args.branch as string,
+    "release",
+    "function call arguments were not parsed",
+  );
+});
+
+await test("Codex fallback recovers final text when delta events are absent", () => {
+  const parsed = parseCodexFallbackSSE(
+    [
+      "event: response.output_item.done",
+      'data: {"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"final answer"}]}}',
+      "",
+      "event: response.completed",
+      'data: {"type":"response.completed","response":{"status":"completed"}}',
+      "",
+    ].join("\n"),
+  );
+  assertEqual(
+    parsed.text,
+    "final answer",
+    "completed message text was not used as a fallback",
+  );
+});
+
+await test("Codex fallback rejects empty, malformed, and incomplete streams", () => {
+  const cases = [
+    [
+      "empty",
+      [
+        "event: response.completed",
+        'data: {"type":"response.completed","response":{"status":"completed"}}',
+        "",
+      ].join("\n"),
+    ],
+    [
+      "malformed",
+      ["event: response.output_text.delta", "data: {not-json}", ""].join("\n"),
+    ],
+    [
+      "incomplete",
+      [
+        "event: response.output_text.delta",
+        'data: {"type":"response.output_text.delta","delta":"partial"}',
+        "",
+      ].join("\n"),
+    ],
+  ] as const;
+  for (const [name, stream] of cases) {
+    let rejected = false;
+    try {
+      parseCodexFallbackSSE(stream);
+    } catch {
+      rejected = true;
+    }
+    assert(rejected, `${name} Codex stream was treated as a success`);
+  }
+});
+
+await test("Codex fallback consumes non-success responses before rejecting", async () => {
+  const response = new Response('{"error":{"message":"quota exhausted"}}', {
+    status: 429,
+    headers: { "content-type": "application/json" },
+  });
+  let rejected = false;
+  try {
+    await consumeCodexFallbackResponse(response);
+  } catch {
+    rejected = true;
+  }
+  assert(rejected, "non-success Codex response was treated as a success");
+  assert(response.bodyUsed, "non-success Codex response body was not consumed");
+});
+
+await test("an unavailable Anthropic model remains eligible for configured fallback", async () => {
+  const account = {
+    key: "anthropic:legacy@example.com",
+    label: "legacy@example.com",
+    token: "test-token",
+    type: "oauth" as const,
+  };
+  const run = (
+    allowConfiguredModelFallback: boolean,
+    message = "model: claude-3-5-sonnet",
+  ) =>
+    claudeProxyTestHooks.handleAnthropicNonOkResponse({
+      response: new Response(
+        JSON.stringify({
+          type: "error",
+          error: {
+            type: "not_found_error",
+            message,
+          },
+        }),
+        { status: 404, headers: { "content-type": "application/json" } },
+      ),
+      account: account as never,
+      accountState: {
+        consecutiveRefreshFailures: 0,
+        permanentlyDisabled: false,
+      } as never,
+      enabledAccounts: [account] as never,
+      orderedAccounts: [account] as never,
+      requestStartTime: Date.now(),
+      fetchStartMs: Date.now(),
+      attemptNumber: 1,
+      logAttempt: () => undefined,
+      logProxyBody: () => undefined,
+      logFinalRequest: () => undefined,
+      lastError: undefined,
+      authFailureMessage: null,
+      sawTransientFailure: false,
+      invalidRequestFailure: null,
+      entitlementFailure: null,
+      allowConfiguredModelFallback,
+    });
+
+  const fallbackEligible = await run(true);
+  assertEqual(
+    fallbackEligible.continueLoop,
+    false,
+    "model-not-found should end the Anthropic account loop",
+  );
+  assertEqual(
+    fallbackEligible.response,
+    undefined,
+    "model-not-found should reach the configured fallback",
+  );
+  assertEqual(
+    fallbackEligible.invalidRequestFailure,
+    null,
+    "model-not-found should not suppress configured fallback",
+  );
+
+  const terminal = await run(false);
+  const terminalError = terminal.response as {
+    type?: string;
+    error?: { type?: string };
+  };
+  if (!terminalError) {
+    throw new Error("unconfigured model-not-found did not remain terminal");
+  }
+  assertEqual(
+    terminalError.type,
+    "error",
+    "unconfigured model-not-found did not retain Claude error shape",
+  );
+  assertEqual(
+    terminalError.error?.type,
+    "not_found_error",
+    "unconfigured model-not-found did not retain error type",
+  );
+
+  const unrelated = await run(true, "resource: missing-file");
+  const unrelatedError = unrelated.response as {
+    type?: string;
+    error?: { type?: string };
+  };
+  if (!unrelatedError) {
+    throw new Error("unrelated 404 did not remain terminal");
+  }
+  assertEqual(
+    unrelatedError.error?.type,
+    "not_found_error",
+    "configured fallback captured an unrelated 404",
+  );
+});
+
+await test("Codex fallback preserves a request error without an Anthropic cooldown", async () => {
+  const responseBody = JSON.stringify({
+    error: {
+      type: "invalid_request_error",
+      message: "The image data you provided does not represent a valid image.",
+    },
+  });
+  const invalidRequestFailure =
+    claudeProxyTestHooks.getCodexFallbackInvalidRequestFailure(
+      new CodexFallbackResponseError(400, responseBody),
+    );
+  assert(invalidRequestFailure !== null, "Codex 400 was not retained");
+  assertEqual(
+    claudeProxyTestHooks.getCodexFallbackInvalidRequestFailure(
+      new CodexFallbackResponseError(429, responseBody),
+    ),
+    null,
+    "Codex quota errors must not be treated as invalid requests",
+  );
+
+  const result = claudeProxyTestHooks.buildClaudeAnthropicFailureResponse({
+    tracer: undefined,
+    requestStartTime: Date.now(),
+    authFailureMessage: null,
+    authCooldownMessage: null,
+    invalidRequestFailure,
+    entitlementFailure: null,
+    scopedExhaustion: null,
+    sawNetworkError: false,
+    sawTransientFailure: false,
+    sawRateLimit: false,
+    lastError: undefined,
+    orderedAccounts: [],
+    buildLoggedClaudeError: (() => {
+      throw new Error("invalid request should build a direct HTTP response");
+    }) as never,
+    logProxyBody: () => undefined,
+    logFinalRequest: () => undefined,
+  });
+  if (!(result instanceof Response)) {
+    throw new Error("invalid request did not retain HTTP status");
+  }
+  assertEqual(result.status, 400, "Codex 400 was rewritten unexpectedly");
+  const body = (await result.json()) as {
+    type?: string;
+    error?: { type?: string; message?: string };
+  };
+  assertEqual(body.type, "error", "response was not Claude-compatible");
+  assertEqual(
+    body.error?.type,
+    "invalid_request_error",
+    "response did not retain invalid_request_error",
+  );
+  assert(
+    body.error?.message?.includes("does not represent a valid image") === true,
+    "response did not retain the Codex validation message",
+  );
+});
+
+await test("Claude invalid requests retain structured upstream error details", async () => {
+  const responseBody = JSON.stringify({
+    type: "error",
+    error: {
+      type: "invalid_request_error",
+      message: `The invalid field is messages[0].content: ${"x".repeat(220)}`,
+      details: { error_code: "invalid_field" },
+    },
+  });
+  const result = claudeProxyTestHooks.buildClaudeAnthropicFailureResponse({
+    tracer: undefined,
+    requestStartTime: Date.now(),
+    authFailureMessage: null,
+    authCooldownMessage: null,
+    invalidRequestFailure: {
+      status: 400,
+      body: responseBody,
+      contentType: "application/vnd.anthropic+json; charset=utf-8",
+    },
+    entitlementFailure: null,
+    scopedExhaustion: null,
+    sawNetworkError: false,
+    sawTransientFailure: false,
+    sawRateLimit: false,
+    lastError: undefined,
+    orderedAccounts: [],
+    buildLoggedClaudeError: (() => {
+      throw new Error("invalid request should build a direct HTTP response");
+    }) as never,
+    logProxyBody: () => undefined,
+    logFinalRequest: () => undefined,
+  });
+  if (!(result instanceof Response)) {
+    throw new Error("invalid request did not retain HTTP status");
+  }
+  assertEqual(result.status, 400, "invalid request did not retain HTTP status");
+  assertEqual(
+    result.headers.get("content-type"),
+    "application/vnd.anthropic+json; charset=utf-8",
+    "invalid request did not retain the upstream content type",
+  );
+  assertEqual(
+    await result.text(),
+    responseBody,
+    "invalid request discarded structured upstream error detail",
+  );
+});
+
+await test("mixed Anthropic pool failures retain cooldown precedence", async () => {
+  const invalidRequestFailure =
+    claudeProxyTestHooks.getCodexFallbackInvalidRequestFailure(
+      new CodexFallbackResponseError(
+        400,
+        JSON.stringify({ error: { message: "invalid converted request" } }),
+      ),
+    );
+  assert(invalidRequestFailure !== null, "Codex 400 was not retained");
+
+  const result = claudeProxyTestHooks.buildClaudeAnthropicFailureResponse({
+    tracer: undefined,
+    requestStartTime: Date.now(),
+    authFailureMessage: null,
+    authCooldownMessage: null,
+    invalidRequestFailure,
+    entitlementFailure: null,
+    scopedExhaustion: null,
+    sawNetworkError: false,
+    sawTransientFailure: false,
+    sawRateLimit: true,
+    lastError: undefined,
+    orderedAccounts: [],
+    buildLoggedClaudeError: (() => {
+      throw new Error("rate limit should build a direct HTTP response");
+    }) as never,
+    logProxyBody: () => undefined,
+    logFinalRequest: () => undefined,
+  });
+  if (!(result instanceof Response)) {
+    throw new Error("rate limit did not retain HTTP status");
+  }
+  assertEqual(result.status, 429, "Codex 400 masked the Anthropic cooldown");
+  const body = (await result.json()) as {
+    type?: string;
+    error?: { type?: string };
+  };
+  assertEqual(body.type, "error", "response was not Claude-compatible");
+  assertEqual(
+    body.error?.type,
+    "overloaded_error",
+    "response did not retain rate-limit semantics",
+  );
+});
+
+await test("account snapshots coalesce concurrent readers without rewriting credentials", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "proxy-account-snapshot-"));
+  const path = join(dir, "tokens.json");
+  const store = new TokenStore({
+    encryptionEnabled: false,
+    customStoragePath: path,
+  });
+  const otherProcess = new TokenStore({
+    encryptionEnabled: false,
+    customStoragePath: path,
+  });
+  try {
+    await store.saveTokens("codex:shared", {
+      accessToken: "first",
+      expiresAt: Date.now() + 3_600_000,
+      tokenType: "Bearer",
+    });
+    const before = readFileSync(path, "utf8");
+    const mtime = statSync(path).mtimeMs;
+    const snapshots = await Promise.all(
+      Array.from({ length: 64 }, () => store.getProviderSnapshot()),
+    );
+    assertEqual(
+      readFileSync(path, "utf8"),
+      before,
+      "reading the inventory rewrote credential metadata",
+    );
+    assertEqual(
+      statSync(path).mtimeMs,
+      mtime,
+      "reading the inventory touched the credential file",
+    );
+    snapshots[0]["codex:shared"].tokens.accessToken = "caller-mutation";
+    assertEqual(
+      snapshots[1]["codex:shared"].tokens.accessToken,
+      "first",
+      "snapshots share mutable tokens",
+    );
+    await otherProcess.markDisabled("codex:shared", "operator");
+    const disabled = await store.getProviderSnapshot();
+    assertEqual(
+      disabled["codex:shared"].disabled,
+      true,
+      "an external disable was hidden by cached inventory",
+    );
+    await otherProcess.clearTokens("codex:shared");
+    assertEqual(
+      Object.keys(await store.getProviderSnapshot()).length,
+      0,
+      "a removed account remained in the pool",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function codexEvent(
+  type: string,
+  fields: Record<string, unknown> = {},
+): string {
+  return `event: ${type}\r\ndata: ${JSON.stringify({ type, ...fields })}\r\n\r\n`;
+}
+function codexDone(output: unknown[] = [], text = ""): string {
+  return codexEvent("response.completed", {
+    response: {
+      status: "completed",
+      output: text
+        ? [{ type: "message", content: [{ type: "output_text", text }] }]
+        : output,
+      usage: {
+        input_tokens: 123,
+        output_tokens: 8,
+        input_tokens_details: { cached_tokens: 100 },
+      },
+    },
+  });
+}
+async function within<T>(promise: Promise<T>): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("stream progress deadline exceeded")),
+          2000,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+await test("Codex bridge emits text before upstream completion and preserves split UTF8 and tool calls", async () => {
+  const encoder = new TextEncoder();
+  let controller!: ReadableStreamDefaultController<Uint8Array>;
+  const upstream = new ReadableStream<Uint8Array>({
+    start(c) {
+      controller = c;
+    },
+  });
+  const bridge = await createCodexFallbackStream(
+    new Response(upstream, {
+      headers: { "content-type": "text/event-stream" },
+    }),
+    "claude-test",
+  );
+  try {
+    const first = await within(bridge.frames.next());
+    assert(
+      String(first.value).includes("message_start"),
+      "response headers waited for upstream output",
+    );
+    await bridge.frames.next(); // initial ping
+    const bytes = encoder.encode(
+      codexEvent("response.output_text.delta", {
+        output_index: 0,
+        delta: "hello 🌍",
+      }),
+    );
+    for (const byte of bytes) {
+      controller.enqueue(new Uint8Array([byte]));
+    }
+    let early = "";
+    while (!early.includes("hello 🌍")) {
+      early += (await within(bridge.frames.next())).value;
+    }
+    assert(
+      !early.includes("message_stop"),
+      "stream completed before upstream did",
+    );
+    const call = {
+      type: "function_call",
+      call_id: "call-1",
+      name: "lookup",
+      arguments: '{"q":"world"}',
+    };
+    controller.enqueue(
+      encoder.encode(
+        codexEvent("response.output_item.done", {
+          output_index: 1,
+          item: call,
+        }) +
+          codexDone([
+            {
+              type: "message",
+              content: [{ type: "output_text", text: "hello 🌍" }],
+            },
+            call,
+          ]),
+      ),
+    );
+    controller.close();
+    let rest = "";
+    let result;
+    while (true) {
+      const next = await within(bridge.frames.next());
+      if (next.done) {
+        result = next.value;
+        break;
+      }
+      rest += next.value;
+    }
+    assertEqual(
+      result?.text,
+      "hello 🌍",
+      "completed items duplicated text deltas",
+    );
+    assertEqual(
+      (rest.match(/"name":"lookup"/g) ?? []).length,
+      1,
+      "a mirrored tool call was emitted twice",
+    );
+    assert(
+      rest.includes('"input_tokens":23') &&
+        rest.includes('"cache_read_input_tokens":100'),
+      "final input/cache usage was lost",
+    );
+    assert(
+      rest.includes('"stop_reason":"tool_use"') &&
+        rest.includes("message_stop"),
+      "tool stream did not finish correctly",
+    );
+  } finally {
+    await bridge.cancel();
+  }
+});
+
+await test("Codex bridge cancellation releases a pending upstream read", async () => {
+  let cancelled = false;
+  const bridge = await createCodexFallbackStream(
+    new Response(
+      new ReadableStream({
+        cancel() {
+          cancelled = true;
+        },
+      }),
+      { headers: { "content-type": "text/event-stream" } },
+    ),
+    "claude-test",
+  );
+  await bridge.frames.next();
+  await bridge.frames.next();
+  const blocked = bridge.frames.next().catch(() => undefined);
+  await bridge.cancel();
+  await within(blocked);
+  assert(cancelled, "the abandoned upstream reader remained open");
+});
+
+for (const [name, payload] of [
+  ["truncated", codexEvent("response.output_text.delta", { delta: "partial" })],
+  ["failed", codexEvent("response.failed", { response: { status: "failed" } })],
+  ["malformed", "event: response.completed\ndata: {bad}\n\n"],
+  ["duplicate terminal", codexDone([], "one") + codexDone([], "two")],
+] as const) {
+  await test(`Codex streaming bridge rejects ${name} completion without a false stop`, async () => {
+    const bridge = await createCodexFallbackStream(
+      new Response(payload, {
+        headers: { "content-type": "text/event-stream" },
+      }),
+      "claude-test",
+    );
+    let output = "",
+      rejected = false;
+    try {
+      for await (const frame of bridge.frames) {
+        output += frame;
+      }
+    } catch {
+      rejected = true;
+    }
+    assert(rejected, "an invalid recorded stream was accepted");
+    assert(
+      !output.includes("message_stop"),
+      "an invalid stream claimed completion",
+    );
+  });
+}
+
+await test("Codex bridge treats a premature close after a complete response.completed as success", async () => {
+  const encoder = new TextEncoder();
+  let pulls = 0;
+  const upstream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      pulls++;
+      if (pulls === 1) {
+        controller.enqueue(encoder.encode(codexDone([], "hello")));
+        return;
+      }
+      throw new Error("simulated premature close");
+    },
+  });
+  const bridge = await createCodexFallbackStream(
+    new Response(upstream, {
+      headers: { "content-type": "text/event-stream" },
+    }),
+    "claude-test",
+  );
+  let result;
+  while (true) {
+    const next = await within(bridge.frames.next());
+    if (next.done) {
+      result = next.value;
+      break;
+    }
+  }
+  assertEqual(
+    result?.text,
+    "hello",
+    "a premature close after a complete turn was reported as a failure",
+  );
+});
+
+await test("Codex bridge still rejects a premature close before response.completed", async () => {
+  const encoder = new TextEncoder();
+  let pulls = 0;
+  const upstream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      pulls++;
+      if (pulls === 1) {
+        controller.enqueue(
+          encoder.encode(
+            codexEvent("response.output_text.delta", {
+              output_index: 0,
+              delta: "partial",
+            }),
+          ),
+        );
+        return;
+      }
+      throw new Error("simulated premature close");
+    },
+  });
+  const bridge = await createCodexFallbackStream(
+    new Response(upstream, {
+      headers: { "content-type": "text/event-stream" },
+    }),
+    "claude-test",
+  );
+  let rejected = false;
+  try {
+    for await (const _frame of bridge.frames) {
+      /* drain */
+    }
+  } catch {
+    rejected = true;
+  }
+  assert(rejected, "truncation before completion was swallowed as success");
+});
+
+async function withFallbackRoute(
+  run: (
+    route: NonNullable<
+      ReturnType<typeof createClaudeProxyRoutes>["routes"]
+    >[number],
+    context: ServerContext,
+  ) => Promise<void>,
+  coolingAnthropic = false,
+): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), "fallback-reliability-"));
+  const configPath = join(dir, "config.json");
+  const key = "codex:reliability@example.test";
+  const savedFetch = globalThis.fetch;
+  const anthropicKey = "anthropic:cooling-reliability@example.test";
+  const { saveAccountCooldown, clearAccountCooldown } =
+    await import("../src/lib/proxy/accountCooldown.js");
+  try {
+    if (coolingAnthropic) {
+      await tokenStore.saveTokens(anthropicKey, {
+        accessToken: "isolated-anthropic",
+        tokenType: "Bearer",
+        expiresAt: Date.now() + 7_200_000,
+      });
+      await saveAccountCooldown(
+        anthropicKey,
+        Date.now() + 3_600_000,
+        "session",
+      );
+    }
+    await tokenStore.saveTokens(key, {
+      accessToken: "isolated-access",
+      expiresAt: Date.now() + 7_200_000,
+      tokenType: "Bearer",
+    });
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        routing: {
+          fallbackChain: [
+            {
+              provider: "codex",
+              model: "gpt-6-astra",
+              reasoningEffort: "xhigh",
+            },
+          ],
+        },
+      }),
+    );
+    const runtime = await ProxyRuntimeConfigStore.create({
+      configPath,
+      configRequired: true,
+      baseEnv: {},
+      passthrough: false,
+    });
+    const route = createClaudeProxyRoutes(
+      runtime.getSnapshot().modelRouter,
+      "",
+      "fill-first",
+      false,
+      undefined,
+      coolingAnthropic ? new Set([anthropicKey]) : new Set<string>(),
+    ).routes.find((x) => x.path === "/v1/messages" && x.method === "POST");
+    assert(route !== undefined, "Messages route is missing");
+    const context = {
+      requestId: `reliability-${Date.now()}`,
+      method: "POST",
+      path: "/v1/messages",
+      headers: {},
+      query: {},
+      params: {},
+      metadata: {},
+      responseHeaders: {},
+      timestamp: Date.now(),
+      neurolink: {},
+      toolRegistry: {},
+      body: {
+        model: "claude-sonnet-test",
+        stream: true,
+        max_tokens: 128,
+        messages: [{ role: "user", content: "hello" }],
+      },
+    } as ServerContext;
+    await run(route!, context);
+  } finally {
+    globalThis.fetch = savedFetch;
+    await tokenStore.clearTokens(key);
+    await tokenStore.clearTokens(anthropicKey);
+    await clearAccountCooldown(anthropicKey);
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+await test("Messages streams early, reports partial failure once, and never replays output", async () => {
+  await withFallbackRoute(async (route, context) => {
+    const { getStats } = await import("../src/lib/proxy/usageStats.js");
+    let requests = 0;
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    globalThis.fetch = async (_input, init) => {
+      requests += 1;
+      const sent = JSON.parse(String(init?.body));
+      assertEqual(sent.model, "gpt-6-astra", "model routing changed");
+      assertEqual(sent.reasoning.effort, "xhigh", "reasoning routing changed");
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            controller = c;
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    };
+    const before = getStats();
+    const stream = (await within(
+      route.handler(context),
+    )) as AsyncGenerator<string>;
+    assert(
+      String((await within(stream.next())).value).includes("message_start"),
+      "the handler buffered the complete response",
+    );
+    assertEqual(
+      getStats().totalSuccess,
+      before.totalSuccess,
+      "headers were counted as success",
+    );
+    controller.enqueue(
+      new TextEncoder().encode(
+        codexEvent("response.output_text.delta", { delta: "partial" }),
+      ),
+    );
+    let frames = "";
+    while (!frames.includes("partial")) {
+      frames += String((await within(stream.next())).value);
+    }
+    controller.error(new Error("recorded socket closure"));
+    for await (const frame of stream) {
+      frames += frame;
+    }
+    assert(
+      frames.includes("event: error") && !frames.includes("message_stop"),
+      "partial stream failure was presented as success",
+    );
+    assertEqual(requests, 1, "an already-started response was replayed");
+    assertEqual(
+      context.metadata.terminalErrorType,
+      "stream_error",
+      "lifecycle telemetry lost the in-band stream failure",
+    );
+    assertEqual(
+      getStats().totalErrors,
+      before.totalErrors + 1,
+      "partial failure was not counted exactly once",
+    );
+    assertEqual(
+      getStats().totalSuccess,
+      before.totalSuccess,
+      "partial failure incremented successes",
+    );
+  });
+});
+
+await test("Messages cancellation before consuming output cancels Codex and records one cancellation", async () => {
+  await withFallbackRoute(async (route, context) => {
+    const { takeProxyResponseObservers } =
+      await import("../src/lib/proxy/proxyActivity.js");
+    const { getStats } = await import("../src/lib/proxy/usageStats.js");
+    let cancelled = false;
+    globalThis.fetch = async () =>
+      new Response(
+        new ReadableStream({
+          cancel() {
+            cancelled = true;
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    const before = getStats().totalErrors;
+    await route.handler(context);
+    for (const observer of takeProxyResponseObservers(context.metadata)) {
+      observer.onTerminal?.({
+        outcome: "client_cancelled",
+        observedBodyBytes: 0,
+        responseChunks: 0,
+      });
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    assert(cancelled, "unconsumed fallback kept upstream work alive");
+    assertEqual(
+      getStats().totalErrors,
+      before + 1,
+      "cancellation accounting was duplicated or missing",
+    );
+  });
+});
+
+await test("Messages surfaces fallback transport failure instead of the empty Anthropic pool", async () => {
+  await withFallbackRoute(async (route, context) => {
+    globalThis.fetch = async () =>
+      new Response("recorded upstream unavailable", { status: 503 });
+    const result = await route.handler(context);
+    if (!(result instanceof Response)) {
+      throw new Error(
+        "fallback failure did not preserve an explicit HTTP status",
+      );
+    }
+    assertEqual(result.status, 502, "fallback gateway status was changed");
+    const response = await result.json();
+    assertEqual(
+      response.error?.type,
+      "api_error",
+      "fallback failure was masked by credential or quota status",
+    );
+    assert(
+      response.error?.message?.includes("codex/gpt-6-astra") === true,
+      "error omitted the failed fallback provider",
+    );
+  });
+});
+
+// Deliberately delayed IPC offers reproduce the observed handoff failure without
+// blocking the live worker or depending on operating-system scheduling pressure.
+await test("an uncommitted socket timeout preserves unrelated streams and never serves the cancelled offer", async () => {
+  const { startRollingProxyServer } =
+    await import("../src/lib/proxy/rollingProxyServer.js");
+  const { spawnProxySocketWorker } =
+    await import("../src/lib/proxy/rollingWorkerProcess.js");
+  const { get } = await import("node:http");
+  const { fileURLToPath } = await import("node:url");
+  const fixture = fileURLToPath(
+    new URL("./fixtures/proxySocketWorker.cjs", import.meta.url),
+  );
+  const proxy = await startRollingProxyServer({
+    host: "127.0.0.1",
+    port: 0,
+    initialVersion: "1.0.0",
+    spawnWorker: (generation, expectedVersion) =>
+      spawnProxySocketWorker({
+        generation,
+        expectedVersion,
+        command: process.execPath,
+        args: [fixture],
+        socketAckTimeoutMs: 200,
+        env: {
+          NEUROLINK_PROXY_WORKER_SOCKET_ACCEPT_DELAY_MS: "700",
+          NEUROLINK_PROXY_WORKER_DELAY_OFFER_NUMBER: "2",
+          NEUROLINK_PROXY_WORKER_STREAM_CHUNKS: "200",
+        },
+        stdout: "ignore",
+        stderr: "ignore",
+      }),
+  });
+  try {
+    const port = proxy.address.port;
+    let started!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const streaming = new Promise<number>((resolve, reject) => {
+      get(
+        { host: "127.0.0.1", port, path: "/stream", agent: false },
+        (response) => {
+          let bytes = 0;
+          response.on("data", (chunk) => {
+            bytes += chunk.length;
+            started();
+          });
+          response.on("end", () => resolve(bytes));
+          response.on("error", reject);
+        },
+      ).on("error", reject);
+    });
+    await within(ready);
+    const pid = proxy.snapshot().active?.pid;
+    const declined = await new Promise<boolean>((resolve) => {
+      const request = get(
+        { host: "127.0.0.1", port, path: "/must-not-execute", agent: false },
+        (response) => {
+          response.resume();
+          resolve(false);
+        },
+      );
+      request.on("error", () => resolve(true));
+    });
+    assert(declined, "the timed-out offer was served after its deadline");
+    assertEqual(
+      await within(streaming),
+      200 * 256,
+      "a socket offer failure interrupted an unrelated response",
+    );
+    assertEqual(
+      proxy.snapshot().active?.pid,
+      pid,
+      "the serving worker was killed for an uncommitted offer",
+    );
+    assertEqual(
+      proxy.snapshot().lastFailure?.supervisorAction,
+      "cancel_uncommitted_socket",
+      "the failure cause was misreported",
+    );
+    const count = await new Promise<string | string[] | undefined>(
+      (resolve, reject) => {
+        get(
+          { host: "127.0.0.1", port, path: "/health", agent: false },
+          (response) => {
+            response.resume();
+            response.once("end", () =>
+              resolve(response.headers["x-worker-served-requests"]),
+            );
+          },
+        ).on("error", reject);
+      },
+    );
+    assertEqual(
+      count,
+      "2",
+      "cancelled socket request was executed or replayed",
+    );
+  } finally {
+    await proxy.close();
+  }
+});
+
+await test("socket handoff backpressure bounds IPC offers while serving a burst without drops", async () => {
+  const { startRollingProxyServer } =
+    await import("../src/lib/proxy/rollingProxyServer.js");
+  const { spawnProxySocketWorker } =
+    await import("../src/lib/proxy/rollingWorkerProcess.js");
+  const { get } = await import("node:http");
+  const { fileURLToPath } = await import("node:url");
+  let peakPending = 0,
+    peakQueue = 0;
+  let lastPending = 0,
+    lastQueue = 0;
+  let publications = 0;
+  const proxy = await startRollingProxyServer({
+    host: "127.0.0.1",
+    port: 0,
+    initialVersion: "1.0.0",
+    maxPendingTransfers: 2,
+    onStateChange: (state) => {
+      publications += 1;
+      lastPending = state.pendingTransfers ?? 0;
+      lastQueue = state.queuedSockets;
+      peakPending = Math.max(peakPending, state.pendingTransfers ?? 0);
+      peakQueue = Math.max(peakQueue, state.queuedSockets);
+    },
+    spawnWorker: (generation, expectedVersion) =>
+      spawnProxySocketWorker({
+        generation,
+        expectedVersion,
+        command: process.execPath,
+        args: [
+          fileURLToPath(
+            new URL("./fixtures/proxySocketWorker.cjs", import.meta.url),
+          ),
+        ],
+        socketAckTimeoutMs: 2000,
+        env: { NEUROLINK_PROXY_WORKER_SOCKET_ACCEPT_DELAY_MS: "30" },
+        stdout: "ignore",
+        stderr: "ignore",
+      }),
+  });
+  try {
+    await Promise.all(
+      Array.from(
+        { length: 24 },
+        () =>
+          new Promise<void>((resolve, reject) => {
+            get(
+              {
+                host: "127.0.0.1",
+                port: proxy.address.port,
+                path: "/health",
+                agent: false,
+              },
+              (response) => {
+                response.resume();
+                response.on("end", () => resolve());
+                response.on("error", reject);
+              },
+            ).on("error", reject);
+          }),
+      ),
+    );
+    assert(peakPending <= 2, "IPC offer capacity was exceeded");
+    assert(peakQueue > 0, "burst requests bypassed the bounded offer queue");
+    assertEqual(
+      proxy.snapshot().rejectedSockets,
+      0,
+      "bounded handoff dropped a queued request",
+    );
+    assertEqual(
+      proxy.snapshot().pendingTransfers,
+      0,
+      "completed socket offers were retained",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assertEqual(
+      lastPending + lastQueue,
+      0,
+      "published transfer diagnostics stayed stale after draining",
+    );
+    assert(publications < 12, "handoff telemetry wrote once per socket");
+  } finally {
+    await proxy.close();
+  }
+});
+
+await test("built proxy status renders qualified accounts once and reads status once", async () => {
+  const { createServer } = await import("node:http");
+  const { mkdirSync } = await import("node:fs");
+  const dir = mkdtempSync(join(tmpdir(), "proxy-status-rows-"));
+  const stateDir = join(dir, ".neurolink");
+  mkdirSync(stateDir);
+  let statusReads = 0;
+  const accounts = [
+    {
+      key: null,
+      provider: "unknown",
+      label: "shared@example.test",
+      type: "codex-oauth",
+      attempts: 10,
+      success: 8,
+      errors: 2,
+      cooling: false,
+      status: "unattributed",
+    },
+    {
+      key: "codex:shared@example.test",
+      provider: "codex",
+      label: "shared@example.test",
+      type: "codex-oauth",
+      attempts: 20,
+      success: 20,
+      errors: 0,
+      cooling: false,
+      status: "active",
+    },
+    {
+      key: "anthropic:shared@example.test",
+      provider: "anthropic",
+      label: "shared@example.test",
+      type: "oauth",
+      attempts: 30,
+      success: 29,
+      errors: 1,
+      cooling: true,
+      status: "cooling",
+    },
+  ];
+  const server = createServer((request, response) => {
+    response.setHeader("content-type", "application/json");
+    if (request.url === "/status") {
+      statusReads += 1;
+      response.end(
+        JSON.stringify({
+          stats: {
+            totalRequests: 60,
+            totalSuccess: 57,
+            totalErrors: 3,
+            totalRateLimits: 0,
+            accounts,
+          },
+        }),
+      );
+    } else {
+      response.end(JSON.stringify({ status: "ok" }));
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    assert(
+      address !== null && typeof address === "object",
+      "fixture listener did not bind",
+    );
+    writeFileSync(
+      join(stateDir, "proxy-state.json"),
+      JSON.stringify({
+        pid: process.pid,
+        port: (address as { port: number }).port,
+        host: "127.0.0.1",
+        strategy: "fill-first",
+        startTime: new Date().toISOString(),
+        version: "1.0.0",
+      }),
+    );
+    const result = await runCLI(["proxy", "status"], {
+      env: { HOME: dir, USERPROFILE: dir },
+    });
+    assertEqual(result.exitCode, 0, "built status command failed");
+    assertEqual(
+      statusReads,
+      1,
+      "status command fetched the detailed snapshot more than once",
+    );
+    assertEqual(
+      (result.stdout.match(/codex:shared@example.test/g) ?? []).length,
+      1,
+      "Codex account was duplicated",
+    );
+    assertEqual(
+      (result.stdout.match(/anthropic:shared@example.test/g) ?? []).length,
+      1,
+      "Anthropic account was duplicated",
+    );
+    assertEqual(
+      (result.stdout.match(/shared@example.test/g) ?? []).length,
+      2,
+      "legacy history was rendered as another live account",
+    );
+    assert(
+      result.stdout.includes("Historical usage") &&
+        result.stdout.includes("10 attempts, 8 success, 2 errors"),
+      "legacy usage was lost from the display",
+    );
+    assert(
+      result.stdout.includes("60 total, 57 success, 3 errors"),
+      "account presentation changed the totals",
+    );
+    const json = await runCLI(["proxy", "status", "--format", "json"], {
+      env: { HOME: dir, USERPROFILE: dir },
+    });
+    const body = JSON.parse(json.stdout);
+    assertEqual(
+      body.stats.accounts.length,
+      3,
+      "JSON consumers lost historical records",
+    );
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("exhausted Anthropic pool surfaces the actual fallback failure", async () => {
+  for (const status of [400, 503]) {
+    await withFallbackRoute(async (route, context) => {
+      let requests = 0;
+      globalThis.fetch = async (url) => {
+        assert(
+          new URL(url instanceof Request ? url.url : String(url)).hostname ===
+            "chatgpt.com",
+          "a cooling account was attempted",
+        );
+        requests += 1;
+        return new Response(
+          JSON.stringify({ error: { message: "invalid converted request" } }),
+          { status },
+        );
+      };
+      const result = await route.handler(context);
+      const body = result instanceof Response ? await result.json() : result;
+      assertEqual(requests, 1, "fallback request count changed");
+      assertEqual(
+        body.error?.type,
+        status === 400 ? "invalid_request_error" : "api_error",
+        "the exhausted primary masked the fallback failure",
+      );
+      if (status === 400) {
+        assert(
+          result instanceof Response && result.status === 400,
+          "fallback validation lost its HTTP status",
+        );
+      } else {
+        assert(
+          body.error?.message?.includes("codex/gpt-6-astra"),
+          "fallback failure lost its provider",
+        );
+      }
+    }, true);
+  }
+});
+
+await test("client cancellation before Codex headers stops account rotation", async () => {
+  await withFallbackRoute(async (route, context) => {
+    const second = "codex:second-cancel@example.test";
+    await tokenStore.saveTokens(second, {
+      accessToken: "isolated-second",
+      tokenType: "Bearer",
+      expiresAt: Date.now() + 7_200_000,
+    });
+    const controller = new AbortController();
+    context.abortSignal = controller.signal;
+    let started!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let requests = 0;
+    globalThis.fetch = async (_url, init) => {
+      requests += 1;
+      started();
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener(
+          "abort",
+          () => reject(new Error("recorded cancellation")),
+          { once: true },
+        );
+      });
+    };
+    try {
+      const pending = route.handler(context);
+      await within(ready);
+      controller.abort();
+      const response = await within(pending);
+      if (!(response instanceof Response)) {
+        throw new Error(
+          "cancellation did not preserve an explicit HTTP status",
+        );
+      }
+      assertEqual(response.status, 499, "cancellation status was changed");
+      const result = await response.json();
+      assertEqual(requests, 1, "cancelled work rotated to another account");
+      assertEqual(
+        result.error.type,
+        "client_cancelled",
+        "cancellation was reported as provider failure",
+      );
+    } finally {
+      await tokenStore.clearTokens(second);
+    }
+  });
+});
+
+await test("completed Messages fallback records one successful final response", async () => {
+  await withFallbackRoute(async (route, context) => {
+    const { getStats } = await import("../src/lib/proxy/usageStats.js");
+    const controller = new AbortController();
+    context.abortSignal = controller.signal;
+    globalThis.fetch = async () =>
+      new Response(codexDone([], "complete"), {
+        headers: { "content-type": "text/event-stream" },
+      });
+    const before = getStats();
+    const response = (await route.handler(context)) as AsyncGenerator<string>;
+    let body = "";
+    while (!body.includes("message_stop")) {
+      const next = await within(response.next());
+      if (next.done) {
+        break;
+      }
+      body += next.value;
+    }
+    // Clients may close immediately after the protocol's terminal frame.
+    controller.abort();
+    await response.return(undefined);
+    assert(
+      body.includes("message_stop") && body.includes("complete"),
+      "successful output did not finish",
+    );
+    assertEqual(
+      getStats().totalSuccess,
+      before.totalSuccess + 1,
+      "completed fallback was not counted exactly once",
+    );
+    assertEqual(
+      getStats().totalErrors,
+      before.totalErrors,
+      "completed fallback was counted as an error",
+    );
+  });
+});
+
+await test("HTTP Messages adapter applies slow-reader backpressure and cancels upstream", async () => {
+  await withFallbackRoute(async (_route, context) => {
+    const { createProxyStartApp } =
+      await import("../src/cli/commands/proxy.js");
+    const dir = mkdtempSync(join(tmpdir(), "http-fallback-reliability-"));
+    const configPath = join(dir, "config.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        routing: {
+          fallbackChain: [
+            {
+              provider: "codex",
+              model: "gpt-6-astra",
+              reasoningEffort: "xhigh",
+            },
+          ],
+        },
+      }),
+    );
+    const runtime = await ProxyRuntimeConfigStore.create({
+      configPath,
+      configRequired: true,
+      baseEnv: {},
+      passthrough: false,
+    });
+    let pulls = 0;
+    let cancelled = false;
+    globalThis.fetch = async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          pull(c) {
+            pulls += 1;
+            c.enqueue(
+              new TextEncoder().encode(
+                codexEvent("response.output_text.delta", {
+                  delta: "chunk".repeat(1024),
+                }),
+              ),
+            );
+          },
+          cancel() {
+            cancelled = true;
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    try {
+      const { app } = await createProxyStartApp({
+        neurolink: {
+          getToolRegistry: () => context.toolRegistry,
+        } as Parameters<typeof createProxyStartApp>[0]["neurolink"],
+        modelRouter: runtime.getSnapshot().modelRouter,
+        strategy: "fill-first",
+        passthrough: false,
+        port: 0,
+        host: "127.0.0.1",
+        proxyConfig: null,
+        primaryAccountKey: undefined,
+        accountAllowlist: new Set<string>(),
+      });
+      const response = await within(
+        Promise.resolve(
+          app.request("http://localhost/v1/messages", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(context.body),
+          }),
+        ),
+      );
+      assertEqual(
+        response.status,
+        200,
+        "HTTP adapter rejected the isolated request",
+      );
+      const reader = response.body!.getReader();
+      const first = await within(reader.read());
+      assert(
+        new TextDecoder().decode(first.value).includes("message_start"),
+        "HTTP adapter delayed headers until completion",
+      );
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const pausedPulls = pulls;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assertEqual(
+        pulls,
+        pausedPulls,
+        "slow clients allowed unbounded upstream reads",
+      );
+      assert(pulls < 16, "the adapter buffered too much before client demand");
+      await within(reader.cancel());
+      assert(cancelled, "HTTP cancellation left upstream generation active");
+      globalThis.fetch = async () =>
+        new Response("recorded unavailable", { status: 503 });
+      const failed = await within(
+        Promise.resolve(
+          app.request("http://localhost/v1/messages", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(context.body),
+          }),
+        ),
+      );
+      assertEqual(
+        failed.status,
+        502,
+        "HTTP adapter remapped the fallback gateway status",
+      );
+      const failure = await failed.json();
+      assertEqual(
+        failure.error.type,
+        "api_error",
+        "fallback HTTP error type changed",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+for (const failCandidate of [false, true]) {
+  await test(`repeated socket stalls preserve the active stream when replacement ${failCandidate ? "fails" : "succeeds"}`, async () => {
+    const { startRollingProxyServer } =
+      await import("../src/lib/proxy/rollingProxyServer.js");
+    const { spawnProxySocketWorker } =
+      await import("../src/lib/proxy/rollingWorkerProcess.js");
+    const { get } = await import("node:http");
+    const { fileURLToPath } = await import("node:url");
+    const fixture = fileURLToPath(
+      new URL("./fixtures/proxySocketWorker.cjs", import.meta.url),
+    );
+    let spawns = 0;
+    const proxy = await startRollingProxyServer({
+      host: "127.0.0.1",
+      port: 0,
+      initialVersion: "1.0.0",
+      spawnWorker: (generation, expectedVersion) => {
+        spawns += 1;
+        return spawnProxySocketWorker({
+          generation,
+          expectedVersion,
+          command: process.execPath,
+          args:
+            generation > 1 && failCandidate
+              ? ["-e", "process.exit(1)"]
+              : [fixture],
+          socketAckTimeoutMs: 200,
+          env:
+            generation === 1
+              ? {
+                  NEUROLINK_PROXY_WORKER_SOCKET_ACCEPT_DELAY_MS: "800",
+                  NEUROLINK_PROXY_WORKER_DELAY_OFFERS_AFTER: "1",
+                  NEUROLINK_PROXY_WORKER_STREAM_CHUNKS: "240",
+                }
+              : {},
+          stdout: "ignore",
+          stderr: "ignore",
+        });
+      },
+    });
+    const request = (path: string, onData?: () => void): Promise<number> =>
+      new Promise((resolve, reject) => {
+        get(
+          { host: "127.0.0.1", port: proxy.address.port, path, agent: false },
+          (response) => {
+            let bytes = 0;
+            response.on("data", (chunk) => {
+              bytes += chunk.length;
+              onData?.();
+            });
+            response.on("end", () => resolve(bytes));
+            response.on("error", reject);
+          },
+        ).on("error", reject);
+      });
+    try {
+      let started!: () => void;
+      const ready = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      const streaming = request("/stream", started);
+      await within(ready);
+      const originalPid = proxy.snapshot().active?.pid;
+      const failures = await Promise.allSettled(
+        Array.from({ length: 3 }, () => request("/cancelled")),
+      );
+      assert(
+        failures.every((result) => result.status === "rejected"),
+        "a cancelled offer executed",
+      );
+      assertEqual(
+        await within(streaming),
+        240 * 256,
+        "replacement interrupted the serving stream",
+      );
+      assertEqual(
+        spawns,
+        2,
+        "stall recovery spawned the wrong number of workers",
+      );
+      const state = proxy.snapshot();
+      if (failCandidate) {
+        assertEqual(
+          state.active?.pid,
+          originalPid,
+          "failed replacement removed the active worker",
+        );
+        assertEqual(
+          state.lastFailure?.phase,
+          "startup",
+          "failed candidate was not diagnosed",
+        );
+      } else {
+        assert(
+          state.active?.pid !== originalPid,
+          "persistent stall did not activate a replacement",
+        );
+        assertEqual(
+          await within(request("/health")),
+          "worker-1.0.0".length,
+          "replacement did not serve new traffic",
+        );
+        process.kill(state.active!.pid, "SIGKILL");
+        await within(
+          (async () => {
+            while (proxy.snapshot().active?.pid === state.active?.pid) {
+              await new Promise((resolve) => setTimeout(resolve, 5));
+            }
+          })(),
+        );
+        assertEqual(
+          await within(request("/health")),
+          "worker-1.0.0".length,
+          "unexpected worker exit did not recover queued traffic",
+        );
+      }
+    } finally {
+      await proxy.close();
+    }
+  });
+}
+
+await test("streaming tool output has a bounded aggregate size", async () => {
+  const payload = Array.from({ length: 18 }, (_, i) =>
+    codexEvent("response.output_item.done", {
+      output_index: i,
+      item: {
+        type: "function_call",
+        call_id: `call-${i}`,
+        name: "write_file",
+        arguments: JSON.stringify({ content: "x".repeat(1024 * 1024) }),
+      },
+    }),
+  ).join("");
+  const bridge = await createCodexFallbackStream(
+    new Response(payload, { headers: { "content-type": "text/event-stream" } }),
+    "claude-test",
+  );
+  let rejected = false;
+  let tools = 0;
+  try {
+    for await (const frame of bridge.frames) {
+      if (frame.includes('"type":"tool_use"')) {
+        tools += 1;
+      }
+    }
+  } catch (error) {
+    rejected = error instanceof Error && error.message.includes("stream limit");
+  }
+  assert(rejected && tools < 18, "aggregate tool output grew without a bound");
+});
+
+// The bridged fallback builds its own Codex payload, so nothing pins a
+// conversation to the cache holding its prefix unless this sets it. Measured
+// over 36h: this path cached 28.2% of 228M input tokens, against ~49% on the
+// native path where the Codex client supplies its own key.
+await test("Claude fallback pins a conversation to one prompt cache", () => {
+  const sessionId = "ee313449-09b0-4f0e-bae6-1c0bf6573ad5";
+  const userId = JSON.stringify({
+    device_id: "d".repeat(64),
+    account_uuid: "acf41e1b-0444-41fd-8b4b-8c58d6579a09",
+    session_id: sessionId,
+    parent_session_id: sessionId,
+  });
+  const body = {
+    model: "claude-opus-5",
+    max_tokens: 64,
+    messages: [{ role: "user", content: "hello" }],
+    metadata: { user_id: userId },
+  } as unknown as Parameters<typeof convertClaudeRequestToCodex>[0];
+
+  const request = convertClaudeRequestToCodex(body, "gpt-5.6-sol");
+  assert(
+    typeof request.prompt_cache_key === "string" &&
+      request.prompt_cache_key.length === 64,
+    "a conversation must carry a prompt cache key",
+  );
+  // Stable across turns, or it pins nothing.
+  const second = convertClaudeRequestToCodex(body, "gpt-5.6-sol");
+  assert(
+    request.prompt_cache_key === second.prompt_cache_key,
+    "the cache key must be stable across turns of one conversation",
+  );
+  // A different conversation must not share the key.
+  const other = convertClaudeRequestToCodex(
+    {
+      ...(body as object),
+      metadata: {
+        user_id: JSON.stringify({
+          session_id: "11111111-2222-3333-4444-555555555555",
+        }),
+      },
+    } as unknown as Parameters<typeof convertClaudeRequestToCodex>[0],
+    "gpt-5.6-sol",
+  );
+  assert(
+    other.prompt_cache_key !== request.prompt_cache_key,
+    "separate conversations must not share a cache key",
+  );
+  // The key is hashed: no account, device or raw session identifier upstream.
+  const wire = JSON.stringify(request);
+  assert(
+    !wire.includes(sessionId) &&
+      !wire.includes("acf41e1b-0444-41fd-8b4b-8c58d6579a09") &&
+      !wire.includes("d".repeat(64)),
+    "identifiers must not reach the upstream in the clear",
+  );
+});
+
+// A key shared by every conversation would pin unrelated prefixes onto one
+// cache, which is worse than leaving routing alone.
+await test("Claude fallback omits the cache key when no session is known", () => {
+  const plain = {
+    model: "claude-opus-5",
+    max_tokens: 64,
+    messages: [{ role: "user", content: "hello" }],
+  } as unknown as Parameters<typeof convertClaudeRequestToCodex>[0];
+  assert(
+    convertClaudeRequestToCodex(plain, "gpt-5.6-sol").prompt_cache_key ===
+      undefined,
+    "no metadata must mean no cache key",
+  );
+  for (const userId of ["not json", JSON.stringify({ device_id: "d" }), ""]) {
+    const body = {
+      ...(plain as object),
+      metadata: { user_id: userId },
+    } as unknown as Parameters<typeof convertClaudeRequestToCodex>[0];
+    assert(
+      convertClaudeRequestToCodex(body, "gpt-5.6-sol").prompt_cache_key ===
+        undefined,
+      `unusable metadata must not produce a shared key: ${userId.slice(0, 20)}`,
+    );
+  }
+});
+
+// Keying by session gave every caller a private cache namespace, so a fan-out
+// of N agents over one system prompt and tool set paid that shared prefix N
+// times. The key describes the prefix now, so they share it.
+await test("Claude fallback shares one cache key across callers with one prefix", () => {
+  const shared = {
+    model: "claude-opus-5",
+    max_tokens: 64,
+    system: "You are a coding agent operating in /repo.",
+    tools: [
+      {
+        name: "read_file",
+        description: "Read a file",
+        input_schema: {
+          type: "object",
+          properties: { path: { type: "string" } },
+        },
+      },
+    ],
+  };
+  const keyFor = (sessionId: string, userTurn: string): string | undefined =>
+    convertClaudeRequestToCodex(
+      {
+        ...shared,
+        messages: [{ role: "user", content: userTurn }],
+        metadata: { user_id: JSON.stringify({ session_id: sessionId }) },
+      } as unknown as Parameters<typeof convertClaudeRequestToCodex>[0],
+      "gpt-5.6-sol",
+    ).prompt_cache_key;
+
+  // Different sessions, different conversations, one prefix: one key.
+  const a = keyFor("11111111-1111-1111-1111-111111111111", "find the bug");
+  const b = keyFor("22222222-2222-2222-2222-222222222222", "write a test");
+  assert(
+    typeof a === "string" && a.length === 64,
+    "a request carrying a prefix must produce a cache key",
+  );
+  assert(
+    a === b,
+    "subagents sharing a prefix must share its cache, not pay it each",
+  );
+
+  // No session id at all must not change the answer — the prefix is the key.
+  const anonymous = convertClaudeRequestToCodex(
+    {
+      ...shared,
+      messages: [{ role: "user", content: "find the bug" }],
+    } as unknown as Parameters<typeof convertClaudeRequestToCodex>[0],
+    "gpt-5.6-sol",
+  ).prompt_cache_key;
+  assert(anonymous === a, "the key must not depend on caller identity");
+
+  // A conversation grows without changing its prefix, so its key holds still.
+  const laterTurn = convertClaudeRequestToCodex(
+    {
+      ...shared,
+      messages: [
+        { role: "user", content: "find the bug" },
+        { role: "assistant", content: "Looking." },
+        { role: "user", content: "and fix it" },
+      ],
+      metadata: {
+        user_id: JSON.stringify({
+          session_id: "11111111-1111-1111-1111-111111111111",
+        }),
+      },
+    } as unknown as Parameters<typeof convertClaudeRequestToCodex>[0],
+    "gpt-5.6-sol",
+  ).prompt_cache_key;
+  assert(laterTurn === a, "the key must be stable across turns");
+});
+
+// Sharing is only safe while the prefixes really are identical: a key common
+// to genuinely different prefixes pins them onto one cache and they evict each
+// other.
+await test("Claude fallback separates cache keys when the prefix differs", () => {
+  const base = {
+    model: "claude-opus-5",
+    max_tokens: 64,
+    system: "You are a coding agent operating in /repo.",
+    tools: [
+      {
+        name: "read_file",
+        description: "Read a file",
+        input_schema: {
+          type: "object",
+          properties: { path: { type: "string" } },
+        },
+      },
+    ],
+    messages: [{ role: "user", content: "hello" }],
+  };
+  const keyOf = (patch: Record<string, unknown>): string | undefined =>
+    convertClaudeRequestToCodex(
+      { ...base, ...patch } as unknown as Parameters<
+        typeof convertClaudeRequestToCodex
+      >[0],
+      "gpt-5.6-sol",
+    ).prompt_cache_key;
+
+  const original = keyOf({});
+  for (const [label, patch] of [
+    [
+      "a different system prompt",
+      { system: "You are a coding agent in /other." },
+    ],
+    ["a renamed tool", { tools: [{ ...base.tools[0], name: "open_file" }] }],
+    [
+      "an added tool",
+      { tools: [...base.tools, { name: "write_file", input_schema: {} }] },
+    ],
+  ] as const) {
+    assert(
+      keyOf(patch as Record<string, unknown>) !== original,
+      `${label} must not reuse the original prefix's cache key`,
+    );
+  }
+});
+
+// The system prompt is not byte-stable: its trailing session-memory section is
+// rewritten every turn while the first ~88% holds still. Keying on the whole
+// string therefore minted a fresh key per request, which pins nothing at all.
+// The key covers a bounded head for exactly this reason.
+await test("Claude fallback holds its cache key when the prompt's tail churns", () => {
+  const head = "You are a coding agent operating in /repo.\n".repeat(400);
+  assert(head.length > 8192, "the fixture must exceed the bounded head");
+  const keyWithTail = (tail: string): string | undefined =>
+    convertClaudeRequestToCodex(
+      {
+        model: "claude-opus-5",
+        max_tokens: 64,
+        system: `${head}\n## Session memory\n${tail}`,
+        tools: [{ name: "read_file", input_schema: {} }],
+        messages: [{ role: "user", content: "hello" }],
+      } as unknown as Parameters<typeof convertClaudeRequestToCodex>[0],
+      "gpt-5.6-sol",
+    ).prompt_cache_key;
+
+  assert(
+    keyWithTail("Task 4 still running clean; repeated idle checks confirm.") ===
+      keyWithTail(
+        "Task 4 still running clean; latest check confirmed no change.",
+      ),
+    "a rewritten tail must not mint a new cache key",
+  );
+});
+
+// A request with no instructions and no tools has no prefix worth pinning, so
+// the session id is all that is left to keep its own turns together.
+await test("Claude fallback falls back to the session when there is no prefix", () => {
+  const sessionId = "ee313449-09b0-4f0e-bae6-1c0bf6573ad5";
+  const bare = {
+    model: "claude-opus-5",
+    max_tokens: 64,
+    messages: [{ role: "user", content: "hello" }],
+    metadata: { user_id: JSON.stringify({ session_id: sessionId }) },
+  } as unknown as Parameters<typeof convertClaudeRequestToCodex>[0];
+  const key = convertClaudeRequestToCodex(bare, "gpt-5.6-sol").prompt_cache_key;
+  assert(
+    typeof key === "string" && key.length === 64,
+    "a bare conversation must still pin its own turns",
+  );
+  const other = convertClaudeRequestToCodex(
+    {
+      ...(bare as object),
+      metadata: {
+        user_id: JSON.stringify({
+          session_id: "11111111-2222-3333-4444-555555555555",
+        }),
+      },
+    } as unknown as Parameters<typeof convertClaudeRequestToCodex>[0],
+    "gpt-5.6-sol",
+  ).prompt_cache_key;
+  assert(
+    other !== key,
+    "without a prefix, separate sessions must not share a key",
+  );
+  assert(
+    !JSON.stringify(convertClaudeRequestToCodex(bare, "gpt-5.6-sol")).includes(
+      sessionId,
+    ),
+    "the session id must not reach the upstream in the clear",
+  );
+});
+
+// An empty or non-string session_id must not shadow a usable
+// parent_session_id: with no prefix to hash, losing the session means the
+// request goes out with no cache key at all.
+await test("Claude fallback uses parent_session_id when session_id is empty or not a string", () => {
+  const parentId = "ee313449-09b0-4f0e-bae6-1c0bf6573ad5";
+  const keyFor = (fields: Record<string, unknown>): string | undefined =>
+    convertClaudeRequestToCodex(
+      {
+        model: "claude-opus-5",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "hello" }],
+        metadata: { user_id: JSON.stringify(fields) },
+      } as unknown as Parameters<typeof convertClaudeRequestToCodex>[0],
+      "gpt-5.6-sol",
+    ).prompt_cache_key;
+
+  const viaParent = keyFor({ parent_session_id: parentId });
+  assert(
+    typeof viaParent === "string" && viaParent.length === 64,
+    "a parent session alone must still pin the conversation",
+  );
+  for (const shadow of ["", 42, null]) {
+    assert(
+      keyFor({ session_id: shadow, parent_session_id: parentId }) === viaParent,
+      "an unusable session_id must fall through to the parent session",
+    );
+  }
+  assert(
+    keyFor({ session_id: "", parent_session_id: "" }) === undefined,
+    "two empty session fields must still mean no cache key",
+  );
+});
+
+// The two real bugs this PR fixed both lived in the seam between fallback
+// legs, and neither was reachable by a test that drives a single leg: a failed
+// Codex leg left its model, account, deferred-failure flag and failure usage
+// in `ctx.metadata`, and the leg that served next read them. This drives the
+// configured chain for real — Codex attempted and failing, Vertex then
+// serving — through the shipped `/v1/messages` route.
+await test("a failed Codex leg leaves nothing behind for the Vertex leg that serves", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "codex-vertex-chain-"));
+  const configPath = join(dir, "proxy.json");
+  const key = "codex:chain-test@example.test";
+  const originalFetch = globalThis.fetch;
+  const prevProject = process.env.GOOGLE_CLOUD_PROJECT;
+  const prevLocation = process.env.GOOGLE_CLOUD_LOCATION;
+  const upstreams: string[] = [];
+  try {
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        routing: {
+          fallbackChain: [
+            { provider: "codex", model: "gpt-6-astra" },
+            { provider: "vertex", model: "claude-opus-5-5" },
+          ],
+        },
+      }),
+    );
+    await tokenStore.saveTokens(key, {
+      accessToken: "chain-test-access",
+      refreshToken: "chain-test-refresh",
+      expiresAt: Date.now() + 3_600_000,
+      tokenType: "Bearer",
+    });
+    process.env.GOOGLE_CLOUD_PROJECT = "chain-test-project";
+    process.env.GOOGLE_CLOUD_LOCATION = "global";
+    // gaxios resolves its transport to node-fetch rather than
+    // `globalThis.fetch`, so the credential lookup cannot be reached by the
+    // mock below. Without this seam the leg throws before reaching the model.
+    setVertexAccessTokenProviderForTests(async () => "chain-test-token");
+
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      upstreams.push(url);
+      if (url.includes("api.anthropic.com")) {
+        // The primary is tried before any configured fallback. Exhaust it so
+        // the chain runs, which is what this test is about.
+        return new Response(
+          JSON.stringify({
+            type: "error",
+            error: { type: "rate_limit_error", message: "quota exhausted" },
+          }),
+          { status: 429, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.includes("chatgpt.com")) {
+        // Fails after recording its model — the state that used to leak onto
+        // the turn Vertex went on to serve.
+        return new Response(
+          JSON.stringify({ error: { message: "codex down" } }),
+          { status: 500, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.includes("aiplatform.googleapis.com")) {
+        return new Response(
+          JSON.stringify({
+            id: "msg_vrtx_chain",
+            type: "message",
+            role: "assistant",
+            model: "claude-opus-5-5",
+            content: [{ type: "text", text: "vertex-served" }],
+            usage: { input_tokens: 1200, output_tokens: 34 },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      throw new Error(`unexpected upstream: ${url}`);
+    }) as typeof globalThis.fetch;
+
+    const runtime = await ProxyRuntimeConfigStore.create({
+      configPath,
+      configRequired: true,
+      baseEnv: {},
+      passthrough: false,
+    });
+    const route = createClaudeProxyRoutes(
+      undefined,
+      "",
+      "fill-first",
+      false,
+      undefined,
+      { runtimeConfigProvider: () => runtime.getSnapshot() },
+    ).routes.find(
+      (entry) => entry.method === "POST" && entry.path === "/v1/messages",
+    );
+    assert(route !== undefined, "Messages route was not registered");
+
+    const ctx = {
+      requestId: "codex-then-vertex",
+      method: "POST",
+      path: "/v1/messages",
+      headers: {},
+      query: {},
+      params: {},
+      metadata: {} as Record<string, unknown>,
+      responseHeaders: {},
+      timestamp: Date.now(),
+      neurolink: {},
+      toolRegistry: {},
+      body: {
+        model: "claude-sonnet-5",
+        stream: false,
+        max_tokens: 64,
+        messages: [{ role: "user", content: "Reply briefly." }],
+      },
+    } as unknown as ServerContext;
+
+    await route!.handler(ctx);
+
+    assert(
+      upstreams.some((u) => u.includes("chatgpt.com")),
+      "the Codex leg was never attempted, so nothing was left behind to clear",
+    );
+    assert(
+      upstreams.some((u) => u.includes("aiplatform.googleapis.com")),
+      "the Vertex leg never served the turn",
+    );
+    // The point of the test: the turn Vertex served carries Vertex's identity
+    // and none of the failed Codex leg's.
+    assertEqual(
+      ctx.metadata.vertexFallbackModel,
+      "claude-opus-5-5",
+      "the served Vertex model must be recorded for billing",
+    );
+    for (const leftover of [
+      "codexFallbackModel",
+      "codexFallbackAccount",
+      "codexFallbackAccountType",
+      "codexFallbackDeferredFailure",
+      "codexFallbackFailureUsage",
+    ]) {
+      assertEqual(
+        ctx.metadata[leftover],
+        undefined,
+        `${leftover} survived the failed Codex leg and would mis-bill this turn`,
+      );
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    setVertexAccessTokenProviderForTests(undefined);
+    if (prevProject === undefined) {
+      delete process.env.GOOGLE_CLOUD_PROJECT;
+    } else {
+      process.env.GOOGLE_CLOUD_PROJECT = prevProject;
+    }
+    if (prevLocation === undefined) {
+      delete process.env.GOOGLE_CLOUD_LOCATION;
+    } else {
+      process.env.GOOGLE_CLOUD_LOCATION = prevLocation;
+    }
+    // The account would otherwise stay in the pool for every later case.
+    await tokenStore.clearTokens(key);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Codex-outbound fallback: cache-preservation (stage-a-cache spec, §5/§Tests)
+// ---------------------------------------------------------------------------
+//
+// Uses the real shipped translation entry point, `translateCodexRequestToClaude`
+// (`src/lib/proxy/codexOutboundFallback.ts`) — its signature takes a `target`
+// and returns a `{ ok, value | error }` discriminated union, not the
+// `convertCodexRequestToClaudeRequest(native): ClaudeRequest` placeholder name
+// the design draft assumed before PRs 1-4 shipped.
+
+const CODEX_CACHE_TARGET = {
+  provider: "anthropic" as const,
+  model: "claude-sonnet-5",
+};
+
+function loadCodexFixture(name: string): CodexNativeRequest {
+  const raw = readFileSync(
+    new URL(`./fixtures/${name}`, import.meta.url),
+    "utf8",
+  );
+  const body = (JSON.parse(raw) as { body: unknown }).body;
+  const parsed = parseCodexNativeRequest(body);
+  if (!parsed.ok) {
+    throw new Error(
+      `fixture ${name} failed to parse: ${parsed.error.code} ${parsed.error.message}`,
+    );
+  }
+  return parsed.value;
+}
+
+function translateCodexFixtureToClaude(
+  native: CodexNativeRequest,
+): ClaudeRequest {
+  const translated = translateCodexRequestToClaude(native, CODEX_CACHE_TARGET);
+  if (!translated.ok) {
+    throw new Error(
+      `translate failed: ${translated.error.code} ${translated.error.message}`,
+    );
+  }
+  return translated.value;
+}
+
+// Test 1 (spec §5): byte-stability + placement determinism.
+await test("codex outbound fallback: translated Anthropic prefix is byte-stable, and breakpoint 1 lands on the stable element, across two turns with unchanged tools/instructions", () => {
+  const turn1 = loadCodexFixture("codex-request-interactive-mode.json");
+  const turn2 = loadCodexFixture("codex-request-turn2-same-session.json");
+  const c1 = applyClaudeRequestCacheBreakpoints(
+    translateCodexFixtureToClaude(turn1),
+    { ttl: "1h" },
+  );
+  const c2 = applyClaudeRequestCacheBreakpoints(
+    translateCodexFixtureToClaude(turn2),
+    { ttl: "1h" },
+  );
+  const s1 = c1.system as ClaudeTextBlock[];
+  const s2 = c2.system as ClaudeTextBlock[];
+
+  // slice(0,4) alone would pass even if the marker silently landed on a
+  // 5th, volatile element — assert the length invariant AND which index
+  // carries the marker, not just prefix equality.
+  assertEqual(s1.length, 4, "system must be exactly the 4 developer blocks");
+  assertEqual(s2.length, 4, "system must be exactly the 4 developer blocks");
+  assertEqual(
+    JSON.stringify(c1.tools),
+    JSON.stringify(c2.tools),
+    "tool array drifted across turns with no tool change — breakpoint 1 will miss every turn",
+  );
+  assertEqual(
+    JSON.stringify(s1),
+    JSON.stringify(s2),
+    "developer-message prefix drifted across turns — breakpoint 1 will miss every turn",
+  );
+  assert(
+    s1[3].cache_control?.ttl === "1h" && s2[3].cache_control?.ttl === "1h",
+    "breakpoint 1 must carry ttl:'1h' on the stable 4th (last) developer block specifically",
+  );
+});
+
+// Test 2 (spec Tests #2): TTL selection — 1h on breakpoint 1 only.
+await test("applyClaudeRequestCacheBreakpoints: ttl:'1h' applies only to breakpoint 1, never to the rolling history breakpoints", () => {
+  const native = loadCodexFixture("codex-request-interactive-mode.json");
+  const claudeRequest = translateCodexFixtureToClaude(native);
+  const result = applyClaudeRequestCacheBreakpoints(claudeRequest, {
+    ttl: "1h",
+  });
+  const system = result.system as ClaudeTextBlock[];
+  assertEqual(
+    system[system.length - 1].cache_control?.ttl,
+    "1h",
+    "breakpoint 1 (last system block) must carry the requested 1h ttl",
+  );
+
+  let historyMarkersSeen = 0;
+  for (const message of result.messages) {
+    const content: unknown = message.content;
+    if (!Array.isArray(content) || content.length === 0) {
+      continue;
+    }
+    const last = content[content.length - 1] as {
+      cache_control?: { ttl?: string };
+    };
+    if (!last.cache_control) {
+      continue;
+    }
+    historyMarkersSeen++;
+    assertEqual(
+      last.cache_control.ttl,
+      undefined,
+      "rolling history breakpoints must keep the 5-minute default (no ttl), never inherit breakpoint 1's ttl",
+    );
+  }
+  assert(
+    historyMarkersSeen > 0,
+    "expected at least one rolling history breakpoint on a multi-message request",
+  );
+});
+
+// Test 3 (spec Tests #3): budget ceiling — never exceeds 4 markers even when
+// the translated request already carries one in its message history.
+await test("applyClaudeRequestCacheBreakpoints never exceeds the 4-marker Anthropic ceiling on an already-marked Codex-shaped request", () => {
+  const native = loadCodexFixture("codex-request-tool-result-turn.json");
+  const claudeRequest = translateCodexFixtureToClaude(native);
+  assert(
+    claudeRequest.messages.length > 0,
+    "fixture must translate to at least one message to pre-mark",
+  );
+
+  const messages: ClaudeMessage[] = claudeRequest.messages.map((m) => ({
+    ...m,
+  }));
+  const lastIndex = messages.length - 1;
+  const lastContent: unknown = messages[lastIndex].content;
+  assert(
+    Array.isArray(lastContent) && lastContent.length > 0,
+    "last message must have block-array content to pre-mark",
+  );
+  const blocks = (lastContent as Record<string, unknown>[]).map((b) => ({
+    ...b,
+  }));
+  blocks[blocks.length - 1] = {
+    ...blocks[blocks.length - 1],
+    cache_control: { type: "ephemeral" },
+  };
+  messages[lastIndex] = {
+    ...messages[lastIndex],
+    content: blocks as ClaudeMessage["content"],
+  };
+
+  const preMarked: ClaudeRequest = { ...claudeRequest, messages };
+  const result = applyClaudeRequestCacheBreakpoints(preMarked, {
+    ttl: "1h",
+  });
+  const count = countAnthropicCacheMarkers({
+    system: result.system,
+    tools: result.tools,
+    messages: result.messages as unknown as Parameters<
+      typeof countAnthropicCacheMarkers
+    >[0]["messages"],
+  });
+  assert(
+    count <= ANTHROPIC_MAX_CACHE_BREAKPOINTS,
+    `expected at most ${ANTHROPIC_MAX_CACHE_BREAKPOINTS} cache_control markers, got ${count}`,
+  );
+});
+
+// Test 4 (spec Tests #4): system-shape guard.
+await test("assertClaudeSystemPrefixShape: throws when system gains a 5th (e.g. environment_context-leaked) block, passes silently at the exact expected length", () => {
+  const fourBlocks: ClaudeTextBlock[] = [
+    { type: "text", text: "a" },
+    { type: "text", text: "b" },
+    { type: "text", text: "c" },
+    { type: "text", text: "d" },
+  ];
+  const fiveBlocks: ClaudeTextBlock[] = [
+    ...fourBlocks,
+    { type: "text", text: "environment_context leaked into system" },
+  ];
+
+  let threw: unknown;
+  try {
+    assertClaudeSystemPrefixShape(fiveBlocks, 4);
+  } catch (error) {
+    threw = error;
+  }
+  assert(
+    threw instanceof ClaudeSystemPrefixShapeError,
+    "expected ClaudeSystemPrefixShapeError on a system array longer than the fixed developer-block prefix",
+  );
+
+  // Passes silently (no throw) at the exact expected length.
+  assertClaudeSystemPrefixShape(fourBlocks, 4);
+});
+
+// Test 5 (spec Tests #5): role-alternation guard.
+await test("assertClaudeMessagesAlternate: throws naming the offending index on back-to-back same-role messages, passes on a well-formed alternating array", () => {
+  const backToBackUser: ClaudeMessage[] = [
+    { role: "user", content: [{ type: "text", text: "notice" }] },
+    { role: "user", content: [{ type: "text", text: "say OK" }] },
+  ];
+  let threw: unknown;
+  try {
+    assertClaudeMessagesAlternate(backToBackUser);
+  } catch (error) {
+    threw = error;
+  }
+  assert(
+    threw instanceof ClaudeSystemPrefixShapeError,
+    "expected ClaudeSystemPrefixShapeError on two consecutive user-role messages",
+  );
+  assert(
+    threw instanceof Error && threw.message.includes("messages[1]"),
+    "error must name the offending index",
+  );
+
+  const alternating: ClaudeMessage[] = [
+    { role: "user", content: [{ type: "text", text: "hi" }] },
+    { role: "assistant", content: [{ type: "text", text: "hello" }] },
+  ];
+  assertClaudeMessagesAlternate(alternating);
+});
+
+// Test 6 (spec Tests #6): affinity-key derivation.
+await test("codexAnthropicAffinityKey: prefers prompt_cache_key, then client_metadata.thread_id, then client_metadata.session_id, then a prefix digest shared by two identity-free requests with the same stable prefix", () => {
+  // codex-request-interactive-mode.json carries neither prompt_cache_key
+  // nor client_metadata (only codex-request-resumed-session.json does),
+  // so it is already identity-free as loaded.
+  const base = loadCodexFixture("codex-request-interactive-mode.json");
+  assert(
+    base.prompt_cache_key === undefined && base.client_metadata === undefined,
+    "fixture assumption: codex-request-interactive-mode.json must carry no identity fields",
+  );
+
+  const withPromptCacheKey: CodexNativeRequest = {
+    ...base,
+    prompt_cache_key: "pck_synthetic_0001",
+    client_metadata: {
+      thread_id: "thread_should_lose",
+      session_id: "session_should_lose",
+    },
+  };
+  assertEqual(
+    codexAnthropicAffinityKey(withPromptCacheKey),
+    "codex-thread:pck_synthetic_0001",
+    "prompt_cache_key must win over client_metadata",
+  );
+
+  const withThreadIdOnly: CodexNativeRequest = {
+    ...base,
+    client_metadata: { thread_id: "thread_synthetic_only" },
+  };
+  assertEqual(
+    codexAnthropicAffinityKey(withThreadIdOnly),
+    "codex-thread:thread_synthetic_only",
+    "client_metadata.thread_id must be used when prompt_cache_key is absent",
+  );
+
+  const withSessionIdOnly: CodexNativeRequest = {
+    ...base,
+    client_metadata: { session_id: "session_synthetic_only" },
+  };
+  assertEqual(
+    codexAnthropicAffinityKey(withSessionIdOnly),
+    "codex-session:session_synthetic_only",
+    "client_metadata.session_id must be used when neither prompt_cache_key nor thread_id is present",
+  );
+
+  // Two identity-free requests sharing the same tools + developer-message
+  // prefix (turn1/turn2 share that prefix by construction — asserted in
+  // the determinism test above) but different environment_context/user
+  // turns must degrade to the SAME prefix-derived key, proving it is
+  // prefix-derived rather than full-body-derived.
+  const turn2Raw = loadCodexFixture("codex-request-turn2-same-session.json");
+  const { client_metadata: _turn2ClientMetadata, ...turn2WithoutIdentity } =
+    turn2Raw;
+  const turn2Identity: CodexNativeRequest = { ...turn2WithoutIdentity };
+
+  const key1 = codexAnthropicAffinityKey(base);
+  const key2 = codexAnthropicAffinityKey(turn2Identity);
+  assert(
+    typeof key1 === "string" && key1.startsWith("codex-prefix:"),
+    "an identity-free request must degrade to a codex-prefix: key",
+  );
+  assertEqual(
+    key1,
+    key2,
+    "two identity-free requests sharing the same stable tools+developer-message prefix must produce the same prefix-derived affinity key",
+  );
+
+  // No identity signal AND no derivable prefix (empty input) -> undefined.
+  const empty: CodexNativeRequest = {
+    model: "gpt-5-codex",
+    stream: true,
+    store: false,
+    input: [],
+  };
+  assertEqual(
+    codexAnthropicAffinityKey(empty),
+    undefined,
+    "a request with no identity signal and no derivable prefix must return undefined",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Codex outbound-fallback config: keys, kill switch, runtime plumbing
+// (stage-b-config.md §A-§E). This stage is a no-op — nothing branches on
+// these values yet — so these tests cover parsing/validation/threading only.
+// ---------------------------------------------------------------------------
+
+await test("validateProxyConfig accepts valid codex-outbound-fallback-* values", async () => {
+  for (const enabledValue of [true, false, "true", "false", "TRUE", "False"]) {
+    const errors = validateProxyConfig({
+      routing: { "codex-outbound-fallback-enabled": enabledValue },
+    });
+    assertEqual(
+      errors.length,
+      0,
+      `codex-outbound-fallback-enabled: ${JSON.stringify(enabledValue)} should be accepted`,
+    );
+  }
+
+  const validTargets = validateProxyConfig({
+    routing: {
+      "codex-outbound-fallback-targets": [
+        { provider: "anthropic", model: "claude-opus-4-6" },
+        { provider: "vertex", model: "claude-opus-4-6" },
+      ],
+    },
+  });
+  assertEqual(
+    validTargets.length,
+    0,
+    "a well-formed codex-outbound-fallback-targets array should be accepted",
+  );
+
+  const validMappings = validateProxyConfig({
+    routing: {
+      "codex-outbound-fallback-model-mappings": [
+        { from: "gpt-6-astra", to: "claude-opus-4-6", provider: "anthropic" },
+        { from: "gpt-6-astra", to: "claude-opus-4-6" },
+      ],
+    },
+  });
+  assertEqual(
+    validMappings.length,
+    0,
+    "a well-formed codex-outbound-fallback-model-mappings array should be accepted",
+  );
+
+  // camelCase spelling must be accepted identically to kebab-case.
+  const camelCase = validateProxyConfig({
+    routing: {
+      codexOutboundFallbackEnabled: true,
+      codexOutboundFallbackTargets: [
+        { provider: "anthropic", model: "claude-opus-4-6" },
+      ],
+    },
+  });
+  assertEqual(
+    camelCase.length,
+    0,
+    "camelCase codex-outbound-fallback-* keys should be accepted identically to kebab-case",
+  );
+});
+
+await test("validateProxyConfig rejects malformed codex-outbound-fallback-* values", async () => {
+  const badEnabled = validateProxyConfig({
+    routing: { "codex-outbound-fallback-enabled": 1 },
+  });
+  assert(
+    badEnabled.some((e) => e.includes("codex-outbound-fallback-enabled")),
+    "a non-boolean, non-true/false-string codex-outbound-fallback-enabled must be rejected",
+  );
+
+  const explicitNullEnabled = validateProxyConfig({
+    routing: { "codex-outbound-fallback-enabled": null },
+  });
+  assert(
+    explicitNullEnabled.some((e) =>
+      e.includes("codex-outbound-fallback-enabled"),
+    ),
+    "an explicit null codex-outbound-fallback-enabled must be rejected, not treated as unset",
+  );
+
+  const badProvider = validateProxyConfig({
+    routing: {
+      "codex-outbound-fallback-targets": [
+        { provider: "openai", model: "gpt-6-astra" },
+      ],
+    },
+  });
+  assert(
+    badProvider.some((e) => e.includes("provider must be anthropic or vertex")),
+    "a target with provider: openai must be rejected (only anthropic/vertex are outbound targets)",
+  );
+
+  const emptyModel = validateProxyConfig({
+    routing: {
+      "codex-outbound-fallback-targets": [{ provider: "anthropic", model: "" }],
+    },
+  });
+  assert(
+    emptyModel.some((e) => e.includes("model must be a non-empty string")),
+    "a target with an empty model must be rejected",
+  );
+
+  const tooManyTargets = validateProxyConfig({
+    routing: {
+      "codex-outbound-fallback-targets": Array.from({ length: 9 }, () => ({
+        provider: "anthropic",
+        model: "claude-opus-4-6",
+      })),
+    },
+  });
+  assert(
+    tooManyTargets.some((e) => e.includes("at most 8 entries")),
+    "a 9-entry codex-outbound-fallback-targets array must exceed the cap and be rejected",
+  );
+
+  const explicitNullTargets = validateProxyConfig({
+    routing: { "codex-outbound-fallback-targets": null },
+  });
+  assert(
+    explicitNullTargets.some((e) =>
+      e.includes("codex-outbound-fallback-targets"),
+    ),
+    "an explicit null codex-outbound-fallback-targets must be rejected, not treated as unset",
+  );
+
+  const badMapping = validateProxyConfig({
+    routing: {
+      "codex-outbound-fallback-model-mappings": [{ from: "", to: "" }],
+    },
+  });
+  assert(
+    badMapping.some((e) => e.includes("from must be a non-empty string")) &&
+      badMapping.some((e) => e.includes("to must be a non-empty string")),
+    "a model-mapping entry missing from/to must be rejected",
+  );
+});
+
+await test("parseRoutingConfig drops a malformed codex-outbound-fallback-targets entry without discarding valid siblings", async () => {
+  const result = parseRoutingConfig({
+    "codex-outbound-fallback-targets": [
+      { provider: "anthropic", model: "claude-opus-4-6" },
+      { provider: "openai", model: "gpt-6-astra" }, // invalid provider, dropped
+      { provider: "vertex", model: "claude-opus-4-6" },
+    ],
+  });
+  assertEqual(
+    result?.codexOutboundFallbackTargets?.length,
+    2,
+    "exactly one malformed entry should be dropped, leaving the two valid ones",
+  );
+  assertEqual(
+    result?.codexOutboundFallbackTargets?.map((t) => t.provider).join(","),
+    "anthropic,vertex",
+    "the surviving entries must be the two structurally valid ones, in order",
+  );
+});
+
+await test("parseRoutingConfig drops a malformed codex-outbound-fallback-model-mappings entry without discarding valid siblings", async () => {
+  const result = parseRoutingConfig({
+    "codex-outbound-fallback-model-mappings": [
+      { from: "gpt-6-astra", to: "claude-opus-4-6" },
+      { from: "", to: "claude-opus-4-6" }, // empty from, dropped
+      { from: "gpt-6-sky", to: "claude-sonnet-4-6" },
+    ],
+  });
+  assertEqual(
+    result?.codexOutboundFallbackModelMappings?.length,
+    2,
+    "exactly one malformed entry should be dropped, leaving the two valid ones",
+  );
+});
+
+await test("createCodexProxyRoutes() without a runtimeConfigProvider argument behaves identically to the pre-existing single-argument call", async () => {
+  const withoutProvider = createCodexProxyRoutes("");
+  const withUndefinedProvider = createCodexProxyRoutes("", undefined);
+
+  assertEqual(
+    withoutProvider.prefix,
+    withUndefinedProvider.prefix,
+    "route group prefix must be unaffected by the new optional argument",
+  );
+  assertEqual(
+    withoutProvider.routes.length,
+    2,
+    "the Codex route group must still expose exactly its two routes (responses, models)",
+  );
+  assertEqual(
+    withoutProvider.routes.map((r) => `${r.method} ${r.path}`).join("|"),
+    withUndefinedProvider.routes.map((r) => `${r.method} ${r.path}`).join("|"),
+    "route method/path pairs must be identical whether or not the second argument is passed",
+  );
+  assertEqual(
+    withoutProvider.prefix,
+    "/backend-api/codex",
+    "route prefix must remain unchanged from before this stage's signature extension",
+  );
+});
+
+await test("configHash changes when codex-outbound-fallback-enabled flips", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "codex-outbound-fallback-hash-"));
+  const configPath = join(dir, "proxy.json");
+  const writeConfig = (enabled: boolean) =>
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        routing: { "codex-outbound-fallback-enabled": enabled },
+      }),
+    );
+  try {
+    writeConfig(false);
+    const runtime = await ProxyRuntimeConfigStore.create({
+      configPath,
+      configRequired: true,
+      baseEnv: {},
+      passthrough: false,
+    });
+    const before = runtime.getSnapshot();
+    assertEqual(
+      before.codexOutboundFallbackEnabled,
+      false,
+      "unset/false config must resolve codexOutboundFallbackEnabled to false",
+    );
+
+    writeConfig(true);
+    await runtime.reload("manual");
+    const after = runtime.getSnapshot();
+    assertEqual(
+      after.codexOutboundFallbackEnabled,
+      true,
+      "the reloaded snapshot must reflect the new enabled value",
+    );
+    assert(
+      after.configHash !== before.configHash,
+      "flipping codex-outbound-fallback-enabled must change the config hash",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("NEUROLINK_PROXY_CODEX_OUTBOUND_FALLBACK=off overrides a config-enabled codex-outbound-fallback", async () => {
+  const dir = mkdtempSync(
+    join(tmpdir(), "codex-outbound-fallback-killswitch-"),
+  );
+  const configPath = join(dir, "proxy.json");
+  writeFileSync(
+    configPath,
+    JSON.stringify({
+      routing: { "codex-outbound-fallback-enabled": true },
+    }),
+  );
+  try {
+    const runtimeWithoutOverride = await ProxyRuntimeConfigStore.create({
+      configPath,
+      configRequired: true,
+      baseEnv: {},
+      passthrough: false,
+    });
+    assertEqual(
+      runtimeWithoutOverride.getSnapshot().codexOutboundFallbackEnabled,
+      true,
+      "with no env override, a config-enabled flag must resolve to enabled",
+    );
+
+    const runtimeWithOverride = await ProxyRuntimeConfigStore.create({
+      configPath,
+      configRequired: true,
+      baseEnv: { NEUROLINK_PROXY_CODEX_OUTBOUND_FALLBACK: "off" },
+      passthrough: false,
+    });
+    assertEqual(
+      runtimeWithOverride.getSnapshot().codexOutboundFallbackEnabled,
+      false,
+      "the env kill switch must override a config value of true",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Item 6 (fix-pass brief): an empty or whitespace-only env value (e.g. `FOO=`
+// left over in a .env file) must mean "unset", i.e. defer to the config
+// value -- not be read as a present-but-falsy override that always resolves
+// to disabled regardless of what the config says.
+await test("NEUROLINK_PROXY_CODEX_OUTBOUND_FALLBACK='' (empty/whitespace) means unset, deferring to config, on both a true and a false config", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "codex-outbound-fallback-empty-env-"));
+  const enabledConfigPath = join(dir, "proxy-enabled.json");
+  const disabledConfigPath = join(dir, "proxy-disabled.json");
+  writeFileSync(
+    enabledConfigPath,
+    JSON.stringify({ routing: { "codex-outbound-fallback-enabled": true } }),
+  );
+  writeFileSync(
+    disabledConfigPath,
+    JSON.stringify({ routing: { "codex-outbound-fallback-enabled": false } }),
+  );
+  try {
+    for (const emptyValue of ["", "   "]) {
+      const runtimeOnTrue = await ProxyRuntimeConfigStore.create({
+        configPath: enabledConfigPath,
+        configRequired: true,
+        baseEnv: { NEUROLINK_PROXY_CODEX_OUTBOUND_FALLBACK: emptyValue },
+        passthrough: false,
+      });
+      assertEqual(
+        runtimeOnTrue.getSnapshot().codexOutboundFallbackEnabled,
+        true,
+        `an empty/whitespace env value (${JSON.stringify(emptyValue)}) must not override a config value of true to false`,
+      );
+
+      const runtimeOnFalse = await ProxyRuntimeConfigStore.create({
+        configPath: disabledConfigPath,
+        configRequired: true,
+        baseEnv: { NEUROLINK_PROXY_CODEX_OUTBOUND_FALLBACK: emptyValue },
+        passthrough: false,
+      });
+      assertEqual(
+        runtimeOnFalse.getSnapshot().codexOutboundFallbackEnabled,
+        false,
+        `an empty/whitespace env value (${JSON.stringify(emptyValue)}) must not force-enable over a config value of false`,
+      );
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Item 7 (fix-pass brief): createAllRoutes/registerAllRoutes (the generic SDK
+// route surface) has no option that threads loopbackPort/internalDispatch
+// through to createCodexProxyRoutes, so a consumer enabling the feature with
+// an anthropic target there would otherwise fail every such request silently,
+// with nothing at startup explaining why. warnIfAnthropicOutboundFallbackUnreachable
+// logs one clear warning at route-creation time instead -- this proves that
+// warning fires exactly when it should (enabled + anthropic target + no
+// loopback seam) and stays silent otherwise (vertex-only, feature off, or a
+// seam actually provided).
+await test("createCodexProxyRoutes warns once when an anthropic target is enabled but no loopbackPort/internalDispatch was provided", async () => {
+  const dir = mkdtempSync(
+    join(tmpdir(), "codex-outbound-fallback-route-warn-"),
+  );
+  const configPath = join(dir, "proxy.json");
+  const originalWarn = logger.warn.bind(logger);
+  const warnings: string[] = [];
+  logger.warn = (...args: unknown[]): void => {
+    warnings.push(args.map((a) => String(a)).join(" "));
+  };
+  try {
+    // Case 1: enabled, anthropic target, no loopback seam -- must warn.
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        routing: {
+          "codex-outbound-fallback-enabled": true,
+          "codex-outbound-fallback-targets": [
+            { provider: "anthropic", model: "claude-opus-4-6" },
+          ],
+        },
+      }),
+    );
+    const anthropicRuntime = await ProxyRuntimeConfigStore.create({
+      configPath,
+      configRequired: true,
+      baseEnv: {},
+      passthrough: false,
+    });
+    warnings.length = 0;
+    createCodexProxyRoutes(
+      "",
+      () => anthropicRuntime.getSnapshot(),
+      undefined,
+      undefined,
+    );
+    assertEqual(
+      warnings.filter((w) => w.includes("loopbackPort or internalDispatch"))
+        .length,
+      1,
+      "an anthropic target enabled with no loopback seam must log exactly one clear warning at route-creation time",
+    );
+
+    // Case 2: enabled, anthropic target, loopbackPort IS provided -- silent.
+    warnings.length = 0;
+    createCodexProxyRoutes(
+      "",
+      () => anthropicRuntime.getSnapshot(),
+      4123,
+      undefined,
+    );
+    assertEqual(
+      warnings.filter((w) => w.includes("loopbackPort or internalDispatch"))
+        .length,
+      0,
+      "providing loopbackPort must silence the warning -- the seam exists",
+    );
+
+    // Case 3: enabled, vertex-only target, no loopback seam -- silent (vertex
+    // never reads loopbackPort).
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        routing: {
+          "codex-outbound-fallback-enabled": true,
+          "codex-outbound-fallback-targets": [
+            { provider: "vertex", model: "claude-opus-4-6" },
+          ],
+        },
+      }),
+    );
+    const vertexRuntime = await ProxyRuntimeConfigStore.create({
+      configPath,
+      configRequired: true,
+      baseEnv: {},
+      passthrough: false,
+    });
+    warnings.length = 0;
+    createCodexProxyRoutes(
+      "",
+      () => vertexRuntime.getSnapshot(),
+      undefined,
+      undefined,
+    );
+    assertEqual(
+      warnings.filter((w) => w.includes("loopbackPort or internalDispatch"))
+        .length,
+      0,
+      "a vertex-only target must never warn about the anthropic loopback seam",
+    );
+
+    // Case 4: feature disabled entirely -- silent.
+    writeFileSync(
+      configPath,
+      JSON.stringify({ routing: { "codex-outbound-fallback-enabled": false } }),
+    );
+    const disabledRuntime = await ProxyRuntimeConfigStore.create({
+      configPath,
+      configRequired: true,
+      baseEnv: {},
+      passthrough: false,
+    });
+    warnings.length = 0;
+    createCodexProxyRoutes(
+      "",
+      () => disabledRuntime.getSnapshot(),
+      undefined,
+      undefined,
+    );
+    assertEqual(
+      warnings.filter((w) => w.includes("loopbackPort or internalDispatch"))
+        .length,
+      0,
+      "the feature must be silent at route-creation time when disabled",
+    );
+  } finally {
+    logger.warn = originalWarn;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A pool parked only by "auth" cooldowns (a token refresh that failed
+// transiently, or a 401 with no refresh token to retry with) is not out of
+// quota. The terminal error has to say so: `insufficient_quota` tells the
+// client the plan is spent, which for these accounts is false.
+await test("Codex responses does not report an auth-cooled pool as spent quota", async () => {
+  const { saveAccountCooldown, clearAccountCooldown } =
+    await import("../src/lib/proxy/accountCooldown.js");
+  const route = createCodexProxyRoutes("").routes.find(
+    (entry) =>
+      entry.method === "POST" && entry.path === "/backend-api/codex/responses",
+  );
+  assert(route !== undefined, "the Codex responses route was not registered");
+  const keys = [
+    "codex:auth-cooling-a@example.test",
+    "codex:auth-cooling-b@example.test",
+  ];
+  const savedFetch = globalThis.fetch;
+  assertEqual(
+    (await __testHooks.loadCodexProxyAccounts()).length,
+    0,
+    "an earlier case left a Codex account in the shared pool",
+  );
+  const terminalFor = async (
+    reasons: AccountCoolingReason[],
+  ): Promise<{
+    code: unknown;
+    message: unknown;
+    retryAfter: string | null;
+  }> => {
+    try {
+      for (const [index, reason] of reasons.entries()) {
+        await tokenStore.saveTokens(keys[index], {
+          accessToken: "isolated-access",
+          tokenType: "Bearer",
+          expiresAt: Date.now() + 7_200_000,
+        });
+        await saveAccountCooldown(keys[index], Date.now() + 120_000, reason);
+      }
+      // Every account is cooling, so no upstream request may be made.
+      globalThis.fetch = async () => {
+        throw new Error("a cooling pool must not reach the upstream");
+      };
+      const result = await route!.handler({
+        requestId: `auth-cooling-${reasons.join("-")}`,
+        method: "POST",
+        path: "/backend-api/codex/responses",
+        headers: {},
+        query: {},
+        params: {},
+        metadata: {},
+        responseHeaders: {},
+        timestamp: Date.now(),
+        neurolink: {},
+        toolRegistry: {},
+        body: {
+          model: "gpt-5.6-sol",
+          stream: true,
+          store: false,
+          input: [
+            {
+              type: "message",
+              role: "user",
+              content: [{ type: "input_text", text: "hello" }],
+            },
+          ],
+        },
+      } as unknown as ServerContext);
+      if (!(result instanceof Response)) {
+        throw new Error("the handler did not return a Response");
+      }
+      const data = (await result.text())
+        .split("\n")
+        .find((line) => line.startsWith("data: "));
+      if (data === undefined) {
+        throw new Error("the terminal event carried no data");
+      }
+      const error = (
+        JSON.parse(data.slice("data: ".length)) as {
+          response?: { error?: { code?: unknown; message?: unknown } };
+        }
+      ).response?.error;
+      return {
+        code: error?.code,
+        message: error?.message,
+        retryAfter: result.headers.get("retry-after"),
+      };
+    } finally {
+      globalThis.fetch = savedFetch;
+      for (const key of keys) {
+        await tokenStore.clearTokens(key);
+        await clearAccountCooldown(key);
+      }
+    }
+  };
+
+  const authOnly = await terminalFor(["auth", "auth"]);
+  assertEqual(
+    authOnly.code,
+    "server_error",
+    "an auth-cooled pool was reported as spent quota",
+  );
+  assert(
+    typeof authOnly.message === "string" &&
+      !authOnly.message.includes("quota exhausted"),
+    "the auth-cooled message still claimed the quota was exhausted",
+  );
+  assert(
+    Number(authOnly.retryAfter) > 0,
+    "the auth-cooled response lost its retry-after",
+  );
+
+  // Controls: any account cooling for a quota reason keeps the quota error, so
+  // the distinction is not simply "always server_error".
+  for (const reasons of [
+    ["weekly", "weekly"],
+    ["auth", "weekly"],
+  ] as const) {
+    const quota = await terminalFor([...reasons]);
+    assertEqual(
+      quota.code,
+      "insufficient_quota",
+      "a pool with a quota cooldown must still report spent quota",
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Stage C trigger policy (stage-c-trigger.md §1): classifyCodexOutboundFailure
+// / parseCodexErrorCode are pure functions with no dispatch, HTTP or account
+// state, driven directly under this file's existing determinism exception
+// (see header) for the same reason translateCodexRequestToClaude is above.
+// ---------------------------------------------------------------------------
+
+await test("classifyCodexOutboundFailure: no_accounts is eligible for outbound fallback", async () => {
+  const decision = classifyCodexOutboundFailure({
+    failureClass: "no_accounts",
+  });
+  assertEqual(
+    decision.eligible,
+    true,
+    "no configured Codex accounts must be eligible to fall outbound",
+  );
+  assert(
+    decision.reason.length > 0,
+    "the decision must carry a non-empty human-readable reason",
+  );
+});
+
+await test("classifyCodexOutboundFailure: pool_exhausted is eligible for outbound fallback", async () => {
+  const decision = classifyCodexOutboundFailure({
+    failureClass: "pool_exhausted",
+  });
+  assertEqual(
+    decision.eligible,
+    true,
+    "every Codex account cooling down must be eligible to fall outbound",
+  );
+});
+
+await test("classifyCodexOutboundFailure: loop_fallthrough is eligible for outbound fallback", async () => {
+  const decision = classifyCodexOutboundFailure({
+    failureClass: "loop_fallthrough",
+  });
+  assertEqual(
+    decision.eligible,
+    true,
+    "an exhausted account-retry loop must be eligible to fall outbound",
+  );
+});
+
+await test("classifyCodexOutboundFailure: loop_fallthrough with a bare 401/403 stays eligible (Codex credential failure)", async () => {
+  for (const lastStatus of [401, 403]) {
+    const decision = classifyCodexOutboundFailure({
+      failureClass: "loop_fallthrough",
+      lastStatus,
+    });
+    assertEqual(
+      decision.eligible,
+      true,
+      `a ${lastStatus} with no content-policy code is a credential failure on Codex's own pool and must stay eligible`,
+    );
+  }
+});
+
+await test("classifyCodexOutboundFailure: loop_fallthrough with a content-policy or invalid-request code is NOT eligible", async () => {
+  for (const [lastStatus, lastErrorCode] of [
+    [403, "content_policy_violation"],
+    [403, "cyber_policy"],
+    [400, "invalid_request_error"],
+  ] as const) {
+    const decision = classifyCodexOutboundFailure({
+      failureClass: "loop_fallthrough",
+      lastStatus,
+      lastErrorCode,
+    });
+    assertEqual(
+      decision.eligible,
+      false,
+      `${lastStatus} ${lastErrorCode} rejects the request itself and must not fall outbound`,
+    );
+  }
+});
+
+await test("classifyCodexOutboundFailure: loop_fallthrough with any other 4xx except 429 is NOT eligible", async () => {
+  for (const lastStatus of [400, 404, 422]) {
+    const decision = classifyCodexOutboundFailure({
+      failureClass: "loop_fallthrough",
+      lastStatus,
+      lastErrorCode: "some_unrecognized_code",
+    });
+    assertEqual(
+      decision.eligible,
+      false,
+      `a ${lastStatus} rejects the request itself and must not fall outbound`,
+    );
+  }
+  const rateLimited = classifyCodexOutboundFailure({
+    failureClass: "loop_fallthrough",
+    lastStatus: 429,
+    lastErrorCode: "usage_limit_reached",
+  });
+  assertEqual(
+    rateLimited.eligible,
+    true,
+    "a 429 exhausting every account is a pool failure and must stay eligible",
+  );
+});
+
+await test("classifyCodexOutboundFailure: loop_fallthrough with a 5xx lastStatus stays eligible", async () => {
+  const decision = classifyCodexOutboundFailure({
+    failureClass: "loop_fallthrough",
+    lastStatus: 500,
+  });
+  assertEqual(
+    decision.eligible,
+    true,
+    "a 500 on the last exhausted account attempt is a pool-health failure, not a content-policy rejection, so it must remain eligible for outbound fallback",
+  );
+});
+
+await test("classifyCodexOutboundFailure: non_retryable_transport is eligible for a socket-level code", async () => {
+  const decision = classifyCodexOutboundFailure({
+    failureClass: "non_retryable_transport",
+    transportErrorCode: "ECONNRESET",
+  });
+  assertEqual(
+    decision.eligible,
+    true,
+    "a non-retryable socket failure says nothing about the request and must be eligible to fall outbound",
+  );
+});
+
+await test("classifyCodexOutboundFailure: non_retryable_transport is NOT eligible for a content-policy-shaped code", async () => {
+  const decision = classifyCodexOutboundFailure({
+    failureClass: "non_retryable_transport",
+    transportErrorCode: "content_policy_violation",
+  });
+  assertEqual(
+    decision.eligible,
+    false,
+    "a content-policy rejection must not be treated as a Codex pool failure eligible for outbound fallback",
+  );
+});
+
+await test("classifyCodexOutboundFailure: non_retryable_transport is NOT eligible for an invalid-request code", async () => {
+  for (const transportErrorCode of [
+    "invalid_request_error",
+    "context_length_exceeded",
+    "max_output_tokens",
+  ]) {
+    const decision = classifyCodexOutboundFailure({
+      failureClass: "non_retryable_transport",
+      transportErrorCode,
+    });
+    assertEqual(
+      decision.eligible,
+      false,
+      `${transportErrorCode} rejects the request itself and must not fall outbound`,
+    );
+  }
+});
+
+await test("classifyCodexOutboundFailure: non_retryable_transport with no transport code still resolves (defaults to eligible)", async () => {
+  const decision = classifyCodexOutboundFailure({
+    failureClass: "non_retryable_transport",
+  });
+  assertEqual(
+    decision.eligible,
+    true,
+    "an unclassified/absent transport code must not be mistaken for a content-policy rejection",
+  );
+});
+
+await test("parseCodexErrorCode: reads a direct .code", async () => {
+  const code = parseCodexErrorCode({ code: "content_policy_violation" });
+  assertEqual(
+    code,
+    "content_policy_violation",
+    "a direct .code field must be returned as-is",
+  );
+});
+
+await test("parseCodexErrorCode: falls back to .cause.code when .code is absent", async () => {
+  const code = parseCodexErrorCode({
+    cause: { code: "context_length_exceeded" },
+  });
+  assertEqual(
+    code,
+    "context_length_exceeded",
+    "a nested .cause.code must be read when the top-level .code is absent",
+  );
+});
+
+await test("parseCodexErrorCode: returns undefined for a code-less error", async () => {
+  const code = parseCodexErrorCode(new Error("boom"));
+  assertEqual(
+    code,
+    undefined,
+    "an error carrying neither .code nor .cause.code must resolve to undefined",
+  );
+});
+
+await test("parseCodexErrorCode: returns undefined for a non-object input", async () => {
+  assertEqual(
+    parseCodexErrorCode("not-an-error"),
+    undefined,
+    "a non-object value must not be mistaken for a code-bearing error",
+  );
+  assertEqual(
+    parseCodexErrorCode(undefined),
+    undefined,
+    "undefined must resolve to undefined, not throw",
+  );
+});
+
+await test("MAX_ENGINE_CROSSINGS bounds a single engine crossing per turn", async () => {
+  assertEqual(
+    MAX_ENGINE_CROSSINGS,
+    1,
+    "the trigger policy must cap engine crossings at 1 per turn (Codex->Anthropic, never a further hop back)",
+  );
+});
+
+await runSuite();

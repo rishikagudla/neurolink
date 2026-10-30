@@ -322,8 +322,9 @@ app.use(
 );
 
 // External rate limiting with Redis
-const Redis = require("ioredis");
-const redis = new Redis();
+const { createClient } = require("redis");
+const redis = createClient();
+await redis.connect();
 
 app.use(
   ratelimit({
@@ -454,9 +455,11 @@ app.use(async (ctx, next) => {
     ctx.status = 200;
 
     // Manual streaming
-    for await (const chunk of neurolink.generateStream({
-      prompt: ctx.request.body.prompt,
-    })) {
+    const result = await neurolink.stream({
+      input: { text: ctx.request.body.prompt },
+    });
+
+    for await (const chunk of result.stream) {
       ctx.res.write(`data: ${JSON.stringify(chunk)}\n\n`);
     }
 
@@ -536,11 +539,11 @@ describe("Koa API Server", () => {
 
 ## Related Documentation
 
-- **[Server Adapters Overview](/guides/server-adapters)** - Getting started with server adapters
-- **[Hono Adapter](/guides/server-adapters/hono)** - Recommended framework for most use cases
-- **[Express Adapter](/guides/server-adapters/express)** - Compare with Express adapter
-- **[Security Best Practices](/guides/server-adapters/security)** - Authentication patterns
-- **[Deployment Guide](/guides/server-adapters/deployment)** - Production deployment strategies
+- **[Server Adapters Overview](./index.md)** - Getting started with server adapters
+- **[Hono Adapter](./hono.md)** - Recommended framework for most use cases
+- **[Express Adapter](./express.md)** - Compare with Express adapter
+- **[Security Best Practices](./security.md)** - Authentication patterns
+- **[Deployment Guide](./deployment.md)** - Production deployment strategies
 
 ---
 

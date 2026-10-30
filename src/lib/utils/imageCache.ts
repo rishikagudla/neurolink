@@ -15,11 +15,12 @@
 
 import { createHash } from "crypto";
 import { logger } from "./logger.js";
+import { normalizeUrlForCache, redactUrlForError } from "./logSanitize.js";
 import type {
   CachedImage,
   ImageCacheConfig,
   ImageCacheStats,
-} from "../types/utilities.js";
+} from "../types/index.js";
 
 /**
  * LRU Cache for downloaded images
@@ -29,7 +30,11 @@ import type {
  */
 export class ImageCache {
   private cache = new Map<string, CachedImage>();
-  private contentHashIndex = new Map<string, string>(); // contentHash -> url
+  // contentHash -> set of normalized urls whose cache entry holds that
+  // content. A Set (not a single url) so that evicting/deleting one url
+  // doesn't drop the dedup mapping for other urls still caching the same
+  // content (#1213).
+  private contentHashIndex = new Map<string, Set<string>>();
   private maxSize: number;
   private ttlMs: number;
   private maxImageSize: number;
@@ -122,29 +127,19 @@ export class ImageCache {
   }
 
   /**
-   * Normalize URL for consistent cache key generation
-   * Removes tracking parameters and normalizes the URL
+   * Normalize URL for consistent cache key generation.
+   *
+   * Delegates to the shared {@link normalizeUrlForCache} — this normalized
+   * URL is used as the in-memory Map key (see `get`/`set` below), which lives
+   * for the process lifetime, so both tracking-param noise and presigned-URL
+   * auth/signature secrets must be stripped consistently with
+   * `fileDetector.cacheKeyForUrl`'s identical requirement. See
+   * `stripSensitiveUrlParamsForCacheKey`'s doc comment for why a naive
+   * strip-only approach (no hash suffix) would be a correctness bug, not just
+   * a hygiene one.
    */
   private normalizeUrl(url: string): string {
-    try {
-      const parsed = new URL(url);
-      // Remove common tracking parameters that don't affect content
-      const trackingParams = [
-        "utm_source",
-        "utm_medium",
-        "utm_campaign",
-        "utm_term",
-        "utm_content",
-        "fbclid",
-        "gclid",
-        "_ga",
-      ];
-      trackingParams.forEach((param) => parsed.searchParams.delete(param));
-      return parsed.toString();
-    } catch {
-      // If URL parsing fails, use the original URL
-      return url;
-    }
+    return normalizeUrlForCache(url);
   }
 
   /**
@@ -186,7 +181,9 @@ export class ImageCache {
 
     if (!entry) {
       this.stats.misses++;
-      logger.debug("Image cache miss", { url: normalizedUrl.substring(0, 50) });
+      logger.debug("Image cache miss", {
+        url: redactUrlForError(normalizedUrl),
+      });
       return null;
     }
 
@@ -195,7 +192,7 @@ export class ImageCache {
       this.stats.expirations++;
       this.delete(normalizedUrl);
       logger.debug("Image cache entry expired", {
-        url: normalizedUrl.substring(0, 50),
+        url: redactUrlForError(normalizedUrl),
       });
       return null;
     }
@@ -210,7 +207,7 @@ export class ImageCache {
 
     this.stats.hits++;
     logger.debug("Image cache hit", {
-      url: normalizedUrl.substring(0, 50),
+      url: redactUrlForError(normalizedUrl),
       accessCount: entry.accessCount,
     });
 
@@ -222,11 +219,40 @@ export class ImageCache {
    * Useful for deduplication when the same image is accessed via different URLs
    */
   getByContentHash(contentHash: string): CachedImage | null {
-    const url = this.contentHashIndex.get(contentHash);
-    if (!url) {
+    const urlSet = this.contentHashIndex.get(contentHash);
+    if (!urlSet) {
       return null;
     }
-    return this.get(url);
+
+    // Find the first url whose cache entry is still live, pruning any url
+    // whose entry no longer exists in `this.cache` along the way. Entries
+    // that exist but are expired are left in the set (not "gone") - the
+    // normal TTL/get() path is responsible for reaping those.
+    let liveUrl: string | null = null;
+    // Iterate a copy so reaping below can mutate the set safely.
+    for (const url of [...urlSet]) {
+      const entry = this.cache.get(url);
+      if (!entry) {
+        urlSet.delete(url);
+        continue;
+      }
+      if (this.isExpired(entry)) {
+        // Reap expired entries here too (matching get() semantics) so stale
+        // urls don't accumulate when callers primarily use getByContentHash.
+        this.cache.delete(url);
+        urlSet.delete(url);
+        continue;
+      }
+      if (liveUrl === null) {
+        liveUrl = url;
+      }
+    }
+
+    if (urlSet.size === 0) {
+      this.contentHashIndex.delete(contentHash);
+    }
+
+    return liveUrl ? this.get(liveUrl) : null;
   }
 
   /**
@@ -250,7 +276,7 @@ export class ImageCache {
     // Skip caching if image exceeds max size
     if (size > this.maxImageSize) {
       logger.debug("Image too large to cache", {
-        url: normalizedUrl.substring(0, 50),
+        url: redactUrlForError(normalizedUrl),
         size,
         maxSize: this.maxImageSize,
       });
@@ -260,21 +286,42 @@ export class ImageCache {
     // Generate content hash
     const contentHash = this.generateContentHash(imageData);
 
-    // Check if same content already exists under different URL
-    const existingUrl = this.contentHashIndex.get(contentHash);
-    if (existingUrl && existingUrl !== normalizedUrl) {
-      // Content already cached under different URL - create a shallow copy
-      const existingEntry = this.cache.get(existingUrl);
-      if (existingEntry && !this.isExpired(existingEntry)) {
-        // Create a shallow copy for the new URL to avoid shared reference issues
-        this.cache.set(normalizedUrl, { ...existingEntry });
-        // Update content hash index to point to the new URL as well
-        this.contentHashIndex.set(contentHash, normalizedUrl);
-        logger.debug("Image cache dedup hit", {
-          newUrl: normalizedUrl.substring(0, 50),
-          existingUrl: existingUrl.substring(0, 50),
-        });
-        return;
+    // Check if same content already exists under a different URL
+    const existingUrls = this.contentHashIndex.get(contentHash);
+    if (existingUrls) {
+      for (const existingUrl of existingUrls) {
+        if (existingUrl === normalizedUrl) {
+          continue;
+        }
+        // Content already cached under a different URL - create a shallow copy
+        const existingEntry = this.cache.get(existingUrl);
+        if (existingEntry && !this.isExpired(existingEntry)) {
+          // A dedup hit still adds a cache entry for the new URL, so enforce
+          // capacity first — otherwise many URLs sharing one content hash could
+          // grow the cache past maxSize.
+          while (this.cache.size >= this.maxSize && this.cache.size > 0) {
+            this.evictOldest();
+          }
+          // Create a shallow copy for the new URL to avoid shared reference issues
+          this.cache.set(normalizedUrl, { ...existingEntry });
+          // Re-fetch (or re-create) the hash's URL set: the eviction above may
+          // have removed this hash's last url, emptying the set and deleting it
+          // from contentHashIndex — reusing the stale `existingUrls` reference
+          // would add the new url to an orphaned set that the index no longer
+          // points to, leaving a live entry unreachable by content hash
+          // (the exact #1213 failure mode). Never replace an existing mapping.
+          let hashUrls = this.contentHashIndex.get(contentHash);
+          if (!hashUrls) {
+            hashUrls = new Set<string>();
+            this.contentHashIndex.set(contentHash, hashUrls);
+          }
+          hashUrls.add(normalizedUrl);
+          logger.debug("Image cache dedup hit", {
+            newUrl: redactUrlForError(normalizedUrl),
+            existingUrl: redactUrlForError(existingUrl),
+          });
+          return;
+        }
       }
     }
 
@@ -295,10 +342,15 @@ export class ImageCache {
     };
 
     this.cache.set(normalizedUrl, entry);
-    this.contentHashIndex.set(contentHash, normalizedUrl);
+    let urlSet = this.contentHashIndex.get(contentHash);
+    if (!urlSet) {
+      urlSet = new Set<string>();
+      this.contentHashIndex.set(contentHash, urlSet);
+    }
+    urlSet.add(normalizedUrl);
 
     logger.debug("Image cached", {
-      url: normalizedUrl.substring(0, 50),
+      url: redactUrlForError(normalizedUrl),
       size,
       contentHash: contentHash.substring(0, 8),
       cacheSize: this.cache.size,
@@ -313,9 +365,14 @@ export class ImageCache {
     const entry = this.cache.get(normalizedUrl);
 
     if (entry) {
-      // Remove from content hash index
-      if (this.contentHashIndex.get(entry.contentHash) === normalizedUrl) {
-        this.contentHashIndex.delete(entry.contentHash);
+      // Remove this URL from its content hash's URL set; only drop the
+      // hash entry once no URL maps to that content anymore (#1213).
+      const urlSet = this.contentHashIndex.get(entry.contentHash);
+      if (urlSet) {
+        urlSet.delete(normalizedUrl);
+        if (urlSet.size === 0) {
+          this.contentHashIndex.delete(entry.contentHash);
+        }
       }
       this.cache.delete(normalizedUrl);
       return true;
@@ -333,14 +390,21 @@ export class ImageCache {
     if (oldestKey !== undefined) {
       const entry = this.cache.get(oldestKey);
       if (entry) {
-        if (this.contentHashIndex.get(entry.contentHash) === oldestKey) {
-          this.contentHashIndex.delete(entry.contentHash);
+        // Remove only the evicted URL from its content hash's URL set; the
+        // hash entry is dropped only once no URL maps to it anymore
+        // (#1213).
+        const urlSet = this.contentHashIndex.get(entry.contentHash);
+        if (urlSet) {
+          urlSet.delete(oldestKey);
+          if (urlSet.size === 0) {
+            this.contentHashIndex.delete(entry.contentHash);
+          }
         }
       }
       this.cache.delete(oldestKey);
       this.stats.evictions++;
       logger.debug("Image cache eviction", {
-        url: String(oldestKey).substring(0, 50),
+        url: redactUrlForError(String(oldestKey)),
       });
     }
   }

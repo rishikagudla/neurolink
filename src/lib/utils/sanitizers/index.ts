@@ -30,8 +30,6 @@ export {
   isDangerousExtension,
   isValidDisplayName,
   isValidFileName,
-  type SanitizeDisplayNameOptions,
-  type SanitizeFileNameOptions,
   sanitizeDisplayName,
   sanitizeFileName,
 } from "./filename.js";
@@ -54,7 +52,6 @@ export {
 export {
   getSvgSanitizationRules,
   isSvgContentSafe,
-  type SvgSanitizationResult,
   sanitizeSvg,
   sanitizeSvgContent,
   sanitizeSvgContentDetailed,

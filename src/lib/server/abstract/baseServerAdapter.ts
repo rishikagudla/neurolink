@@ -8,13 +8,31 @@ import { EventEmitter } from "events";
 import type { ExternalServerManager } from "../../mcp/externalServerManager.js";
 import type { MCPToolRegistry } from "../../mcp/toolRegistry.js";
 import type { NeuroLink } from "../../neurolink.js";
-import { withTimeout } from "../../utils/errorHandling.js";
-import { logger } from "../../utils/logger.js";
 import {
+  getMetricsAggregator,
+  SpanSerializer,
+  SpanStatus,
+  SpanType,
+} from "../../observability/index.js";
+import { withTimeout } from "../../utils/errorHandling.js";
+import { MAX_TIMER_MS } from "../../constants/timeouts.js";
+import { logger } from "../../utils/logger.js";
+import { markContextCarried } from "../utils/carriedContextMark.js";
+import { isLoopbackAddress } from "../utils/clientAddress.js";
+import { pathStartsWithSegment } from "../utils/pathMatch.js";
+import { tryImport } from "../../utils/tryImport.js";
+import {
+  ConfigurationError,
   DrainTimeoutError,
   InvalidLifecycleStateError,
+  MissingDependencyError,
+  ServerAdapterError,
+  ServerTimeoutError,
   ShutdownTimeoutError,
 } from "../errors.js";
+
+/** The interface an adapter binds unless told otherwise: this host only. */
+export const DEFAULT_SERVER_HOST = "127.0.0.1";
 import type {
   MiddlewareDefinition,
   RedactionConfig,
@@ -23,11 +41,12 @@ import type {
   RouteDefinition,
   ServerAdapterConfig,
   ServerAdapterEvents,
+  ServerCarriedContext,
   ServerContext,
   ServerLifecycleState,
   ServerStatus,
   TrackedConnection,
-} from "../types.js";
+} from "../../types/index.js";
 
 /**
  * Abstract base class for server adapters
@@ -44,10 +63,25 @@ export abstract class BaseServerAdapter extends EventEmitter {
   protected isRunning = false;
   protected startTime?: Date;
 
+  // Adapters build their framework app lazily in initialize(), so routes and
+  // middleware registered before that are queued here and replayed once the
+  // app exists — middleware first, so it still guards those routes.
+  private frameworkReady = false;
+  private pendingMiddlewares: MiddlewareDefinition[] = [];
+  private pendingRouteKeys: Set<string> = new Set();
+
   // Lifecycle management properties
   protected lifecycleState: ServerLifecycleState = "uninitialized";
   protected activeConnections: Map<string, TrackedConnection> = new Map();
   protected readonly shutdownConfig: RequiredShutdownConfig;
+
+  // Set by enableMiddlewareStateCarry(); the carryMiddlewareState option is the
+  // other way in.
+  private carryRequestedByRoutes = false;
+
+  // Set by noteSensitiveRoutes(); read when the server starts.
+  private sensitiveRoutesRegistered = false;
+  private sensitiveRoutesAllowedOpen = false;
 
   constructor(neurolink: NeuroLink, config: ServerAdapterConfig = {}) {
     super();
@@ -70,11 +104,16 @@ export abstract class BaseServerAdapter extends EventEmitter {
     // Apply defaults
     this.config = {
       port: config.port ?? 3000,
-      host: config.host ?? "0.0.0.0",
+      // Loopback unless the operator names an interface: the routes run tools
+      // and remove MCP servers, so reachability is opt-in.
+      host: config.host ?? DEFAULT_SERVER_HOST,
       basePath: config.basePath ?? "/api",
       cors: {
         enabled: config.cors?.enabled ?? true,
-        origins: config.cors?.origins ?? ["*"],
+        // No origin by default: a browser page may call this server only
+        // from an origin the operator listed, or from any origin with an
+        // explicit ["*"]. The adapters honour the wildcard, so it is opt-in.
+        origins: config.cors?.origins ?? [],
         methods: config.cors?.methods ?? [
           "GET",
           "POST",
@@ -100,11 +139,16 @@ export abstract class BaseServerAdapter extends EventEmitter {
           "Too many requests, please try again later",
         skipPaths: config.rateLimit?.skipPaths,
         keyGenerator: config.rateLimit?.keyGenerator,
+        trustProxy: config.rateLimit?.trustProxy ?? false,
+        trustedProxies: config.rateLimit?.trustedProxies ?? [],
       },
       bodyParser: {
         enabled: config.bodyParser?.enabled ?? true,
         maxSize: config.bodyParser?.maxSize ?? "10mb",
         jsonLimit: config.bodyParser?.jsonLimit ?? "10mb",
+        // An operator's explicit maxSize also caps raw uploads.
+        rawMaxSize:
+          config.bodyParser?.rawMaxSize ?? config.bodyParser?.maxSize ?? "64mb",
         urlEncoded: config.bodyParser?.urlEncoded ?? true,
       },
       logging: {
@@ -118,6 +162,135 @@ export abstract class BaseServerAdapter extends EventEmitter {
       enableSwagger: config.enableSwagger ?? false,
       disableBuiltInHealth: config.disableBuiltInHealth ?? false,
       shutdown: this.shutdownConfig,
+      carryMiddlewareState: config.carryMiddlewareState ?? false,
+    };
+
+    // A wildcard origin with credentials is what the CORS specification
+    // forbids and what an adapter reflecting the request's Origin would grant:
+    // any page could make credentialed calls. Refuse it for every adapter.
+    if (
+      this.config.cors.enabled &&
+      this.config.cors.credentials &&
+      this.config.cors.origins.includes("*")
+    ) {
+      throw new ConfigurationError(
+        'cors.credentials cannot be combined with the wildcard origin "*"; list the origins that may send credentials',
+        { origins: this.config.cors.origins },
+      );
+    }
+  }
+
+  /**
+   * Whether middleware marked `authenticates: true` is registered (the
+   * built-in authentication middleware marks itself). The tool and MCP
+   * execution routes ask on every request; `registerAllRoutes()` wires them.
+   */
+  public hasAuthenticationMiddleware(): boolean {
+    return this.middlewares.some(
+      (middleware) => middleware.authenticates === true,
+    );
+  }
+
+  /**
+   * Called by `registerAllRoutes()`: routes that act on the host (tool and
+   * MCP execution) are mounted, so `start()` warns when no authentication
+   * middleware guards them. The check runs at start, when the middleware set
+   * is final, so registering authentication after the routes is fine.
+   */
+  public noteSensitiveRoutes(options?: {
+    allowUnauthenticated?: boolean;
+  }): void {
+    this.sensitiveRoutesRegistered = true;
+    if (options?.allowUnauthenticated) {
+      this.sensitiveRoutesAllowedOpen = true;
+    }
+  }
+
+  /**
+   * The warning promised by `noteSensitiveRoutes()`, always on stderr: a
+   * `logger.warn` is dropped unless debug logging is on, which would hide a
+   * notice meant for the operator who just started the server.
+   */
+  protected warnIfSensitiveRoutesUnauthenticated(): void {
+    if (
+      !this.sensitiveRoutesRegistered ||
+      this.sensitiveRoutesAllowedOpen ||
+      this.hasAuthenticationMiddleware()
+    ) {
+      return;
+    }
+    const where = isLoopbackAddress(this.config.host)
+      ? `loopback only (${this.config.host})`
+      : `${this.config.host}, reachable from the network`;
+    logger.alwaysStderr(
+      `[ServerAdapter] WARNING: no authentication middleware is registered and the server listens on ${where}. ` +
+        "The tool and MCP execution routes answer 403 until authentication middleware (marked authenticates: true) is registered, " +
+        "or allowUnauthenticated: true / NEUROLINK_SERVER_ALLOW_UNAUTHENTICATED=1 opts out of that gate.",
+    );
+  }
+
+  /**
+   * Give the handler a way to notice that the client is gone or the request
+   * is over time. The controller is this request's own unless middleware
+   * already attached one that the adapter carried; `applyTimeout` arms the
+   * configured request timeout, which the caller leaves off for a streaming
+   * route (a stream legitimately outlives it, as under Hono's own timeout
+   * middleware). `release()` disarms the timer once the response is written.
+   */
+  protected attachRequestAbort(
+    ctx: ServerContext,
+    options: {
+      onClientClose: (listener: () => void) => void;
+      applyTimeout: boolean;
+    },
+  ): {
+    controller: AbortController;
+    deadline: Promise<never> | undefined;
+    timedOut: () => boolean;
+    release: () => void;
+  } {
+    const controller = ctx.abortController ?? new AbortController();
+    ctx.abortController = controller;
+    ctx.abortSignal = controller.signal;
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeoutMs = this.config.timeout;
+    // Node turns an over-range delay into 1 ms; keep long request budgets
+    // at the timer limit, as the readiness deadline does through withTimeout.
+    const delayMs = timeoutMs > MAX_TIMER_MS ? MAX_TIMER_MS : timeoutMs;
+    const deadline =
+      options.applyTimeout && timeoutMs > 0
+        ? new Promise<never>((_, reject) => {
+            timer = setTimeout(() => {
+              timedOut = true;
+              const error = new ServerTimeoutError(
+                timeoutMs,
+                `${ctx.method} ${ctx.path}`,
+                ctx.requestId,
+              );
+              controller.abort(error);
+              reject(error);
+            }, delayMs);
+          })
+        : undefined;
+    // A rejection nobody awaits (the handler won on the race) must not
+    // surface as unhandled.
+    deadline?.catch(() => undefined);
+    options.onClientClose(() => {
+      if (!controller.signal.aborted) {
+        controller.abort(new Error("Client disconnected"));
+      }
+    });
+    return {
+      controller,
+      deadline,
+      timedOut: () => timedOut,
+      release: () => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = undefined;
+        }
+      },
     };
   }
 
@@ -127,8 +300,12 @@ export abstract class BaseServerAdapter extends EventEmitter {
 
   /**
    * Initialize the underlying server framework
+   * May be async: adapters that dynamically import their framework package
+   * (e.g. Hono) return a Promise; adapters with a synchronous no-op stub that
+   * defer real setup to their own overridden `initialize()` (Express/Fastify/
+   * Koa) still return void.
    */
-  protected abstract initializeFramework(): void;
+  protected abstract initializeFramework(): void | Promise<void>;
 
   /**
    * Register a route with the framework
@@ -157,6 +334,16 @@ export abstract class BaseServerAdapter extends EventEmitter {
    */
   public abstract getFrameworkInstance(): unknown;
 
+  /**
+   * The listening Node `http.Server`, once `start()` has run and the runtime
+   * is Node (Bun and Deno serve without one). A WebSocket upgrade handler
+   * such as `attachTranscribeWebSocket` attaches to it; `undefined` means
+   * there is nothing to attach to.
+   */
+  public getNativeServer(): unknown {
+    return undefined;
+  }
+
   // ============================================
   // Abstract Lifecycle Methods (Framework-Specific)
   // ============================================
@@ -184,6 +371,32 @@ export abstract class BaseServerAdapter extends EventEmitter {
   // ============================================
 
   /**
+   * Import an optional framework dependency (express/fastify/koa and their
+   * plugins), converting a missing package into a {@link MissingDependencyError}
+   * instead of letting the framework's `Cannot find package` propagate raw.
+   *
+   * Delegates to {@link tryImport} for the actual resolution and message
+   * formatting, then re-wraps only the "package genuinely absent" case — the
+   * one `tryImport` signals by attaching the loader's own module-not-found
+   * error as `cause` — into the adapter-specific error type. Any other
+   * failure (installed but broken, non-package specifier) passes through
+   * unchanged, matching `tryImport`'s own contract.
+   */
+  protected async importFrameworkDependency<T>(
+    pkg: string,
+    framework: string,
+  ): Promise<T> {
+    try {
+      return await tryImport<T>(pkg, `${framework} server adapter`);
+    } catch (error) {
+      if (error instanceof Error && isModuleNotFoundCause(error.cause)) {
+        throw new MissingDependencyError(pkg, framework, `pnpm add ${pkg}`);
+      }
+      throw error;
+    }
+  }
+
+  /**
    * Initialize the server adapter
    * Sets up routes, middleware, and framework
    */
@@ -207,12 +420,27 @@ export abstract class BaseServerAdapter extends EventEmitter {
       basePath: this.config.basePath,
     });
 
+    const span = SpanSerializer.createSpan(
+      SpanType.SERVER_REQUEST,
+      "server.initialize",
+      {
+        "server.operation": "initialize",
+        "server.port": this.config.port,
+        "server.host": this.config.host,
+      },
+    );
+    const startTime = Date.now();
+
     try {
       // Initialize framework-specific setup
-      this.initializeFramework();
+      await this.initializeFramework();
+      this.frameworkReady = true;
 
       // Register built-in middleware
       this.registerBuiltInMiddleware();
+
+      // Replay what callers registered before the framework app existed
+      this.flushPendingRegistrations();
 
       // Register built-in routes
       await this.registerBuiltInRoutes();
@@ -229,8 +457,17 @@ export abstract class BaseServerAdapter extends EventEmitter {
         routes: this.routes.size,
         middlewares: this.middlewares.length,
       });
+
+      span.durationMs = Date.now() - startTime;
+      const endedSpan = SpanSerializer.endSpan(span, SpanStatus.OK);
+      getMetricsAggregator().recordSpan(endedSpan);
     } catch (error) {
       this.lifecycleState = "error";
+      span.durationMs = Date.now() - startTime;
+      const endedSpan = SpanSerializer.endSpan(span, SpanStatus.ERROR);
+      endedSpan.statusMessage =
+        error instanceof Error ? error.message : String(error);
+      getMetricsAggregator().recordSpan(endedSpan);
       throw error;
     }
   }
@@ -248,7 +485,11 @@ export abstract class BaseServerAdapter extends EventEmitter {
     }
 
     this.routes.set(routeKey, route);
-    this.registerFrameworkRoute(route);
+    if (this.frameworkReady) {
+      this.registerFrameworkRoute(route);
+    } else {
+      this.pendingRouteKeys.add(routeKey);
+    }
 
     logger.debug(`[ServerAdapter] Registered route: ${routeKey}`, {
       description: route.description,
@@ -276,8 +517,20 @@ export abstract class BaseServerAdapter extends EventEmitter {
     }
 
     // Register all routes in the group with prefix applied
+    const prefix = this.normalizePath(group.prefix);
+    // The group's root segment ("/api" of "/api/health"): a route whose path
+    // already lives under it is a full path, as every built-in route is.
+    // Testing only the whole prefix put `/api/version`, declared in the health
+    // group, at `/api/health/api/version`.
+    const root = `/${prefix.split("/").filter(Boolean)[0] ?? ""}`;
     for (const route of group.routes) {
-      const prefixedPath = this.normalizePath(`${group.prefix}${route.path}`);
+      const needsPrefix =
+        prefix !== "/" &&
+        !pathStartsWithSegment(route.path, prefix) &&
+        !pathStartsWithSegment(route.path, root);
+      const prefixedPath = this.normalizePath(
+        needsPrefix ? `${prefix}${route.path}` : route.path,
+      );
       const prefixedRoute = {
         ...route,
         path: prefixedPath,
@@ -303,12 +556,73 @@ export abstract class BaseServerAdapter extends EventEmitter {
    */
   public registerMiddleware(middleware: MiddlewareDefinition): void {
     this.middlewares.push(middleware);
-    this.registerFrameworkMiddleware(middleware);
+    if (this.frameworkReady) {
+      this.registerFrameworkMiddleware(middleware);
+    } else {
+      this.pendingMiddlewares.push(middleware);
+    }
 
     logger.debug(`[ServerAdapter] Registered middleware: ${middleware.name}`, {
       order: middleware.order,
       paths: middleware.paths,
     });
+  }
+
+  /**
+   * Log a failed request. A client error (a rejected API key, a failed
+   * validation) is routine traffic, so it is a one-line warning rather than
+   * an error with a stack trace that anyone could flood the logs with.
+   */
+  protected logRequestError(
+    source: string,
+    requestId: string | undefined,
+    error: Error,
+  ): void {
+    if (error instanceof ServerAdapterError && error.getHttpStatus() < 500) {
+      logger.warn(`[${source}] Request rejected`, {
+        requestId,
+        code: error.code,
+        error: error.message,
+      });
+      return;
+    }
+    logger.error(`[${source}] Request error`, {
+      requestId,
+      error: error.message,
+      stack: error.stack,
+    });
+  }
+
+  /**
+   * Notify "error" listeners about a failed request. EventEmitter throws when
+   * "error" has no listener, which inside a framework's error handler turns
+   * every failure into an empty 500, so emit only when someone is listening.
+   */
+  protected emitRequestError(payload: ServerAdapterEvents["error"]): void {
+    if (this.listenerCount("error") > 0) {
+      this.emit("error", payload);
+    }
+  }
+
+  /**
+   * Hand queued registrations to the framework. A route re-registered under
+   * the same key before initialize() is replayed once, in its final form.
+   */
+  private flushPendingRegistrations(): void {
+    const middlewares = this.pendingMiddlewares;
+    const routeKeys = this.pendingRouteKeys;
+    this.pendingMiddlewares = [];
+    this.pendingRouteKeys = new Set();
+
+    for (const middleware of middlewares) {
+      this.registerFrameworkMiddleware(middleware);
+    }
+    for (const routeKey of routeKeys) {
+      const route = this.routes.get(routeKey);
+      if (route) {
+        this.registerFrameworkRoute(route);
+      }
+    }
   }
 
   /**
@@ -322,6 +636,7 @@ export abstract class BaseServerAdapter extends EventEmitter {
     query?: Record<string, string>;
     params?: Record<string, string>;
     body?: unknown;
+    remoteAddress?: string;
   }): ServerContext {
     return {
       requestId: options.requestId,
@@ -331,6 +646,7 @@ export abstract class BaseServerAdapter extends EventEmitter {
       query: options.query ?? {},
       params: options.params ?? {},
       body: options.body,
+      remoteAddress: options.remoteAddress,
       neurolink: this.neurolink,
       toolRegistry: this.toolRegistry,
       externalServerManager: this.externalServerManager,
@@ -407,8 +723,8 @@ export abstract class BaseServerAdapter extends EventEmitter {
           const toolRegistry = ctx.toolRegistry;
           const readinessTimeout = this.config.timeout || 5000;
 
-          let tools: unknown[] = [];
-          let toolsAvailable = false;
+          let tools: unknown[];
+          let toolsAvailable: boolean;
 
           try {
             tools = await withTimeout(
@@ -468,6 +784,81 @@ export abstract class BaseServerAdapter extends EventEmitter {
         description: "Server metrics endpoint",
         tags: ["system"],
       });
+    }
+  }
+
+  /**
+   * Ask the adapter to carry middleware state (`ctx.user` and the rest) to later
+   * middleware and the route handler, as the `carryMiddlewareState` option does.
+   * `registerAllRoutes()` calls it when given `perUserAuth`, which cannot work
+   * without the user in the handler. It takes effect for requests that start
+   * after the call, so call it before the server starts, as registering routes
+   * is.
+   */
+  public enableMiddlewareStateCarry(): void {
+    this.carryRequestedByRoutes = true;
+  }
+
+  /** Whether this adapter carries middleware state to the handler. */
+  protected carriesMiddlewareState(): boolean {
+    return this.config.carryMiddlewareState || this.carryRequestedByRoutes;
+  }
+
+  /**
+   * What middleware has set on its context that later middleware and the route
+   * handler must see. Each step gets a freshly built context, so unless this is
+   * parked in the framework's per-request storage an authenticated `ctx.user`
+   * set by middleware is gone before the handler runs. `undefined` when the
+   * adapter does not carry middleware state, so nothing is parked.
+   */
+  protected captureCarriedContext(
+    ctx: ServerContext,
+  ): ServerCarriedContext | undefined {
+    if (!this.carriesMiddlewareState()) {
+      return undefined;
+    }
+    return {
+      user: ctx.user,
+      session: ctx.session,
+      metadata: ctx.metadata,
+      abortSignal: ctx.abortSignal,
+      abortController: ctx.abortController,
+    };
+  }
+
+  /**
+   * Put what `captureCarriedContext` saved onto a freshly built context, and
+   * mark the context as one that received the carry. The agent routes read the
+   * mark: a request that never used to reach its handler with `ctx.user` must
+   * not start being identified by it unless the server opts in. Does nothing
+   * when the adapter does not carry middleware state: the context stays the
+   * fresh one it always was, and unmarked.
+   */
+  protected restoreCarriedContext(
+    ctx: ServerContext,
+    carried: ServerCarriedContext | undefined,
+  ): void {
+    if (!this.carriesMiddlewareState()) {
+      return;
+    }
+    markContextCarried(ctx);
+    if (!carried) {
+      return;
+    }
+    if (carried.user) {
+      ctx.user = carried.user;
+    }
+    if (carried.session) {
+      ctx.session = carried.session;
+    }
+    if (carried.metadata) {
+      ctx.metadata = { ...ctx.metadata, ...carried.metadata };
+    }
+    if (carried.abortSignal) {
+      ctx.abortSignal = carried.abortSignal;
+    }
+    if (carried.abortController) {
+      ctx.abortController = carried.abortController;
     }
   }
 
@@ -550,41 +941,50 @@ export abstract class BaseServerAdapter extends EventEmitter {
       drainTimeoutMs,
     });
 
-    // Set draining state
-    this.lifecycleState = "draining";
-
-    // Stop accepting new connections
-    await this.stopAcceptingConnections();
-
-    logger.info("[ServerAdapter] Stopped accepting new connections");
-
-    // Create drain promise that resolves when all connections are closed
-    const drainPromise = this.drainConnections();
+    const shutdownSpan = SpanSerializer.createSpan(
+      SpanType.SERVER_REQUEST,
+      "server.shutdown",
+      {
+        "server.operation": "gracefulShutdown",
+        "server.activeConnections": this.activeConnections.size,
+      },
+    );
+    const shutdownStartTime = Date.now();
 
     // Timer references for cleanup
     let shutdownTimer: NodeJS.Timeout | undefined;
     let drainTimer: NodeJS.Timeout | undefined;
 
-    // Create timeout promise for overall shutdown
-    const shutdownTimeoutPromise = new Promise<never>((_, reject) => {
-      shutdownTimer = setTimeout(() => {
-        reject(
-          new ShutdownTimeoutError(
-            gracefulShutdownTimeoutMs,
-            this.activeConnections.size,
-          ),
-        );
-      }, gracefulShutdownTimeoutMs);
-    });
-
-    // Create timeout promise for drain phase
-    const drainTimeoutPromise = new Promise<"drain_timeout">((resolve) => {
-      drainTimer = setTimeout(() => {
-        resolve("drain_timeout");
-      }, drainTimeoutMs);
-    });
-
     try {
+      // Set draining state
+      this.lifecycleState = "draining";
+
+      // Stop accepting new connections (covered by shutdown span)
+      await this.stopAcceptingConnections();
+
+      logger.info("[ServerAdapter] Stopped accepting new connections");
+
+      // Create drain promise that resolves when all connections are closed
+      const drainPromise = this.drainConnections();
+
+      // Create timeout promise for overall shutdown
+      const shutdownTimeoutPromise = new Promise<never>((_, reject) => {
+        shutdownTimer = setTimeout(() => {
+          reject(
+            new ShutdownTimeoutError(
+              gracefulShutdownTimeoutMs,
+              this.activeConnections.size,
+            ),
+          );
+        }, gracefulShutdownTimeoutMs);
+      });
+
+      // Create timeout promise for drain phase
+      const drainTimeoutPromise = new Promise<"drain_timeout">((resolve) => {
+        drainTimer = setTimeout(() => {
+          resolve("drain_timeout");
+        }, drainTimeoutMs);
+      });
       // Race drain against drain timeout
       const drainResult = await Promise.race([
         drainPromise,
@@ -614,6 +1014,13 @@ export abstract class BaseServerAdapter extends EventEmitter {
       await Promise.race([this.closeServer(), shutdownTimeoutPromise]);
 
       logger.info("[ServerAdapter] Server closed successfully");
+
+      shutdownSpan.durationMs = Date.now() - shutdownStartTime;
+      const endedShutdownSpan = SpanSerializer.endSpan(
+        shutdownSpan,
+        SpanStatus.OK,
+      );
+      getMetricsAggregator().recordSpan(endedShutdownSpan);
     } catch (error) {
       // If force close is enabled and we hit a timeout, try to force close
       if (
@@ -626,8 +1033,22 @@ export abstract class BaseServerAdapter extends EventEmitter {
         });
         await this.forceCloseConnections();
         await this.closeServer();
+        shutdownSpan.durationMs = Date.now() - shutdownStartTime;
+        const endedShutdownSpan = SpanSerializer.endSpan(
+          shutdownSpan,
+          SpanStatus.OK,
+        );
+        getMetricsAggregator().recordSpan(endedShutdownSpan);
       } else {
         this.lifecycleState = "error";
+        shutdownSpan.durationMs = Date.now() - shutdownStartTime;
+        const endedShutdownSpan = SpanSerializer.endSpan(
+          shutdownSpan,
+          SpanStatus.ERROR,
+        );
+        endedShutdownSpan.statusMessage =
+          error instanceof Error ? error.message : String(error);
+        getMetricsAggregator().recordSpan(endedShutdownSpan);
         throw error;
       }
     } finally {
@@ -727,4 +1148,19 @@ export abstract class BaseServerAdapter extends EventEmitter {
   public getConfig(): RequiredServerAdapterConfig {
     return { ...this.config };
   }
+}
+
+/**
+ * True when `cause` is the module loader's own "package not found" error —
+ * the shape `tryImport` attaches as `cause` exactly when it decides the
+ * package is genuinely missing (see `isMissingModule` in `tryImport.ts`).
+ * Anything else (installed-but-broken, no cause at all) is not our case to
+ * convert into a {@link MissingDependencyError}.
+ */
+function isModuleNotFoundCause(cause: unknown): boolean {
+  if (!(cause instanceof Error)) {
+    return false;
+  }
+  const code = (cause as NodeJS.ErrnoException).code;
+  return code === "ERR_MODULE_NOT_FOUND" || code === "MODULE_NOT_FOUND";
 }

@@ -1,3 +1,16 @@
+import Head from '@docusaurus/Head';
+
+<Head>
+  <script type="application/ld+json">{JSON.stringify({
+    "@context": "https://schema.org",
+    "@type": "SoftwareSourceCode",
+    "name": "NeuroLink SDK — Real-time AI Streaming",
+    "programmingLanguage": "TypeScript",
+    "codeRepository": "https://github.com/juspay/neurolink",
+    "license": "https://opensource.org/licenses/MIT"
+  })}</script>
+</Head>
+
 # API Reference
 
 Complete reference for NeuroLink's TypeScript API.
@@ -8,61 +21,42 @@ The `NeuroLink` class is the main entry point for all SDK functionality.
 
 ### Constructor: `new NeuroLink(config?)`
 
-Create a new NeuroLink instance with optional configuration for conversation memory, middleware, and orchestration.
+Create a new NeuroLink instance with optional configuration for conversation memory, orchestration, HITL, and observability.
 
 ```typescript
 import { NeuroLink } from "@juspay/neurolink";
 
-const neurolink = new NeuroLink(config?: NeuroLinkConstructorConfig)
+const neurolink = new NeuroLink(config?: NeurolinkConstructorConfig)
 ```
 
 **Parameters:**
 
 ```typescript
-type NeuroLinkConstructorConfig = {
+type NeurolinkConstructorConfig = {
   // Conversation Memory
-  conversationMemory?: {
-    enabled: boolean;
-    store?: "memory" | "redis"; // Default: 'memory'
-    redis?: {
-      host?: string;
-      port?: number;
-      password?: string;
-      ttl?: number; // Time-to-live in seconds
-    };
-    maxSessions?: number;
-    maxTurnsPerSession?: number;
-  };
-
-  // Middleware Configuration
-  middleware?: {
-    preset?: "default" | "security" | "all";
-    middlewareConfig?: {
-      guardrails?: {
-        enabled: boolean;
-        config?: {
-          badWords?: {
-            enabled: boolean;
-            list?: string[];
-          };
-          modelFilter?: {
-            enabled: boolean;
-            filterModel?: string;
-          };
-        };
-      };
-      analytics?: {
-        enabled: boolean;
-      };
-    };
-  };
+  conversationMemory?: Partial<ConversationMemoryConfig>;
+  // See ConversationMemoryConfig for full options:
+  //   enabled: boolean
+  //   maxSessions?: number
+  //   enableSummarization?: boolean
+  //   tokenThreshold?: number
+  //   summarizationProvider?: string
+  //   summarizationModel?: string
+  //   redisConfig?: RedisStorageConfig
+  //   contextCompaction?: { enabled?, threshold?, enablePruning?, ... }
+  //   maxTurnsPerSession?: number  // @deprecated - use tokenThreshold instead
 
   // Provider Orchestration
   enableOrchestration?: boolean;
-  orchestrationConfig?: {
-    fallbackChain?: string[]; // Provider fallback order
-    preferCheap?: boolean;
-  };
+
+  // Human-in-the-Loop safety features
+  hitl?: HITLConfig;
+
+  // Custom tool registry (advanced)
+  toolRegistry?: MCPToolRegistry;
+
+  // Observability (Langfuse; auto-enabled from LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY, `langfuse: false` disables)
+  observability?: ObservabilityConfig;
 };
 ```
 
@@ -78,31 +72,22 @@ const neurolink = new NeuroLink();
 const neurolinkWithMemory = new NeuroLink({
   conversationMemory: {
     enabled: true,
-    store: "redis",
-    redis: {
+    redisConfig: {
       host: "localhost",
       port: 6379,
       ttl: 7 * 24 * 60 * 60, // 7 days
     },
-    maxTurnsPerSession: 100,
+    tokenThreshold: 100000, // Token threshold to trigger summarization
   },
 });
 
-// With guardrails middleware
-const neurolinkWithGuardrails = new NeuroLink({
-  middleware: {
-    preset: "security", // Enables guardrails automatically
-    middlewareConfig: {
-      guardrails: {
-        enabled: true,
-        config: {
-          badWords: {
-            enabled: true,
-            list: ["profanity1", "profanity2"],
-          },
-        },
-      },
-    },
+// With HITL safety features
+const neurolinkWithHITL = new NeuroLink({
+  hitl: {
+    enabled: true,
+    dangerousActions: ["delete", "remove", "drop"],
+    timeout: 30000,
+    allowArgumentModification: true,
   },
 });
 
@@ -110,19 +95,24 @@ const neurolinkWithGuardrails = new NeuroLink({
 const neurolinkComplete = new NeuroLink({
   conversationMemory: {
     enabled: true,
-    store: "redis",
-  },
-  middleware: {
-    preset: "all", // Analytics + Guardrails
+    redisConfig: { host: "localhost", port: 6379 },
+    enableSummarization: true,
   },
   enableOrchestration: true,
+  hitl: { enabled: true, dangerousActions: ["delete", "remove", "drop"] },
+  observability: {
+    langfuse: {
+      publicKey: process.env.LANGFUSE_PUBLIC_KEY,
+      secretKey: process.env.LANGFUSE_SECRET_KEY,
+    },
+  },
 });
 ```
 
 See also:
 
 - [Redis Conversation Export](../features/conversation-history.md)
-- [Guardrails Middleware](../features/guardrails.md)
+- [Human-in-the-Loop (HITL)](../features/hitl.md)
 - [Provider Orchestration](../features/provider-orchestration.md)
 
 ---
@@ -146,8 +136,7 @@ type GenerateOptions = {
     images?: Array<string | Buffer>; // Local paths, URLs, or buffers
     csvFiles?: Array<string | Buffer>; // CSV files (converted to text)
     pdfFiles?: Array<string | Buffer>; // PDF files (native binary)
-    officeFiles?: Array<string | Buffer>; // Office documents (DOCX, PPTX, XLSX)
-    files?: Array<string | Buffer>; // Auto-detect file types
+    files?: Array<string | Buffer>; // Auto-detect file types (Office documents, PDF, CSV, images, audio, code, ...)
     content?: Array<TextContent | ImageContent>; // Advanced multimodal payloads
   };
   provider?: AIProviderName | string; // Leave undefined to allow orchestration/fallback
@@ -160,6 +149,20 @@ type GenerateOptions = {
   tools?: Record<string, Tool>; // Optional tool overrides
   timeout?: number | string; // 120 (seconds) or '2m', '1h'
   disableTools?: boolean;
+  maxSteps?: number; // Max tool execution steps (default: 5)
+  toolChoice?: ToolChoice; // 'auto' | 'none' | 'required' | { type: 'tool', toolName: string }
+  toolChoiceSteps?: number; // Leading steps a forced toolChoice stays in force (default: 1)
+  prepareStep?: PrepareStepCallback; // Per-step tool choice — see SDK Custom Tools Guide
+  replayToolSteps?: "full" | "marker" | "off"; // How stored tool steps are replayed into the prompt (default: 'marker')
+  abortSignal?: AbortSignal; // External cancellation support
+  toolFilter?: string[]; // Whitelist of tools to include (only matching tools are available)
+  excludeTools?: string[]; // Blacklist of tools to exclude (applied after toolFilter)
+  skipToolPromptInjection?: boolean; // Skip injecting tool schemas into system prompt (~30K token savings)
+  tts?: TTSOptions; // Text-to-Speech configuration
+  maxBudgetUsd?: number; // Per-session USD budget cap — exceeding throws SESSION_BUDGET_EXCEEDED
+  workflow?: string; // Use predefined workflow by ID
+  workflowConfig?: WorkflowConfig; // Inline workflow configuration
+  requestId?: string; // Request ID for observability and log correlation
   enableAnalytics?: boolean;
   enableEvaluation?: boolean;
   evaluationDomain?: string;
@@ -167,12 +170,20 @@ type GenerateOptions = {
   context?: Record<string, JsonValue>;
   conversationHistory?: Array<{ role: string; content: string }>;
   thinkingLevel?: "minimal" | "low" | "medium" | "high"; // Gemini 3 models only
+  thinkingConfig?: {
+    // Full thinking/reasoning configuration (takes precedence over thinkingLevel)
+    enabled?: boolean;
+    type?: "enabled" | "disabled";
+    budgetTokens?: number; // Anthropic: 5000-100000 tokens
+    thinkingLevel?: "minimal" | "low" | "medium" | "high"; // Gemini 3 models
+  };
 
   // Output configuration
   output?: {
     format?: "text" | "structured" | "json";
-    mode?: "text" | "video"; // Output mode: 'text' (default) or 'video'
+    mode?: "text" | "video" | "ppt"; // Output mode: 'text' (default), 'video', or 'ppt'
     video?: VideoOutputOptions; // Video generation options (when mode is 'video')
+    ppt?: PPTOutputOptions; // PPT generation options (when mode is 'ppt')
   };
 
   // Document processing options
@@ -183,12 +194,12 @@ type GenerateOptions = {
 };
 
 // Video output configuration (for Veo 3.1 via Vertex AI)
-interface VideoOutputOptions {
+type VideoOutputOptions = {
   resolution?: "720p" | "1080p"; // Video resolution (default: "720p")
   length?: 4 | 6 | 8; // Video duration in seconds (default: 6)
   aspectRatio?: "9:16" | "16:9"; // Aspect ratio (default: "16:9")
   audio?: boolean; // Include synchronized audio (default: true)
-}
+};
 ```
 
 **Returns:**
@@ -220,6 +231,22 @@ type GenerateResult = {
       duration?: number; // Video duration in seconds
       dimensions?: { width: number; height: number };
       model?: string; // Model used for generation
+    };
+  };
+
+  // PPT generation result (when output.mode is 'ppt')
+  ppt?: {
+    filePath: string; // Path to generated PPTX file
+    totalSlides: number; // Number of slides generated
+    format: "pptx"; // Output format
+    provider: string; // Provider used for content planning
+    model: string; // Model used for content planning
+    metadata?: {
+      theme?: string; // Theme applied
+      audience?: string; // Target audience
+      tone?: string; // Presentation tone
+      imageModel?: string; // Model used for image generation
+      fileSize?: number; // File size in bytes
     };
   };
 
@@ -414,13 +441,57 @@ type StreamOptions = {
 
 ```typescript
 type StreamResult = {
-  stream: AsyncIterable<{ content: string }>;
+  stream: AsyncIterable<
+    | { content: string }
+    | { type: "audio"; audio: AudioChunk }
+    | { type: "image"; imageOutput: { base64: string } }
+  >;
   provider?: string;
   model?: string;
+
+  // Usage and completion info
+  usage?: TokenUsage; // Token usage statistics (prompt, completion, total)
+  finishReason?: string; // Why generation stopped (e.g., "stop", "length", "tool-calls")
+
+  // Tool integration
+  toolCalls?: ToolCall[]; // Tool calls made during generation
+  toolResults?: ToolResult[]; // Results from tool executions
+  toolEvents?: AsyncIterable<ToolExecutionEvent>; // Real-time tool event stream
+  toolExecutions?: ToolExecutionSummary[]; // Final summary of all tool executions
+  toolsUsed?: string[]; // Names of tools used during generation
+
+  // Stream metadata
   metadata?: {
     streamId?: string;
     startTime?: number;
     totalChunks?: number;
+    estimatedDuration?: number;
+    responseTime?: number;
+    preliminaryTime?: number; // Time to first (preliminary) response
+    fallback?: boolean;
+    totalToolExecutions?: number;
+    toolExecutionTime?: number;
+    hasToolErrors?: boolean;
+  };
+
+  // Analytics and evaluation (available after stream completion)
+  analytics?: AnalyticsData | Promise<AnalyticsData>;
+  evaluation?: EvaluationData | Promise<EvaluationData>;
+
+  // Workflow engine integration data
+  workflow?: {
+    originalResponse: string;
+    processedResponse: string;
+    ensembleResponses: Array<{
+      provider: string;
+      model: string;
+      content: string;
+      responseTime: number;
+      status: "success" | "failure" | "timeout" | "partial";
+    }>;
+    selectedModel: string;
+    workflowId: string;
+    workflowName: string;
   };
 };
 ```
@@ -445,16 +516,44 @@ for await (const chunk of result.stream) {
 
 ---
 
-### `gen(options)`
+### Embeddings
 
-Short alias for `generate()`. Identical signature and behavior.
+Generate embeddings directly via the provider's `embed()` and `embedMany()` methods.
+
+#### `provider.embed(text, modelName?)`
+
+Generate an embedding vector for a single text.
 
 ```typescript
-const result = await neurolink.gen({
-  input: { text: "Hello" },
-  provider: "openai",
-});
+import { ProviderFactory } from "@juspay/neurolink";
+
+const provider = await ProviderFactory.createProvider("googleAiStudio");
+const embedding = await provider.embed("Hello world");
+// embedding: number[] (e.g., 768 dimensions)
 ```
+
+#### `provider.embedMany(texts, modelName?)`
+
+Generate embedding vectors for multiple texts in a single batch. The AI SDK automatically handles chunking for models with batch limits.
+
+```typescript
+const provider = await ProviderFactory.createProvider("openai");
+const embeddings = await provider.embedMany([
+  "First document",
+  "Second document",
+  "Third document",
+]);
+// embeddings: number[][] (e.g., 3 × 1536 dimensions)
+```
+
+**Supported providers and default models:**
+
+| Provider         | Default Embedding Model        | Env Override                |
+| ---------------- | ------------------------------ | --------------------------- |
+| OpenAI           | `text-embedding-3-small`       | —                           |
+| Google AI Studio | `gemini-embedding-001`         | `GOOGLE_AI_EMBEDDING_MODEL` |
+| Google Vertex    | `text-embedding-004`           | `VERTEX_EMBEDDING_MODEL`    |
+| Amazon Bedrock   | `amazon.titan-embed-text-v2:0` | —                           |
 
 ---
 
@@ -501,58 +600,15 @@ import {
 
 ## MCP Server Management
 
-### `addMCPServer(serverId, config)`
+### `addExternalMCPServer(serverId, config)`
 
-Programmatically add MCP servers at runtime. Supports stdio, SSE, WebSocket, and HTTP transports.
+Programmatically add external MCP servers at runtime. Supports stdio, SSE, WebSocket, and HTTP transports.
 
 ```typescript
-async addMCPServer(
+async addExternalMCPServer(
   serverId: string,
-  config: {
-    // For stdio transport
-    command?: string;
-    args?: string[];
-    env?: Record<string, string>;
-    cwd?: string;
-    // For HTTP transport
-    transport?: "stdio" | "sse" | "websocket" | "http";
-    url?: string;
-    headers?: Record<string, string>;
-    httpOptions?: {
-      connectionTimeout?: number;
-      requestTimeout?: number;
-      idleTimeout?: number;
-      keepAliveTimeout?: number;
-    };
-    retryConfig?: {
-      maxAttempts?: number;
-      initialDelay?: number;
-      maxDelay?: number;
-      backoffMultiplier?: number;
-    };
-    rateLimiting?: {
-      requestsPerMinute?: number;
-      requestsPerHour?: number;
-      maxBurst?: number;
-      useTokenBucket?: boolean;
-    };
-    auth?: {
-      type: "oauth2" | "bearer" | "api-key";
-      token?: string;
-      apiKey?: string;
-      apiKeyHeader?: string;
-      oauth?: {
-        clientId: string;
-        clientSecret?: string;
-        authorizationUrl: string;
-        tokenUrl: string;
-        redirectUrl: string;
-        scope?: string;
-        usePKCE?: boolean;
-      };
-    };
-  }
-): Promise<void>
+  config: MCPServerInfo
+): Promise<ExternalMCPOperationResult<ExternalMCPServerInstance>>
 ```
 
 **Examples:**
@@ -563,7 +619,7 @@ import { NeuroLink } from "@juspay/neurolink";
 const neurolink = new NeuroLink();
 
 // Add Bitbucket integration (stdio transport)
-await neurolink.addMCPServer("bitbucket", {
+await neurolink.addExternalMCPServer("bitbucket", {
   command: "npx",
   args: ["-y", "@nexus2520/bitbucket-mcp-server"],
   env: {
@@ -573,7 +629,7 @@ await neurolink.addMCPServer("bitbucket", {
 });
 
 // Add HTTP remote server with full configuration
-await neurolink.addMCPServer("remote-api", {
+await neurolink.addExternalMCPServer("remote-api", {
   transport: "http",
   url: "https://api.example.com/mcp",
   headers: {
@@ -600,7 +656,7 @@ await neurolink.addMCPServer("remote-api", {
 });
 
 // Add HTTP server with OAuth 2.1 authentication
-await neurolink.addMCPServer("oauth-api", {
+await neurolink.addExternalMCPServer("oauth-api", {
   transport: "http",
   url: "https://api.enterprise.com/mcp",
   auth: {
@@ -618,7 +674,7 @@ await neurolink.addMCPServer("oauth-api", {
 });
 
 // Add SSE server
-await neurolink.addMCPServer("sse-server", {
+await neurolink.addExternalMCPServer("sse-server", {
   transport: "sse",
   url: "https://api.example.com/mcp/sse",
   headers: { Authorization: "Bearer YOUR_TOKEN" },
@@ -659,16 +715,6 @@ console.log(`Total tools: ${status.totalTools}`);
 
 ---
 
-### `getUnifiedRegistry()`
-
-Access the unified MCP registry for advanced server management.
-
-```typescript
-getUnifiedRegistry(): UnifiedMCPRegistry
-```
-
----
-
 ## Conversation History Management
 
 ### Currently Available Methods
@@ -705,7 +751,7 @@ import { NeuroLink } from "@juspay/neurolink";
 const neurolink = new NeuroLink({
   conversationMemory: {
     enabled: true,
-    store: "redis", // or 'memory'
+    redisConfig: { host: "localhost", port: 6379 }, // omit for in-memory
   },
 });
 
@@ -974,22 +1020,32 @@ import { NeuroLink } from "@juspay/neurolink";
 
 const neurolink = new NeuroLink();
 
-// Analyze Word document
+// Analyze Word document (converted to Markdown before it reaches the model)
 const result = await neurolink.generate({
   input: {
     text: "Summarize this document",
-    officeFiles: ["report.docx"],
+    files: ["report.docx"],
   },
-  provider: "bedrock",
+  provider: "openai",
 });
 
-// Analyze Excel spreadsheet
+// Analyze one sheet of an Excel workbook, rendered as a markdown table
 const data = await neurolink.generate({
   input: {
     text: "What are the top products by revenue?",
-    officeFiles: ["sales-data.xlsx"],
+    files: ["sales-data.xlsx"],
   },
-  provider: "bedrock",
+  provider: "openai",
+  officeOptions: { sheetName: "Sales", formatStyle: "markdown" },
+});
+
+// Summarize a presentation (slide text, tables, and speaker notes)
+const deck = await neurolink.generate({
+  input: {
+    text: "Summarize each slide",
+    files: ["quarterly-review.pptx"],
+  },
+  provider: "openai",
 });
 
 // Mixed file types with auto-detection
@@ -998,7 +1054,7 @@ const analysis = await neurolink.generate({
     text: "Compare all documents",
     files: ["report.docx", "data.xlsx", "chart.png", "notes.pdf"],
   },
-  provider: "bedrock",
+  provider: "openai",
 });
 ```
 
@@ -1008,11 +1064,7 @@ const analysis = await neurolink.generate({
 import { NeuroLink } from "@juspay/neurolink";
 
 const neurolink = new NeuroLink({
-  enableOrchestration: true,
-  orchestrationConfig: {
-    fallbackChain: ["openai", "anthropic", "bedrock"],
-    preferCheap: false,
-  },
+  enableOrchestration: true, // Enables smart model routing via ModelRouter
 });
 
 // Will automatically fallback if primary provider fails
@@ -1134,8 +1186,8 @@ type McpRegistry = {
 
 ```typescript
 type OpenAIModel =
-  | "gpt-4o" // Default - Latest multimodal model
-  | "gpt-4o-mini" // Cost-effective variant
+  | "gpt-4o" // Previous generation multimodal model
+  | "gpt-4o-mini" // Default - cost-effective variant
   | "gpt-4-turbo"; // High-performance model
 ```
 
@@ -1275,7 +1327,7 @@ AZURE_OPENAI_DEPLOYMENT_ID?: string              // Deployment ID
 
 // Hugging Face
 HUGGINGFACE_API_KEY: string                      // HF token from huggingface.co
-HUGGINGFACE_MODEL?: string                       // Default: 'microsoft/DialoGPT-medium'
+HUGGINGFACE_MODEL?: string                       // Default: 'Qwen/Qwen2.5-72B-Instruct'
 
 // Ollama (Local)
 OLLAMA_BASE_URL?: string                         // Default: 'http://localhost:11434'
@@ -1374,65 +1426,40 @@ type TokenUsage = {
 
 ### Office Document Types
 
-Types for processing Office documents (DOCX, PPTX, XLSX):
+Office documents (DOCX, PPTX, XLSX) have no input field of their own. They travel in `input.files` like any other file, and NeuroLink turns them into text for the prompt, so they work with every provider:
 
 ```typescript
 /**
- * Supported Office document types
+ * File types the detector recognises. Office documents are "docx", "pptx"
+ * and "xlsx".
  */
-type OfficeFileType = "docx" | "pptx" | "xlsx" | "doc" | "xls";
+type FileType =
+  | "csv"
+  | "image"
+  | "pdf"
+  | "audio"
+  | "video"
+  | "archive"
+  | "text"
+  | "svg"
+  | "docx"
+  | "pptx"
+  | "xlsx"
+  | "unknown";
 
 /**
- * Extended file type including Office formats
- */
-type FileType = "csv" | "image" | "pdf" | "office" | "text" | "unknown";
-
-/**
- * Office processor options
+ * Options for Office documents, passed as `officeOptions` on generate()
+ * and stream(). Only `sheetName` and `formatStyle` are read, both for XLSX.
  */
 type OfficeProcessorOptions = {
-  /** Provider to use for document processing */
-  provider?: string;
-
-  /** Maximum file size in MB (default: 5) */
-  maxSizeMB?: number;
-
-  /** Whether to extract embedded images */
-  extractImages?: boolean;
-
-  /** Whether to preserve document structure in output */
-  preserveStructure?: boolean;
-};
-
-/**
- * Office processing result
- */
-type OfficeProcessingResult = {
-  type: "office";
-  content: Buffer;
-  mimeType: string;
-  metadata: {
-    confidence: number;
-    size: number;
-    filename?: string;
-    format: OfficeFileType;
-    provider: string;
-    estimatedPages?: number;
-    hasEmbeddedImages?: boolean;
-    hasCharts?: boolean;
-  };
+  /** Restrict the workbook to this sheet; an unknown name lists the sheets that exist */
+  sheetName?: string;
+  /** How sheets are rendered: tab-separated preview (default), CSV, a markdown table, or row objects */
+  formatStyle?: "raw" | "csv" | "markdown" | "json";
 };
 ```
 
-**Office Document Provider Support:**
-
-| Provider             | DOCX | PPTX | XLSX | DOC  | XLS  | Notes                                |
-| -------------------- | ---- | ---- | ---- | ---- | ---- | ------------------------------------ |
-| **AWS Bedrock**      | Yes  | Yes  | Yes  | Yes  | Yes  | Full native support via Converse API |
-| **Google Vertex AI** | Yes  | Some | Yes  | Some | Some | Best for DOCX and XLSX               |
-| **Anthropic Claude** | Yes  | Some | Yes  | Some | Some | Via document API                     |
-| **OpenAI**           | No   | No   | No   | No   | No   | Not supported                        |
-| **Azure OpenAI**     | No   | No   | No   | No   | No   | Not supported                        |
+The exported type also declares `format`, `extractTextOnly`, `maxSizeMB`, `includeMetadata`, `processAllSheets`, and `includeSlideNotes`; nothing reads them today. See the [Office Documents guide](../features/office-documents.md) for what the model receives for each format, including DOCX metrics, PPTX tables and speaker notes, and the placeholder note that replaces content a reader cannot extract (legacy `.doc`/`.xls`/`.ppt`, corrupt, or password-protected files).
 
 ---
 
@@ -1584,17 +1611,300 @@ const resultNoTools = await neurolink.generate({
 
 ---
 
+## Context Compaction
+
+Methods for managing conversation context size within model token limits. Requires conversation memory to be enabled.
+
+### `compactSession(sessionId, config?)`
+
+Manually trigger the full 5-stage context compaction pipeline for a session. The pipeline stages are: (0) Relevance drop — needs a decision provider, skipped without one, (1) Tool output pruning, (2) File read deduplication, (3) LLM summarization, (4) Sliding window truncation.
+
+```typescript
+async compactSession(
+  sessionId: string,
+  config?: CompactionConfig
+): Promise<CompactionResult | null>
+```
+
+**Parameters:**
+
+| Parameter   | Type                | Description                                                        |
+| ----------- | ------------------- | ------------------------------------------------------------------ |
+| `sessionId` | `string`            | The session ID to compact                                          |
+| `config`    | `CompactionConfig?` | Optional overrides for summarization provider, model, and behavior |
+
+**Returns:** `CompactionResult | null` — `null` if no conversation memory is configured or the session is empty.
+
+```typescript
+type CompactionResult = {
+  compacted: boolean; // Whether compaction was performed
+  messages: ChatMessage[]; // The compacted messages
+  originalTokens?: number; // Token count before compaction
+  compactedTokens?: number; // Token count after compaction
+};
+```
+
+**Example:**
+
+```typescript
+const neurolink = new NeuroLink({
+  conversationMemory: { enabled: true },
+});
+
+const result = await neurolink.compactSession("session-123", {
+  provider: "openai",
+  summarizationProvider: "openai",
+  summarizationModel: "gpt-4o-mini",
+});
+
+if (result?.compacted) {
+  console.log(
+    `Compacted from ${result.originalTokens} to ${result.compactedTokens} tokens`,
+  );
+}
+```
+
+---
+
+### `getContextStats(sessionId, provider?, model?)`
+
+Get context usage statistics for a session, including token counts and whether compaction is needed.
+
+```typescript
+async getContextStats(
+  sessionId: string,
+  provider?: string,
+  model?: string
+): Promise<{
+  estimatedInputTokens: number;
+  availableInputTokens: number;
+  usageRatio: number;
+  shouldCompact: boolean;
+  messageCount: number;
+} | null>
+```
+
+**Parameters:**
+
+| Parameter   | Type      | Description                                                   |
+| ----------- | --------- | ------------------------------------------------------------- |
+| `sessionId` | `string`  | The session ID to inspect                                     |
+| `provider`  | `string?` | Provider name for context window lookup (default: `"openai"`) |
+| `model`     | `string?` | Model name for context window lookup                          |
+
+**Returns:** Stats object or `null` if conversation memory is not configured or the session is empty.
+
+**Example:**
+
+```typescript
+const stats = await neurolink.getContextStats(
+  "session-123",
+  "openai",
+  "gpt-4o",
+);
+
+if (stats) {
+  console.log(
+    `Token usage: ${stats.estimatedInputTokens}/${stats.availableInputTokens}`,
+  );
+  console.log(`Usage ratio: ${(stats.usageRatio * 100).toFixed(1)}%`);
+  console.log(`Messages: ${stats.messageCount}`);
+  if (stats.shouldCompact) {
+    console.log("Context is approaching limit — compaction recommended");
+  }
+}
+```
+
+---
+
+### `needsCompaction(sessionId, provider?, model?)`
+
+Synchronously check if a session's context exceeds the compaction threshold (80% of the model's context window by default).
+
+```typescript
+needsCompaction(
+  sessionId: string,
+  provider?: string,
+  model?: string
+): boolean
+```
+
+**Parameters:**
+
+| Parameter   | Type      | Description                                                   |
+| ----------- | --------- | ------------------------------------------------------------- |
+| `sessionId` | `string`  | The session ID to check                                       |
+| `provider`  | `string?` | Provider name for context window lookup (default: `"openai"`) |
+| `model`     | `string?` | Model name for context window lookup                          |
+
+**Returns:** `boolean` — `true` if the session should be compacted, `false` otherwise (also returns `false` if memory is not configured or session does not exist).
+
+**Example:**
+
+```typescript
+if (
+  neurolink.needsCompaction("session-123", "anthropic", "claude-3-5-sonnet")
+) {
+  await neurolink.compactSession("session-123", { provider: "anthropic" });
+}
+```
+
+---
+
+## Lifecycle
+
+Methods for gracefully releasing resources held by a NeuroLink instance.
+
+### `shutdown()`
+
+Gracefully shut down all NeuroLink resources. Flushes and shuts down OpenTelemetry, closes external MCP server connections, and releases conversation memory resources (e.g., Redis connections).
+
+```typescript
+async shutdown(): Promise<void>
+```
+
+**Example:**
+
+```typescript
+const neurolink = new NeuroLink();
+
+// ... use neurolink ...
+
+// Graceful shutdown before process exit
+await neurolink.shutdown();
+```
+
+---
+
+### `dispose()`
+
+Full resource disposal. Performs everything `shutdown()` does, plus removes all event listeners, clears circuit breakers, purges internal caches and maps, and resets initialization state. Use this when you are completely done with the instance, especially in test environments where multiple NeuroLink instances are created.
+
+```typescript
+async dispose(): Promise<void>
+```
+
+**Example:**
+
+```typescript
+const neurolink = new NeuroLink();
+
+try {
+  const result = await neurolink.generate({
+    input: { text: "Hello" },
+    provider: "openai",
+  });
+} finally {
+  // Full cleanup — prevents resource leaks in tests
+  await neurolink.dispose();
+}
+```
+
+---
+
+## Event System
+
+`NeuroLink` emits events throughout the generation and streaming lifecycle through a `TypedEventEmitter`. `NeuroLink` does not extend `EventEmitter` itself, so there is no `neurolink.on()`: get the emitter with `getEventEmitter()`, subscribe with `on()` and unsubscribe with `off()`.
+
+```typescript
+const neurolink = new NeuroLink();
+const emitter = neurolink.getEventEmitter();
+
+emitter.on("generation:start", (data) => {
+  console.log("Generation started");
+});
+
+emitter.on("tool:end", (data) => {
+  console.log("Tool execution finished");
+});
+
+emitter.on("stream:chunk", (data) => {
+  // Received a streaming chunk
+});
+```
+
+### Core Events
+
+| Event              | Emitted When                         |
+| ------------------ | ------------------------------------ |
+| `generation:start` | A `generate()` call begins           |
+| `generation:end`   | A `generate()` call completes        |
+| `stream:start`     | A `stream()` call begins             |
+| `stream:chunk`     | A new chunk arrives during streaming |
+| `stream:end`       | Streaming completes normally         |
+| `stream:complete`  | Stream fully consumed                |
+| `stream:error`     | An error occurs during streaming     |
+| `tool:start`       | A tool execution begins              |
+| `tool:end`         | A tool execution completes           |
+| `response:start`   | A provider response begins           |
+| `response:end`     | A provider response completes        |
+
+### MCP Server Events
+
+| Event                            | Emitted When                              |
+| -------------------------------- | ----------------------------------------- |
+| `externalMCP:serverConnected`    | An external MCP server connects           |
+| `externalMCP:serverDisconnected` | An external MCP server disconnects        |
+| `externalMCP:serverFailed`       | An external MCP server connection fails   |
+| `externalMCP:toolDiscovered`     | A new tool is discovered on an MCP server |
+| `externalMCP:toolRemoved`        | A tool is removed from an MCP server      |
+| `externalMCP:serverAdded`        | A new MCP server registration is added    |
+| `externalMCP:serverRemoved`      | An MCP server registration is removed     |
+
+### Conversation Memory Events
+
+| Event                         | Emitted When                                                                                                                     |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `conversation:titleGenerated` | A new Redis-backed conversation's title is stored (see [Conversation Memory](../conversation-memory.md#title-generation-events)) |
+
+### Other Events
+
+| Event                  | Emitted When                        |
+| ---------------------- | ----------------------------------- |
+| `tools-register:start` | Tool registration process begins    |
+| `tools-register:end`   | Tool registration process completes |
+| `connected`            | Connection established              |
+| `message`              | General message event               |
+| `error`                | An error occurs                     |
+| `log`                  | A log message is emitted            |
+| `log-event`            | A structured log event is emitted   |
+
+**TypedEventEmitter Interface:**
+
+```typescript
+type TypedEventEmitter<TEvents> = {
+  on<K extends keyof TEvents>(
+    event: K,
+    listener: (...args: unknown[]) => void,
+  ): TypedEventEmitter<TEvents>;
+  off<K extends keyof TEvents>(
+    event: K,
+    listener: (...args: unknown[]) => void,
+  ): TypedEventEmitter<TEvents>;
+  emit<K extends keyof TEvents>(event: K, ...args: unknown[]): boolean;
+  removeAllListeners<K extends keyof TEvents>(
+    event?: K,
+  ): TypedEventEmitter<TEvents>;
+  listenerCount<K extends keyof TEvents>(event: K): number;
+  listeners<K extends keyof TEvents>(
+    event: K,
+  ): Array<(...args: unknown[]) => void>;
+};
+```
+
+---
+
 ## Related Features
 
 - [Human-in-the-Loop (HITL)](../features/hitl.md) - Mark tools with `requiresConfirmation: true`
-- [Guardrails Middleware](../features/guardrails.md) - Enable with `middleware: { preset: 'security' }`
+- [Guardrails Middleware](../features/guardrails.md) - Set `middleware` per call, in `new NeuroLink({ middleware })` or with `configureGlobalMiddleware()`; add `badWords` or `modelFilter` to filter
 - [Conversation History](../features/conversation-history.md) - Use `getConversationHistory()` method
 - [Multimodal Chat](../features/multimodal-chat.md) - Use `images` array in `generate()` options
 - [Auto Evaluation](../features/auto-evaluation.md) - Enable with `enableEvaluation: true`
 - [CLI Loop Sessions](../features/cli-loop-sessions.md) - Interactive mode with persistent state
 - [Provider Orchestration](../features/provider-orchestration.md) - Set `enableOrchestration: true`
 - [Regional Streaming](../features/regional-streaming.md) - Use `region` parameter in `generate()`
-- [Office Documents](../features/office-documents.md) - Use `officeFiles` array for DOCX, PPTX, XLSX
+- [Office Documents](../features/office-documents.md) - Use the `files` array (or `--file`) for DOCX, PPTX, XLSX
 - [PDF Support](../features/pdf-support.md) - Use `pdfFiles` array for PDF documents
 - [CSV Support](../features/csv-support.md) - Use `csvFiles` array for spreadsheet data
 - [CLI Commands Reference](../cli/commands.md) - CLI equivalents for all SDK methods

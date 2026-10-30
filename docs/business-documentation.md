@@ -29,7 +29,7 @@ This hub provides comprehensive business-focused documentation for implementing 
 - **Hospitality**: Marketing content (18% booking increase)
 - **Mobile Apps**: App store optimization
 
-### 📚 [Integration Tutorials](./tutorials.md)
+### 📚 Integration Tutorials
 
 **Step-by-step implementation guides**
 
@@ -80,7 +80,7 @@ This hub provides comprehensive business-focused documentation for implementing 
 
 ### 👩‍💻 **Developers & Engineers**
 
-**Start Here**: [Integration Tutorials](./tutorials.md)
+**Start Here**: Integration Tutorials
 
 - Follow step-by-step implementation guides
 - Review code examples and best practices
@@ -107,7 +107,7 @@ This hub provides comprehensive business-focused documentation for implementing 
 
 ### Week 2: Implementation
 
-1. **Follow**: [Quick Start Tutorial](./tutorials.md#quick-start-15-minutes)
+1. **Follow**: [Quick Start Tutorial](/tutorials/step-by-step#quick-start-15-minutes)
 2. **Enable**: Analytics and evaluation features
 3. **Configure**: Quality gates and cost monitoring
 4. **Test**: Validation using [Testing Guide](./testing.md)
@@ -180,7 +180,7 @@ This hub provides comprehensive business-focused documentation for implementing 
 ```
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
 │   Application   │────│   NeuroLink SDK  │────│  AI Providers   │
-│  (Your Code)    │    │  with Analytics  │    │ (9 Providers)   │
+│  (Your Code)    │    │  with Analytics  │    │ (AI Providers)  │
 └─────────────────┘    └──────────────────┘    └─────────────────┘
          │                       │                       │
          ▼                       ▼                       ▼
@@ -217,7 +217,7 @@ This hub provides comprehensive business-focused documentation for implementing 
 
 1. **Assess Your Needs**: Review [Industry Use Cases](./use-cases.md) for your sector
 2. **Calculate ROI**: Use examples in [Business Value Guide](./business-value.md)
-3. **Start Implementation**: Follow [Integration Tutorials](./tutorials.md)
+3. **Start Implementation**: Follow the Integration Tutorials
 4. **Validate Results**: Use [Testing & Validation](./testing.md)
 5. **Optimize & Scale**: Monitor analytics and optimize based on data
 

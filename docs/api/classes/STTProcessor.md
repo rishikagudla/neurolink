@@ -1,0 +1,253 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / STTProcessor
+
+# Class: STTProcessor
+
+STT processor class for orchestrating speech-to-text operations
+
+Follows the same pattern as TTSProcessor, CSVProcessor, ImageProcessor, and PDFProcessor.
+Provides a unified interface for STT transcription across multiple providers.
+
+## Example
+
+```typescript
+// Register a handler
+STTProcessor.registerHandler("whisper", whisperHandler);
+
+// Check if provider is supported
+if (STTProcessor.supports("whisper")) {
+  // Provider is registered
+}
+```
+
+## Constructors
+
+### Constructor
+
+> **new STTProcessor**(): `STTProcessor`
+
+#### Returns
+
+`STTProcessor`
+
+## Methods
+
+### registerHandler()
+
+> `static` **registerHandler**(`providerName`, `handler`): `void`
+
+Register an STT handler for a specific provider
+
+Allows providers to register their STT implementation at runtime.
+
+#### Parameters
+
+##### providerName
+
+`string`
+
+Provider identifier (e.g., 'whisper', 'deepgram')
+
+##### handler
+
+[`STTHandler`](../type-aliases/STTHandler.md)
+
+STT handler implementation
+
+#### Returns
+
+`void`
+
+#### Example
+
+```typescript
+const whisperHandler: STTHandler = {
+  transcribe: async (audio, options) => { ... },
+  getSupportedFormats: () => ["mp3", "wav"],
+  isConfigured: () => true
+};
+
+STTProcessor.registerHandler('whisper', whisperHandler);
+```
+
+---
+
+### getHandler()
+
+> `static` **getHandler**(`providerName`): [`STTHandler`](../type-aliases/STTHandler.md) \| `undefined`
+
+Get a registered STT handler by provider name.
+
+Exposed publicly so module-level auto-registration code can reuse an
+already-registered primary handler when backfilling its aliases.
+
+#### Parameters
+
+##### providerName
+
+`string`
+
+Provider identifier
+
+#### Returns
+
+[`STTHandler`](../type-aliases/STTHandler.md) \| `undefined`
+
+Handler instance or undefined if not registered
+
+---
+
+### resolveHandler()
+
+> `static` **resolveHandler**(`provider`, `credentials?`): `Promise`\<[`STTHandler`](../type-aliases/STTHandler.md) \| `undefined`\>
+
+The handler a call should use. A credentials slice for a shipped
+provider builds a fresh handler for this call; otherwise the registered
+one is used, and a shipped provider that was never registered (its key
+arrived after registration, or it is the local engine on a registry that
+was cleared) is built from the environment rather than reported as
+unsupported. Names that are neither registered nor shipped resolve to
+`undefined`.
+
+The handler classes are loaded lazily: `voice/index.ts` imports this
+module, so a static import back would be a cycle.
+
+#### Parameters
+
+##### provider
+
+`string`
+
+##### credentials?
+
+[`STTCredentials`](../type-aliases/STTCredentials.md)
+
+#### Returns
+
+`Promise`\<[`STTHandler`](../type-aliases/STTHandler.md) \| `undefined`\>
+
+---
+
+### listProviders()
+
+> `static` **listProviders**(): `string`[]
+
+List the names of all registered providers.
+
+#### Returns
+
+`string`[]
+
+---
+
+### clearHandlers()
+
+> `static` **clearHandlers**(): `void`
+
+Removes every registered STT handler. Primarily for test isolation —
+production code should not need to call this.
+
+#### Returns
+
+`void`
+
+---
+
+### supports()
+
+> `static` **supports**(`providerName`): `boolean`
+
+Check if a provider is supported (has a registered STT handler)
+
+#### Parameters
+
+##### providerName
+
+`string`
+
+Provider identifier
+
+#### Returns
+
+`boolean`
+
+True if handler is registered
+
+#### Example
+
+```typescript
+if (STTProcessor.supports("whisper")) {
+  console.log("Whisper STT is supported");
+}
+```
+
+---
+
+### transcribe()
+
+> `static` **transcribe**(`audio`, `provider`, `options`, `credentials?`): `Promise`\<[`STTResult`](../type-aliases/STTResult.md)\>
+
+Transcribe audio to text using a registered STT provider
+
+Orchestrates the speech-to-text transcription process:
+
+1. Validates audio input (non-empty)
+2. Looks up the provider handler
+3. Verifies provider configuration
+4. Delegates transcription to the provider
+5. Enriches result with provider metadata
+
+#### Parameters
+
+##### audio
+
+`ArrayBuffer` \| `Buffer`\<`ArrayBufferLike`\>
+
+Audio data as Buffer or ArrayBuffer
+
+##### provider
+
+`string`
+
+Provider identifier
+
+##### options
+
+[`STTOptions`](../type-aliases/STTOptions.md)
+
+STT configuration options
+
+##### credentials?
+
+[`STTCredentials`](../type-aliases/STTCredentials.md)
+
+Per-call credentials (`credentials.stt`). When it
+carries a slice for this provider — even an empty one — a fresh handler
+is built from that slice (environment as fallback) for this call alone,
+instead of the registry's shared instance: per-call beats instance
+beats environment, exactly as for text providers.
+
+#### Returns
+
+`Promise`\<[`STTResult`](../type-aliases/STTResult.md)\>
+
+Transcription result with text and metadata
+
+#### Throws
+
+STTError if validation fails or provider not supported/configured
+
+#### Example
+
+```typescript
+const result = await STTProcessor.transcribe(audioBuffer, "whisper", {
+  language: "en-US",
+  punctuation: true,
+});
+
+console.log(`Transcription: ${result.text}`);
+console.log(`Confidence: ${result.confidence}`);
+```

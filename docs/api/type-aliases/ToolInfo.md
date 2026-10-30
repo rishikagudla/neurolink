@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v8.32.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,14 +8,12 @@
 
 > **ToolInfo** = `object`
 
-Defined in: [types/tools.ts:96](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L96)
-
 Tool information with extensibility
 Moved from src/lib/mcp/contracts/mcpContract.ts
 
 ## Indexable
 
-\[`key`: `string`\]: `unknown`
+> \[`key`: `string`\]: `unknown`
 
 ## Properties
 
@@ -23,44 +21,64 @@ Moved from src/lib/mcp/contracts/mcpContract.ts
 
 > **name**: `string`
 
-Defined in: [types/tools.ts:97](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L97)
-
 ---
 
 ### description?
 
-> `optional` **description**: `string`
-
-Defined in: [types/tools.ts:98](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L98)
+> `optional` **description?**: `string`
 
 ---
 
 ### category?
 
-> `optional` **category**: `string`
-
-Defined in: [types/tools.ts:99](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L99)
+> `optional` **category?**: `string`
 
 ---
 
 ### serverId?
 
-> `optional` **serverId**: `string`
-
-Defined in: [types/tools.ts:100](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L100)
+> `optional` **serverId?**: `string`
 
 ---
 
 ### inputSchema?
 
-> `optional` **inputSchema**: `StandardRecord`
-
-Defined in: [types/tools.ts:101](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L101)
+> `optional` **inputSchema?**: [`StandardRecord`](StandardRecord.md)
 
 ---
 
 ### outputSchema?
 
-> `optional` **outputSchema**: `StandardRecord`
+> `optional` **outputSchema?**: [`StandardRecord`](StandardRecord.md)
 
-Defined in: [types/tools.ts:102](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L102)
+---
+
+### annotations?
+
+> `optional` **annotations?**: [`MCPToolAnnotations`](MCPToolAnnotations.md)
+
+MCP tool annotations (safety hints, metadata). Auto-inferred when mcp.annotations.autoInfer is enabled.
+
+---
+
+### timeoutMs?
+
+> `optional` **timeoutMs?**: `number`
+
+Per-tool timeout in milliseconds, set at registration time
+
+---
+
+### maxRetries?
+
+> `optional` **maxRetries?**: `number`
+
+---
+
+### totalTimeoutMs?
+
+> `optional` **totalTimeoutMs?**: `number`
+
+Ceiling on the WHOLE execution — every attempt plus the delays between
+them. Declared explicitly rather than left to the index signature below,
+which would type it `unknown` and silently defeat the default.

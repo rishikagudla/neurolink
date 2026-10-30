@@ -18,7 +18,7 @@ NeuroLink's middleware system provides a powerful and flexible way to intercept,
 - Factory pattern for easy middleware management
 - Priority-based execution ordering
 - Provider-specific conditional execution
-- Built on top of Vercel AI SDK's middleware system
+- Built on NeuroLink's own `wrapLanguageModel` (`src/lib/middleware/wrapLanguageModel.ts`), which keeps the familiar wrap-a-model shape without depending on a third-party SDK
 
 ## Architecture Diagram
 
@@ -233,6 +233,8 @@ const factory = new MiddlewareFactory({
 | `all`      | Analytics + Guardrails | Production with safety |
 | `security` | Guardrails only        | Security-focused       |
 | Custom     | Your choice            | Define your own        |
+
+`security` switches guardrails on and nothing more: it ships no word list and no model filter, so it redacts nothing until `badWords`, `modelFilter` or `precallEvaluation` is configured. A preset, and any other `MiddlewareFactoryOptions`, can also be set as a default for every call: `NEUROLINK_MIDDLEWARE_PRESET` (a preset name only), `configureGlobalMiddleware()` and `new NeuroLink({ middleware })`, each overridden by the next and finally by the call's own `middleware`. See [Guardrails: Defaults and precedence](../features/guardrails.md#defaults-and-precedence).
 
 ## Factory Pattern
 
@@ -483,40 +485,53 @@ const metadata: NeuroLinkMiddlewareMetadata = {
 
 ### NeuroLinkMiddleware
 
-The core middleware interface that combines AI SDK middleware with metadata:
+The core middleware interface, which combines the model-middleware contract with NeuroLink metadata:
 
 ```typescript
-import type { LanguageModelV1Middleware } from "ai";
+import type { LanguageModelMiddleware } from "@juspay/neurolink";
 
-type NeuroLinkMiddleware = LanguageModelV1Middleware & {
+type NeuroLinkMiddleware = LanguageModelMiddleware & {
   // Metadata about this middleware
   metadata: NeuroLinkMiddlewareMetadata;
 };
 ```
 
-### LanguageModelV1Middleware (from AI SDK)
+### LanguageModelMiddleware
 
-The underlying middleware interface from Vercel AI SDK:
+NeuroLink declares this contract itself — it no longer comes from the Vercel AI
+SDK, which is not a dependency. The shape follows the v3 model protocol:
 
 ```typescript
-interface LanguageModelV1Middleware {
-  // Transform request parameters before provider call
+type LanguageModelMiddleware = {
+  readonly specificationVersion: "v3";
+
+  // Override how the model identifies itself
+  overrideProvider?: (options: { model: LanguageModelV3 }) => string;
+  overrideModelId?: (options: { model: LanguageModelV3 }) => string;
+
+  // Transform request parameters before the provider call
   transformParams?: (options: {
-    params: LanguageModelV1CallOptions;
-  }) => PromiseLike<LanguageModelV1CallOptions>;
+    type: "generate" | "stream";
+    params: LanguageModelV3CallOptions;
+    model: LanguageModelV3;
+  }) => PromiseLike<LanguageModelV3CallOptions>;
 
   // Wrap generate() calls
   wrapGenerate?: (options: {
-    doGenerate: () => PromiseLike<LanguageModelV1CallResult>;
-    params: LanguageModelV1CallOptions;
-  }) => PromiseLike<LanguageModelV1CallResult>;
+    doGenerate: () => PromiseLike<LanguageModelV3GenerateResult>;
+    doStream: () => PromiseLike<LanguageModelV3StreamResult>;
+    params: LanguageModelV3CallOptions;
+    model: LanguageModelV3;
+  }) => PromiseLike<LanguageModelV3GenerateResult>;
 
   // Wrap stream() calls
   wrapStream?: (options: {
-    doStream: () => PromiseLike<LanguageModelV1StreamResult>;
-    params: LanguageModelV1CallOptions;
-  }) => PromiseLike<LanguageModelV1StreamResult>;
-}
+    doGenerate: () => PromiseLike<LanguageModelV3GenerateResult>;
+    doStream: () => PromiseLike<LanguageModelV3StreamResult>;
+    params: LanguageModelV3CallOptions;
+    model: LanguageModelV3;
+  }) => PromiseLike<LanguageModelV3StreamResult>;
+};
 ```
 
 ### MiddlewareContext

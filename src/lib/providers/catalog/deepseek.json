@@ -1,0 +1,99 @@
+{
+  "$schema": "./provider-catalog.schema.json",
+  "id": "deepseek",
+  "displayName": "DeepSeek",
+  "enumTypeName": "DeepSeekModels",
+  "aliases": ["ds"],
+  "tier": 2,
+  "wire": {
+    "baseURL": "https://api.deepseek.com"
+  },
+  "models": {
+    "default": "deepseek-chat",
+    "fallbacks": ["deepseek-chat", "deepseek-reasoner", "deepseek-v4-pro"],
+    "defaultContextWindow": 1048576,
+    "defaultMaxOutputTokens": 393216,
+    "catalog": {
+      "deepseek-chat": {
+        "contextWindow": 1048576,
+        "maxOutputTokens": 393216,
+        "vision": true,
+        "status": "production",
+        "description": "Alias of deepseek-flash with thinking off (DeepSeek-V4.1-Flash)"
+      },
+      "deepseek-reasoner": {
+        "contextWindow": 1048576,
+        "maxOutputTokens": 393216,
+        "vision": true,
+        "status": "production",
+        "description": "Alias of deepseek-flash with thinking on (DeepSeek-V4.1-Flash)"
+      },
+      "deepseek-flash": {
+        "contextWindow": 1048576,
+        "maxOutputTokens": 393216,
+        "vision": true,
+        "status": "production",
+        "description": "DeepSeek-V4.1-Flash — thinking on by default, image input"
+      },
+      "deepseek-v4-pro": {
+        "contextWindow": 1048576,
+        "maxOutputTokens": 393216,
+        "vision": false,
+        "status": "production",
+        "description": "DeepSeek-V4-Pro-0813 — thinking on by default, text only"
+      }
+    }
+  },
+  "capabilities": {
+    "text": true,
+    "streaming": true,
+    "tools": true,
+    "toolsWithStreaming": true,
+    "structuredOutput": true,
+    "structuredOutputWithTools": true,
+    "embeddings": false,
+    "thinking": true
+  },
+  "errorRules": [
+    {
+      "status": 401,
+      "pattern": "Invalid API key|Authentication",
+      "class": "authentication",
+      "message": "Invalid DeepSeek API key. Please check your {apiKeyEnvVar} environment variable."
+    },
+    {
+      "status": 402,
+      "pattern": "Insufficient Balance|insufficient_balance",
+      "class": "provider",
+      "message": "DeepSeek account has insufficient balance. Top up at https://platform.deepseek.com/usage"
+    },
+    {
+      "pattern": "supported API model names|model_not_found",
+      "class": "invalid-model",
+      "message": "DeepSeek model '{model}' not found. Use 'deepseek-flash' or 'deepseek-v4-pro'."
+    }
+  ],
+  "quirks": {
+    "responseFormatDowngrade": "json-schema-to-json-object",
+    "replayReasoningContent": true
+  },
+  "setup": {
+    "url": "https://platform.deepseek.com/api_keys",
+    "apiKeyFormat": null,
+    "billingPolicy": "no-free-tier",
+    "instructions": [
+      "1. Visit: https://platform.deepseek.com/api_keys",
+      "2. Create or sign in to your DeepSeek account",
+      "3. Generate a new API key",
+      "4. Set {apiKeyEnvVar} in your .env file"
+    ]
+  },
+  "evidence": {
+    "rosterVerified": {
+      "date": "2026-09-24",
+      "method": "Live against api.deepseek.com on 2026-09-24. GET /models lists only deepseek-flash and deepseek-v4-pro, with context_window 1048576 and max_output_tokens 393216 (the pricing page's 1M / 384K). deepseek-chat and deepseek-reasoner still answer 200 but report model deepseek-flash — deepseek-chat without reasoning_content, deepseek-reasoner with it — so both stay production as aliases rather than being marked retired. Vision was probed with a solid-blue PNG: deepseek-flash, deepseek-chat and deepseek-reasoner all named the colour; deepseek-v4-pro answered 200 but described a scene that was not in the image, so it keeps vision false, matching the pricing page. An unknown model id returns 400 'The supported API model names are …' with code invalid_request_error — never 'model_not_found' — so the invalid-model rule now matches that text. tools plus response_format json_object in one request returned 200 with tool_calls, confirming structuredOutputWithTools. billingPolicy is not re-verified."
+    },
+    "liveMatrix": null,
+    "addedInPR": "https://github.com/juspay/neurolink/pull/1781"
+  }
+}

@@ -8,8 +8,8 @@
 import type {
   SageMakerErrorCode,
   SageMakerErrorInfo,
-} from "../../types/providers.js";
-import type { UnknownRecord } from "../../types/common.js";
+  UnknownRecord,
+} from "../../types/index.js";
 import {
   ERROR_MESSAGE_TEMPLATES,
   ERROR_MESSAGE_PREFIXES,
@@ -290,11 +290,12 @@ export function handleSageMakerError(
 /**
  * Extract request ID from AWS SDK error for debugging
  *
- * @param error - Error object that might contain request ID
+ * @param error - Error object that might contain request ID (AWS SDK errors
+ *   carry it as an untyped extra field, so the value is treated as opaque)
  * @returns Request ID if found, undefined otherwise
  */
-function extractRequestId(error: Error): string | undefined {
-  const errorAny = error as unknown as UnknownRecord;
+function extractRequestId(error: unknown): string | undefined {
+  const errorAny = error as UnknownRecord;
   return (
     (errorAny.requestId as string) ||
     (errorAny.RequestId as string) ||

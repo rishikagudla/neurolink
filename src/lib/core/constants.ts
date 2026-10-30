@@ -3,22 +3,124 @@
  * Single source of truth for all default values
  */
 
+import type { ProviderModelManifest } from "../types/index.js";
+import { anthropicManifest } from "../models/manifests/anthropic.js";
+import { openaiManifest } from "../models/manifests/openai.js";
+import { googleAiManifest } from "../models/manifests/google-ai.js";
+import { vertexManifest } from "../models/manifests/vertex.js";
+import { bedrockManifest } from "../models/manifests/bedrock.js";
+import { azureManifest } from "../models/manifests/azure.js";
+import { mistralManifest } from "../models/manifests/mistral.js";
+import { ollamaManifest } from "../models/manifests/ollama.js";
+import { litellmManifest } from "../models/manifests/litellm.js";
+
 // Image Generation Model Identifiers
-// Used to detect if a model is an image generation model (not text generation)
+// Used to detect if a model is an image generation model (not text generation).
+// `isImageGenerationModel(name)` (below) does boundary-aware matching:
+// the modelName must equal an entry OR contain an entry followed by a
+// non-alphanumeric character (`-`, `_`, `:`, `/`, `.`, end-of-string).
+// This prevents short identifiers like `"V_1"` or `"gpt-image-1"` from
+// accidentally matching unrelated model names that happen to embed them.
 export const IMAGE_GENERATION_MODELS = [
+  // Gemini image models (Vertex AI, Google AI Studio)
   "gemini-3-pro-image-preview",
   "gemini-2.5-flash-image",
+  "gemini-3.1-flash-image-preview",
+
+  // Stability AI (direct provider — image-only)
+  "stable-image-ultra",
+  "stable-image-core",
+  "sd3.5-large",
+  "sd3.5-large-turbo",
+  "sd3.5-medium",
+
+  // Ideogram (direct provider — image-only). API uses model-version
+  // identifiers like "V_1", "V_1_TURBO", "V_2", "V_2_TURBO", "V_2A",
+  // "V_2A_TURBO", "V_3". Keep prefixes that won't collide with generic
+  // text-model names.
+  "V_1",
+  "V_1_TURBO",
+  "V_2",
+  "V_2_TURBO",
+  "V_2A",
+  "V_2A_TURBO",
+  "V_3",
+
+  // Recraft (direct provider — image-only)
+  "recraftv3",
+  "recraftv2",
+
+  // OpenAI image models (DALL-E + GPT-Image). Substring match keeps
+  // version variants like "dall-e-3" / "dall-e-2" routed correctly.
+  "gpt-image-1",
+  "dall-e-3",
+  "dall-e-2",
+
+  // Replicate-hosted image models (matched on model slug prefix).
+  // Replicate model slugs are passed through as-is via the LLM
+  // provider; image-gen models trigger the image-gen path.
+  "black-forest-labs/flux",
+  "stability-ai/sdxl",
+  "stability-ai/stable-diffusion",
 ];
+
+/**
+ * Boundary-aware test for whether `modelName` represents an image-generation
+ * model.
+ *
+ * Matches when the model name **equals** an entry in
+ * {@link IMAGE_GENERATION_MODELS} or contains the entry as a prefix followed
+ * by a separator (`-`, `_`, `:`, `/`, `.`) or end-of-string. This avoids
+ * accidental matches such as a custom fine-tune named `"my-V_1"` matching
+ * `"V_1"` via plain substring inclusion.
+ */
+export function isImageGenerationModel(modelName: string | undefined): boolean {
+  if (!modelName) {
+    return false;
+  }
+  for (const entry of IMAGE_GENERATION_MODELS) {
+    if (modelName === entry) {
+      return true;
+    }
+    const idx = modelName.indexOf(entry);
+    if (idx === -1) {
+      continue;
+    }
+    const before = idx === 0 ? "" : modelName[idx - 1];
+    const after = modelName[idx + entry.length] ?? "";
+    const isBoundary = (ch: string): boolean =>
+      ch === "" || /[-_:./@]/.test(ch);
+    if (isBoundary(before) && isBoundary(after)) {
+      return true;
+    }
+  }
+  return false;
+}
 
 // PDF Image Generation Models
 // Models that support generating images from PDFs
-export const PDF_IMAGE_GENERATION_MODELS = ["gemini-3-pro-image-preview"];
+export const PDF_IMAGE_GENERATION_MODELS = [
+  "gemini-3-pro-image-preview",
+  "gemini-3.1-flash-image-preview",
+];
 
 // Global Location Models
 // Models that require global location configuration (uses aiplatform.googleapis.com instead of region-specific endpoints)
+// Includes Gemini 3.x text and image models, which are only available via the global endpoint on Vertex AI.
+// IMAGE_GENERATION_MODELS is spread in to keep the two lists from drifting:
+// any new image-gen model added there is automatically routed to global here.
 export const GLOBAL_LOCATION_MODELS = [
-  "gemini-3-pro-image-preview",
-  "gemini-2.5-flash-image",
+  // Image generation (sourced from IMAGE_GENERATION_MODELS)
+  ...IMAGE_GENERATION_MODELS,
+  // Gemini 3.1 text models (global-only)
+  "gemini-3.1-pro-preview",
+  "gemini-3.1-flash-lite-preview",
+  "gemini-3.1-pro-preview-customtools",
+  // Gemini 3 text models (global-only)
+  "gemini-3-pro-preview",
+  "gemini-3-pro-preview-11-2025",
+  "gemini-3-pro-latest",
+  "gemini-3-flash-preview",
 ];
 
 // Core AI Generation Defaults
@@ -27,6 +129,66 @@ export const DEFAULT_TEMPERATURE = 0.7;
 export const DEFAULT_TIMEOUT = 60000;
 export const DEFAULT_MAX_STEPS = 200;
 export const DEFAULT_TOOL_MAX_RETRIES = 2; // Maximum retries per tool before permanently failing
+
+/** Defensive wall-clock ceiling for a native Gemini-3 agentic turn (generate + stream). */
+export const DEFAULT_GEMINI_STREAM_TIMEOUT_MS = 300_000;
+
+/**
+ * Default per-tool-execution timeout for native agentic loops. A tool that
+ * exceeds it fails with an error tool_result and costs one step — the turn
+ * continues instead of hanging on a wedged tool. Override per call with
+ * `toolTimeoutMs`, or remove the bound entirely with `toolTimeoutMs: null`.
+ */
+export const DEFAULT_TOOL_EXECUTION_TIMEOUT_MS = 300_000;
+
+/**
+ * Resolve a caller's `toolTimeoutMs` into the bound a loop should actually
+ * apply: a number of milliseconds, or `null` for no bound at all.
+ *
+ * The three-way distinction is the whole point, and `??` cannot express it:
+ * `undefined` means "no opinion, take the default", while `null` is a stated
+ * choice to run tools unbounded — the pre-existing behaviour of the loops that
+ * never had a per-tool timer, and the only way to say it, since a finite
+ * number is always a ceiling and `Infinity` silently desugars to `setTimeout`'s
+ * ~24.9-day cap. Every loop resolves it through here so `null` cannot come to
+ * mean "the default" on one provider and "unbounded" on another.
+ */
+export function resolveToolTimeoutMs(
+  toolTimeoutMs: number | null | undefined,
+): number | null {
+  return toolTimeoutMs === null
+    ? null
+    : (toolTimeoutMs ?? DEFAULT_TOOL_EXECUTION_TIMEOUT_MS);
+}
+
+/**
+ * Default wrap-up lead applied when `turnTimeoutMs` is set but
+ * `wrapupTimeLeadMs` is not: with less than this much turn time remaining,
+ * a wrap-up nudge rides the next tool-result turn.
+ */
+export const DEFAULT_WRAPUP_TIME_LEAD_MS = 120_000;
+
+/**
+ * In-loop context guard threshold for native agentic loops: when the last
+ * model call's actual prompt size (provider-reported usage) plus the
+ * estimated growth from this step's tool results crosses this fraction of
+ * the model's context window, the loop stops calling tools and synthesizes a
+ * final answer instead of stepping into a provider 400 ("prompt is too
+ * long") that would destroy the whole turn's work.
+ */
+export const DEFAULT_CONTEXT_GUARD_RATIO = 0.85;
+
+/**
+ * Floor for the turn budget handed to the post-overflow recovery retry.
+ * The retry inherits the REMAINING `turnTimeoutMs` (whole-turn semantics —
+ * one generate() must not stack two full budgets), but never less than this,
+ * so a compacted retry still gets a workable window.
+ */
+export const MIN_RECOVERY_TURN_BUDGET_MS = 30_000;
+
+// Fire-and-forget tool storage writes (Redis). 5s is generous for a single
+// Redis write; if breached, the .catch logs a warning.
+export const TOOL_STORAGE_TIMEOUT_MS = 5000;
 
 // Step execution limits
 export const STEP_LIMITS = {
@@ -57,34 +219,86 @@ export const PROVIDER_CONFIG = {
   },
 };
 
-// Provider-specific maxTokens limits
+/**
+ * Per-model output-token overrides for a manifest, keyed by canonical model
+ * id. The manifest's synthetic "_default" entry is excluded — the
+ * provider-level `default` in PROVIDER_MAX_TOKENS already carries that role,
+ * and is left as the hand-authored value below rather than replaced with
+ * this data (a provider's `_default` entry, when present, is a minimal
+ * catch-all sized for an unlisted/gateway model id, not a considered
+ * provider-wide ceiling).
+ */
+function maxTokensOverridesFrom(
+  manifest: ProviderModelManifest,
+): Record<string, number> {
+  const overrides: Record<string, number> = {};
+  for (const [id, entry] of Object.entries(manifest.models)) {
+    if (id === "_default") {
+      continue;
+    }
+    overrides[id] = entry.maxOutputTokens;
+  }
+  return overrides;
+}
+
+// Provider-specific maxTokens limits. Each provider's `default` is the
+// original hand-authored ceiling (unchanged); per-model keys are generated
+// from that provider's manifest (src/lib/models/manifests/) so
+// getSafeMaxTokens()'s existing per-model lookup (tokenLimits.ts) actually
+// has data to find instead of always falling through to the coarse
+// `default`. This resolves the historical disagreement between
+// getSafeMaxTokens("anthropic", "claude-opus-4-6") (used to return the flat
+// 64000) and resolveClaudeMaxTokens("claude-opus-4-6") (tokenLimits.ts's
+// regex ladder, correctly 32000 for the Opus family) — the manifest's own
+// per-model maxOutputTokens now wins for every listed model, on every
+// provider below, not just Anthropic.
+//
+// Manifests are imported directly from src/lib/models/manifests/ rather
+// than through manifestRegistry.ts's aggregator: manifestRegistry.ts
+// imports PROVIDER_MAX_TOKENS from this file (to size the synthetic
+// `_default` entry for manifests that don't declare their own), so
+// importing the aggregator back here would form a constants.ts <->
+// manifestRegistry.ts import cycle whose safety depends on which module a
+// given entrypoint happens to reach first — an ES module TDZ hazard, not
+// something a type-checker catches. The individual manifest files have no
+// dependency on this module (only on the ProviderModelManifest type), so
+// reaching past the aggregator avoids the cycle entirely.
 export const PROVIDER_MAX_TOKENS = {
   anthropic: {
     default: 64000,
+    ...maxTokensOverridesFrom(anthropicManifest),
   },
   openai: {
     default: 128000,
+    ...maxTokensOverridesFrom(openaiManifest),
   },
   "google-ai": {
     default: 64000,
+    ...maxTokensOverridesFrom(googleAiManifest),
   },
   vertex: {
     default: 64000,
+    ...maxTokensOverridesFrom(vertexManifest),
   },
   bedrock: {
     default: 64000,
+    ...maxTokensOverridesFrom(bedrockManifest),
   },
   azure: {
     default: 128000,
+    ...maxTokensOverridesFrom(azureManifest),
   },
   mistral: {
     default: 128000,
+    ...maxTokensOverridesFrom(mistralManifest),
   },
   ollama: {
     default: 64000,
+    ...maxTokensOverridesFrom(ollamaManifest),
   },
   litellm: {
     default: 128000,
+    ...maxTokensOverridesFrom(litellmManifest),
   },
   default: 64000,
 };
@@ -109,6 +323,28 @@ export const PDF_LIMITS = {
   MAX_SIZE_MB: 20,
   // Default maximum pages for image conversion
   DEFAULT_MAX_PAGES: 20,
+  // Upper bound for the render scale factor. Above this, a single page can
+  // allocate hundreds of MB; scale <= 0 produces a degenerate viewport.
+  MAX_SCALE: 10,
+  // Lower bound for the render scale factor (#297). Below this the render is
+  // effectively unreadable; enforcing it makes the documented 0.1–10 range real
+  // (previously only scale <= 0 was rejected).
+  MIN_SCALE: 0.1,
+  // Default render scale (#297). Lowered from 2 → 1.5 to roughly halve the
+  // per-page canvas memory while staying legible for OCR/vision.
+  DEFAULT_SCALE: 1.5,
+  // Timeout (ms) for the accurate pdf-parse page-count probe (#287); on timeout
+  // the processor falls back to the regex estimate rather than blocking.
+  PAGE_COUNT_TIMEOUT_MS: 5000,
+  // Default per-page pixel ceiling for image conversion (#260). 16.7M px ×
+  // 4 bytes RGBA ≈ 64 MB per page — safely bounded. A larger page is
+  // uniformly downscaled to stay under this instead of allocating gigabytes.
+  DEFAULT_MAX_CANVAS_PIXELS: 16_777_216,
+  // Floor for the downscaled render scale (#260 follow-up). A crafted/malformed
+  // MediaBox can drive the estimated pixel count toward Infinity, which would
+  // otherwise collapse `effectiveScale` to 0 and hand the renderer a degenerate
+  // viewport. Never let the downscale branch go below this.
+  MIN_EFFECTIVE_SCALE: 0.1,
 };
 
 // Performance and System Limits
@@ -132,6 +368,9 @@ export const SYSTEM_LIMITS = {
   DEFAULT_MAX_DELAY: 30000, // 30 seconds
   DEFAULT_BACKOFF_MULTIPLIER: 2,
 };
+
+// Pre-call tool routing: hard ceiling for the router LLM call before failing open
+export const DEFAULT_TOOL_ROUTING_TIMEOUT_MS = 15000;
 
 // Environment Variable Support (for future use)
 export const ENV_DEFAULTS = {

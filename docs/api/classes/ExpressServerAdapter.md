@@ -1,0 +1,1071 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / ExpressServerAdapter
+
+# Class: ExpressServerAdapter
+
+Express-specific server adapter
+
+## Extends
+
+- [`BaseServerAdapter`](BaseServerAdapter.md)
+
+## Constructors
+
+### Constructor
+
+> **new ExpressServerAdapter**(`neurolink`, `config?`): `ExpressServerAdapter`
+
+#### Parameters
+
+##### neurolink
+
+[`NeuroLink`](NeuroLink.md)
+
+##### config?
+
+[`ServerAdapterConfig`](../type-aliases/ServerAdapterConfig.md) = `{}`
+
+#### Returns
+
+`ExpressServerAdapter`
+
+#### Overrides
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`constructor`](BaseServerAdapter.md#constructor)
+
+## Properties
+
+### config
+
+> `protected` `readonly` **config**: [`RequiredServerAdapterConfig`](../type-aliases/RequiredServerAdapterConfig.md)
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`config`](BaseServerAdapter.md#config)
+
+---
+
+### redactionConfig?
+
+> `protected` `readonly` `optional` **redactionConfig?**: [`RedactionConfig`](../type-aliases/RedactionConfig.md)
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`redactionConfig`](BaseServerAdapter.md#redactionconfig)
+
+---
+
+### neurolink
+
+> `protected` `readonly` **neurolink**: [`NeuroLink`](NeuroLink.md)
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`neurolink`](BaseServerAdapter.md#neurolink)
+
+---
+
+### toolRegistry
+
+> `protected` `readonly` **toolRegistry**: [`MCPToolRegistry`](MCPToolRegistry.md)
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`toolRegistry`](BaseServerAdapter.md#toolregistry)
+
+---
+
+### externalServerManager?
+
+> `protected` `readonly` `optional` **externalServerManager?**: [`ExternalServerManager`](ExternalServerManager.md)
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`externalServerManager`](BaseServerAdapter.md#externalservermanager)
+
+---
+
+### routes
+
+> `protected` **routes**: `Map`\<`string`, [`RouteDefinition`](../type-aliases/RouteDefinition.md)\>
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`routes`](BaseServerAdapter.md#routes)
+
+---
+
+### middlewares
+
+> `protected` **middlewares**: [`MiddlewareDefinition`](../type-aliases/MiddlewareDefinition.md)[] = `[]`
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`middlewares`](BaseServerAdapter.md#middlewares)
+
+---
+
+### isRunning
+
+> `protected` **isRunning**: `boolean` = `false`
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`isRunning`](BaseServerAdapter.md#isrunning)
+
+---
+
+### startTime?
+
+> `protected` `optional` **startTime?**: `Date`
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`startTime`](BaseServerAdapter.md#starttime)
+
+---
+
+### lifecycleState
+
+> `protected` **lifecycleState**: [`ServerLifecycleState`](../type-aliases/ServerLifecycleState.md) = `"uninitialized"`
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`lifecycleState`](BaseServerAdapter.md#lifecyclestate)
+
+---
+
+### activeConnections
+
+> `protected` **activeConnections**: `Map`\<`string`, [`TrackedConnection`](../type-aliases/TrackedConnection.md)\>
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`activeConnections`](BaseServerAdapter.md#activeconnections)
+
+---
+
+### shutdownConfig
+
+> `protected` `readonly` **shutdownConfig**: [`RequiredShutdownConfig`](../type-aliases/RequiredShutdownConfig.md)
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`shutdownConfig`](BaseServerAdapter.md#shutdownconfig)
+
+## Methods
+
+### hasAuthenticationMiddleware()
+
+> **hasAuthenticationMiddleware**(): `boolean`
+
+Whether middleware marked `authenticates: true` is registered (the
+built-in authentication middleware marks itself). The tool and MCP
+execution routes ask on every request; `registerAllRoutes()` wires them.
+
+#### Returns
+
+`boolean`
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`hasAuthenticationMiddleware`](BaseServerAdapter.md#hasauthenticationmiddleware)
+
+---
+
+### noteSensitiveRoutes()
+
+> **noteSensitiveRoutes**(`options?`): `void`
+
+Called by `registerAllRoutes()`: routes that act on the host (tool and
+MCP execution) are mounted, so `start()` warns when no authentication
+middleware guards them. The check runs at start, when the middleware set
+is final, so registering authentication after the routes is fine.
+
+#### Parameters
+
+##### options?
+
+###### allowUnauthenticated?
+
+`boolean`
+
+#### Returns
+
+`void`
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`noteSensitiveRoutes`](BaseServerAdapter.md#notesensitiveroutes)
+
+---
+
+### warnIfSensitiveRoutesUnauthenticated()
+
+> `protected` **warnIfSensitiveRoutesUnauthenticated**(): `void`
+
+The warning promised by `noteSensitiveRoutes()`, always on stderr: a
+`logger.warn` is dropped unless debug logging is on, which would hide a
+notice meant for the operator who just started the server.
+
+#### Returns
+
+`void`
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`warnIfSensitiveRoutesUnauthenticated`](BaseServerAdapter.md#warnifsensitiveroutesunauthenticated)
+
+---
+
+### attachRequestAbort()
+
+> `protected` **attachRequestAbort**(`ctx`, `options`): `object`
+
+Give the handler a way to notice that the client is gone or the request
+is over time. The controller is this request's own unless middleware
+already attached one that the adapter carried; `applyTimeout` arms the
+configured request timeout, which the caller leaves off for a streaming
+route (a stream legitimately outlives it, as under Hono's own timeout
+middleware). `release()` disarms the timer once the response is written.
+
+#### Parameters
+
+##### ctx
+
+[`ServerContext`](../type-aliases/ServerContext.md)
+
+##### options
+
+###### onClientClose
+
+(`listener`) => `void`
+
+###### applyTimeout
+
+`boolean`
+
+#### Returns
+
+`object`
+
+##### controller
+
+> **controller**: `AbortController`
+
+##### deadline
+
+> **deadline**: `Promise`\<`never`\> \| `undefined`
+
+##### timedOut
+
+> **timedOut**: () => `boolean`
+
+###### Returns
+
+`boolean`
+
+##### release
+
+> **release**: () => `void`
+
+###### Returns
+
+`void`
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`attachRequestAbort`](BaseServerAdapter.md#attachrequestabort)
+
+---
+
+### importFrameworkDependency()
+
+> `protected` **importFrameworkDependency**\<`T`\>(`pkg`, `framework`): `Promise`\<`T`\>
+
+Import an optional framework dependency (express/fastify/koa and their
+plugins), converting a missing package into a [MissingDependencyError](MissingDependencyError.md)
+instead of letting the framework's `Cannot find package` propagate raw.
+
+Delegates to tryImport for the actual resolution and message
+formatting, then re-wraps only the "package genuinely absent" case — the
+one `tryImport` signals by attaching the loader's own module-not-found
+error as `cause` — into the adapter-specific error type. Any other
+failure (installed but broken, non-package specifier) passes through
+unchanged, matching `tryImport`'s own contract.
+
+#### Type Parameters
+
+##### T
+
+`T`
+
+#### Parameters
+
+##### pkg
+
+`string`
+
+##### framework
+
+`string`
+
+#### Returns
+
+`Promise`\<`T`\>
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`importFrameworkDependency`](BaseServerAdapter.md#importframeworkdependency)
+
+---
+
+### registerRoute()
+
+> **registerRoute**(`route`): `void`
+
+Register a custom route
+
+#### Parameters
+
+##### route
+
+[`RouteDefinition`](../type-aliases/RouteDefinition.md)
+
+#### Returns
+
+`void`
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`registerRoute`](BaseServerAdapter.md#registerroute)
+
+---
+
+### registerRouteGroup()
+
+> **registerRouteGroup**(`group`): `void`
+
+Register multiple routes from a route group
+
+#### Parameters
+
+##### group
+
+###### prefix
+
+`string`
+
+###### routes
+
+[`RouteDefinition`](../type-aliases/RouteDefinition.md)[]
+
+###### middleware?
+
+[`MiddlewareDefinition`](../type-aliases/MiddlewareDefinition.md)[]
+
+#### Returns
+
+`void`
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`registerRouteGroup`](BaseServerAdapter.md#registerroutegroup)
+
+---
+
+### registerMiddleware()
+
+> **registerMiddleware**(`middleware`): `void`
+
+Register custom middleware
+
+#### Parameters
+
+##### middleware
+
+[`MiddlewareDefinition`](../type-aliases/MiddlewareDefinition.md)
+
+#### Returns
+
+`void`
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`registerMiddleware`](BaseServerAdapter.md#registermiddleware)
+
+---
+
+### logRequestError()
+
+> `protected` **logRequestError**(`source`, `requestId`, `error`): `void`
+
+Log a failed request. A client error (a rejected API key, a failed
+validation) is routine traffic, so it is a one-line warning rather than
+an error with a stack trace that anyone could flood the logs with.
+
+#### Parameters
+
+##### source
+
+`string`
+
+##### requestId
+
+`string` \| `undefined`
+
+##### error
+
+`Error`
+
+#### Returns
+
+`void`
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`logRequestError`](BaseServerAdapter.md#logrequesterror)
+
+---
+
+### emitRequestError()
+
+> `protected` **emitRequestError**(`payload`): `void`
+
+Notify "error" listeners about a failed request. EventEmitter throws when
+"error" has no listener, which inside a framework's error handler turns
+every failure into an empty 500, so emit only when someone is listening.
+
+#### Parameters
+
+##### payload
+
+###### requestId?
+
+`string`
+
+###### error
+
+`Error`
+
+###### timestamp
+
+`Date`
+
+#### Returns
+
+`void`
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`emitRequestError`](BaseServerAdapter.md#emitrequesterror)
+
+---
+
+### createContext()
+
+> `protected` **createContext**(`options`): [`ServerContext`](../type-aliases/ServerContext.md)
+
+Create request context from incoming request
+
+#### Parameters
+
+##### options
+
+###### requestId
+
+`string`
+
+###### method
+
+`string`
+
+###### path
+
+`string`
+
+###### headers
+
+`Record`\<`string`, `string`\>
+
+###### query?
+
+`Record`\<`string`, `string`\>
+
+###### params?
+
+`Record`\<`string`, `string`\>
+
+###### body?
+
+`unknown`
+
+###### remoteAddress?
+
+`string`
+
+#### Returns
+
+[`ServerContext`](../type-aliases/ServerContext.md)
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`createContext`](BaseServerAdapter.md#createcontext)
+
+---
+
+### registerBuiltInMiddleware()
+
+> `protected` **registerBuiltInMiddleware**(): `void`
+
+Register built-in middleware
+
+#### Returns
+
+`void`
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`registerBuiltInMiddleware`](BaseServerAdapter.md#registerbuiltinmiddleware)
+
+---
+
+### registerBuiltInRoutes()
+
+> `protected` **registerBuiltInRoutes**(): `Promise`\<`void`\>
+
+Register built-in routes
+Only registers health routes if disableBuiltInHealth is false (default)
+
+#### Returns
+
+`Promise`\<`void`\>
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`registerBuiltInRoutes`](BaseServerAdapter.md#registerbuiltinroutes)
+
+---
+
+### enableMiddlewareStateCarry()
+
+> **enableMiddlewareStateCarry**(): `void`
+
+Ask the adapter to carry middleware state (`ctx.user` and the rest) to later
+middleware and the route handler, as the `carryMiddlewareState` option does.
+`registerAllRoutes()` calls it when given `perUserAuth`, which cannot work
+without the user in the handler. It takes effect for requests that start
+after the call, so call it before the server starts, as registering routes
+is.
+
+#### Returns
+
+`void`
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`enableMiddlewareStateCarry`](BaseServerAdapter.md#enablemiddlewarestatecarry)
+
+---
+
+### carriesMiddlewareState()
+
+> `protected` **carriesMiddlewareState**(): `boolean`
+
+Whether this adapter carries middleware state to the handler.
+
+#### Returns
+
+`boolean`
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`carriesMiddlewareState`](BaseServerAdapter.md#carriesmiddlewarestate)
+
+---
+
+### captureCarriedContext()
+
+> `protected` **captureCarriedContext**(`ctx`): [`ServerCarriedContext`](../type-aliases/ServerCarriedContext.md) \| `undefined`
+
+What middleware has set on its context that later middleware and the route
+handler must see. Each step gets a freshly built context, so unless this is
+parked in the framework's per-request storage an authenticated `ctx.user`
+set by middleware is gone before the handler runs. `undefined` when the
+adapter does not carry middleware state, so nothing is parked.
+
+#### Parameters
+
+##### ctx
+
+[`ServerContext`](../type-aliases/ServerContext.md)
+
+#### Returns
+
+[`ServerCarriedContext`](../type-aliases/ServerCarriedContext.md) \| `undefined`
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`captureCarriedContext`](BaseServerAdapter.md#capturecarriedcontext)
+
+---
+
+### restoreCarriedContext()
+
+> `protected` **restoreCarriedContext**(`ctx`, `carried`): `void`
+
+Put what `captureCarriedContext` saved onto a freshly built context, and
+mark the context as one that received the carry. The agent routes read the
+mark: a request that never used to reach its handler with `ctx.user` must
+not start being identified by it unless the server opts in. Does nothing
+when the adapter does not carry middleware state: the context stays the
+fresh one it always was, and unmarked.
+
+#### Parameters
+
+##### ctx
+
+[`ServerContext`](../type-aliases/ServerContext.md)
+
+##### carried
+
+[`ServerCarriedContext`](../type-aliases/ServerCarriedContext.md) \| `undefined`
+
+#### Returns
+
+`void`
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`restoreCarriedContext`](BaseServerAdapter.md#restorecarriedcontext)
+
+---
+
+### generateRequestId()
+
+> `protected` **generateRequestId**(): `string`
+
+Generate unique request ID
+
+#### Returns
+
+`string`
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`generateRequestId`](BaseServerAdapter.md#generaterequestid)
+
+---
+
+### getLifecycleState()
+
+> **getLifecycleState**(): [`ServerLifecycleState`](../type-aliases/ServerLifecycleState.md)
+
+Get the current lifecycle state
+
+#### Returns
+
+[`ServerLifecycleState`](../type-aliases/ServerLifecycleState.md)
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`getLifecycleState`](BaseServerAdapter.md#getlifecyclestate)
+
+---
+
+### trackConnection()
+
+> `protected` **trackConnection**(`id`, `socket?`, `requestId?`): `void`
+
+Track a new connection
+
+#### Parameters
+
+##### id
+
+`string`
+
+Unique connection identifier
+
+##### socket?
+
+`unknown`
+
+Optional underlying socket object
+
+##### requestId?
+
+`string`
+
+Optional associated request ID
+
+#### Returns
+
+`void`
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`trackConnection`](BaseServerAdapter.md#trackconnection)
+
+---
+
+### untrackConnection()
+
+> `protected` **untrackConnection**(`id`): `void`
+
+Untrack a connection (when it's completed)
+
+#### Parameters
+
+##### id
+
+`string`
+
+Connection identifier to remove
+
+#### Returns
+
+`void`
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`untrackConnection`](BaseServerAdapter.md#untrackconnection)
+
+---
+
+### getActiveConnectionCount()
+
+> **getActiveConnectionCount**(): `number`
+
+Get the number of active connections
+
+#### Returns
+
+`number`
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`getActiveConnectionCount`](BaseServerAdapter.md#getactiveconnectioncount)
+
+---
+
+### gracefulShutdown()
+
+> `protected` **gracefulShutdown**(): `Promise`\<`void`\>
+
+Perform graceful shutdown with connection draining
+This method handles the complete shutdown lifecycle
+
+#### Returns
+
+`Promise`\<`void`\>
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`gracefulShutdown`](BaseServerAdapter.md#gracefulshutdown)
+
+---
+
+### drainConnections()
+
+> `protected` **drainConnections**(): `Promise`\<`void`\>
+
+Wait for all active connections to drain
+Resolves when activeConnections is empty
+
+#### Returns
+
+`Promise`\<`void`\>
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`drainConnections`](BaseServerAdapter.md#drainconnections)
+
+---
+
+### resetServerState()
+
+> `protected` **resetServerState**(): `void`
+
+Reset server state for restart capability
+Call this after stop() completes to allow restart
+
+#### Returns
+
+`void`
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`resetServerState`](BaseServerAdapter.md#resetserverstate)
+
+---
+
+### validateLifecycleState()
+
+> `protected` **validateLifecycleState**(`operation`, `allowedStates`): `void`
+
+Validate lifecycle state transition
+
+#### Parameters
+
+##### operation
+
+`string`
+
+The operation being performed
+
+##### allowedStates
+
+[`ServerLifecycleState`](../type-aliases/ServerLifecycleState.md)[]
+
+States that allow the operation
+
+#### Returns
+
+`void`
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`validateLifecycleState`](BaseServerAdapter.md#validatelifecyclestate)
+
+---
+
+### getStatus()
+
+> **getStatus**(): [`ServerStatus`](../type-aliases/ServerStatus.md)
+
+Get server status
+
+#### Returns
+
+[`ServerStatus`](../type-aliases/ServerStatus.md)
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`getStatus`](BaseServerAdapter.md#getstatus)
+
+---
+
+### listRoutes()
+
+> **listRoutes**(): [`RouteDefinition`](../type-aliases/RouteDefinition.md)[]
+
+List all registered routes
+
+#### Returns
+
+[`RouteDefinition`](../type-aliases/RouteDefinition.md)[]
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`listRoutes`](BaseServerAdapter.md#listroutes)
+
+---
+
+### getConfig()
+
+> **getConfig**(): [`RequiredServerAdapterConfig`](../type-aliases/RequiredServerAdapterConfig.md)
+
+Get configuration
+
+#### Returns
+
+[`RequiredServerAdapterConfig`](../type-aliases/RequiredServerAdapterConfig.md)
+
+#### Inherited from
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`getConfig`](BaseServerAdapter.md#getconfig)
+
+---
+
+### initializeFramework()
+
+> `protected` **initializeFramework**(): `void`
+
+Initialize Express framework asynchronously
+
+#### Returns
+
+`void`
+
+#### Overrides
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`initializeFramework`](BaseServerAdapter.md#initializeframework)
+
+---
+
+### initialize()
+
+> **initialize**(): `Promise`\<`void`\>
+
+Override initialize to ensure async framework setup
+
+#### Returns
+
+`Promise`\<`void`\>
+
+#### Overrides
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`initialize`](BaseServerAdapter.md#initialize)
+
+---
+
+### registerFrameworkRoute()
+
+> `protected` **registerFrameworkRoute**(`route`): `void`
+
+Register route with Express
+
+#### Parameters
+
+##### route
+
+[`RouteDefinition`](../type-aliases/RouteDefinition.md)
+
+#### Returns
+
+`void`
+
+#### Overrides
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`registerFrameworkRoute`](BaseServerAdapter.md#registerframeworkroute)
+
+---
+
+### registerFrameworkMiddleware()
+
+> `protected` **registerFrameworkMiddleware**(`middleware`): `void`
+
+Register middleware with Express
+
+#### Parameters
+
+##### middleware
+
+[`MiddlewareDefinition`](../type-aliases/MiddlewareDefinition.md)
+
+#### Returns
+
+`void`
+
+#### Overrides
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`registerFrameworkMiddleware`](BaseServerAdapter.md#registerframeworkmiddleware)
+
+---
+
+### start()
+
+> **start**(): `Promise`\<`void`\>
+
+Start the Express server
+
+#### Returns
+
+`Promise`\<`void`\>
+
+#### Overrides
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`start`](BaseServerAdapter.md#start)
+
+---
+
+### stop()
+
+> **stop**(): `Promise`\<`void`\>
+
+Stop the Express server with graceful shutdown
+
+#### Returns
+
+`Promise`\<`void`\>
+
+#### Overrides
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`stop`](BaseServerAdapter.md#stop)
+
+---
+
+### stopAcceptingConnections()
+
+> `protected` **stopAcceptingConnections**(): `Promise`\<`void`\>
+
+Stop accepting new connections
+
+#### Returns
+
+`Promise`\<`void`\>
+
+#### Overrides
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`stopAcceptingConnections`](BaseServerAdapter.md#stopacceptingconnections)
+
+---
+
+### closeServer()
+
+> `protected` **closeServer**(): `Promise`\<`void`\>
+
+Close the underlying server
+
+#### Returns
+
+`Promise`\<`void`\>
+
+#### Overrides
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`closeServer`](BaseServerAdapter.md#closeserver)
+
+---
+
+### forceCloseConnections()
+
+> `protected` **forceCloseConnections**(): `Promise`\<`void`\>
+
+Force close all active connections
+
+#### Returns
+
+`Promise`\<`void`\>
+
+#### Overrides
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`forceCloseConnections`](BaseServerAdapter.md#forcecloseconnections)
+
+---
+
+### getFrameworkInstance()
+
+> **getFrameworkInstance**(): `unknown`
+
+Get the Express app instance
+
+#### Returns
+
+`unknown`
+
+#### Overrides
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`getFrameworkInstance`](BaseServerAdapter.md#getframeworkinstance)
+
+---
+
+### getNativeServer()
+
+> **getNativeServer**(): `unknown`
+
+The listening Node `http.Server`, once `start()` has run and the runtime
+is Node (Bun and Deno serve without one). A WebSocket upgrade handler
+such as `attachTranscribeWebSocket` attaches to it; `undefined` means
+there is nothing to attach to.
+
+#### Returns
+
+`unknown`
+
+#### Overrides
+
+[`BaseServerAdapter`](BaseServerAdapter.md).[`getNativeServer`](BaseServerAdapter.md#getnativeserver)

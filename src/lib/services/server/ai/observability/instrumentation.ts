@@ -1,990 +1,605 @@
-/**
- * OpenTelemetry Instrumentation for Langfuse v4
- *
- * Configures OpenTelemetry TracerProvider with LangfuseSpanProcessor to capture
- * traces from Vercel AI SDK's experimental_telemetry feature.
- *
- * Flow: Vercel AI SDK → OpenTelemetry Spans → LangfuseSpanProcessor → Langfuse Platform
- */
-
+import {
+  propagateAttributes,
+  setLangfuseTracerProvider,
+} from "@langfuse/tracing";
+import {
+  context,
+  createContextKey,
+  metrics,
+  type Context,
+} from "@opentelemetry/api";
+import { W3CTraceContextPropagator } from "@opentelemetry/core";
+import {
+  resourceFromAttributes,
+  type Resource,
+} from "@opentelemetry/resources";
+import type { MeterProvider } from "@opentelemetry/sdk-metrics";
+import type {
+  ReadableSpan,
+  SpanProcessor,
+} from "@opentelemetry/sdk-trace-base";
 import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
-import { LangfuseSpanProcessor } from "@langfuse/otel";
-import type { Span, SpanProcessor } from "@opentelemetry/sdk-trace-base";
 import {
   ATTR_SERVICE_NAME,
   ATTR_SERVICE_VERSION,
 } from "@opentelemetry/semantic-conventions";
-import { resourceFromAttributes } from "@opentelemetry/resources";
-import { AsyncLocalStorage } from "async_hooks";
-import { trace } from "@opentelemetry/api";
-import { logger } from "../../../../utils/logger.js";
+import { DEFAULT_FLUSH_BUDGET_MS } from "../../../../constants/langfuse.js";
+import {
+  OTEL_LOG_PREFIX,
+  TRACE_METADATA_CONTEXT_KEY,
+} from "../../../../constants/telemetry.js";
+import { getExporterRegistry } from "../../../../observability/exporterRegistry.js";
+import { ExporterSpanProcessor } from "../../../../observability/exporterSpanProcessor.js";
+import { LangfuseExporter } from "../../../../observability/exporters/langfuseExporter.js";
+import { spanJsonAttribute } from "../../../../telemetry/attributes.js";
+import {
+  hasHostTracerProvider,
+  registerTelemetryStarter,
+} from "../../../../telemetry/telemetryStarter.js";
 import type {
-  LangfuseConfig,
-  LangfuseSpanAttributes,
-} from "../../../../types/observability.js";
+  NeurolinkTraceContext,
+  ObservabilityConfig,
+  OtlpConnections,
+  SpanContent,
+} from "../../../../types/index.js";
+import { logger } from "../../../../utils/logger.js";
+import {
+  createLangfuseExporter,
+  isLangfuseEnabled,
+  isOff,
+  resolveEnvironment,
+  resolveRelease,
+} from "./langfuseSetup.js";
+import {
+  createOtlpConnections,
+  createOtlpMeterProvider,
+  createOtlpSpanProcessor,
+} from "./otlpSetup.js";
 
-const LOG_PREFIX = "[OpenTelemetry]";
-
-/**
- * Extended context for Langfuse spans
- * Supports all Langfuse trace attributes for rich observability
- */
-type LangfuseContext = {
-  userId?: string | null;
-  sessionId?: string | null;
-  /** Conversation/thread identifier for grouping related traces */
-  conversationId?: string | null;
-  /** Request identifier for correlating with application logs */
-  requestId?: string | null;
-  /** Custom trace name for better organization in Langfuse UI */
-  traceName?: string | null;
-  /** Custom metadata to attach to spans */
-  metadata?: Record<string, unknown> | null;
-
-  // Operation Name Support
-
-  /**
-   * Explicit operation name (e.g., "ai.streamText", "chat", "embeddings")
-   *
-   * If set, this overrides auto-detection from the span name.
-   * Use this when you want a custom operation name that doesn't match
-   * the auto-detected Vercel AI SDK operation.
-   *
-   * @example
-   * await setLangfuseContext({
-   *   userId: "user@email.com",
-   *   operationName: "customer-support-chat"
-   * }, async () => {
-   *   // Trace name: "user@email.com:customer-support-chat"
-   * });
-   */
-  operationName?: string | null;
-
-  /**
-   * Override global autoDetectOperationName setting for this context.
-   *
-   * When undefined, uses the global setting from LangfuseConfig.
-   * Set to false to disable auto-detection for this specific context.
-   *
-   * @default undefined (uses global setting, which defaults to true)
-   */
-  autoDetectOperationName?: boolean;
-};
-
-const contextStorage = new AsyncLocalStorage<LangfuseContext>();
+const MAX_PROPAGATED_CHARS = 200;
+const LANGFUSE_EXPORTER_NAME = "langfuse";
+const TRACE_METADATA_KEY = createContextKey(TRACE_METADATA_CONTEXT_KEY);
+const CONTEXT_PROBE_KEY = createContextKey("neurolink.context-manager-probe");
+// `false`, `0`, `off` or `no` skips the flush at process exit; the released build had none.
+const EXIT_FLUSH_SWITCH = "NEUROLINK_TELEMETRY_EXIT_FLUSH";
 
 let tracerProvider: NodeTracerProvider | null = null;
-let langfuseProcessor: LangfuseSpanProcessor | null = null;
-let isInitialized = false;
-let isCredentialsValid = false;
-let currentConfig: LangfuseConfig | null = null;
+let registryProcessor: SpanProcessor | null = null;
+let otlpProcessor: SpanProcessor | null = null;
+let meterProvider: MeterProvider | null = null;
+let otlpConnections: OtlpConnections | null = null;
+let flushBudgetMs = DEFAULT_FLUSH_BUDGET_MS;
+let langfuseExporter: LangfuseExporter | null = null;
 let usingExternalProvider = false;
-let cachedContextEnricher: ContextEnricher | null = null;
+let started = false;
+let startedConfig: ObservabilityConfig | undefined;
+let initialized = false;
+let ignoredConfigDebugLogged = false;
+const ignoredConfigWarnings = new Set<string>();
+let exitFlushRegistered = false;
+let initializationError: string | null = null;
+let terminated = false;
+let terminationLogged = false;
+let unconfiguredLogged = false;
+let missingKeysLogged = false;
+let holders = 0;
 
-/**
- * Check if a real TracerProvider (not ProxyTracerProvider) is already registered
- *
- * IMPORTANT: This function checks the @opentelemetry/api global state as seen by THIS
- * module's bundled copy of @opentelemetry/api. If Neurolink is bundled with its own
- * copy of @opentelemetry/api (which is common in bundled libraries), this function
- * will NOT detect TracerProviders registered by the host application on their
- * @opentelemetry/api instance. Use `useExternalTracerProvider: true` or
- * `autoDetectExternalProvider: true` to explicitly signal external provider usage.
- *
- * @returns true if an external TracerProvider is detected in this module's OTEL instance
- */
-function _hasExternalTracerProvider(): boolean {
-  try {
-    const provider = trace.getTracerProvider();
+function differingConfigFields(
+  first: ObservabilityConfig | undefined,
+  later: ObservabilityConfig,
+): string[] {
+  const firstLangfuse = first?.langfuse;
+  const laterLangfuse = later.langfuse;
+  if ((firstLangfuse === false) !== (laterLangfuse === false)) {
+    return ["langfuse"];
+  }
+  const left: Record<string, unknown> =
+    typeof firstLangfuse === "object" ? firstLangfuse : {};
+  const right: Record<string, unknown> =
+    typeof laterLangfuse === "object" ? laterLangfuse : {};
+  return [...new Set([...Object.keys(left), ...Object.keys(right)])]
+    .filter((key) => left[key] !== right[key])
+    .sort();
+}
 
-    if (!provider) {
-      return false;
-    }
-
-    // ProxyTracerProvider is the default "no-op" provider
-    // Any other provider means someone else registered one
-    const providerName = provider.constructor?.name || "";
-    const isProxy =
-      providerName === "ProxyTracerProvider" ||
-      providerName === "NoopTracerProvider";
-
-    if (!isProxy) {
+function reportIgnoredConfig(config: ObservabilityConfig): void {
+  const differing = differingConfigFields(startedConfig, config);
+  if (differing.length === 0) {
+    if (!ignoredConfigDebugLogged) {
+      ignoredConfigDebugLogged = true;
       logger.debug(
-        `${LOG_PREFIX} Detected external TracerProvider: ${providerName}`,
+        `${OTEL_LOG_PREFIX} Telemetry already started; ignoring observability config`,
       );
     }
-
-    return !isProxy;
-  } catch (error) {
-    logger.warn(`${LOG_PREFIX} Error checking for external TracerProvider`, {
-      error: error instanceof Error ? error.message : String(error),
-    });
-    return false;
-  }
-}
-
-/**
- * Span processor that enriches spans with user and session context from AsyncLocalStorage
- * Also extracts GenAI semantic convention attributes for Langfuse integration
- *
- * Key features:
- * - Enriches spans with userId, sessionId, conversationId, requestId
- * - Auto-detects operation names from Vercel AI SDK span names
- * - Builds formatted trace names for Langfuse (e.g., "user@email.com:ai.streamText")
- * - Supports custom trace name formats via configuration
- * - Handles wrapper spans by detecting operations from child spans and updating trace name in onEnd()
- */
-class ContextEnricher implements SpanProcessor {
-  /**
-   * Maximum number of detected operations to track to prevent memory leaks.
-   * Once this limit is reached, oldest entries are evicted (FIFO).
-   */
-  private static readonly MAX_DETECTED_OPERATIONS = 10000;
-
-  /**
-   * Track detected operations per trace for wrapper span support.
-   * When a host app creates a wrapper span before AI operations, the wrapper's
-   * onStart() runs before the AI SDK child span exists. We store detected
-   * operations here so we can update the trace name in onEnd().
-   */
-  private detectedOperations = new Map<string, string>();
-
-  onStart(span: Span): void {
-    const context = contextStorage.getStore();
-    const userId = context?.userId ?? currentConfig?.userId ?? "guest";
-    const sessionId = context?.sessionId ?? currentConfig?.sessionId;
-
-    // Get span name for operation auto-detection
-    const spanName = (span as unknown as { name?: string }).name;
-
-    // Determine if auto-detection is enabled for this context
-    const autoDetect = this.shouldAutoDetectOperationName(context);
-
-    // Resolve operation name: explicit > auto-detected > undefined
-    const operationName = this.resolveOperationName(
-      context?.operationName,
-      spanName,
-      autoDetect,
-    );
-
-    // Store detected AI operations for wrapper span support (optional, defensive).
-    // When a host app creates a wrapper span before calling AI operations,
-    // this allows us to update the trace name in onEnd() with the operation.
-    // Only store the first detected operation for each trace (subsequent operations are ignored).
-    try {
-      if (operationName && spanName?.startsWith("ai.")) {
-        const traceId = span.spanContext?.()?.traceId;
-        if (traceId && !this.detectedOperations.has(traceId)) {
-          // Evict oldest entry if at capacity to prevent memory leak
-          if (
-            this.detectedOperations.size >=
-            ContextEnricher.MAX_DETECTED_OPERATIONS
-          ) {
-            const firstKey = this.detectedOperations.keys().next().value;
-            if (firstKey) {
-              this.detectedOperations.delete(firstKey);
-            }
-          }
-          this.detectedOperations.set(traceId, operationName);
-        }
-      }
-    } catch {
-      // Wrapper span support is optional - don't fail if spanContext isn't available
-    }
-
-    // Build trace name based on priority:
-    // 1. Explicit traceName (100% backward compatible)
-    // 2. Formatted name with userId + operationName
-    // 3. userId only (legacy fallback)
-    const traceName = this.buildTraceName(
-      context?.traceName,
-      userId,
-      operationName,
-    );
-
-    // Set user and session attributes
-    if (userId && userId !== "guest") {
-      span.setAttribute("user.id", userId);
-    }
-    if (sessionId) {
-      span.setAttribute("session.id", sessionId);
-    }
-
-    // Add extended context fields
-    if (context?.conversationId) {
-      span.setAttribute("conversation.id", context.conversationId);
-    }
-    if (context?.requestId) {
-      span.setAttribute("request.id", context.requestId);
-    }
-
-    // Set trace name for Langfuse (using proper Langfuse attribute)
-    if (traceName) {
-      span.setAttribute("langfuse.trace.name", traceName);
-      span.setAttribute("trace.name", traceName); // Keep for compatibility
-    }
-
-    // Set operation name as separate attribute for filtering/analytics
-    if (operationName) {
-      span.setAttribute("gen_ai.operation.name", operationName);
-    }
-
-    // Add custom metadata as span attributes
-    const metadata = context?.metadata;
-    if (metadata && typeof metadata === "object") {
-      for (const [key, value] of Object.entries(metadata)) {
-        if (value !== undefined && value !== null) {
-          // Preserve primitive types that OTEL supports natively
-          if (
-            typeof value === "string" ||
-            typeof value === "number" ||
-            typeof value === "boolean"
-          ) {
-            span.setAttribute(`metadata.${key}`, value);
-          } else if (
-            Array.isArray(value) &&
-            value.every(
-              (v) =>
-                typeof v === "string" ||
-                typeof v === "number" ||
-                typeof v === "boolean",
-            )
-          ) {
-            // OTEL supports homogeneous arrays of primitives
-            span.setAttribute(
-              `metadata.${key}`,
-              value as string[] | number[] | boolean[],
-            );
-          } else {
-            // Fall back to JSON string for complex types
-            span.setAttribute(`metadata.${key}`, JSON.stringify(value));
-          }
-        }
-      }
-    }
-  }
-
-  /**
-   * Determine if auto-detection should be used for operation names
-   */
-  private shouldAutoDetectOperationName(context?: LangfuseContext): boolean {
-    // Context-level override takes precedence
-    if (context?.autoDetectOperationName !== undefined) {
-      return context.autoDetectOperationName;
-    }
-    // Fall back to global config (default: true)
-    return currentConfig?.autoDetectOperationName !== false;
-  }
-
-  /**
-   * Resolve operation name from explicit setting, auto-detection, or undefined
-   */
-  private resolveOperationName(
-    explicit: string | null | undefined,
-    spanName: string | undefined,
-    autoDetect: boolean,
-  ): string | undefined {
-    // Explicit operation name takes precedence
-    if (explicit) {
-      return explicit;
-    }
-
-    // Auto-detect from span name if enabled
-    if (autoDetect && spanName) {
-      // Detect Vercel AI SDK operation spans (ai.streamText, ai.generateText, etc.)
-      if (spanName.startsWith("ai.")) {
-        return spanName;
-      }
-      // Detect OpenTelemetry GenAI convention spans (chat, embeddings, text_completion)
-      if (
-        spanName === "chat" ||
-        spanName === "embeddings" ||
-        spanName === "text_completion"
-      ) {
-        return spanName;
-      }
-    }
-
-    return undefined;
-  }
-
-  /**
-   * Build trace name based on format configuration and available data
-   */
-  private buildTraceName(
-    explicitTraceName: string | null | undefined,
-    userId: string,
-    operationName: string | undefined,
-  ): string {
-    // 1. Explicit traceName always wins (100% backward compatibility)
-    if (explicitTraceName) {
-      return explicitTraceName;
-    }
-
-    // 2. Build formatted trace name based on config
-    const format = currentConfig?.traceNameFormat ?? "userId:operationName";
-
-    // Handle custom function format
-    if (typeof format === "function") {
-      return format({ userId, operationName });
-    }
-
-    // Handle predefined string formats
-    switch (format) {
-      case "userId:operationName":
-        return operationName ? `${userId}:${operationName}` : userId;
-      case "operationName:userId":
-        return operationName ? `${operationName}:${userId}` : userId;
-      case "operationName":
-        return operationName || userId;
-      case "userId":
-      default:
-        return userId;
-    }
-  }
-
-  /**
-   * Called when span ends - extracts GenAI semantic convention attributes
-   * from Vercel AI SDK spans and enriches them for Langfuse.
-   *
-   * Also handles wrapper span support: when a host app creates a wrapper/trace-root
-   * span before AI operations, we update the trace name here with the detected operation.
-   */
-  onEnd(span: Span): void {
-    try {
-      // Get span attributes (ReadableSpan interface)
-      const readableSpan = span as unknown as {
-        attributes?: LangfuseSpanAttributes;
-        name?: string;
-      };
-      const attributes = readableSpan.attributes || {};
-
-      // Handle wrapper/trace-root spans: update trace name with detected operation
-      // This supports host apps (like Curator) that create wrapper spans before AI calls
-      // This is optional - if spanContext fails, we skip wrapper span support
-      try {
-        const traceId = span.spanContext?.()?.traceId;
-        if (traceId) {
-          const isTraceRoot = attributes["langfuse.span.type"] === "trace-root";
-          const detectedOp = this.detectedOperations.get(traceId);
-
-          if (isTraceRoot && detectedOp) {
-            const context = contextStorage.getStore();
-            const userId =
-              (attributes["user.id"] as string) ||
-              context?.userId ||
-              currentConfig?.userId ||
-              "guest";
-
-            // Only update if there's no explicit traceName set
-            const existingTraceName = attributes[
-              "langfuse.trace.name"
-            ] as string;
-            const hasExplicitTraceName =
-              context?.traceName ||
-              (existingTraceName && existingTraceName !== userId);
-
-            if (!hasExplicitTraceName) {
-              const newTraceName = this.buildTraceName(
-                null,
-                userId,
-                detectedOp,
-              );
-
-              // Update the trace name attribute
-              span.setAttribute("langfuse.trace.name", newTraceName);
-              span.setAttribute("trace.name", newTraceName);
-              span.setAttribute("gen_ai.operation.name", detectedOp);
-
-              logger.debug(
-                `${LOG_PREFIX} Updated trace-root span with detected operation`,
-                {
-                  traceId,
-                  operation: detectedOp,
-                  newTraceName,
-                },
-              );
-            }
-
-            // Cleanup the detected operation
-            this.detectedOperations.delete(traceId);
-          }
-        }
-      } catch {
-        // Wrapper span support is optional - don't fail if spanContext isn't available
-      }
-
-      // Check if this is a GenAI span (from Vercel AI SDK)
-      const isGenAISpan =
-        attributes["gen_ai.system"] ||
-        attributes["ai.model.id"] ||
-        attributes["gen_ai.request.model"];
-
-      if (isGenAISpan) {
-        logger.debug(`${LOG_PREFIX} GenAI span detected`, {
-          spanName: readableSpan.name,
-          model:
-            attributes["gen_ai.request.model"] || attributes["ai.model.id"],
-          provider:
-            attributes["gen_ai.system"] || attributes["ai.model.provider"],
-        });
-
-        // Log token usage for observability
-        const inputTokens =
-          attributes["gen_ai.usage.input_tokens"] ||
-          attributes["ai.usage.promptTokens"];
-        const outputTokens =
-          attributes["gen_ai.usage.output_tokens"] ||
-          attributes["ai.usage.completionTokens"];
-
-        if (inputTokens !== undefined || outputTokens !== undefined) {
-          logger.debug(`${LOG_PREFIX} Token usage captured`, {
-            inputTokens,
-            outputTokens,
-            totalTokens: attributes["gen_ai.usage.total_tokens"],
-          });
-        }
-      }
-    } catch (error) {
-      // Don't fail span processing on errors
-      logger.debug(`${LOG_PREFIX} Error reading span attributes`, {
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }
-
-  shutdown(): Promise<void> {
-    // Clean up tracked operations to prevent memory leaks
-    this.detectedOperations.clear();
-    return Promise.resolve();
-  }
-
-  forceFlush(): Promise<void> {
-    return Promise.resolve();
-  }
-}
-
-/**
- * Initialize OpenTelemetry with Langfuse span processor
- *
- * This connects Vercel AI SDK's experimental_telemetry to Langfuse by:
- * 1. Creating LangfuseSpanProcessor with Langfuse credentials
- * 2. Creating a NodeTracerProvider with service metadata and span processor
- * 3. Registering the provider globally for AI SDK to use
- *
- * NEW: If useExternalTracerProvider is true or autoDetectExternalProvider detects
- * an existing provider, steps 2 and 3 are skipped. The span processors are still
- * created and can be retrieved via getSpanProcessors().
- *
- * @param config - Langfuse configuration passed from parent application
- */
-export function initializeOpenTelemetry(config: LangfuseConfig): void {
-  // Guard against multiple initializations
-  if (isInitialized) {
-    logger.debug(`${LOG_PREFIX} Already initialized`, {
-      usingExternalProvider,
-      hasLangfuseProcessor: !!langfuseProcessor,
-    });
     return;
   }
+  const fields = differing.join(", ");
+  if (ignoredConfigWarnings.has(fields)) {
+    return;
+  }
+  ignoredConfigWarnings.add(fields);
+  logger.warn(
+    `${OTEL_LOG_PREFIX} Telemetry already started; ignoring the observability config of a later NeuroLink instance. The first config stays in effect; the ignored one differs in: ${fields}`,
+  );
+}
 
-  // FIRST: Check for external provider mode - bypasses enabled check
-  // NOTE: When autoDetectExternalProvider is true, we trust the flag directly rather than
-  // calling hasExternalTracerProvider(). This is because Neurolink may bundle its own copy
-  // of @opentelemetry/api, which has a separate global state from the host application.
-  // The hasExternalTracerProvider() check would query Neurolink's bundled @opentelemetry/api
-  // global state (which has no provider registered), not the host's global state.
-  // By trusting autoDetectExternalProvider=true, we let the host application signal that
-  // it has already registered a TracerProvider.
-  const shouldUseExternal =
-    config?.useExternalTracerProvider === true ||
-    config?.autoDetectExternalProvider === true;
+function flushBudgetOf(config?: ObservabilityConfig): number {
+  const budget =
+    typeof config?.langfuse === "object"
+      ? config.langfuse.flushBudgetMs
+      : undefined;
+  return budget !== undefined && budget > 0 ? budget : DEFAULT_FLUSH_BUDGET_MS;
+}
 
-  if (shouldUseExternal) {
-    // Validate credentials even in external mode
-    if (!config?.publicKey || !config?.secretKey) {
-      logger.warn(
-        `${LOG_PREFIX} External provider mode but missing credentials, skipping initialization`,
-        {
-          hasPublicKey: !!config?.publicKey,
-          hasSecretKey: !!config?.secretKey,
-        },
-      );
-      isInitialized = true;
-      isCredentialsValid = false;
-      return;
-    }
+function hasLangfuseKeys(config?: ObservabilityConfig): boolean {
+  const options = typeof config?.langfuse === "object" ? config.langfuse : {};
+  return Boolean(
+    (options.publicKey ?? process.env.LANGFUSE_PUBLIC_KEY) &&
+    (options.secretKey ?? process.env.LANGFUSE_SECRET_KEY),
+  );
+}
 
-    try {
-      currentConfig = config;
-      isCredentialsValid = true;
+// An unreachable collector must not hold the caller past the budget. When the
+// budget runs out `onExpiry` closes what the work still has open, so the export
+// does not carry on to its own timeout and hold the process open.
+async function withinBudget(
+  work: Promise<void> | undefined,
+  budgetMs: number,
+  onExpiry?: () => void,
+): Promise<void> {
+  if (!work) {
+    return;
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      onExpiry?.();
+      reject(new Error(`did not finish within ${budgetMs}ms`));
+    }, budgetMs);
+  });
+  try {
+    await Promise.race([work, expired]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
-      // Create span processor for external provider mode
-      langfuseProcessor = new LangfuseSpanProcessor({
-        publicKey: config.publicKey,
-        secretKey: config.secretKey,
-        baseUrl: config.baseUrl || "https://cloud.langfuse.com",
-        environment: config.environment || "dev",
-        release: config.release || "v1.0.0",
+function cutOtlpConnections(): void {
+  otlpConnections?.cut();
+}
+
+function reportUnsettled(
+  action: string,
+  results: PromiseSettledResult<unknown>[],
+): void {
+  const errors = results.flatMap((result) =>
+    result.status === "rejected"
+      ? [
+          result.reason instanceof Error
+            ? result.reason.message
+            : String(result.reason),
+        ]
+      : [],
+  );
+  if (errors.length > 0) {
+    logger.warn(
+      `${OTEL_LOG_PREFIX} ${action} did not complete; spans or metrics still pending may be lost`,
+      { errors },
+    );
+  }
+}
+
+function flushBeforeExit(): void {
+  if (isOff(process.env[EXIT_FLUSH_SWITCH])) {
+    return;
+  }
+  flushOpenTelemetry().catch((error: unknown) => {
+    logger.debug(`${OTEL_LOG_PREFIX} Flush at process exit failed`, {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  });
+}
+
+function registerExitFlush(): void {
+  if (exitFlushRegistered) {
+    return;
+  }
+  exitFlushRegistered = true;
+  process.once("beforeExit", flushBeforeExit);
+}
+
+// Without a registered context manager `context.with` runs the callback but
+// `context.active()` stays the root context, so nothing set on a context
+// (user, session, the parent span) reaches the spans created inside.
+function hasContextManager(): boolean {
+  return context.with(
+    context.active().setValue(CONTEXT_PROBE_KEY, true),
+    () => context.active().getValue(CONTEXT_PROBE_KEY) === true,
+  );
+}
+
+// The OTLP traces and metrics keep the service name existing dashboards and
+// alerts match on. The provider's own resource, which the registry exporters
+// (Langfuse) read, is built in `initialize` with its own default.
+function otlpResourceOf(config?: ObservabilityConfig): Resource {
+  const environment = resolveEnvironment(config);
+  return resourceFromAttributes({
+    [ATTR_SERVICE_NAME]: process.env.OTEL_SERVICE_NAME || "ai-service",
+    [ATTR_SERVICE_VERSION]:
+      resolveRelease(config) || process.env.npm_package_version || "v1.0.0",
+    ...(environment && { "deployment.environment": environment }),
+  });
+}
+
+// A view over each ended span rather than a copy, so the methods and fields the
+// exporter reads stay intact, with the sink's own resource on top.
+function withResource(
+  processor: SpanProcessor,
+  resource: Resource,
+): SpanProcessor {
+  return {
+    onStart: (span, parentContext) => processor.onStart(span, parentContext),
+    onEnd: (span) => {
+      const view: ReadableSpan = Object.create(span, {
+        resource: { value: resource, enumerable: true },
       });
+      processor.onEnd(view);
+    },
+    forceFlush: () => processor.forceFlush(),
+    shutdown: () => processor.shutdown(),
+  };
+}
 
-      usingExternalProvider = true;
-      isInitialized = true;
+function registerLangfuseExporter(
+  config?: ObservabilityConfig,
+): LangfuseExporter | null {
+  const registry = getExporterRegistry();
+  const existing = registry.get(LANGFUSE_EXPORTER_NAME);
+  if (existing) {
+    return existing instanceof LangfuseExporter ? existing : null;
+  }
+  const exporter = createLangfuseExporter(config);
+  if (exporter) {
+    registry.register(exporter);
+  }
+  return exporter;
+}
 
-      // Auto-register ContextEnricher with the global TracerProvider
-      // This ensures trace names are set even when host doesn't call getSpanProcessors()
-      try {
-        const globalProvider = trace.getTracerProvider();
+function initialize(config?: ObservabilityConfig): boolean {
+  const langfuseRequested = isLangfuseEnabled(config);
+  // Without both keys there is nothing to export to, so Langfuse counts as not
+  // configured and a later config that has them can still start tracing.
+  const langfuse = langfuseRequested && hasLangfuseKeys(config);
+  if (langfuseRequested && !langfuse && !missingKeysLogged) {
+    missingKeysLogged = true;
+    logger.warn(
+      `${OTEL_LOG_PREFIX} Langfuse is enabled but publicKey and secretKey are not both set in config or LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY; not exporting to Langfuse`,
+    );
+  }
+  const otlpEndpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
+  // An options object starts the pipeline even without keys, as it always did:
+  // exporters registered on the shared registry still receive the spans.
+  const optionsObject =
+    langfuseRequested && typeof config?.langfuse === "object";
+  if (!langfuse && !optionsObject && !otlpEndpoint) {
+    if (!unconfiguredLogged) {
+      unconfiguredLogged = true;
+      logger.debug(
+        `${OTEL_LOG_PREFIX} Langfuse and OTLP not configured; skipping`,
+      );
+    }
+    return config?.langfuse === false;
+  }
 
-        // Check if it's a real provider with addSpanProcessor method (not the no-op default)
-        if (
-          globalProvider &&
-          typeof (globalProvider as unknown as { addSpanProcessor?: unknown })
-            .addSpanProcessor === "function"
-        ) {
-          const provider = globalProvider as unknown as {
-            addSpanProcessor: (processor: SpanProcessor) => void;
-          };
+  flushBudgetMs = flushBudgetOf(config);
 
-          // Add ContextEnricher for trace name enrichment
-          provider.addSpanProcessor(new ContextEnricher());
-
-          // Also add LangfuseSpanProcessor so traces are sent to Langfuse
-          provider.addSpanProcessor(langfuseProcessor);
-
-          logger.info(
-            `${LOG_PREFIX} Auto-registered processors with global TracerProvider`,
-            {
-              processors: ["ContextEnricher", "LangfuseSpanProcessor"],
-              reason: "External provider mode with auto-registration",
-            },
-          );
-        } else {
-          // No real provider found - host will need to add processors manually
-          logger.info(`${LOG_PREFIX} Using external TracerProvider mode`, {
-            reason: config.useExternalTracerProvider
-              ? "useExternalTracerProvider=true"
-              : "autoDetectExternalProvider=true (trusting host signal)",
-            instructions:
-              "Add span processors to your TracerProvider using getSpanProcessors()",
-          });
-
-          logger.info(`${LOG_PREFIX} Span processors ready for external use`, {
-            processors: ["ContextEnricher", "LangfuseSpanProcessor"],
-            usage: "import { getSpanProcessors } from '@juspay/neurolink'",
-          });
-        }
-      } catch (autoRegisterError) {
-        // Auto-registration failed - fall back to manual registration
+  if (hasHostTracerProvider()) {
+    usingExternalProvider = true;
+    initialized = true;
+    langfuseExporter = langfuse ? registerLangfuseExporter(config) : null;
+    if (langfuseExporter) {
+      logger.info(
+        `${OTEL_LOG_PREFIX} Host TracerProvider detected; Langfuse exporter registered. Add \`createExporterSpanProcessor()\` to the host provider to export NeuroLink spans to it, and register a context manager (\`NodeTracerProvider.register()\` and \`NodeSDK\` do) so user, session and parent spans reach the spans NeuroLink creates.`,
+      );
+      if (!hasContextManager()) {
         logger.warn(
-          `${LOG_PREFIX} Auto-registration failed, manual registration required`,
-          {
-            error:
-              autoRegisterError instanceof Error
-                ? autoRegisterError.message
-                : String(autoRegisterError),
-            instructions:
-              "Add span processors to your TracerProvider using getSpanProcessors()",
-          },
+          `${OTEL_LOG_PREFIX} The host TracerProvider has no context manager registered: setLangfuseContext() user, session and metadata and parent/child span nesting are lost. Register one, for example with \`NodeTracerProvider.register()\`, or start the host with \`NodeSDK\`.`,
         );
       }
-
-      return;
-    } catch (error) {
-      logger.error(
-        `${LOG_PREFIX} Failed to create span processor for external mode`,
-        {
-          error: error instanceof Error ? error.message : String(error),
-          stack: error instanceof Error ? error.stack : undefined,
-        },
+    } else {
+      logger.info(
+        `${OTEL_LOG_PREFIX} Host TracerProvider detected; NeuroLink registers no provider and no exporter.`,
       );
-      isInitialized = true;
-      return;
     }
-  }
-
-  // THEN: Check enabled for standalone mode
-  if (!config?.enabled) {
-    logger.debug(
-      `${LOG_PREFIX} Langfuse disabled and no external provider, skipping initialization`,
-    );
-    isInitialized = true;
-    return;
-  }
-
-  // Validate credentials for standalone mode
-  if (!config.publicKey || !config.secretKey) {
-    logger.warn(
-      `${LOG_PREFIX} Langfuse enabled but missing credentials, skipping initialization`,
-      {
-        hasPublicKey: !!config.publicKey,
-        hasSecretKey: !!config.secretKey,
-      },
-    );
-    isInitialized = true;
-    isCredentialsValid = false;
-    return;
-  }
-
-  try {
-    currentConfig = config;
-    isCredentialsValid = true;
-
-    // Step 1: Create LangfuseSpanProcessor for standalone mode
-    langfuseProcessor = new LangfuseSpanProcessor({
-      publicKey: config.publicKey,
-      secretKey: config.secretKey,
-      baseUrl: config.baseUrl || "https://cloud.langfuse.com",
-      environment: config.environment || "dev",
-      release: config.release || "v1.0.0",
-    });
-
-    logger.debug(`${LOG_PREFIX} Created LangfuseSpanProcessor`, {
-      baseUrl: config.baseUrl || "https://cloud.langfuse.com",
-      environment: config.environment || "dev",
-    });
-
-    // Step 2: Create our own TracerProvider (standalone behavior)
-    const resource = resourceFromAttributes({
-      [ATTR_SERVICE_NAME]: "neurolink",
-      [ATTR_SERVICE_VERSION]: config.release || "v1.0.0",
-      "deployment.environment": config.environment || "dev",
-    });
-
-    tracerProvider = new NodeTracerProvider({
-      resource,
-      spanProcessors: [new ContextEnricher(), langfuseProcessor],
-    });
-
-    // Step 4: Register globally
-    tracerProvider.register();
-    usingExternalProvider = false;
-    isInitialized = true;
-
-    logger.info(`${LOG_PREFIX} Initialized with Langfuse span processor`, {
-      baseUrl: config.baseUrl || "https://cloud.langfuse.com",
-      environment: config.environment || "dev",
-      release: config.release || "v1.0.0",
-      mode: "standalone",
-    });
-  } catch (error) {
-    // Check if this is a duplicate registration error
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    const isDuplicateError =
-      errorMessage.includes("duplicate registration") ||
-      errorMessage.includes("already registered") ||
-      errorMessage.includes("already set");
-
-    if (isDuplicateError) {
-      // Graceful handling: switch to external mode
+    if (otlpEndpoint) {
       logger.warn(
-        `${LOG_PREFIX} TracerProvider already registered, switching to external mode`,
-        {
-          error: errorMessage,
-          recommendation:
-            "Set useExternalTracerProvider=true or autoDetectExternalProvider=true in config",
-        },
+        `${OTEL_LOG_PREFIX} OTEL_EXPORTER_OTLP_ENDPOINT is ignored because a host TracerProvider is registered; NeuroLink exports no traces or metrics to it. Add an OTLP exporter to the host's own providers. NeuroLink's ai_* metrics are recorded on the host's MeterProvider.`,
       );
-
-      usingExternalProvider = true;
-      isInitialized = true;
-
-      // Don't throw - processors are still usable
-      return;
     }
-
-    // Other errors: log and re-throw
-    logger.error(`${LOG_PREFIX} Initialization failed`, {
-      error: errorMessage,
-      stack: error instanceof Error ? error.stack : undefined,
-    });
-    throw error;
+    if (langfuseExporter) {
+      registerExitFlush();
+    }
+    return true;
   }
+
+  const environment = resolveEnvironment(config);
+  const resource = resourceFromAttributes({
+    [ATTR_SERVICE_NAME]: process.env.OTEL_SERVICE_NAME || "neurolink",
+    [ATTR_SERVICE_VERSION]:
+      resolveRelease(config) || process.env.npm_package_version || "v1.0.0",
+    ...(environment && { "deployment.environment": environment }),
+  });
+
+  const exporter = langfuse ? registerLangfuseExporter(config) : null;
+  const otlpResource = otlpResourceOf(config);
+  const connections = otlpEndpoint ? createOtlpConnections() : null;
+  const otlpExporter = otlpEndpoint
+    ? createOtlpSpanProcessor(
+        otlpEndpoint,
+        flushBudgetMs,
+        connections ?? undefined,
+      )
+    : null;
+  const otlpSpanProcessor =
+    otlpExporter && withResource(otlpExporter, otlpResource);
+  const exporterSpanProcessor = new ExporterSpanProcessor(
+    getExporterRegistry(),
+    true,
+  );
+  const spanProcessors: SpanProcessor[] = [exporterSpanProcessor];
+  if (otlpSpanProcessor) {
+    spanProcessors.push(otlpSpanProcessor);
+  }
+
+  const provider = new NodeTracerProvider({ resource, spanProcessors });
+  provider.register({ propagator: new W3CTraceContextPropagator() });
+  setLangfuseTracerProvider(provider);
+
+  tracerProvider = provider;
+  registryProcessor = exporterSpanProcessor;
+  otlpProcessor = otlpSpanProcessor;
+  langfuseExporter = exporter;
+  meterProvider = otlpEndpoint
+    ? createOtlpMeterProvider(
+        otlpEndpoint,
+        otlpResource,
+        flushBudgetMs,
+        connections ?? undefined,
+      )
+    : null;
+  otlpConnections = connections;
+  usingExternalProvider = false;
+  initialized = true;
+  registerExitFlush();
+
+  logger.info(`${OTEL_LOG_PREFIX} Observability initialized`, {
+    langfuseEnabled: exporter !== null,
+    otlpEnabled: otlpSpanProcessor !== null,
+  });
+  return true;
+}
+
+async function stop(): Promise<void> {
+  const provider = tracerProvider;
+  const registry = registryProcessor;
+  const otlp = otlpProcessor;
+  const meters = meterProvider;
+  const connections = otlpConnections;
+  const hostExporter = usingExternalProvider ? langfuseExporter : null;
+  const budgetMs = flushBudgetMs;
+  terminated = true;
+  tracerProvider = null;
+  registryProcessor = null;
+  otlpProcessor = null;
+  meterProvider = null;
+  otlpConnections = null;
+  langfuseExporter = null;
+  usingExternalProvider = false;
+  started = false;
+  startedConfig = undefined;
+  initialized = false;
+  initializationError = null;
+  process.off("beforeExit", flushBeforeExit);
+  exitFlushRegistered = false;
+  if (provider) {
+    setLangfuseTracerProvider(null);
+  }
+  if (meters) {
+    metrics.disable();
+  }
+  if (hostExporter) {
+    getExporterRegistry().unregister(hostExporter.getName());
+  }
+  // The provider's own shutdown only shuts down these processors; each is shut
+  // down here so the OTLP one is bounded and Langfuse keeps its own budget.
+  const results = await Promise.allSettled([
+    registry?.shutdown(),
+    withinBudget(otlp?.shutdown(), budgetMs, () => connections?.cut()),
+    hostExporter?.shutdown(),
+    withinBudget(meters?.shutdown(), budgetMs, () => connections?.cut()),
+  ]);
+  reportUnsettled("Shutdown", results);
 }
 
 /**
- * Flush all pending spans to Langfuse
+ * @description Starts NeuroLink's tracing once per process, synchronously. Every span created through the shared tracers calls it first once this module is loaded, as the main, server and livekit entries do, so direct provider calls without a NeuroLink instance are traced too. Langfuse is enabled unless `config.langfuse` is `false` or has `enabled: false`, when `config.langfuse` is `true` or an options object, or when `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are set and `LANGFUSE_ENABLED` is not `false`, `0`, `off` or `no`; an OTLP exporter is added when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. When the host already registered a TracerProvider no provider is created and `OTEL_EXPORTER_OTLP_ENDPOINT` is ignored with a warning; the Langfuse exporter, if configured, is registered on the shared exporter registry and the host adds `createExporterSpanProcessor()` to its provider. The first call that finds tracing configured decides the setup and a later `config` is ignored, with a warning naming the options that differ from the first when it does differ; calls made before anything is configured start nothing, so a later config or environment can still start tracing, unless `langfuse: false` was passed. Langfuse enabled without both keys (in config or the environment) exports nothing to Langfuse, and a warning says so once. With `langfuse: true` or the environment alone that counts as not configured, so only an OTLP endpoint starts tracing; an options object starts tracing anyway, as it always did, so exporters registered on the shared registry receive the spans. Pending spans and metrics are flushed when the process runs out of work (`beforeExit`), within the same budget as `flushOpenTelemetry`, which an explicit `process.exit()` skips; `NEUROLINK_TELEMETRY_EXIT_FLUSH` set to `false`, `0`, `off` or `no` skips that flush too, and the process ends as soon as it has no work. After `shutdownOpenTelemetry` it does nothing.
+ * @param config {ObservabilityConfig | undefined} - Observability options, honoured only when this is the first call.
+ * @returns {void} Nothing; a failed setup is logged and recorded in `getLangfuseHealthStatus`.
+ */
+export function ensureTelemetry(config?: ObservabilityConfig): void {
+  if (terminated) {
+    if (!terminationLogged) {
+      terminationLogged = true;
+      logger.debug(
+        `${OTEL_LOG_PREFIX} Telemetry was shut down for this process; not restarting`,
+      );
+    }
+    return;
+  }
+  if (started) {
+    if (config) {
+      reportIgnoredConfig(config);
+    }
+    return;
+  }
+  initializationError = null;
+  try {
+    started = initialize(config);
+    startedConfig = started ? config : undefined;
+  } catch (error) {
+    started = true;
+    startedConfig = config;
+    initializationError =
+      error instanceof Error ? error.message : String(error);
+    logger.error(`${OTEL_LOG_PREFIX} Initialization failed`, {
+      error: initializationError,
+    });
+  }
+}
+
+registerTelemetryStarter(ensureTelemetry);
+
+/**
+ * @description Registers a holder of the process-wide telemetry and starts it if needed. Pair every call with `releaseTelemetry`.
+ * @param config {ObservabilityConfig | undefined} - Observability options forwarded to `ensureTelemetry`.
+ * @returns {void} Nothing.
+ */
+export function acquireTelemetry(config?: ObservabilityConfig): void {
+  holders++;
+  ensureTelemetry(config);
+}
+
+/**
+ * @description Releases one holder registered by `acquireTelemetry` and flushes pending spans as `flushOpenTelemetry` does. The provider stays registered for the process so cached tracers keep working and later instances reuse it.
+ * @returns {Promise<void>} Resolves when pending spans are flushed.
+ * @throws {Error} When any provider fails to flush or does not finish within the flush budget.
+ */
+export async function releaseTelemetry(): Promise<void> {
+  holders = Math.max(0, holders - 1);
+  await flushOpenTelemetry();
+}
+
+/**
+ * @description Exports pending spans and metrics from the providers NeuroLink owns and flushes its Langfuse exporter. A host provider is never flushed. The OTLP span and metric exports are waited for at most the flush budget (`observability.langfuse.flushBudgetMs`, default 3000 ms) and the Langfuse exporter within its own budget. A provider that fails to flush, or does not finish within the budget (a collector that cannot be reached, for one), is logged as a warning and makes the call reject once every provider has settled.
+ * @returns {Promise<void>} Resolves when every owned provider has flushed.
+ * @throws {Error} When any provider fails to flush or does not finish within the flush budget.
  */
 export async function flushOpenTelemetry(): Promise<void> {
-  if (!isInitialized) {
-    logger.debug(`${LOG_PREFIX} Not initialized, skipping flush`);
-    return;
-  }
-
-  if (!langfuseProcessor) {
-    logger.debug(`${LOG_PREFIX} No processor to flush (Langfuse disabled)`);
-    return;
-  }
-
-  try {
-    logger.info(`${LOG_PREFIX} Flushing pending spans to Langfuse...`);
-    await langfuseProcessor.forceFlush();
-    logger.info(`${LOG_PREFIX} Successfully flushed spans to Langfuse`);
-  } catch (error) {
-    logger.error(`${LOG_PREFIX} Flush failed`, {
-      error: error instanceof Error ? error.message : String(error),
-      stack: error instanceof Error ? error.stack : undefined,
+  const budgetMs = flushBudgetMs;
+  const results = await Promise.allSettled([
+    registryProcessor?.forceFlush(),
+    usingExternalProvider ? langfuseExporter?.flush() : undefined,
+    withinBudget(otlpProcessor?.forceFlush(), budgetMs, cutOtlpConnections),
+    withinBudget(meterProvider?.forceFlush(), budgetMs, cutOtlpConnections),
+  ]);
+  reportUnsettled("Flush", results);
+  const failed = results.filter((result) => result.status === "rejected");
+  if (failed.length > 0) {
+    throw new Error(`${OTEL_LOG_PREFIX} Flush failed`, {
+      cause: failed.map((result) => result.reason),
     });
-    throw error;
   }
 }
 
 /**
- * Shutdown OpenTelemetry and Langfuse span processor
+ * @description Terminally shuts down the providers NeuroLink owns once no `acquireTelemetry` holder remains; while holders remain it only flushes, as `flushOpenTelemetry` does. Telemetry cannot be restarted in this process afterwards. A host provider is never shut down; with one, only NeuroLink's Langfuse exporter is shut down and unregistered. The OTLP exporters get the same budget as `flushOpenTelemetry`, and a failure of the shutdown itself is logged as a warning.
+ * @returns {Promise<void>} Resolves when telemetry is flushed or shut down, or the flush budget has run out.
+ * @throws {Error} When holders remain and the flush they get fails.
  */
 export async function shutdownOpenTelemetry(): Promise<void> {
-  if (!isInitialized) {
+  if (holders > 0) {
+    await flushOpenTelemetry();
     return;
   }
-
-  try {
-    // Only shutdown tracerProvider if we created it
-    if (tracerProvider && !usingExternalProvider) {
-      await tracerProvider.shutdown();
-    }
-
-    // Always shutdown the Langfuse processor
-    if (langfuseProcessor) {
-      await langfuseProcessor.shutdown();
-    }
-
-    // Shutdown cached ContextEnricher
-    if (cachedContextEnricher) {
-      await cachedContextEnricher.shutdown();
-    }
-
-    tracerProvider = null;
-    langfuseProcessor = null;
-    cachedContextEnricher = null;
-    isInitialized = false;
-    isCredentialsValid = false;
-    usingExternalProvider = false;
-
-    logger.debug(`${LOG_PREFIX} Shutdown complete`);
-  } catch (error) {
-    logger.error(`${LOG_PREFIX} Shutdown failed`, {
-      error: error instanceof Error ? error.message : String(error),
-    });
-  }
+  await stop();
 }
 
 /**
- * Get the Langfuse span processor
- */
-export function getLangfuseSpanProcessor(): LangfuseSpanProcessor | null {
-  return langfuseProcessor;
-}
-
-/**
- * Get the tracer provider
- */
-export function getTracerProvider(): NodeTracerProvider | null {
-  return tracerProvider;
-}
-
-/**
- * Check if OpenTelemetry is initialized
+ * @description Reports whether NeuroLink's tracing is active, either on its own provider or alongside a host provider.
+ * @returns {boolean} `true` once `ensureTelemetry` has set tracing up.
  */
 export function isOpenTelemetryInitialized(): boolean {
-  return isInitialized;
+  return initialized;
 }
 
 /**
- * Get health status for Langfuse observability
- *
- * @returns Health status object with initialization and configuration details
+ * @description Summarizes the Langfuse export state for health checks.
+ * @returns {{ isHealthy: boolean; initialized: boolean; hasProcessor: boolean; usingExternalProvider: boolean; error?: string }} `isHealthy` and `hasProcessor` are `true` only while a Langfuse exporter is registered, on NeuroLink's own provider or beside a host provider (where it still needs `createExporterSpanProcessor()` on the host provider to receive spans); `error` carries the message of a failed initialization.
  */
 export function getLangfuseHealthStatus(): {
   isHealthy: boolean;
   initialized: boolean;
-  credentialsValid: boolean;
-  enabled: boolean;
   hasProcessor: boolean;
   usingExternalProvider: boolean;
-  config?: {
-    baseUrl: string;
-    environment: string;
-    release: string;
-  };
+  error?: string;
 } {
   return {
-    isHealthy: !!(
-      currentConfig?.enabled &&
-      isInitialized &&
-      isCredentialsValid &&
-      langfuseProcessor !== null
-    ),
-    initialized: isInitialized,
-    credentialsValid: isCredentialsValid,
-    enabled: currentConfig?.enabled || false,
-    hasProcessor: langfuseProcessor !== null,
+    isHealthy: initialized && langfuseExporter !== null,
+    initialized,
+    hasProcessor: langfuseExporter !== null,
     usingExternalProvider,
-    config: currentConfig
-      ? {
-          baseUrl: currentConfig.baseUrl || "https://cloud.langfuse.com",
-          environment: currentConfig.environment || "dev",
-          release: currentConfig.release || "v1.0.0",
-        }
-      : undefined,
+    ...(initializationError !== null && { error: initializationError }),
   };
 }
 
 /**
- * Set user and session context for Langfuse spans in the current async context
- *
- * Merges the provided context with existing AsyncLocalStorage context. If a callback is provided,
- * the context is scoped to that callback execution and returns the callback's result.
- * Without a callback, the context applies to the current execution context and its children.
- *
- * Uses AsyncLocalStorage to properly scope context per request, avoiding race conditions
- * in concurrent scenarios.
- *
- * @param context - Object containing context fields to merge with existing context
- * @param callback - Optional callback to run within the context scope. If omitted, context applies to current execution
- * @returns The callback's return value if provided, otherwise void
- *
- * @example
- * // With callback - returns the result
- * const result = await setLangfuseContext({ userId: "user123" }, async () => {
- *   return await generateText({ model: "gpt-4", prompt: "Hello" });
- * });
- *
- * @example
- * // Without callback - sets context for current execution
- * await setLangfuseContext({ sessionId: "session456", traceName: "chat-completion" });
+ * @description Reads the full trace metadata that `setLangfuseContext` stored on a context.
+ * @param ctx {Context} - Context to read, normally the active one.
+ * @returns {Record<string, SpanContent>} Metadata set by enclosing `setLangfuseContext` calls, inner keys winning; empty when none was set.
  */
-export async function setLangfuseContext<T = void>(
-  context: {
-    userId?: string | null;
-    sessionId?: string | null;
-    conversationId?: string | null;
-    requestId?: string | null;
-    traceName?: string | null;
-    metadata?: Record<string, unknown> | null;
-    /** Explicit operation name (overrides auto-detection) */
-    operationName?: string | null;
-    /** Override global autoDetectOperationName for this context */
-    autoDetectOperationName?: boolean;
-  },
-  callback?: () => T | Promise<T>,
-): Promise<T | void> {
-  const currentContext = contextStorage.getStore() || {};
-  const newContext: LangfuseContext = {
-    userId:
-      context.userId !== undefined ? context.userId : currentContext.userId,
-    sessionId:
-      context.sessionId !== undefined
-        ? context.sessionId
-        : currentContext.sessionId,
-    conversationId:
-      context.conversationId !== undefined
-        ? context.conversationId
-        : currentContext.conversationId,
-    requestId:
-      context.requestId !== undefined
-        ? context.requestId
-        : currentContext.requestId,
-    traceName:
-      context.traceName !== undefined
-        ? context.traceName
-        : currentContext.traceName,
-    metadata:
-      context.metadata !== undefined
-        ? context.metadata
-        : currentContext.metadata,
-    // Operation name support
-    operationName:
-      context.operationName !== undefined
-        ? context.operationName
-        : currentContext.operationName,
-    autoDetectOperationName:
-      context.autoDetectOperationName !== undefined
-        ? context.autoDetectOperationName
-        : currentContext.autoDetectOperationName,
-  };
+export function traceMetadataFromContext(
+  ctx: Context,
+): Record<string, SpanContent> {
+  const stored = ctx.getValue(TRACE_METADATA_KEY);
+  return stored && typeof stored === "object"
+    ? (stored as Record<string, SpanContent>)
+    : {};
+}
 
-  if (callback) {
-    return await contextStorage.run(newContext, callback);
-  } else {
-    contextStorage.enterWith(newContext);
+/**
+ * @description Runs `fn` with trace attributes propagated to every span it creates. `conversationId` and `requestId` become metadata; empty values are dropped. Metadata values of up to 200 characters once stringified are on every observation; longer values and arrays are recorded in full on the trace only, written by the trace root.
+ * @param params {NeurolinkTraceContext} - User, session, trace name, tags and metadata for the trace.
+ * @param fn {() => T} - Work to run inside the propagated context.
+ * @returns {T} Whatever `fn` returns.
+ * @example
+ * await setLangfuseContext({ userId: "u1", sessionId: "s1" }, () => neurolink.generate({ input: { text: "hi" } }));
+ */
+export function setLangfuseContext<T>(
+  params: NeurolinkTraceContext,
+  fn: () => T,
+): T {
+  const full: Record<string, SpanContent> = {};
+  const propagated: Record<string, string> = {};
+  for (const [key, value] of Object.entries({
+    ...params.metadata,
+    conversationId: params.conversationId,
+    requestId: params.requestId,
+  })) {
+    if (value === undefined || value === null || value === "") {
+      continue;
+    }
+    full[key] = value;
+    const text = spanJsonAttribute(value, Number.POSITIVE_INFINITY);
+    if (text.length <= MAX_PROPAGATED_CHARS) {
+      propagated[key] = text;
+    }
   }
-}
-
-/**
- * Get the current Langfuse context from AsyncLocalStorage
- *
- * Returns the current context including userId, sessionId, conversationId,
- * requestId, traceName, and metadata. Returns undefined if no context is set.
- *
- * @returns The current LangfuseContext or undefined
- *
- * @example
- * const context = getLangfuseContext();
- * console.log(context?.userId, context?.sessionId);
- */
-export function getLangfuseContext(): LangfuseContext | undefined {
-  return contextStorage.getStore();
-}
-
-/**
- * Get an OpenTelemetry Tracer for creating custom spans
- *
- * This allows applications to create their own spans that will be
- * processed by the same span processors (ContextEnricher + LangfuseSpanProcessor).
- *
- * @param name - Tracer name, defaults to "neurolink"
- * @param version - Tracer version, optional
- * @returns OpenTelemetry Tracer instance
- *
- * @example
- * const tracer = getTracer("my-app");
- * const span = tracer.startSpan("custom-operation");
- * try {
- *   // ... do work
- * } finally {
- *   span.end();
- * }
- */
-export function getTracer(
-  name: string = "neurolink",
-  version?: string,
-): ReturnType<typeof trace.getTracer> {
-  return trace.getTracer(name, version);
-}
-
-/**
- * Create a new ContextEnricher span processor
- * Use this when useExternalTracerProvider is true to add to your own TracerProvider
- *
- * @returns A new ContextEnricher instance
- */
-export function createContextEnricher(): SpanProcessor {
-  return new ContextEnricher();
-}
-
-/**
- * Get all span processors that NeuroLink would use
- * Convenience function that returns [ContextEnricher, LangfuseSpanProcessor]
- *
- * @returns Array of span processors, or empty array if not initialized
- */
-export function getSpanProcessors(): SpanProcessor[] {
-  if (!isInitialized || !langfuseProcessor) {
-    logger.warn(`${LOG_PREFIX} getSpanProcessors called but not initialized`);
-    return [];
-  }
-  // Reuse cached ContextEnricher to avoid creating multiple instances
-  if (!cachedContextEnricher) {
-    cachedContextEnricher = new ContextEnricher();
-  }
-  return [cachedContextEnricher, langfuseProcessor];
-}
-
-/**
- * Check if using external TracerProvider mode
- *
- * @returns true if operating in external TracerProvider mode
- */
-export function isUsingExternalTracerProvider(): boolean {
-  return usingExternalProvider;
+  const tags = params.tags?.filter((tag) => tag.length > 0);
+  const active = context.active();
+  const withMetadata = active.setValue(TRACE_METADATA_KEY, {
+    ...traceMetadataFromContext(active),
+    ...full,
+  });
+  return context.with(withMetadata, () =>
+    propagateAttributes(
+      {
+        userId: params.userId || undefined,
+        sessionId: params.sessionId || undefined,
+        traceName: params.traceName || undefined,
+        ...(tags && tags.length > 0 && { tags }),
+        ...(Object.keys(propagated).length > 0 && { metadata: propagated }),
+      },
+      fn,
+    ),
+  );
 }

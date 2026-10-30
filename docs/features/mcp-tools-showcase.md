@@ -1,16 +1,16 @@
 ---
-title: MCP Tools Ecosystem - 58+ Integrations
+title: MCP Tools Ecosystem - Built-in Tools + Any MCP Server
 description: Complete showcase of Model Context Protocol tools - built-in core tools and external MCP server ecosystem
 keywords: mcp, model context protocol, tools, integrations, ecosystem, servers
 ---
 
-# MCP Tools Ecosystem: 58+ Integrations
+# MCP Tools Ecosystem: Built-in Tools + Any MCP Server
 
 > **Since**: v7.0.0 | **Status**: Production Ready | **MCP Version**: 2024-11-05
 
 ## Overview
 
-NeuroLink's Model Context Protocol (MCP) integration provides a **universal plugin system** that transforms the SDK from a simple AI interface into a complete AI development platform. With 6 built-in core tools and access to 58+ community MCP servers, you can extend AI capabilities to interact with filesystems, databases, APIs, cloud services, and custom enterprise systems.
+NeuroLink's Model Context Protocol (MCP) integration provides a **universal plugin system** that transforms the SDK from a simple AI interface into a complete AI development platform. With 6 built-in core tools and the ability to connect any community MCP server (58+ cataloged in the [server directory](../guides/mcp/server-catalog.md)), you can extend AI capabilities to interact with filesystems, databases, APIs, cloud services, and custom enterprise systems.
 
 ### What is MCP?
 
@@ -22,13 +22,13 @@ The Model Context Protocol is an **open standard** (like USB-C for AI) that enab
 
 ### Why MCP Matters
 
-| Traditional Approach                    | MCP Approach                   | Benefit                 |
-| --------------------------------------- | ------------------------------ | ----------------------- |
-| Custom tool integrations per provider   | One MCP tool works everywhere  | 10x faster integration  |
-| Manual tool discovery and configuration | Automatic tool registry        | Zero-config tool usage  |
-| Provider-specific tool formats          | Universal JSON-RPC protocol    | Provider portability    |
-| Limited to SDK-defined tools            | 58+ community servers + custom | Unlimited extensibility |
-| Static tool set                         | Dynamic runtime addition       | Adapt to changing needs |
+| Traditional Approach                    | MCP Approach                      | Benefit                 |
+| --------------------------------------- | --------------------------------- | ----------------------- |
+| Custom tool integrations per provider   | One MCP tool works everywhere     | 10x faster integration  |
+| Manual tool discovery and configuration | Automatic tool registry           | Zero-config tool usage  |
+| Provider-specific tool formats          | Universal JSON-RPC protocol       | Provider portability    |
+| Limited to SDK-defined tools            | any community MCP server + custom | Unlimited extensibility |
+| Static tool set                         | Dynamic runtime addition          | Adapt to changing needs |
 
 ### NeuroLink's Deep MCP Integration
 
@@ -55,6 +55,28 @@ const result = await neurolink.generate({
 - **Rich Context**: 15+ fields including session, user, permissions, metadata
 - **Performance Optimized**: 0-11ms tool execution (target: <100ms)
 - **Enterprise Grade**: Comprehensive error handling, audit logging, security
+
+## Quick Start
+
+```typescript
+import { NeuroLink } from "@juspay/neurolink";
+
+const neurolink = new NeuroLink();
+
+// Add the GitHub MCP server
+await neurolink.addExternalMCPServer("github", {
+  command: "npx",
+  args: ["-y", "@modelcontextprotocol/server-github"],
+  env: { GITHUB_PERSONAL_ACCESS_TOKEN: process.env.GITHUB_TOKEN! },
+});
+
+// The AI can now use GitHub tools automatically
+const result = await neurolink.generate({
+  input: { text: "List open issues in my-org/my-repo" },
+});
+
+console.log(result.content);
+```
 
 ---
 
@@ -147,7 +169,7 @@ const result = await neurolink.generate({
 
 **Purpose**: Write content to filesystem
 
-**Auto-Available**: Yes (with HITL approval recommended)
+**Auto-Available**: Yes (confirmed on every call while HITL is enabled — see [Built-in tools](/docs/features/hitl#built-in-tools))
 
 **Use Cases**:
 
@@ -159,15 +181,49 @@ const result = await neurolink.generate({
 **Example**:
 
 ```typescript
-const result = await neurolink.generate({
-  input: { text: "Generate a README and save it to README.md" },
+import {
+  NeuroLink,
+  type ConfirmationRequestEvent,
+  type ConfirmationResponseEvent,
+} from "@juspay/neurolink";
+
+// HITL is configured on the NeuroLink instance; generate() has no per-call hitl option
+const neurolink = new NeuroLink({
   hitl: {
     enabled: true,
-    requireApproval: ["writeFile"],
+    // writeFile and executeBashCommand are confirmed on every call once HITL is
+    // enabled (set confirmBuiltinTools: false to gate them by keywords only);
+    // keywords gate everything else.
+    dangerousActions: ["delete"],
   },
 });
-// AI generates content and requests approval to save
+
+// Your app answers the request (see the HITL guide for the full handler)
+const emitter = neurolink.getEventEmitter();
+emitter.on("hitl:confirmation-request", async (event) => {
+  const receivedAt = Date.now();
+  const { payload } = event as ConfirmationRequestEvent; // Listener arguments are typed unknown
+  const approved = await askUser(payload); // Your approval UI
+  emitter.emit("hitl:confirmation-response", {
+    type: "hitl:confirmation-response",
+    payload: {
+      confirmationId: payload.confirmationId,
+      approved,
+      metadata: {
+        timestamp: new Date().toISOString(),
+        responseTime: Date.now() - receivedAt, // ms since the request arrived
+      },
+    },
+  } satisfies ConfirmationResponseEvent);
+});
+
+const result = await neurolink.generate({
+  input: { text: "Generate a README and save it to README.md" },
+});
+// AI generates content, then pauses for approval before writeFile runs
 ```
+
+See the [HITL guide](hitl.md) for the approval flow.
 
 **Tool Schema**:
 
@@ -243,11 +299,43 @@ const result = await neurolink.generate({
 }
 ```
 
+### File tool roots
+
+`readFile`, `writeFile`, `listDirectory` and `analyzeCSV` only touch paths inside their **roots**. By default that is the process working directory. Configure other roots per instance, and narrow them per call:
+
+```typescript
+const neurolink = new NeuroLink({
+  tools: { fileRoots: ["/srv/workspace", "/home/agent"] },
+});
+
+await neurolink.generate({
+  input: { text: "Summarize notes.md" },
+  toolRoots: ["/srv/workspace"], // may only narrow tools.fileRoots
+});
+```
+
+- **Precedence:** per-call `toolRoots`, then instance `tools.fileRoots`, then the `NEUROLINK_TOOL_ROOTS` environment variable (a `:`-separated list; `;` on Windows). A per-call root outside the instance roots is rejected, so a server that forwards caller options cannot widen file access.
+- **Resolution:** each root must be an existing directory and is resolved through symlinks once, when the request starts. A missing root rejects the call before any model request. `fileRoots: []` denies all file access.
+- **Containment:** target paths are resolved through symlinks too, and the prefix check is separator-bounded, so neither `<root>/link → /etc` nor a sibling such as `/srv/workspace-evil` gets through. A symlink that does not resolve is refused. On Linux and macOS, reads, writes and CSV parses open the checked path with `O_NOFOLLOW` (create mode with `O_EXCL`), so a link swapped in at the final path component after the check fails instead of redirecting the operation; Windows has no `O_NOFOLLOW`, so there only create mode carries that last-moment guarantee — the realpath check itself applies on every platform. `analyzeCSV` also refuses anything that is not a regular file (a FIFO, a device, a directory). `listDirectory` reports a symlink entry as `type: "symlink"` with the link's own metadata, never its target's. One race is not closed on any platform: a _directory_ component swapped for a symlink between the check and the open is followed, because Node has no `openat`-style walk and `O_NOFOLLOW` covers only the final component. That needs an attacker writing into the workspace while the agent runs; if that is your threat model, isolate the process at the OS level rather than relying on this check alone. Relative paths resolve against the first root; a root of `/` contains every absolute path. Versions before 12.28.0 compared path strings only, so a symlink planted inside the working directory could read, list or write outside it — upgrade if you are on an older release.
+- **Where it applies:** `generate()`, `generateText()`, `stream()`, `streamText()`, `executeTool()`, the server's tool and MCP routes (which execute through the instance's tool registry), and worker instances (`createWorkerInstance()`, isolated agents, delegates), which inherit the host's roots and can only narrow them. The resolved policy is internal: only `toolRoots` is settable per call.
+- **CLI:** `neurolink generate "…" --tool-root /srv/workspace --tool-root /home/agent`.
+- **Bash:** when the opt-in `executeBashCommand` tool is enabled, roots constrain only its `cwd` argument. The command itself runs with the full privileges of the process and can `cd` anywhere. Use OS-level isolation (a container or a separate user) to sandbox shell commands. While HITL is enabled on the instance, every bash call (and every `writeFile` call) waits for a human to approve it — see [Built-in tools](/docs/features/hitl#built-in-tools).
+
 ### 5. calculateMath
 
-**Purpose**: Complex mathematical calculations
+**Purpose**: Arithmetic calculations
 
 **Auto-Available**: Yes (always enabled)
+
+**What it accepts**: numbers, `+ - * / % **`, parentheses, and the `Math`
+functions `abs ceil floor round trunc sign sqrt cbrt pow exp log log2 log10 sin
+cos tan asin acos atan atan2 sinh cosh tanh hypot min max` plus the constants
+`PI E LN2 LN10 LOG2E LOG10E SQRT2 SQRT1_2`, with or without the `Math.` prefix.
+The expression is parsed and evaluated by a small arithmetic parser — it is
+never run as JavaScript — so anything outside that grammar (`process.exit(1)`,
+`globalThis`, property access, assignment) is refused with an error, and a
+result that is not a finite number (`9**9**9`, `1/0`, `sqrt(-1)`) is reported
+as an error rather than as `Infinity` or `NaN`.
 
 **Use Cases**:
 
@@ -334,9 +422,9 @@ const result = await neurolink.generate({
 
 ---
 
-## External MCP Servers (58+)
+## External MCP Servers
 
-NeuroLink integrates with the growing MCP ecosystem of 58+ external servers across 6 major categories.
+NeuroLink connects to the growing MCP ecosystem — any MCP-compliant server works; the [server catalog](../guides/mcp/server-catalog.md) lists 58+ across 6 major categories.
 
 ### Quick Integration Example
 
@@ -346,7 +434,7 @@ import { NeuroLink } from "@juspay/neurolink";
 const neurolink = new NeuroLink();
 
 // Add external MCP servers dynamically
-await neurolink.addMCPServer("github", {
+await neurolink.addExternalMCPServer("github", {
   command: "npx",
   args: ["-y", "@modelcontextprotocol/server-github"],
   env: {
@@ -354,7 +442,7 @@ await neurolink.addMCPServer("github", {
   },
 });
 
-await neurolink.addMCPServer("postgres", {
+await neurolink.addExternalMCPServer("postgres", {
   command: "npx",
   args: ["-y", "@modelcontextprotocol/server-postgres"],
   env: {
@@ -409,7 +497,7 @@ const result = await neurolink.generate({
 **Example**:
 
 ```typescript
-await neurolink.addMCPServer("github", {
+await neurolink.addExternalMCPServer("github", {
   command: "npx",
   args: ["-y", "@modelcontextprotocol/server-github"],
   env: {
@@ -591,7 +679,7 @@ const result = await neurolink.generate({
 **Configuration**:
 
 ```typescript
-await neurolink.addMCPServer("postgres", {
+await neurolink.addExternalMCPServer("postgres", {
   command: "npx",
   args: ["-y", "@modelcontextprotocol/server-postgres"],
   env: {
@@ -1072,7 +1160,7 @@ import { NeuroLink } from "@juspay/neurolink";
 const neurolink = new NeuroLink();
 
 // Add official MCP server
-await neurolink.addMCPServer("github", {
+await neurolink.addExternalMCPServer("github", {
   command: "npx",
   args: ["-y", "@modelcontextprotocol/server-github"],
   env: {
@@ -1081,7 +1169,7 @@ await neurolink.addMCPServer("github", {
 });
 
 // Add custom MCP server
-await neurolink.addMCPServer("custom-analytics", {
+await neurolink.addExternalMCPServer("custom-analytics", {
   command: "node",
   args: ["./analytics-mcp-server.js"],
   env: {
@@ -1092,7 +1180,7 @@ await neurolink.addMCPServer("custom-analytics", {
 });
 
 // Add remote MCP server (SSE transport)
-await neurolink.addMCPServer("remote-tools", {
+await neurolink.addExternalMCPServer("remote-tools", {
   command: "http://mcp.company.com/tools",
   transport: "sse",
   url: "http://mcp.company.com/tools/mcp",
@@ -1192,14 +1280,15 @@ Total: 70 tools available
 const neurolink = new NeuroLink();
 
 // Discover all tools
-const tools = await neurolink.discoverTools();
+const tools = await neurolink.getAllAvailableTools();
 
 console.log(`Total tools: ${tools.length}`);
 
 // Group by server
 const byServer = tools.reduce((acc, tool) => {
-  if (!acc[tool.server]) acc[tool.server] = [];
-  acc[tool.server].push(tool.name);
+  const server = tool.serverId ?? "unknown";
+  if (!acc[server]) acc[server] = [];
+  acc[server].push(tool.name);
   return acc;
 }, {});
 
@@ -1319,7 +1408,7 @@ await server.connect(transport);
 **Using custom server**:
 
 ```typescript
-await neurolink.addMCPServer("crm", {
+await neurolink.addExternalMCPServer("crm", {
   command: "node",
   args: ["./custom-crm-server.js"],
   env: {
@@ -1335,7 +1424,7 @@ await neurolink.addMCPServer("crm", {
 
 ```typescript
 // Restrict filesystem access
-await neurolink.addMCPServer("filesystem", {
+await neurolink.addExternalMCPServer("filesystem", {
   command: "npx",
   args: [
     "-y",
@@ -1348,7 +1437,8 @@ await neurolink.addMCPServer("filesystem", {
 const neurolink = new NeuroLink({
   hitl: {
     enabled: true,
-    requireApproval: ["writeFile", "deleteFile", "executeCode", "shell_exec"],
+    // Case-insensitive substring match against tool names
+    dangerousActions: ["writeFile", "deleteFile", "executeCode", "shell_exec"],
   },
 });
 ```
@@ -1410,7 +1500,7 @@ const neurolink = new NeuroLink({
 
 ```typescript
 // Reuse database connections
-await neurolink.addMCPServer("postgres", {
+await neurolink.addExternalMCPServer("postgres", {
   command: "npx",
   args: ["-y", "@modelcontextprotocol/server-postgres"],
   env: {
@@ -1447,7 +1537,7 @@ const result2 = await neurolink.generate({
 #### 3. Timeout Handling
 
 ```typescript
-await neurolink.addMCPServer("slow-api", {
+await neurolink.addExternalMCPServer("slow-api", {
   command: "npx",
   args: ["-y", "slow-mcp-server"],
   timeout: 30000, // 30 second timeout

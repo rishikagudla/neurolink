@@ -1,0 +1,21 @@
+# Standalone project — this file exists to stop pnpm's upward workspace-root
+# search at this directory (mirrors landing/pnpm-workspace.yaml). Without it, pnpm walks
+# up to the repo-root pnpm-workspace.yaml and docs-site drops out of its own
+# `pnpm ls -r` / recursive command scope, since it is not listed in that file's
+# `packages:` patterns. docs-site keeps its own lockfile and package.json; it is not
+# part of the root workspace. No `packages:` field here either.
+#
+# Supply-chain cooldown, matching the repository root: a freshly published release
+# of any dependency is not resolved here until it has been on the registry for
+# 3 days (4320 minutes), so a compromised publish has time to be caught before it
+# can land in docs-site/pnpm-lock.yaml. This tree is audited separately by the
+# quality gate and had no cooldown before (the file held only the comment above).
+minimumReleaseAge: 4320
+
+# Accepted risk, no patched release exists: GHSA-ch52-4w7c-c8xp (http-cache-semantics
+# <=4.2.0, max-stale can return one user's cached response to another). It reaches this
+# tree only through Docusaurus's build-time HTTP client, which caches for one process and
+# one user; the deployed site is static and never runs it. Remove once a fix ships.
+auditConfig:
+  ignoreGhsas:
+    - GHSA-ch52-4w7c-c8xp

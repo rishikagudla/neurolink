@@ -15,32 +15,35 @@ NeuroLink provides comprehensive audio input capabilities, enabling real-time vo
 NeuroLink supports the following audio capabilities today:
 
 - **Real-time voice conversations** via Gemini Live (Google AI Studio)
-- **Text-to-Speech (TTS) output** via Google Cloud TTS integration
+- **Text-to-Speech (TTS) output** via Google Cloud TTS, OpenAI TTS, ElevenLabs, and Azure TTS
+- **Speech-to-Text (STT)** via `generate()` and `stream()` options (Whisper/OpenAI STT, Google STT, Deepgram, Azure STT, ElevenLabs Scribe)
 - **WebSocket-based voice streaming** for web applications
 - **Bidirectional audio** - speak and hear AI responses in real-time
 
-### Coming Soon
+### Planned
 
 The following features are planned for future releases:
 
 - CLI commands: `neurolink audio transcribe`, `neurolink audio analyze`, `neurolink audio summarize`
 - CLI commands: `neurolink voice chat`, `neurolink voice demo`
-- OpenAI Whisper transcription integration
-- Cross-provider audio support (Anthropic, Azure, AWS)
+- Cross-provider audio support (Anthropic, AWS Transcribe still planned)
 - File-based audio input processing
 
 ---
 
 ## Provider Support Matrix
 
-| Provider             | Real-time Voice | TTS Output  | Audio Transcription | Status           |
-| -------------------- | --------------- | ----------- | ------------------- | ---------------- |
-| **Google AI Studio** | Yes             | Yes         | Coming Soon         | Production Ready |
-| **Google Vertex AI** | Planned         | Yes         | Coming Soon         | TTS Available    |
-| **OpenAI**           | Coming Soon     | Coming Soon | Coming Soon         | Planned          |
-| **Anthropic**        | Coming Soon     | Coming Soon | Coming Soon         | Planned          |
-| **Azure OpenAI**     | Coming Soon     | Coming Soon | Coming Soon         | Planned          |
-| **AWS Bedrock**      | Coming Soon     | Coming Soon | Coming Soon         | Planned          |
+| Provider             | Real-time Voice | TTS Output | Audio Transcription          | Status           |
+| -------------------- | --------------- | ---------- | ---------------------------- | ---------------- |
+| **Google AI Studio** | Yes             | Yes        | Yes (via Google STT)         | Production Ready |
+| **Google Vertex AI** | Planned         | Yes        | Yes (via Google STT)         | Available        |
+| **OpenAI**           | Planned         | Yes        | Yes (via Whisper/OpenAI STT) | Available        |
+| **Deepgram**         | Planned         | No         | Yes (speaker labels)         | Available        |
+| **Azure**            | Planned         | Yes        | Yes (via Azure STT)          | Available        |
+| **ElevenLabs**       | No              | Yes        | Yes (Scribe, speaker labels) | Available        |
+| **Self-hosted**      | No              | No         | Yes (OpenAI-compatible)      | Available        |
+| **Anthropic**        | Planned         | Planned    | Planned                      | Planned          |
+| **AWS Bedrock**      | Planned         | Planned    | Planned                      | Planned          |
 
 **Supported Model for Real-time Voice:**
 
@@ -242,9 +245,9 @@ const result = await neurolink.generate({
 });
 
 // Save TTS audio
-if (result.tts?.buffer) {
-  writeFileSync("output.mp3", result.tts.buffer);
-  console.log(`Audio saved: ${result.tts.size} bytes`);
+if (result.audio?.buffer) {
+  writeFileSync("output.mp3", result.audio.buffer);
+  console.log(`Audio saved: ${result.audio.size} bytes`);
 }
 
 // Advanced TTS with AI response synthesis
@@ -354,6 +357,89 @@ for await (const ev of streamResult.stream) {
 ```
 
 ---
+
+## Speaker Labels (Diarization)
+
+Ask for speaker labels with `speakerDiarization: true` (the documented alias
+`diarization: true` works too). Providers that diarize: `deepgram`,
+`google-stt`, `elevenlabs-stt` (Scribe), and any OpenAI-compatible endpoint
+that labels its segments (see the next section). Whatever the provider,
+the result has the same shape:
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "" },
+  stt: {
+    enabled: true,
+    audio: meetingBuffer,
+    provider: "elevenlabs-stt",
+    speakerDiarization: true,
+    speakerCount: 3, // optional hint
+  },
+});
+
+for (const turn of result.transcription?.segments ?? []) {
+  console.log(`[${turn.startTime}s] ${turn.speaker}: ${turn.text}`);
+}
+console.log(result.transcription?.speakers); // ["Speaker 0", "Speaker 1", "Speaker 2"]
+```
+
+- `segments[]` is a list of **speaker turns**: consecutive words from one
+  speaker, with `speaker`, `startTime`, `endTime` and `text`.
+- `speakers[]` lists the distinct labels in order of first appearance.
+- Providers that label words rather than segments (Deepgram, Google, Scribe)
+  have their turns derived by `STTProcessor`, so callers never see the
+  per-provider difference. A provider that returns its own speaker-labelled
+  segments (the diarization sidecar) is passed through untouched.
+- CLI: `neurolink generate --stt --input-audio meeting.wav --stt-provider elevenlabs-stt --stt-diarize`.
+
+**ElevenLabs Scribe** (`elevenlabs-stt`, alias `scribe`) shares
+`ELEVENLABS_API_KEY` with the TTS handler. It detects the language itself,
+transcribes code-switched speech (Hinglish comes back romanized unless a
+`language: "hi"` hint asks for Devanagari), and accepts audio or video
+containers. Options: `model` (`scribe_v2` default), `tagAudioEvents`.
+
+## Self-hosted STT (OpenAI-compatible endpoints)
+
+The `whisper` handler talks to any server that implements OpenAI's
+`/audio/transcriptions` — vLLM serving an ASR model such as Qwen3-ASR,
+LiteLLM, or NeuroLink's diarization sidecar (NVIDIA Nemotron-3 diarization in
+front of a local ASR). Point it at the server and pass the model name per
+call:
+
+```bash
+OPENAI_STT_BASE_URL=http://spark:8006/v1   # the server's /v1 root
+OPENAI_STT_API_KEY=dummy                   # keyless local server
+OPENAI_STT_TIMEOUT_MS=600000               # whole meetings take minutes
+```
+
+```typescript
+const result = await neurolink.generate({
+  input: { text: "" },
+  stt: {
+    enabled: true,
+    audio: meetingBuffer,
+    provider: "whisper",
+    model: "qwen3-asr-diarized",
+    speakerDiarization: true, // sent as diarize=true to compatible servers only
+    timeoutMs: 600_000,
+  },
+});
+```
+
+Or construct the handler directly when several endpoints coexist:
+
+```typescript
+import { OpenAISTT, STTProcessor } from "@juspay/neurolink";
+STTProcessor.registerHandler(
+  "spark-asr",
+  new OpenAISTT("dummy", "http://spark:8004/v1"),
+);
+```
+
+`diarize` and `max_speakers` (from `speakerCount`) are only sent to non-OpenAI
+endpoints, because OpenAI's own API rejects unknown fields. A `speaker` on a
+returned segment, and a top-level `speakers[]`, are surfaced as-is.
 
 ## Audio Specifications
 
@@ -563,7 +649,7 @@ type AudioContent = {
 - Voice demo example application
 - TTS output integration
 
-### Phase 2 (Coming Soon)
+### Phase 2 (Planned)
 
 - **CLI Voice Commands**
 
@@ -585,23 +671,42 @@ type AudioContent = {
   neurolink audio analyze podcast.mp3 --prompt "Summarize key points"
   ```
 
-### Phase 3 (Planned)
+### Phase 3 (Partially Available)
 
-- **OpenAI Whisper Integration**
+- **Speech-to-Text via `generate()` / `stream()`** — Available now via the `stt` option. There is no standalone `neurolink.transcribe()` method; STT is integrated directly into `generate()` and `stream()`:
 
   ```typescript
-  const transcription = await neurolink.transcribe({
-    audioFile: "./recording.mp3",
-    provider: "openai",
-    model: "whisper-1",
-    language: "en",
+  const result = await neurolink.generate({
+    input: { text: "Respond to the audio" },
+    provider: "vertex",
+    stt: {
+      enabled: true,
+      provider: "google-stt",
+      audio: audioBuffer,
+      language: "en-US",
+    },
   });
+  console.log("Transcription:", result.transcription?.text);
+  console.log("AI Response:", result.content);
   ```
 
+  **CLI equivalent:**
+
+  ```bash
+  neurolink generate "Respond to the audio" \
+    --provider vertex \
+    --stt \
+    --stt-provider google-stt \
+    --input-audio recording.wav
+  ```
+
+  **Available STT providers:** `whisper` / `openai-stt`, `google-stt`, `deepgram`, `azure-stt`, `elevenlabs-stt` (aliases `scribe`, `elevenlabs`)
+
+  **CLI STT flags:** `--stt`, `--stt-provider <provider>`, `--input-audio <file>`, `--stt-language <lang>`
+
 - **Cross-provider Audio Support**
-  - Anthropic voice capabilities
-  - Azure Speech Services
-  - AWS Transcribe
+  - Anthropic voice capabilities — Planned
+  - AWS Transcribe — Planned
 
 - **File-based Audio Input**
   ```typescript
@@ -696,6 +801,7 @@ const neurolink = new NeuroLink({
 
 - [TTS Integration Guide](tts.md) - Complete Text-to-Speech documentation
 - [Video Generation](video-generation.md) - AI-powered video with audio
+- [PPT Generation](ppt-generation.md) - AI-powered PowerPoint presentations
 
 **Multimodal Capabilities:**
 
@@ -723,15 +829,15 @@ NeuroLink's audio input capabilities provide:
 
 - Real-time voice conversations via Gemini Live
 - Bidirectional audio streaming (speak and hear)
-- TTS output via Google Cloud
+- TTS output via Google Cloud, OpenAI TTS, ElevenLabs, and Azure TTS
+- STT via `generate({ stt: { ... } })` — Whisper/OpenAI STT, Google STT, Deepgram, Azure STT, ElevenLabs Scribe
 - Voice demo example application
 - PCM16LE audio format support
 
-**Coming Soon:**
+**Planned:**
 
 - CLI voice commands (`voice chat`, `audio transcribe`)
-- OpenAI Whisper transcription
-- Cross-provider audio support
+- Anthropic and AWS Transcribe audio support
 - File-based audio processing
 
 **Next Steps:**

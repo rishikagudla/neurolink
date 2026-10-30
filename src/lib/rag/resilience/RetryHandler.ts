@@ -6,10 +6,9 @@
  * vector queries, and LLM-based extraction.
  */
 
-import {
-  type RetryOptions as _RetryOptions,
-  withRetry,
-} from "../../core/infrastructure/index.js";
+import { withRetry } from "../../core/infrastructure/index.js";
+import type { RAGRetryConfig } from "../../types/index.js";
+import { isAbortError } from "../../utils/errorHandling.js";
 import { logger } from "../../utils/logger.js";
 import {
   EmbeddingError,
@@ -19,28 +18,6 @@ import {
   RAGErrorCodes,
   VectorQueryError,
 } from "../errors/RAGError.js";
-
-/**
- * RAG-specific retry configuration
- */
-export interface RAGRetryConfig {
-  /** Maximum number of retry attempts (default: 3) */
-  maxRetries: number;
-  /** Initial delay in ms (default: 1000) */
-  initialDelay: number;
-  /** Maximum delay in ms (default: 30000) */
-  maxDelay: number;
-  /** Backoff multiplier (default: 2) */
-  backoffMultiplier: number;
-  /** Whether to add jitter (default: true) */
-  jitter: boolean;
-  /** Custom function to determine if error is retryable */
-  shouldRetry?: (error: Error) => boolean;
-  /** Retryable error codes */
-  retryableErrorCodes?: string[];
-  /** Retryable HTTP status codes */
-  retryableStatusCodes?: number[];
-}
 
 /**
  * Default retry configuration
@@ -93,6 +70,11 @@ export function isRetryable(
   error: unknown,
   config: RAGRetryConfig = DEFAULT_RAG_RETRY_CONFIG,
 ): boolean {
+  // Never retry abort errors - the operation was intentionally cancelled
+  if (isAbortError(error)) {
+    return false;
+  }
+
   // Use custom shouldRetry if provided
   if (config.shouldRetry) {
     return config.shouldRetry(error as Error);
@@ -118,8 +100,7 @@ export function isRetryable(
     if (
       errorObj.name === "TimeoutError" ||
       errorObj.code === "TIMEOUT" ||
-      errorObj.code === "ETIMEDOUT" ||
-      errorObj.name === "AbortError"
+      errorObj.code === "ETIMEDOUT"
     ) {
       return true;
     }

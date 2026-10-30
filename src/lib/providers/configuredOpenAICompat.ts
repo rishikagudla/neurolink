@@ -1,0 +1,285 @@
+import type { AIProviderName } from "../constants/enums.js";
+import type {
+  OpenAICompatCatalogEntry,
+  OpenAICompatChatMessage,
+  OpenAICompatChatRequest,
+  OpenAICompatCredentials,
+  OpenAICompatResponseFormat,
+} from "../types/index.js";
+import { ProviderError } from "../types/index.js";
+import { logger } from "../utils/logger.js";
+import { redactUrlCredentials } from "../utils/logSanitize.js";
+import {
+  getProviderModel,
+  resolveOpenAICompatConfig,
+} from "../utils/providerConfig.js";
+import { classifyProviderError } from "../utils/errorClassifier.js";
+import { TimeoutError } from "../utils/timeout.js";
+import { OpenAIChatCompletionsProvider } from "./openaiChatCompletionsBase.js";
+
+const PERPLEXITY_API_HOST = "api.perplexity.ai";
+const PERPLEXITY_INTEGRATION = "neurolink";
+
+/**
+ * Collapse OpenAI's `content` union down to the plain string that
+ * string-only vendors accept. Image parts carry no string representation and
+ * are dropped — a provider that cannot accept a content array cannot accept
+ * inline images either.
+ */
+const flattenMessageContent = (
+  content: OpenAICompatChatMessage["content"],
+): string => {
+  if (typeof content === "string") {
+    return content;
+  }
+  // An assistant message with tool_calls legitimately has null content;
+  // the empty string is its string-only equivalent.
+  if (content === null || content === undefined) {
+    return "";
+  }
+  return content
+    .map((part) => (part.type === "text" ? part.text : ""))
+    .join("");
+};
+
+/**
+ * Generic OpenAI-compatible provider driven entirely by an
+ * OpenAICompatCatalogEntry. Replaces a hand-written subclass for any
+ * provider whose only differences from its siblings are credentials, base
+ * URL, model defaults, and error-classification rules — see
+ * OPENAI_COMPAT_CATALOG in openaiCompatCatalog.ts for the entries.
+ *
+ * If a provider needs a real hook override (adjustRequestBody,
+ * adjustBodyAfter400, getChatCompletionsURL, getAuthHeaders, ...) that isn't
+ * expressible as one of the catalog's data-driven quirks (messageContentFormat,
+ * responseFormatDowngrade, replayReasoningContent,
+ * supportsStructuredOutputWithTools, ...) it does NOT belong in the catalog —
+ * write a dedicated subclass instead (see azureOpenai.ts).
+ *
+ * The exception is a WIRE DIALECT: a vendor that speaks OpenAI for ordinary
+ * chat but encodes one part of the request differently. Expressing that as
+ * data (the catalog's `messageContentFormat` / `responseFormatDowngrade`)
+ * keeps the provider a one-JSON-file entry instead of promoting it to a
+ * hand-written subclass over a single incompatibility.
+ *
+ * Today that is Cloudflare Workers AI, whose OpenAI-compatible endpoint
+ * accepts `messages[].content` only as a plain string — never the
+ * content-parts array OpenAI allows, and never the `null` that OpenAI uses
+ * on an assistant message carrying tool_calls. Its schema rejects both with
+ * HTTP 400 ("Type mismatch of '/messages/N/content'"). That bites precisely
+ * on the second turn of a tool call, so single-turn chat looks healthy while
+ * every tool round-trip fails. Normalizing content to a string below is the
+ * whole fix: tools, tool_choice, the `tool` role and `tool_calls` are all
+ * accepted as-is.
+ *
+ * The same shape covers DeepSeek: its `/chat/completions` rejects
+ * `response_format: { type: "json_schema" }` outright ("This response_format
+ * type is unavailable now"), but accepts `{ type: "json_object" }`. The
+ * catalog's `responseFormatDowngrade` quirk downgrades the request so
+ * `generate({ schema })` keeps working, matching the
+ * `supportsStructuredOutputs: false` behavior of the `@ai-sdk/openai-compatible`
+ * provider this replaced.
+ */
+export class ConfiguredOpenAICompatProvider extends OpenAIChatCompletionsProvider {
+  private readonly entry: OpenAICompatCatalogEntry;
+
+  constructor(
+    entry: OpenAICompatCatalogEntry,
+    modelName?: string,
+    sdk?: unknown,
+    credentials?: OpenAICompatCredentials,
+  ) {
+    const { apiKey, baseURL } = resolveOpenAICompatConfig(entry, credentials);
+    // BaseProvider's constructor calls `this.getDefaultModel()` /
+    // `this.getProviderName()` synchronously inside `super()`, before this
+    // class's own constructor body (or field initializers) ever run — so
+    // `this.entry` is not yet assigned at that point and those overrides
+    // would read `undefined.modelEnvVar`. `entry.providerName` is always
+    // defined, so passing it straight through makes the base constructor's
+    // `providerName || this.getProviderName()` short-circuit; resolving the
+    // model up front and always passing a truthy `modelName` does the same
+    // for `getDefaultModel()`. Both overrides remain correct for any call
+    // made after construction, once `this.entry` is set below.
+    const resolvedModelName =
+      modelName || getProviderModel(entry.modelEnvVar, entry.defaultModel);
+    super(entry.providerName, resolvedModelName, sdk, { baseURL, apiKey });
+    this.entry = entry;
+    logger.debug(`${entry.configOptions.providerName} Provider initialized`, {
+      modelName: this.modelName,
+      providerName: this.providerName,
+      baseURL: redactUrlCredentials(this.config.baseURL),
+    });
+  }
+
+  protected getProviderName(): AIProviderName {
+    return this.entry.providerName;
+  }
+
+  protected getDefaultModel(): string {
+    return getProviderModel(this.entry.modelEnvVar, this.entry.defaultModel);
+  }
+
+  protected getFallbackModelName(): string {
+    return this.entry.fallbackModelName;
+  }
+
+  protected getFallbackModels(): string[] {
+    return this.entry.fallbackModels;
+  }
+
+  /**
+   * See CatalogQuirks.authHeaderStyle. The base class's default is
+   * `Authorization: Bearer <apiKey>`; "x-api-key" vendors (Reka's OpenAPI
+   * spec declares exactly one security scheme, an apiKey in header
+   * `X-Api-Key`) get that header instead, with no Authorization header sent
+   * at all — mirrors AzureOpenAIProvider's own getAuthHeaders() override for
+   * its `api-key` header.
+   */
+  protected override getAuthHeaders(): Record<string, string> {
+    const headers: Record<string, string> =
+      this.entry.authHeaderStyle === "x-api-key"
+        ? { "X-Api-Key": this.config.apiKey }
+        : super.getAuthHeaders();
+    // Perplexity asks to identify NeuroLink on its own API host only; a
+    // custom Perplexity-compatible endpoint gets no attribution header.
+    if (
+      this.entry.providerName === "perplexity" &&
+      new URL(this.config.baseURL).hostname === PERPLEXITY_API_HOST
+    ) {
+      headers["X-Pplx-Integration"] = PERPLEXITY_INTEGRATION;
+    }
+    return headers;
+  }
+
+  /**
+   * The catalog's `capabilities.tools` is the vendor's own answer, probed on
+   * the wire when the entry was written; the model registry (the base
+   * default) knows nothing about Tier-2 models and answers "supported" for
+   * every unknown id. A vendor that declares tools: false must never receive
+   * a `tools` array — Mancer's free model rejects one with 400 — so the
+   * declaration wins here and the registry is only consulted otherwise.
+   * A per-model entry in `modelToolOverrides` (from a "model-dependent"
+   * provider whose catalog names which specific models accept tools — see
+   * CatalogModelSpec.tools) wins over all of this: it is the same kind of
+   * wire-probed fact as `supportsTools`, just scoped to one model instead of
+   * the whole provider, so it is checked first and can both grant and
+   * withhold tools regardless of what the provider-level flag says.
+   *
+   * Like the other entry-reading overrides above, this runs only after
+   * construction: BaseProvider merely closes over it.
+   */
+  supportsTools(): boolean {
+    const override = this.entry.modelToolOverrides?.[this.modelName];
+    if (override !== undefined) {
+      return override;
+    }
+    if (this.entry.supportsTools === false) {
+      return false;
+    }
+    return super.supportsTools();
+  }
+
+  /**
+   * The base class drops `response_format` from any request carrying tools,
+   * because a generic OpenAI-compatible backend may honour it over tool
+   * calling and answer with final-shape JSON on step one instead of running
+   * the agentic loop. For a catalog entry that is not a guess — the flag
+   * comes from a live wire probe (`capabilities.structuredOutputWithTools`)
+   * — so an entry that declares the combination supported sends both and
+   * gets the object from the vendor's own constrained decoding in ONE
+   * request, instead of falling back to a tool-free re-ask.
+   *
+   * Conservative by default: only an explicit `true` opts in. A vendor that
+   * declares support but rejects the combination at runtime is still caught
+   * by `isToolsSchemaConflictError` and retried without structured output,
+   * so a stale flag costs one request rather than the turn.
+   */
+  protected override suppressResponseFormatWithTools(): boolean {
+    return this.entry.supportsStructuredOutputWithTools !== true;
+  }
+
+  /**
+   * Apply catalog-scoped budget, streaming and message dialects to the final
+   * request body. Reapplying these adjustments during a retry preserves the
+   * same endpoint contract without changing an already normalized budget.
+   */
+  protected adjustRequestBody(
+    body: OpenAICompatChatRequest,
+    modelId: string,
+  ): OpenAICompatChatRequest {
+    let adjusted = super.adjustRequestBody(body, modelId);
+    if (this.entry.maxTokensField === "max_completion_tokens") {
+      const { max_tokens, ...withoutLegacyBudget } = adjusted;
+      adjusted = {
+        ...withoutLegacyBudget,
+        ...(max_tokens === undefined
+          ? {}
+          : { max_completion_tokens: max_tokens }),
+      };
+    }
+    if (this.entry.omitStreamOptions === true) {
+      const { stream_options: _streamOptions, ...withoutStreamOptions } =
+        adjusted;
+      adjusted = withoutStreamOptions;
+    }
+    if (
+      this.entry.rejectRequiredToolChoice === true &&
+      adjusted.tool_choice === "required" &&
+      Array.isArray(adjusted.tools) &&
+      adjusted.tools.length > 0
+    ) {
+      throw new ProviderError(
+        "tool_choice='required' is not supported by this endpoint; use auto, none or a named tool choice",
+        this.providerName,
+      );
+    }
+    if (this.entry.messageContentFormat !== "string") {
+      return adjusted;
+    }
+    return {
+      ...adjusted,
+      messages: adjusted.messages.map((message) => ({
+        ...message,
+        content: flattenMessageContent(message.content),
+      })),
+    };
+  }
+
+  protected adjustResponseFormat(
+    rf: OpenAICompatResponseFormat | undefined,
+    modelId: string,
+  ): OpenAICompatResponseFormat | undefined {
+    if (
+      this.entry.responseFormatDowngrade === "json-schema-to-json-object" &&
+      rf?.type === "json_schema"
+    ) {
+      return { type: "json_object" };
+    }
+    return super.adjustResponseFormat(rf, modelId);
+  }
+
+  protected replayReasoningContent(): boolean {
+    return this.entry.replayReasoningContent === true;
+  }
+
+  protected formatProviderError(error: unknown): Error {
+    // classifyProviderError hard-codes TimeoutError -> NetworkError ahead
+    // of any rule table and does not allow a per-provider override. An
+    // entry can opt out of that default via timeoutErrorClass (currently
+    // only Groq, reproducing its pre-migration subclass's own TimeoutError
+    // interception) — checked here, before ever reaching the shared
+    // classifier, so every other entry still gets its unmodified default.
+    if (error instanceof TimeoutError && this.entry.timeoutErrorClass) {
+      return new this.entry.timeoutErrorClass(
+        `${this.entry.configOptions.providerName} request timed out: ${error.message}`,
+        this.entry.providerName,
+      );
+    }
+    return classifyProviderError(
+      error,
+      this.entry.errorRules,
+      this.entry.providerName,
+      this.modelName,
+    );
+  }
+}

@@ -3,46 +3,141 @@ name: CI
 on:
   push:
     branches: [release]
+  # Deliberately UNFILTERED by base branch. Every one of the four required
+  # contexts this repository gates on — test, provider-safety-net,
+  # security-suites, build-check — is a job in THIS file, so a base filter
+  # here decides whether they exist at all, not merely whether they pass.
+  # Scoped to [release], a stacked pull request (one based on another feature
+  # branch so it can build on unmerged work) had NONE of them created. That
+  # does not read as a failure: a check that was never created is reported as
+  # missing, which looks like "still queued" forever, and the pull request can
+  # never go green no matter how good the change is. PR #1670 sat at 1 of 5
+  # required checks for exactly this reason.
   pull_request:
-    branches: [release]
+
+# Cancel a run that a newer push to the same ref has superseded. Without this
+# an amend-and-force-push — routine under the single-commit-per-branch policy —
+# leaves the old run executing to completion, competing for runners with the
+# run whose result anyone actually wants.
+#
+# Keyed on the ref, not the PR number, so pushes to release are covered too.
+# That has a consequence worth knowing before debugging a cache miss: a
+# cancelled run saves no cache. When several merges land on release in quick
+# succession, only the surviving run writes the dist cache, so PRs opened in
+# the gap miss and build from scratch. That is correct but slower — and it
+# means a green run in that window is no evidence either way about the
+# restore-and-stamp path. The cache step itself still runs on a miss; it finds
+# no entry for the key and restores nothing, so the stamp step is skipped and
+# nothing depending on a restored dist was exercised. A cache step that ran is
+# not a cache that was restored.
+# Least privilege for every job in this workflow.
+#
+# Without this block jobs inherit the repository default, which is
+# `default_workflow_permissions: write` with `can_approve_pull_request_reviews:
+# true` — so a build job that only checks out and runs tests holds a token that
+# can push to the repository and approve pull requests. ci.yml was the only
+# workflow here not declaring its own permissions; every other one does.
+#
+# The distribution was also backwards. `test` and `provider-safety-net` declared
+# `contents: read`, but those are the 2-4 second aggregator jobs that run no
+# code. Their shards — which install dependencies and execute the suites, and
+# are the jobs where a compromised dependency would actually run — inherited the
+# write-scoped default.
+#
+# This is the floor for the whole workflow. A job that genuinely needs more must
+# declare it itself, which makes the exception visible in review rather than
+# implicit in a repository setting nobody reads. One job needs more:
+# semantic-release-validation declares `contents: write` because
+# semantic-release's verifyAuth runs `git push --dry-run` on push to release.
+# No other job pushes, tags, publishes or comments, so every other checkout sets
+# `persist-credentials: false` rather than leaving GITHUB_TOKEN in .git/config.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  # The required check. Same reasoning as provider-safety-net below: `test` is
+  # required by both protection layers AND is a `needs:` of
+  # semantic-release-validation, so the name has to survive verbatim.
   test:
+    needs: [test-shards]
+    if: always()
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        node-version: [20]
+    steps:
+      - name: Require every shard to have passed
+        run: |
+          result="${{ needs.test-shards.result }}"
+          echo "shards result: $result"
+          if [ "$result" != "success" ]; then
+            echo "::error::test shards did not all succeed (result=$result)"
+            exit 1
+          fi
+          echo "All test shards passed."
 
+  test-shards:
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [lint, validate, types]
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup PNPM
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          version: 9
-
-      - name: Setup Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ matrix.node-version }}
+          node-version: "22.23.4"
           cache: "pnpm"
 
-      - name: Install ffmpeg
-        uses: AnimMouse/setup-ffmpeg@v1
-
-      - name: Verify ffmpeg installation
-        run: |
-          echo "🎬 Verifying ffmpeg installation..."
-          ffmpeg -version || {
-            echo "❌ ffmpeg installation failed!"
-            echo "Please check the setup-ffmpeg action configuration."
-            exit 1
-          }
-          echo "✅ ffmpeg installed successfully"
+      # ffmpeg is deliberately NOT installed in this workflow. Nothing these
+      # jobs run needs it: no package script invokes it, and src/ shells out to
+      # ffmpeg only at runtime (frame extraction, video merge, audio playback),
+      # never during install, lint, typecheck, build or pack. provider-safety-net
+      # has always built and run its suites without it.
+      #
+      # Removed after the apt install broke CI three ways in one day: a corrupt
+      # published asset, a version pin that stopped resolving, and an Ubuntu
+      # mirror returning Ign: for every index while apt sat for 14 minutes.
+      # Because build-check is a required check, each of those blocked every
+      # open pull request on a dependency none of these jobs use.
+      #
+      # If a job here ever runs a suite that genuinely exercises media, install
+      # ffmpeg in THAT job only, and bound every wait (DPkg::Lock::Timeout,
+      # Acquire::*::Timeout) plus a step timeout-minutes.
 
       - name: Install dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      # The gate's secret scan is gitleaks, and under CI=true
+      # scripts/security-check.ts FAILS when the binary is absent instead of
+      # degrading to its four-regex fallback — which is what every CI run had
+      # silently done, since the runners never had gitleaks. Pinned release,
+      # checksum verified against the published checksums file before anything
+      # from the archive is executed. Bump both values together.
+      - name: Install gitleaks (pinned, sha256-verified)
+        if: matrix.group == 'validate'
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+          GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+        run: |
+          set -euo pipefail
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL --retry 3 --proto '=https' --tlsv1.2 \
+            -o "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"
+          echo "${GITLEAKS_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum --check --strict
+          mkdir -p "${RUNNER_TEMP}/gitleaks"
+          tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}/gitleaks" gitleaks
+          echo "${RUNNER_TEMP}/gitleaks" >> "$GITHUB_PATH"
+          "${RUNNER_TEMP}/gitleaks/gitleaks" version
 
       - name: 🔄 SvelteKit Sync
         run: |
@@ -50,6 +145,7 @@ jobs:
           pnpm exec svelte-kit sync
 
       - name: Check code formatting
+        if: matrix.group == 'lint'
         run: |
           echo "🎨 Checking code formatting..."
           pnpm run format:check || {
@@ -59,115 +155,758 @@ jobs:
           }
 
       - name: Run linting
+        if: matrix.group == 'lint'
         run: |
           echo "🔍 Running ESLint validation with controlled warning limits..."
-          npx eslint src/ --max-warnings=300
-          npx eslint test/ --max-warnings=10
+          pnpm exec eslint src/ --max-warnings=300
+          pnpm exec eslint test/continuous-test-suite*.ts test/zod-schema-test-function.ts --max-warnings=10
+          # Everything else ESLint is configured to see, errors only.
+          #
+          # The two runs above cover src/ and the continuous-test-suite glob.
+          # `eslint .` adds 46 files CI never linted, measured by diffing the
+          # file lists rather than guessed:
+          #
+          #   eslint-rules 13 | test 25 (outside the glob) | docs-site 5
+          #   tools 1 | landing 1 | .pnpmfile.cjs 1
+          #
+          # Note what this does NOT add. `scripts/**` is in the ignores list in
+          # eslint.config.js, so no ESLint run covers it. And every custom
+          # `neurolink/*` rule is enabled only for `files: ["src/**/*.ts", ...]`,
+          # so those rules were never short of coverage — `eslint src/` already
+          # gave them everything they inspect. The value here is the generic
+          # rules reaching the lint rules themselves and the untested test files,
+          # not rescuing a custom rule from a partial view.
+          #
+          # No warning ceiling on purpose: the scoped runs above own the warning
+          # budgets, and duplicating one would let a limit be tightened in one
+          # place and silently loosened in another.
+          #
+          # Free to add, measured: `pnpm exec eslint .` reports 0 errors / 56 warnings
+          # and exits 0.
+          pnpm exec eslint .
 
       - name: 🔒 Security & Environment Validation
+        if: matrix.group == 'validate'
+        env:
+          # `pnpm audit` posts the whole dependency tree to npm's audit API and
+          # waits on it. security-check.ts kills any scanner at 120s and treats
+          # the kill as a failed scan — correct, because a scan that did not
+          # finish cannot be trusted. But the bound was measured against a
+          # ~1.4s local run, and when that endpoint degrades the real audit
+          # takes longer than the bound: on 2026-09-04 it ran 129s locally and
+          # every branch in the repo went red on this step, `release` included.
+          #
+          # 300s is still a bound, so the hang this exists to prevent is still
+          # prevented; it is just wide enough that a slow-but-working registry
+          # produces a verdict instead of a kill. Set here rather than in the
+          # script so local runs keep the tighter default, where a developer is
+          # present to notice a stall.
+          NEUROLINK_SCANNER_TIMEOUT_MS: "300000"
+        # A slow scanner must not hold a runner indefinitely even with the
+        # wider bound.
+        timeout-minutes: 12
         run: |
           echo "🔍 Running build rule enforcement validations..."
           pnpm run validate:all
 
+      # docs/api is 3236 generated files checked into the repo, and nothing kept
+      # them current — release drifted 756 files behind its own source and still
+      # carried five duplicate filenames. This regenerates and fails on any
+      # difference, so the reference cannot silently rot again.
+      #
+      # Only possible because the output is now stable across commits. Typedoc
+      # used to bake the current SHA into every "Defined in:" link and the
+      # package version into every page header, so every commit rewrote all
+      # 3224 files and a drift check would have failed on every PR. typedoc.json
+      # pins gitRevision and drops includeVersion for exactly this reason —
+      # changing either back re-breaks this gate. It also sets disableSources:
+      # "Defined in: file.ts:LINE" put a source line number on every page, so
+      # three added lines near the top of one type file rewrote 143 pages and
+      # made unrelated PRs conflict on docs/api.
+      #
+      # The prettier pass is part of the pipeline, not a tidy-up: docs/api is
+      # not in .prettierignore and raw typedoc output fails format:check.
+      # Costs about 12s.
+      #
+      # `git status --porcelain`, not `git diff`: typedoc runs with
+      # cleanOutputDir, so a real drift can be a file it newly emits or stops
+      # emitting, and only status reports untracked additions.
+      - name: 📚 Check generated API docs are current
+        if: matrix.group == 'validate'
+        run: |
+          echo "📚 Regenerating docs/api and checking for drift..."
+          pnpm run docs:api
+          pnpm exec prettier --write docs/api
+          if [ -n "$(git status --porcelain docs/api)" ]; then
+            echo "❌ docs/api is out of date with src/."
+            echo "Run locally and commit the result:"
+            echo "    pnpm run docs:api && pnpm exec prettier --write docs/api"
+            git --no-pager diff --stat docs/api | tail -20
+            exit 1
+          fi
+          echo "✅ docs/api matches the source it documents."
+
+      - name: Check proxy usage accounting
+        if: matrix.group == 'validate'
+        run: pnpm run test:proxy-usage
+
+      # Provider-catalog codegen freshness — the per-provider JSON in
+      # src/lib/providers/catalog/*.json is the source of truth; the enums,
+      # credential keys, and catalog index it drives must never drift from it.
+      - name: 🧬 Check provider catalog codegen is current
+        if: matrix.group == 'validate'
+        run: |
+          echo "🧬 Checking generated provider-catalog code is current..."
+          pnpm run codegen:catalog -- --check
+          git diff --exit-code -- src/
+
+      - name: 🚫 Check banned dependencies
+        if: matrix.group == 'validate'
+        run: |
+          echo "🔍 Verifying no banned packages leaked into production dependencies..."
+          pnpm run check:deps
+
+      # test/ is excluded from tsconfig too, so `check` never looks at the
+      # suites. A full typecheck there is 296 errors and a separate cleanup;
+      # a parse check is free and catches the breakage that actually happens
+      # when editing them — a stray backtick inside a generated-script template.
+      - name: 🔎 Parse-check the test suites
+        if: matrix.group == 'types'
+        run: pnpm run check:test-parse
+
+      # Reuse dist when every input to the build is byte-identical.
+      #
+      # There are deliberately NO restore-keys. A partial-prefix match would
+      # serve a dist built from different sources, and a stale build that still
+      # reports green is the precise failure this repo has been removing. An
+      # exact hash miss just rebuilds, which costs what it costs today.
+      # Only the `types` shard builds, so only it may participate in the
+      # cache. Without this guard the lint and validate shards reach the
+      # post-job save with no dist/ on disk — and an empty entry saved under
+      # a valid key would make every later job restore nothing and skip the
+      # build, which is worse than never caching at all.
+      - name: Restore built dist
+        id: dist-cache
+        if: matrix.group == 'types'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: dist
+          key: dist-${{ runner.os }}-${{ hashFiles('src/**', 'package.json', 'pnpm-lock.yaml', 'tsconfig*.json', 'vite.config.ts', 'svelte.config.js', 'scripts/build-browser.mjs', 'scripts/collapse-cli-lib-duplicate.mjs') }}
+
+      # A cache HIT restores dist/ with the mtimes it was SAVED with, while
+      # actions/checkout stamps src/ with checkout time — so the repo's
+      # assertDistFresh guard reads a genuinely current dist as stale and kills
+      # every suite that imports it. The key above hashes src/** and every
+      # build input, so a hit proves dist matches this exact tree; re-stamping
+      # its mtimes is truthful, not a freshness bypass.
+      #
+      # That truth DEPENDS on the key being exact: never add `restore-keys`
+      # to the cache step above. A prefix match would restore a dist built
+      # from DIFFERENT sources, and this touch would then make
+      # assertDistFresh certify stale code as fresh — converting the guard's
+      # loud, correct abort into silently testing the wrong build.
+      - name: Stamp restored dist as fresh
+        if: matrix.group == 'types' && steps.dist-cache.outputs.cache-hit == 'true'
+        run: find dist -exec touch {} +
+
       - name: Build package
+        if: matrix.group == 'types' && steps.dist-cache.outputs.cache-hit != 'true'
         run: pnpm run build
 
+      # tools/ and scripts/ are excluded from the root tsconfig, so the files a
+      # workflow actually depends on were never typechecked. That is how the
+      # provider onboarding gate shipped reading a field that does not exist.
+      #
+      # Runs AFTER the build: this config also covers test/helpers/**, and
+      # providerMatrix.ts derives the catalog providers' capability rows from
+      # the BUILT catalog (dist/providers/catalog/**). On an unbuilt tree those
+      # imports do not resolve, which is a missing dist, not a type error.
+      - name: 🔎 Typecheck CI-critical scripts and tools
+        if: matrix.group == 'types'
+        run: pnpm run check:ci-scripts
+
+      # After the build, deliberately: these suites import ../dist/index.js, so
+      # on an unbuilt tree every such import fails and cascades to ~769 errors.
+      - name: 🔎 Typecheck tools/ and test/
+        if: matrix.group == 'types'
+        run: pnpm run check:tools-tests
+
+      # The shipped-declaration guard reads dist/*.d.ts, so it belongs in the
+      # one shard that builds. It was added in #1627 and hardened in #1632 and
+      # until now ran only when someone ran it by hand.
+      - name: 🔎 Check shipped declarations resolve
+        if: matrix.group == 'types'
+        run: pnpm run check:dts
+
+      # Every neurolink.<method>() the README and docs/ show must exist on the
+      # built NeuroLink class. Reads dist/index.js and the same shipped
+      # declarations as check:dts, so it belongs in this shard, after the build.
+      - name: 🔎 Check documented NeuroLink methods exist
+        if: matrix.group == 'types'
+        run: pnpm run test:docs-methods
+
       - name: Test CLI build
+        if: matrix.group == 'types'
         run: |
           pnpm run build:cli
           node dist/cli/index.js --help
 
-  # action-smoke-test:
-  #   name: GitHub Action Smoke Test
-  #   runs-on: ubuntu-latest
-  #   needs: [test]
-  #   steps:
-  #     - name: Checkout code
-  #       uses: actions/checkout@v4
+  # The required check. `provider-safety-net` is required by BOTH the ruleset
+  # and classic branch protection, so the context name has to survive verbatim —
+  # a matrix would rename it to "provider-safety-net (contract)" and every PR
+  # would block on a required check that no longer reports. See the GH013 note
+  # in CLAUDE.md for what a missing required context does to this branch.
+  #
+  # `if: always()` is load-bearing. Without it a failed shard makes this job
+  # SKIPPED rather than failed, and GitHub can treat a skipped required check as
+  # satisfied — the exact "green means nothing" failure this repo keeps hitting.
+  # So it always runs and reads the shards' result explicitly.
+  provider-safety-net:
+    needs: [provider-safety-net-shards]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every shard to have passed
+        run: |
+          result="${{ needs.provider-safety-net-shards.result }}"
+          echo "shards result: $result"
+          if [ "$result" != "success" ]; then
+            echo "::error::provider-safety-net shards did not all succeed (result=$result)"
+            exit 1
+          fi
+          echo "All provider-safety-net shards passed."
 
-  #     - name: Setup PNPM
-  #       uses: pnpm/action-setup@v4
-  #       with:
-  #         version: 9
+  # The work. Split by measured duration: test:providers-mocked alone is
+  # 4m13s of this job's 10m14s; the remaining eight suites total roughly the
+  # same. Two shards therefore halve it rather than leaving one long tail; the observability shard runs beside them.
+  provider-safety-net-shards:
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [contract, rest, observability]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-  #     - name: Setup Node.js
-  #       uses: actions/setup-node@v4
-  #       with:
-  #         node-version: "20"
-  #         cache: "pnpm"
+      - name: Setup PNPM
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22.23.4"
+          cache: "pnpm"
 
-  #     - name: Install dependencies
-  #       run: pnpm install
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
 
-  #     - name: SvelteKit Sync
-  #       run: pnpm exec svelte-kit sync
+      - name: 🔄 SvelteKit Sync
+        run: |
+          echo "🔄 Running SvelteKit sync to generate TypeScript configs..."
+          pnpm exec svelte-kit sync
 
-  #     - name: Build GitHub Action
-  #       run: pnpm run build:action
+      # Reuse dist when every input to the build is byte-identical.
+      #
+      # There are deliberately NO restore-keys. A partial-prefix match would
+      # serve a dist built from different sources, and a stale build that still
+      # reports green is the precise failure this repo has been removing. An
+      # exact hash miss just rebuilds, which costs what it costs today.
+      - name: Restore built dist
+        id: dist-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: dist
+          key: dist-${{ runner.os }}-${{ hashFiles('src/**', 'package.json', 'pnpm-lock.yaml', 'tsconfig*.json', 'vite.config.ts', 'svelte.config.js', 'scripts/build-browser.mjs', 'scripts/collapse-cli-lib-duplicate.mjs') }}
 
-  #     - name: Test NeuroLink Action
-  #       id: neurolink
-  #       uses: ./
-  #       with:
-  #         prompt: "Respond with exactly: Hello from smoke test"
-  #         provider: google-ai
-  #         google_ai_api_key: ${{ secrets.GOOGLE_AI_API_KEY }}
-  #         max_tokens: "20"
-  #         temperature: "0"
-  #         debug: "true"
+      # A cache HIT restores dist/ with the mtimes it was SAVED with, while
+      # actions/checkout stamps src/ with checkout time — so the repo's
+      # assertDistFresh guard reads a genuinely current dist as stale and kills
+      # every suite that imports it. The key above hashes src/** and every
+      # build input, so a hit proves dist matches this exact tree; re-stamping
+      # its mtimes is truthful, not a freshness bypass.
+      #
+      # That truth DEPENDS on the key being exact: never add `restore-keys`
+      # to the cache step above. A prefix match would restore a dist built
+      # from DIFFERENT sources, and this touch would then make
+      # assertDistFresh certify stale code as fresh — converting the guard's
+      # loud, correct abort into silently testing the wrong build.
+      - name: Stamp restored dist as fresh
+        if: steps.dist-cache.outputs.cache-hit == 'true'
+        run: find dist -exec touch {} +
 
-  #     - name: Verify response
-  #       env:
-  #         RESPONSE: ${{ steps.neurolink.outputs.response }}
-  #         PROVIDER: ${{ steps.neurolink.outputs.provider }}
-  #       run: |
-  #         echo "Response: $RESPONSE"
-  #         echo "Provider: $PROVIDER"
+      - name: Build package
+        if: steps.dist-cache.outputs.cache-hit != 'true'
+        run: pnpm run build
 
-  #         if [ -z "$RESPONSE" ]; then
-  #           echo "ERROR: No response received"
-  #           exit 1
-  #         fi
+      - name: Mocked provider contract tests (no API keys required)
+        if: matrix.group == 'contract'
+        run: pnpm run test:providers-mocked
 
-  #         if [ -z "$PROVIDER" ]; then
-  #           echo "ERROR: Provider not reported"
-  #           exit 1
-  #         fi
+      - name: Decide provider contract helper tests (no API keys required)
+        if: matrix.group == 'contract'
+        run: pnpm run test:decide-contract
 
-  #         echo "✅ Action smoke test passed!"
+      - name: Image download lookup containment (owned TLS fixture)
+        if: matrix.group == 'contract'
+        run: pnpm run test:image-download-transport
+
+      - name: Provider structure tests (registry ↔ filesystem, no API keys required)
+        if: matrix.group == 'rest'
+        run: pnpm run test:provider-structure
+
+      - name: Ollama native diagnostic contracts (owned HTTP, no credentials)
+        if: matrix.group == 'rest'
+        run: pnpm run test:ollama-diagnostics
+
+      - name: MCP egress and recovery contracts (owned endpoints, no credentials)
+        if: matrix.group == 'rest'
+        run: pnpm run test:mcp:egress && pnpm run test:mcp:deadline-health && pnpm run test:mcp:timeout-compat && pnpm run test:mcp:startup-readiness
+
+      - name: Error classifier contract tests (TimeoutError classification per provider, no API keys required)
+        if: matrix.group == 'rest'
+        run: pnpm run test:error-classifier-contract
+
+      - name: Orchestrated provider selection contracts (owned JSON/SSE, no credentials)
+        if: matrix.group == 'rest'
+        run: pnpm run test:orchestrated-provider-selection
+
+      - name: MiMo and LongCat overflow budget contracts (owned endpoints, no credentials)
+        if: matrix.group == 'rest'
+        run: pnpm run test:mimo-overflow-budget
+
+      - name: Agent pricing and unknown-cost contracts (owned vendor endpoint)
+        if: matrix.group == 'rest'
+        run: pnpm run test:agent:cost
+
+      - name: Bedrock inference-profile fallback (local HTTP/2 stand-in, no API keys required)
+        if: matrix.group == 'rest'
+        run: pnpm run test:bedrock-inference-profile
+
+      - name: Bedrock loop characterization (local HTTP/2 stand-in, no API keys required)
+        if: matrix.group == 'rest'
+        run: pnpm run test:bedrock-loop-characterization
+
+      - name: SageMaker streaming (local stand-in, no API keys required)
+        if: matrix.group == 'rest'
+        run: pnpm run test:sagemaker-streaming
+
+      - name: Anthropic loop characterization (local SSE stand-in, no API keys required)
+        if: matrix.group == 'rest'
+        run: pnpm run test:anthropic-loop-characterization
+
+      - name: Anthropic execution control contract (local SSE stand-in, no API keys required)
+        if: matrix.group == 'rest'
+        run: pnpm run test:anthropic-execution-control
+
+      - name: HITL timeout consent exclusions (public registry, no credentials)
+        if: matrix.group == 'rest'
+        run: pnpm run test:hitl:timeout-exclusions
+
+      - name: HITL documented configuration (README examples against the built SDK, no credentials)
+        if: matrix.group == 'rest'
+        run: pnpm run test:hitl:documented-config
+
+      - name: Proxy telemetry accuracy (isolated storage faults and HTTP fixtures)
+        if: matrix.group == 'rest'
+        run: pnpm run test:proxy-telemetry
+
+      - name: Proxy lifecycle, accounting, spending and update regressions (isolated)
+        if: matrix.group == 'rest'
+        run: pnpm run test:proxy-reliability
+
+      - name: Codex fallback contract (local SSE stand-in, no API keys required)
+        if: matrix.group == 'rest'
+        run: pnpm run test:codex
+
+      - name: Agent session and platform routing contracts (owned vendor endpoints)
+        if: matrix.group == 'rest'
+        run: pnpm run test:agent:session-stream && pnpm run test:agent:platform-router
+
+      - name: AI Studio loop characterization (local SSE stand-in, no API keys required)
+        if: matrix.group == 'rest'
+        run: pnpm run test:aistudio-loop-characterization
+
+      - name: zod tool schemas on the wire (pinned shapes, local stand-in, no API keys required)
+        if: matrix.group == 'rest'
+        run: pnpm run test:zod-wire-schemas
+
+      - name: 🧩 Provider Onboarding Completeness
+        if: matrix.group == 'rest'
+        run: pnpm run verify:provider-onboarding
+
+      # The observability suites (BZ-6924) are credential-free: fake provider
+      # servers, local OTLP receivers and recorded replies. Two of them compare
+      # the working tree with the merged PR and its parent through `git show`,
+      # and the checkout above is shallow, so those commits are fetched first.
+      - name: Fetch the commits the observability suites compare against
+        if: matrix.group == 'observability'
+        run: git fetch --no-tags --depth=1 origin fc892bbb58087096594f7ab80d5105e62a94189c 2d394138094c3b89015975ea3fdce69e4a75a5c9
+
+      - name: Observability suite (fake servers, no API keys required)
+        if: matrix.group == 'observability'
+        run: pnpm run test:observability
+
+      - name: Observability follow-up suites (local OTLP receivers, no API keys required)
+        if: matrix.group == 'observability'
+        run: pnpm run test:observability:followups
+
+  # REQUIRED. A red run here blocks the merge.
+  #
+  # This comment used to say the opposite — "advisory only … a red run here is
+  # information, not a gate" — and it was correct when written. The branch
+  # protection change it was waiting for has since been made, and nothing
+  # updated the note, so the file spent that time telling anyone debugging a red
+  # `security-suites` that they could ignore it. On the suites that drive zip
+  # bombs, path traversal and XXE-shaped documents, that is the worst possible
+  # thing to be wrong about.
+  #
+  # Where it is required is worth knowing, because the two protection layers
+  # disagree and GitHub enforces their union:
+  #
+  #   classic branch protection   test · provider-safety-net · build-check ·
+  #                               🔒 Single Commit Policy Validation · security-suites
+  #   ruleset 11413189            the same four, WITHOUT security-suites
+  #
+  # So `gh api repos/juspay/neurolink/rulesets/11413189` reports four contexts
+  # and no mention of this job — querying the ruleset alone still says it is
+  # optional. Use `gh api repos/juspay/neurolink/branches/release/protection`,
+  # or check both. CLAUDE.md's "Required status checks and the release bot"
+  # section covers the same trap from the other direction.
+  #
+  # One real consequence of living only on the classic layer: that layer has
+  # `enforce_admins: false`, so this is the one required check a repository
+  # admin can bypass. The ruleset's four have `bypass_actors: []` and nobody can.
+  #
+  # A migration off classic protection would silently drop this check — the job
+  # keeps running and keeps reporting green, so nothing looks different until
+  # something red merges. Add the context to the ruleset first.
+  #
+  # The suites themselves were wired into `test:unit`, which no workflow ever
+  # invoked, so before this job existed they had never executed on a pull
+  # request at all.
+  #
+  # Both suites are credential-free by construction — they never call a model.
+  security-suites:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # This job runs on pull_request and executes code from the checkout.
+          # actions/checkout persists GITHUB_TOKEN in .git/config by default and
+          # nothing here needs authenticated git, so drop it.
+          persist-credentials: false
+
+      - name: Setup PNPM
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22.23.4"
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: 🔄 SvelteKit Sync
+        run: |
+          echo "🔄 Running SvelteKit sync to generate TypeScript configs..."
+          pnpm exec svelte-kit sync
+
+      # Reuse dist when every input to the build is byte-identical.
+      #
+      # There are deliberately NO restore-keys. A partial-prefix match would
+      # serve a dist built from different sources, and a stale build that still
+      # reports green is the precise failure this repo has been removing. An
+      # exact hash miss just rebuilds, which costs what it costs today.
+      - name: Restore built dist
+        id: dist-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: dist
+          key: dist-${{ runner.os }}-${{ hashFiles('src/**', 'package.json', 'pnpm-lock.yaml', 'tsconfig*.json', 'vite.config.ts', 'svelte.config.js', 'scripts/build-browser.mjs', 'scripts/collapse-cli-lib-duplicate.mjs') }}
+
+      # A cache HIT restores dist/ with the mtimes it was SAVED with, while
+      # actions/checkout stamps src/ with checkout time — so the repo's
+      # assertDistFresh guard reads a genuinely current dist as stale and kills
+      # every suite that imports it. The key above hashes src/** and every
+      # build input, so a hit proves dist matches this exact tree; re-stamping
+      # its mtimes is truthful, not a freshness bypass.
+      #
+      # That truth DEPENDS on the key being exact: never add `restore-keys`
+      # to the cache step above. A prefix match would restore a dist built
+      # from DIFFERENT sources, and this touch would then make
+      # assertDistFresh certify stale code as fresh — converting the guard's
+      # loud, correct abort into silently testing the wrong build.
+      - name: Stamp restored dist as fresh
+        if: steps.dist-cache.outputs.cache-hit == 'true'
+        run: find dist -exec touch {} +
+
+      - name: Build package
+        if: steps.dist-cache.outputs.cache-hit != 'true'
+        run: pnpm run build
+
+      - name: Archive security suite (zip bombs, traversal — no API keys required)
+        run: pnpm run test:archive:security
+
+      - name: Office document suite (no API keys required)
+        run: pnpm run test:office
+
+      - name: Office document security suite (no API keys required)
+        run: pnpm run test:office:security
+
+      - name: Docs MCP server suite (no API keys required)
+        run: pnpm run test:docs-mcp
+
+      # The rest of test:unit. Nothing in CI has ever invoked test:unit, so 71
+      # of the repo's 83 suite-running scripts never execute on a pull request
+      # — the archive and office suites above were two instances of that, not
+      # the whole of it.
+      #
+      # These are the credential-free ones. Measured with the entire environment
+      # stripped (no .env, empty env): 654 assertions pass, 9 skip, exit 0, in
+      # 87s total. So this is real coverage rather than a suite that goes green
+      # by skipping, which is the failure mode worth guarding against here.
+      #
+      # test:model-not-found-retryable is deliberately absent: it is a test:live
+      # suite (a real generate() on Anthropic and OpenAI) that skips entirely
+      # without credentials, so running it here would add a step that can only
+      # ever no-op.
+      # test:bugfixes was held out of CI until now. Its four FileDetector
+      # failures were not flaky and not environmental: getGlobalDispatcher()
+      # returns Node's BUILT-IN undici, whose major tracks the runtime, and the
+      # composed result was passed to npm undici 7's request(). On Node 22
+      # (built-in undici 6) that throws "invalid onError method"; on Node 24
+      # (built-in 7) it does not. Node 22 is this package's engines floor, so
+      # consumers hit it too — see src/lib/utils/redirectDispatcher.ts.
+      #
+      # Kept here as a note because the runner is where it will resurface: if
+      # this step starts failing on FileDetector again after a Node or undici
+      # bump, that dispatcher-major check is the first place to look.
+      #
+      # test:file-tool-roots is the symlink-escape regression suite for the
+      # built-in file tools (readFile / writeFile / listDirectory / analyzeCSV).
+      # It was never in test:unit, so the containment fix that shipped in
+      # v12.28.0 had no gate at all until a bug-bounty report against 12.23.2
+      # made that visible. Offline against a local replay endpoint: every
+      # assertion passes with the environment stripped, none skip, ~2s.
+      #
+      # test:realtime-voice drives the Gemini Live and xAI realtime backends
+      # against loopback WebSocket and HTTP stand-ins, with no key. It opens
+      # local servers and spawns child node processes, so it ran first in the
+      # non-blocking extended-suites job, where all 34 assertions passed with
+      # none skipped in about 8s (run 39021843790). It gates merges from here.
+      # The 2026-10 security audit's regression suites. Each one fails on the
+      # code it was written against (a deliberately broken assertion reports ✗,
+      # not ⊘) and none of them needs a provider key:
+      #   cwd-trust       a hostile .mcp-config.json / .env in the working
+      #                   directory spawns nothing and redirects no key
+      #   server          non-loopback bind without a key refuses to start;
+      #                   tool/MCP routes 401 with one; no error text leaks env
+      #   proxy           header-snapshot poisoning, header passthrough,
+      #                   borrower isolation, upstream fan-out caps
+      #   tools           HITL fires for built-in write/bash tools; hostile
+      #                   remote schemas are not evaluated
+      #   ingestion       every caller-supplied URL goes through the SSRF guard;
+      #                   path loaders honour roots
+      #   supply-chain    SHA-pinned actions, exact Node, digest-pinned image,
+      #                   exact dependency pins, action-dist == fresh build,
+      #                   the dependency gate's accepted-risk table vs the live
+      #                   audit, no APPROVE from the AI reviewer
+      - name: Security hardening suites (2026-10 audit regressions)
+        run: |
+          pnpm run test:security:cwd-trust
+          pnpm run test:security:server
+          pnpm run test:security:proxy
+          pnpm run test:security:tools
+          pnpm run test:security:ingestion
+          pnpm run test:security:supply-chain
+
+      - name: Credential-free suites (the rest of test:unit)
+        run: |
+          pnpm run test:bugfixes
+          pnpm run test:file-tool-roots
+          pnpm run test:server-boundaries
+          pnpm run test:tool-replay
+          pnpm run test:stream-tool-telemetry
+          pnpm run test:forced-tool-declared
+          pnpm run test:span-content-redaction
+          pnpm run test:voice-turn-memory
+          pnpm run test:redis-atomic-expiry
+          pnpm run test:memory:hippocampus
+          pnpm run test:security-check-filter
+          pnpm run test:decide
+          pnpm run test:decide-catalog
+          pnpm run test:mcp:infra
+          pnpm run test:mcp:spans
+          pnpm run test:mcp:stdio-lifecycle
+          pnpm run test:proxy-egress
+          pnpm run test:proxy-connect-retry
+          pnpm run test:proxy-restart
+          pnpm run test:tool-routing
+          pnpm run test:tool-routing-cli
+          pnpm run test:tool-dedup
+          pnpm run test:model-pool
+          pnpm run test:tool-routing-semantic
+          pnpm run test:mcp-result-cache
+          pnpm run test:workflow-deadlines
+          pnpm run test:vector-chroma
+          pnpm run test:vector-pgvector
+          pnpm run test:vector-pinecone
+          pnpm run test:provider-wiring
+          pnpm run test:rag-html-markup
+          pnpm run test:cli-fallback
+          pnpm run test:embedding-response-validation
+          pnpm run test:xiaomi-mimo-pilot
+          pnpm run test:rag-bounds
+          pnpm run test:longcat-pilot
+          pnpm run test:runinfra-pilot
+          pnpm run test:catalog-output-ceiling
+          pnpm run test:package-declarations
+          pnpm run test:realtime-voice
+
+  # There is deliberately no action smoke-test job here. The one that used to
+  # sit in this file (commented out) ran the action against a live provider key
+  # on every pull request, which is a credential a PR must not be able to spend;
+  # the bundle is gated instead by the build-check step above, which rebuilds
+  # action-dist/ and fails on any difference.
+
+  # Builds with a full install, prunes optionalDependencies, then runs the
+  # built CLI against the pruned tree.
+  # optionalDependencies (express, the AWS SDK bedrock/sagemaker clients,
+  # fastify, koa, etc.) are exactly the packages npm/pnpm silently skip on a
+  # failed native build or a --no-optional install, so "it built" here proves
+  # nothing about whether the CLI still runs without them.
+  #
+  # This job is now BLOCKING. It spent its whole life non-blocking and red —
+  # first because it installed --no-optional before building (so rolldown's
+  # own native binding vanished and the build tool disappeared), then because
+  # it built with `build:cli` on a clean checkout (so the collapse step found
+  # every rewritten specifier dangling). Neither failure ever ran a smoke
+  # step, and continue-on-error meant nothing ever complained.
+  #
+  # Both are fixed, d9f0b495 made `--help` survive the prune, and the job
+  # reported SUCCESS on the run that fixed it. A green non-blocking job
+  # protects nothing, so the error suppression comes off here.
+  #
+  # Note @aws-sdk/client-bedrock-runtime is also statically imported from an
+  # optionalDependency (amazonBedrock/client.ts, amazonBedrock/loopAdapter.ts).
+  # That import is not reachable from `--help`, `--version` or
+  # `generate --help`, which is why those three pass today; if a later change
+  # pulls it onto the entrypoint path this job goes red, and that is the job
+  # working, not the check being too strict.
+  optional-deps-omitted-smoke-test:
+    name: CLI Smoke Test (optional deps omitted)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup PNPM
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22.23.4"
+          cache: "pnpm"
+
+      # Build with a FULL install, then prune. The previous order installed
+      # --no-optional first and never reached the CLI at all: rolldown's
+      # native binding (@rolldown/binding-linux-x64-gnu) is itself an
+      # optionalDependency, so the BUILD TOOL disappeared and the job failed
+      # at "Build CLI" with "Cannot find native binding" — red forever, and
+      # proving nothing about the CLI.
+      #
+      # What this job exists to prove is a RUNTIME property: that the built
+      # CLI still starts when the optional runtime packages are absent. So the
+      # build gets everything it needs, and only the run is starved.
+      - name: Install dependencies (full, for the build)
+        run: pnpm install --frozen-lockfile
+
+      # The FULL build, not `build:cli`. `build:cli` alone is a
+      # developer-iteration shortcut that assumes a `vite build` output is
+      # already sitting in dist/: it runs tsc plus
+      # scripts/collapse-cli-lib-duplicate.mjs, and that script rewrites
+      # dist/cli's "../../lib/x.js" specifiers to "../../x.js" and then
+      # verifies each one resolves. On a clean CI checkout the vite half of
+      # dist/ does not exist, so every rewritten specifier dangles and the
+      # script exits 1 by design — "the build is broken and must fail loudly
+      # instead of shipping a CLI with dangling imports".
+      #
+      # That is exactly what happened here: this job failed at Build CLI on
+      # every run since it was added, so the three smoke steps below had
+      # never once executed. `pnpm run build` runs `vite build` and then
+      # prepack, which itself runs build:cli — both halves, in the order the
+      # collapse script requires.
+      # Reuse dist when every input to the build is byte-identical.
+      #
+      # There are deliberately NO restore-keys. A partial-prefix match would
+      # serve a dist built from different sources, and a stale build that still
+      # reports green is the precise failure this repo has been removing. An
+      # exact hash miss just rebuilds, which costs what it costs today.
+      - name: Restore built dist
+        id: dist-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: dist
+          key: dist-${{ runner.os }}-${{ hashFiles('src/**', 'package.json', 'pnpm-lock.yaml', 'tsconfig*.json', 'vite.config.ts', 'svelte.config.js', 'scripts/build-browser.mjs', 'scripts/collapse-cli-lib-duplicate.mjs') }}
+
+      # A cache HIT restores dist/ with the mtimes it was SAVED with, while
+      # actions/checkout stamps src/ with checkout time — so the repo's
+      # assertDistFresh guard reads a genuinely current dist as stale and kills
+      # every suite that imports it. The key above hashes src/** and every
+      # build input, so a hit proves dist matches this exact tree; re-stamping
+      # its mtimes is truthful, not a freshness bypass.
+      #
+      # That truth DEPENDS on the key being exact: never add `restore-keys`
+      # to the cache step above. A prefix match would restore a dist built
+      # from DIFFERENT sources, and this touch would then make
+      # assertDistFresh certify stale code as fresh — converting the guard's
+      # loud, correct abort into silently testing the wrong build.
+      - name: Stamp restored dist as fresh
+        if: steps.dist-cache.outputs.cache-hit == 'true'
+        run: find dist -exec touch {} +
+
+      - name: Build (full — the CLI's collapse step needs the SDK output)
+        if: steps.dist-cache.outputs.cache-hit != 'true'
+        run: pnpm run build
+
+      # dist/ survives this: it lives outside node_modules, so the CLI below
+      # is the artifact built above, now running against a pruned tree.
+      - name: Re-install with optionalDependencies omitted
+        run: pnpm install --no-optional
+
+      - name: CLI smoke test — --help
+        run: node dist/cli/index.js --help
+
+      - name: CLI smoke test — --version
+        run: node dist/cli/index.js --version
+
+      - name: CLI smoke test — generate --help
+        run: node dist/cli/index.js generate --help
 
   build-check:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup PNPM
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9
-
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "20"
+          node-version: "22.23.4"
           cache: "pnpm"
 
-      - name: Install ffmpeg
-        uses: AnimMouse/setup-ffmpeg@v1
-
-      - name: Verify ffmpeg installation
-        run: |
-          echo "🎬 Verifying ffmpeg installation..."
-          ffmpeg -version || {
-            echo "❌ ffmpeg installation failed!"
-            echo "Please check the setup-ffmpeg action configuration."
-            exit 1
-          }
-          echo "✅ ffmpeg installed successfully"
-
       - name: Install dependencies
-        run: pnpm i
+        run: pnpm install --frozen-lockfile
 
       - name: 🔄 SvelteKit Sync
         run: |
@@ -182,39 +921,523 @@ jobs:
           pnpm pack
           ls -la dist/
 
+      # The GitHub Action consumers run is the COMMITTED action-dist/ bundle
+      # (action.yml `runs.main`), not anything built at release time: nothing
+      # commits the release job's build, and `linguist-generated` used to
+      # collapse the 1.4 MB file in every pull request diff. So the bundle was
+      # unverifiable — 1,342 lines of drift from source went unnoticed. ncc is
+      # deterministic for a given source tree and lockfile (verified: two builds
+      # byte-identical), so a rebuild that differs means someone changed the
+      # source, the lockfile or the bundle without the others. build-check is a
+      # required context, so this cannot be merged around.
+      - name: GitHub Action bundle is current (action-dist/ == fresh build)
+        run: |
+          set -euo pipefail
+          pnpm run build:action
+          if ! git diff --exit-code --stat -- action-dist/; then
+            echo "::error::action-dist/ does not match a fresh \`pnpm run build:action\`. Rebuild and commit the bundle with the source change (or the lockfile change) that produced it."
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain -- action-dist/)" ]; then
+            echo "::error::\`pnpm run build:action\` produced files that are not committed under action-dist/."
+            git status --porcelain -- action-dist/
+            exit 1
+          fi
+          echo "action-dist/ matches a fresh build."
+
+  # Deliberately NOT a required status check. These suites are new and this job
+  # exists so a regression in them is visible, not so it can block a merge on
+  # day one. Promote it to required once it has proven stable.
+  #
+  # "Stable" had no evidence attached, so: sampled 2026-08-27 over the last 6 CI
+  # runs, all 24 Extended Suites shard results were success.
+  #
+  # That is not the whole argument, and the other half points the other way.
+  # Being non-blocking is what let four suites be wired into this list in one
+  # day. One of those attempts went red — test:proxy failed on a single
+  # attribution case that no local configuration reproduced — and the wire-in
+  # was simply reverted. Had this job been required, that experiment would have
+  # blocked every open pull request instead of reporting a result.
+  #
+  # So the 24/24 is evidence the job is healthy, not evidence that promoting it
+  # is free. The cost lands on whoever next adds a suite. Worth promoting when
+  # the suite list stops changing weekly; today it is still being filled in.
+  #
+  # It exists at all because the alternative was demonstrated: the OpenAI-compat
+  # catalog suite sat in no CI job, broke (it threw on any machine without
+  # GROQ_API_KEY), and nobody noticed — because nothing ran it. A suite wired
+  # into nothing is documentation, not a test.
+  extended-suites:
+    runs-on: ubuntu-latest
+    strategy:
+      # Every shard runs even if another fails, so one broken suite never
+      # hides the state of the other suites — the same property the loop below
+      # has always had within a single job.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    # This job checks out and executes repository code on pull_request.
+    # The repository default is a WRITE-scoped token (and one that may
+    # approve reviews); nothing here needs either. Read is enough to
+    # checkout, install and run suites.
+    name: Extended Suites (non-blocking) ${{ matrix.shard }}/4
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup PNPM
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22.23.4"
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: SvelteKit sync
+        run: pnpm exec svelte-kit sync
+
+      # Every one of these suites imports from ../dist/index.js per rule 15, so
+      # the built output is a prerequisite rather than an optimisation.
+      # Reuse dist when every input to the build is byte-identical.
+      #
+      # There are deliberately NO restore-keys. A partial-prefix match would
+      # serve a dist built from different sources, and a stale build that still
+      # reports green is the precise failure this repo has been removing. An
+      # exact hash miss just rebuilds, which costs what it costs today.
+      - name: Restore built dist
+        id: dist-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: dist
+          key: dist-${{ runner.os }}-${{ hashFiles('src/**', 'package.json', 'pnpm-lock.yaml', 'tsconfig*.json', 'vite.config.ts', 'svelte.config.js', 'scripts/build-browser.mjs', 'scripts/collapse-cli-lib-duplicate.mjs') }}
+
+      # A cache HIT restores dist/ with the mtimes it was SAVED with, while
+      # actions/checkout stamps src/ with checkout time — so the repo's
+      # assertDistFresh guard reads a genuinely current dist as stale and kills
+      # every suite that imports it. The key above hashes src/** and every
+      # build input, so a hit proves dist matches this exact tree; re-stamping
+      # its mtimes is truthful, not a freshness bypass.
+      #
+      # That truth DEPENDS on the key being exact: never add `restore-keys`
+      # to the cache step above. A prefix match would restore a dist built
+      # from DIFFERENT sources, and this touch would then make
+      # assertDistFresh certify stale code as fresh — converting the guard's
+      # loud, correct abort into silently testing the wrong build.
+      - name: Stamp restored dist as fresh
+        if: steps.dist-cache.outputs.cache-hit == 'true'
+        run: find dist -exec touch {} +
+
+      - name: Build
+        if: steps.dist-cache.outputs.cache-hit != 'true'
+        run: pnpm run build
+
+      - name: Run extended suites
+        run: |
+          # No provider credentials are set in this job, and that is the point:
+          # each of these suites drives the public API against stubs, local
+          # fixtures or mocked fetch, so a suite that starts making real network
+          # calls fails here rather than silently costing money and flaking.
+          #
+          # The list below grew from the original 8. The suites added since were
+          # not picked by reading them: every suite script that CI never
+          # invoked was run with the environment fully stripped — `env -i` plus
+          # DOTENV_CONFIG_PATH=/dev/null, checked to actually suppress .env —
+          # and only the ones that passed that way were kept.
+          #
+          # test:middleware is still held back, and the cause is now measured
+          # rather than guessed. Diagnosed 2026-08-27.
+          #
+          # The suite's header says "provider-dependent tests SKIP when
+          # credentials are not configured". It never checks. It issues all
+          # seven live calls — defaulting to vertex — and classifies whatever
+          # error comes back. With no credentials those calls still go out, to
+          # oauth2.googleapis.com and aiplatform.googleapis.com, and Google
+          # throttles them progressively.
+          #
+          # Five identical consecutive credential-free runs, same machine, same
+          # tree, nothing else changed:
+          #
+          #     62s -> 77s -> 95s -> 145s -> 269s
+          #
+          # Monotonic, 4.3x, all still passing 7/7. Nothing in the suite is
+          # slowing down; the far end is. Its per-case bound is the harness
+          # default of 240s — the suite calls `withCaseTimeout(name, fn)` with
+          # no third argument, and its own `TEST_CONFIG.timeout: 60_000` is
+          # declared once and never read by anything. A case that trips 240s
+          # does not merely fail — the runner `break`s, because a raced-out
+          # case is still executing and the process no longer has clean state.
+          # So the remaining cases are recorded as not run, and one slow call
+          # takes the whole suite down. The 269s run above is already past that
+          # bound, which is the point: the trend, not any single figure, is what
+          # makes this reproducible.
+          #
+          # That is why the earlier note found it "reproducible in context, not
+          # flaky", and why blaming the immediately preceding suite was refuted:
+          # the load is CUMULATIVE, not adjacent. test:auth and test:dynamic
+          # both reach the same two googleapis hosts earlier in the run — 7 and
+          # 5 live generate/stream calls respectively, all defaulting to vertex
+          # — so by the time middleware starts, the throttle is already
+          # established. (test:provider-descriptors runs between them but is
+          # NOT part of this: it issues no generate/stream call at all, and its
+          # getProviderStatus() path short-circuits on absent env vars before
+          # any request goes out.) Alone, or straight after test:mcp, it is early
+          # enough to be fast — which is exactly what was observed.
+          #
+          # The fix is to honour what the header already promises: probe once,
+          # and skip the rest without calling when the provider is unavailable,
+          # instead of making seven attempts into a tightening throttle. That
+          # needs care, because a case returns null both for "provider
+          # unavailable" and for an ordinary in-test skip, so the two have to be
+          # told apart at all seven call sites first. Not attempted here: the
+          # credentialed path could not be exercised to prove it unchanged.
+          # Worth 7 assertions to whoever finishes it.
+          #
+          # test:multimodal:sdk used to "exit non-zero with no summary", and
+          # the cause was never in the suite's assertions. The repo's tracked
+          # .mcp-config.json declares a `filesystem` server started via
+          # `npx -y @modelcontextprotocol/server-filesystem`, with
+          # autoDiscovery and autoRegister both on, so every NeuroLink the
+          # suite builds tried to start it and waited the full 60s MCP client
+          # timeout when it could not — once per instance, fourteen times.
+          # Measured: 11 such timeouts and still running past 20 minutes, which
+          # is why it was killed before printing anything. The suite now sets
+          # NEUROLINK_SKIP_MCP, as test:proxy already did, and finishes in 58s
+          # at 14/14. It does not test MCP; it tests whether a file handed to
+          # generate() reaches the model.
+          #
+          # test:proxy stays out too, but the recorded reason for it was
+          # wrong, and the real one only showed up in CI.
+          #
+          # The old reading was that it "passes with credentials (74/6) and
+          # fails without them (68/5/7)". Those conditions are the wrong way
+          # round, and the axis is not credentials at all.
+          #
+          # It neutralises its own environment before anything else runs — a
+          # mkdtemp HOME, USERPROFILE and XDG_CONFIG_HOME, and it deletes
+          # ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, OPENAI_API_KEY and
+          # GOOGLE_API_KEY outright unless NEUROLINK_PROXY_TEST_ALLOW_LIVE=1.
+          # Ambient credentials therefore cannot reach it, which is why running
+          # it with and without them produces byte-identical results.
+          #
+          # The failing condition is the opt-in one, not the bare one:
+          #
+          #   default (keys deleted by the suite)   74 passed / 6 skipped / 0 failed
+          #   NEUROLINK_PROXY_TEST_ALLOW_LIVE=1     75 passed / 0 skipped / 5 failed
+          #
+          # and those five are live round-trips failing on the account's credit
+          # balance, not on anything the suite does. CI never sets that
+          # variable, so CI gets the first row.
+          #
+          # It was wired in on that basis — seven local runs across five
+          # environments, all 74/6/0 — and CI disagreed on the first attempt:
+          #
+          #   local  (7 runs, 5 environments)   74 passed / 0 failed / 6 skipped
+          #   CI     (run 33021689979)          71 passed / 1 FAILED / 8 skipped
+          #
+          # The single failure is "Attribution: the request log records the
+          # calling CLI", asserting "request log carried no attribution for the
+          # unknown caller". It sends two requests under different
+          # user-agents, then reads the proxy's request log back and expects a
+          # record for each; in CI the unknown-caller record was absent. Note
+          # the skip count also moves, 6 to 8, so the environments differ in
+          # more than that one case.
+          #
+          # Local green across many environments is not evidence about CI: no
+          # local configuration reproduced it. Whoever picks this up starts
+          # from a named failing case rather than from a guess, and should
+          # check whether the log write races the read-back. CI measured the
+          # suite at 37s, so weight it there and not at the 80s that was
+          # extrapolated from local timings.
+          #
+          # The 55669 in that suite is a config string it writes into client
+          # config files and asserts on — never a request target — so an
+          # operator's own proxy listening there does not affect it. That is
+          # correct: fetchProxy targets PROXY_PORT, which is 9876.
+          #
+          # It is also incomplete, in the direction that misleads. The suite is
+          # NOT isolated from a running proxy, because the coupling is the log
+          # file rather than the port. startProxy() spawns with neither --dev
+          # nor a HOME override, so its request log resolves to
+          # ~/.neurolink/logs/proxy-<date>.jsonl — the same append-only file an
+          # operator's own daemon writes to. testPerClientAttribution then
+          # stats that path via os.homedir(), sends its two requests, and reads
+          # back everything appended past the recorded offset. Both proxies'
+          # records land in that window: on the machine where this was checked,
+          # the last 4000 lines held 397 claude-code and 198 unknown entries,
+          # the latter being the test's own synthetic user-agent mixed in with
+          # live traffic.
+          #
+          # What that does and does not establish, stated separately because
+          # the difference is the whole value of it:
+          #
+          #   Established, by reading the spawn and confirmed in the log: the
+          #   read-back window is shared, unscoped, and not synchronised with
+          #   anything.
+          #
+          #   NOT established: that concurrency is the cause. The failure was
+          #   seen twice while other work drove a second proxy, but two
+          #   deliberate attempts to reproduce it — one with sustained load,
+          #   one with three parallel generators — both passed 88/0. Treat the
+          #   correlation as a lead, not a diagnosis.
+          #
+          # For CI the shared-log path is probably not it, since a runner has
+          # no second proxy; the race the paragraph above names remains the
+          # better hypothesis there. The value here is that the read-back has
+          # no synchronisation to rely on in either environment, and that an
+          # investigator should stop treating "no operator proxy on 55669" as
+          # evidence of isolation.
+          #
+          # test:model-not-found-retryable is also absent: it is a test:live
+          # suite that skips entirely without credentials, so it could only
+          # ever no-op here — the same reason it is held out of the
+          # security-suites job.
+          #
+          # This job is non-blocking on purpose. These are measured once, not
+          # proven stable, and `security-suites` is a required check that
+          # blocks every open pull request when it breaks.
+          # name@seconds, longest first. The weights affect BALANCE ONLY —
+          # never which suites run. A stale weight makes one shard slower; it
+          # can never cause a suite to be skipped or run twice. An entry with
+          # no @weight still runs, at an assumed 30s.
+          #
+          # Refreshed 2026-08-27: median of 13 runs, read from this job's own
+          # logs. The previous set came from a single run (32808851519) and one
+          # entry had gone badly stale — test:tts:unit was still carrying 367s
+          # after the deadlock fix in #1550 cut it to a median of 140s, a 2.6x
+          # overstatement that survived because nothing re-measures.
+          #
+          # To re-measure, do NOT time these locally: a developer machine is
+          # faster than a runner AND has credentials, so suites that skip in CI
+          # do real work here. Measuring test:tts:unit locally gives ~73s
+          # against a CI median of 140s — wrong by nearly half, in the
+          # direction that would have made the imbalance look worse than it is.
+          # Read the real thing instead; the ::group:: markers below are
+          # timestamped in the raw job log:
+          #
+          #   gh api repos/juspay/neurolink/actions/jobs/<id>/logs | awk '
+          #     function secs(ts,   a) { split(substr(ts,12,8), a, ":")
+          #                              return a[1]*3600 + a[2]*60 + a[3] }
+          #     /##\[group\]test:/        { t=secs($1); n=$2; sub(/^##\[group\]/,"",n) }
+          #     /##\[endgroup\]/ && n!="" { d=secs($1)-t; if (d<0) d+=86400
+          #                              printf "%s@%d\n", n, d; n="" }'
+          #
+          # That prints `suite@seconds` — the exact shape of a SUITES line, so
+          # the output pastes straight in. It avoids gawk's mktime(), which BSD
+          # awk (macOS) does not have, and adds a day's seconds back when a job
+          # crosses midnight UTC. It was run against a captured log before being
+          # written down here, which the version it replaces was not: that one
+          # bound the timestamp only at ::group:: and never read the ::endgroup::
+          # one, so it printed a start time and a `##[group]`-prefixed name and
+          # never computed a duration at all.
+          #
+          # Take a median across several runs, not one sample: the observed
+          # per-suite range is wide (test:tts:unit spans 95s to 155s).
+          #
+          # Two entries are skip-times, not work-times. test:tool-reliability
+          # and test:autoresearch are live-tier and have no credentials here, so
+          # what is being weighted is how long they take to decide to skip. That
+          # is the correct number for THIS job, and the wrong number to reuse
+          # anywhere that runs them for real.
+          #
+          # Round-robin by list position was the previous scheme. It balances
+          # the COUNT of suites, which is the wrong quantity: the measured
+          # spread is 1s to 140s, so equal counts gave shards of 90s and 241s.
+          SUITES="
+            test:tts:unit@140
+            test:agent-delegation@78
+            test:error-classification-e2e@71
+            test:background-commands@23
+            test:middleware-defaults@23
+            test:agent-tasks@13
+            test:artifact-banking@13
+            test:multimodal:sdk@110
+            test:agents@7
+            test:media-registry-collisions@3
+            test:video-abort@3
+            test:classifier-router@3
+            test:resolve-request-kind@1
+            test:vertex-loop-characterization@100
+            test:tool-reliability@57
+            test:reasoning-parity-live@19
+            test:auth@50
+            test:adapter-request-context@5
+            test:vertex-claude-characterization@46
+            test:openai-compat-catalog@24
+            test:decide-catalog-schema@20
+            test:provider-descriptors@17
+            test:openai-compat-streaming-retry@16
+            test:servers@16
+            test:agent-input-guard@17
+            test:proxy-image-input@40
+            test:body-limits@13
+            test:proxy-codex-policy-refusal@60
+            test:video:unit@12
+            test:adjust-body-after-400@10
+            test:anthropic-streaming-retry@10
+            test:anthropic-thinking-disabled@5
+            test:dynamic@10
+            test:local-usage@8
+            test:provider-fallback-latency@6
+            test:decide-engine@5
+            test:credentials@4
+            test:memory-route-scope@30
+            test:stt:unit@4
+            test:avatar:unit@3
+            test:mcp@3
+            test:model-manifests@3
+            test:music:unit@3
+            test:provider-fallback@3
+            test:realtime:unit@3
+            test:tool-resolution@3
+            test:autoresearch@2
+            test:loop-engine@2
+            test:stream-middleware@5
+            test:guardrails-regex-safety@5
+            test:vendor-recovery@5
+            test:browser-bundle@5
+            test:tools-manager-truncation@3
+            test:tooling-scripts@100
+            test:tooling-shell-safety@25
+          "
+          # Normalise every entry to name@weight (missing or non-numeric
+          # weights become 30), then sort by weight descending. Greedy
+          # longest-processing-time needs its input longest-first, and sorting
+          # here means that is a property of the code rather than of how
+          # carefully someone maintained the list above. The list is written in
+          # descending order for readability, but nothing depends on it being
+          # so — add an entry anywhere.
+          NORMALISED=""
+          for entry in $SUITES; do
+            case "$entry" in
+              *@*) w="${entry##*@}"
+                   case "$w" in ''|*[!0-9]*) entry="${entry%@*}@30" ;; esac ;;
+              *)   entry="$entry@30" ;;
+            esac
+            NORMALISED="$NORMALISED $entry"
+          done
+          SORTED=$(printf '%s\n' $NORMALISED | sort -t@ -k2,2rn)
+
+          # Give each suite to whichever shard is currently least loaded. Every
+          # runner sorts the same input the same way, so all four independently
+          # compute an identical assignment without coordinating. The list
+          # stays single-sourced; only which entries this runner executes
+          # changes.
+          FAILED=""
+          L1=0; L2=0; L3=0; L4=0
+          for entry in $SORTED; do
+            s="${entry%@*}"
+            # 10# forces base 10. Bash reads a leading zero as octal, so a
+            # weight of 08 aborts the step outright ("value too great for
+            # base") and 010 silently becomes 8 — a wrong weight is a worse
+            # failure than a loud one, because it just quietly unbalances the
+            # shards. The numeric guard above accepts both forms as digits.
+            w="10#${entry##*@}"
+
+            # if/fi rather than `[ ] && { }`: GitHub runs these steps with
+            # `bash -e`, where a failing test in an AND-OR list can abort the
+            # step. A comparison that is simply false is not an error here.
+            target=1; best=$L1
+            if [ "$L2" -lt "$best" ]; then target=2; best=$L2; fi
+            if [ "$L3" -lt "$best" ]; then target=3; best=$L3; fi
+            if [ "$L4" -lt "$best" ]; then target=4; best=$L4; fi
+            case "$target" in
+              1) L1=$((L1 + w)) ;;
+              2) L2=$((L2 + w)) ;;
+              3) L3=$((L3 + w)) ;;
+              4) L4=$((L4 + w)) ;;
+            esac
+            if [ "$target" -ne ${{ matrix.shard }} ]; then
+              continue
+            fi
+            echo "::group::$s"
+            if pnpm run "$s"; then
+              echo "PASS $s"
+            else
+              echo "FAIL $s"
+              FAILED="$FAILED $s"
+            fi
+            echo "::endgroup::"
+          done
+
+          echo ""
+          echo "──────────────────────────────────────────────"
+          if [ -n "$FAILED" ]; then
+            # Every suite runs before failing, so one broken suite does not hide
+            # the state of the other suites.
+            echo "Failing suites:$FAILED"
+            exit 1
+          fi
+          echo "All extended suites passed."
+
+  proxy-performance:
+    name: Proxy Performance Gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup PNPM
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22.23.4"
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run proxy performance gates
+        run: pnpm run proxy:performance
+
   quality-gate:
     runs-on: ubuntu-latest
     name: 🛡️ Code Quality & Security Gate
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup PNPM
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9
-
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "20"
+          node-version: "22.23.4"
           cache: "pnpm"
 
-      - name: Install ffmpeg
-        uses: AnimMouse/setup-ffmpeg@v1
-
-      - name: Verify ffmpeg installation
-        run: |
-          echo "🎬 Verifying ffmpeg installation..."
-          ffmpeg -version || {
-            echo "❌ ffmpeg installation failed!"
-            echo "Please check the setup-ffmpeg action configuration."
-            exit 1
-          }
-          echo "✅ ffmpeg installed successfully"
-
       - name: Install dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      # The gate's secret scan is gitleaks, and under CI=true
+      # scripts/security-check.ts FAILS when the binary is absent instead of
+      # degrading to its four-regex fallback — which is what every CI run had
+      # silently done, since the runners never had gitleaks. Pinned release,
+      # checksum verified against the published checksums file before anything
+      # from the archive is executed. Bump both values together.
+      - name: Install gitleaks (pinned, sha256-verified)
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+          GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+        run: |
+          set -euo pipefail
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL --retry 3 --proto '=https' --tlsv1.2 \
+            -o "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"
+          echo "${GITLEAKS_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum --check --strict
+          mkdir -p "${RUNNER_TEMP}/gitleaks"
+          tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}/gitleaks" gitleaks
+          echo "${RUNNER_TEMP}/gitleaks" >> "$GITHUB_PATH"
+          "${RUNNER_TEMP}/gitleaks/gitleaks" version
 
       - name: 🔄 SvelteKit Sync
         run: |
@@ -232,7 +1455,7 @@ jobs:
           # Get the commit message for validation and pass it to the validator
           COMMIT_MSG=$(git log -1 --pretty=format:"%s")
           echo "Validating: $COMMIT_MSG"
-          node scripts/commit-validation.cjs "$COMMIT_MSG"
+          pnpm exec tsx scripts/commit-validation.ts "$COMMIT_MSG"
 
       - name: 🌍 Environment Validation
         run: |
@@ -244,23 +1467,118 @@ jobs:
           echo "🔒 Running security checks..."
           pnpm run validate:security
 
+      # `pnpm run validate:security` above only audits the repo root
+      # (scripts/security-check.ts runs `pnpm audit` from process.cwd()).
+      # landing/ and docs-site/ each maintain their own independent
+      # pnpm-lock.yaml and were getting zero audit coverage — exactly how two
+      # critical advisories sat there unnoticed. This step gives them one.
+      #
+      # NOW BLOCKING, at critical severity only. The groundwork this step's
+      # earlier note was waiting on has landed: #1415 raised the stale pnpm
+      # overrides and both lockfiles cleared their criticals. Measured before
+      # promoting, rather than assumed:
+      #
+      #   landing     critical=0  high=6   moderate=2
+      #   docs-site   critical=0  high=17  moderate=15  low=3
+      #
+      #   pnpm audit --audit-level=critical   -> exit 0 in both trees
+      #   pnpm audit (no flag)                -> exit 1 in both trees
+      #
+      # So `--audit-level=critical` is what makes a hard gate achievable today:
+      # it fails on a genuinely new critical and stays quiet for the existing
+      # high/moderate long tail, which is exactly the trade the earlier note
+      # described. Without the flag this step would red-line every PR.
+      #
+      # The long tail is deliberately still unaudited-by-gate. Raising the bar
+      # to `high` needs the high findings triaged or overridden first; doing it
+      # now would just reinstate continue-on-error under a new name.
+      #
+      # That number was recorded as 23, and re-measuring confirms it. Measured
+      # 2026-08-29, for the two trees THIS step actually audits, using the same
+      # scope the step itself uses — `pnpm audit` with NO --prod, which is what
+      # audit_criticals() below runs:
+      #
+      #   landing/     6 high   (plus 2 moderate)
+      #   docs-site/  17 high   (plus 15 moderate, 3 low)
+      #
+      # So 23 high, unchanged. The root tree carries 8 more, but those are gated
+      # separately by scripts/security-check.ts's per-advisory check, not by this
+      # step; do not add them to this total.
+      #
+      # Scope is the whole trap here, and an earlier draft of this note fell into
+      # it: measured WITH --prod, landing/ reports zero and docs-site/ is
+      # unchanged, which reads as "landing/ is clean outright" and shrinks the
+      # backlog to 17. Both halves of that are an artifact of the flag. landing/'s
+      # six are devDependency-only (brace-expansion, postcss, nanoid, via the
+      # vite/sveltekit toolchain) — real for this step, which audits the full
+      # tree, and invisible to any command that adds --prod.
+      #
+      # Re-measure before acting on any of these figures. They are a snapshot of
+      # a dependency tree, which moves on its own. Match the step's scope — no
+      # --prod — or the numbers will not describe the gate:
+      #   (cd landing   && pnpm audit)
+      #   (cd docs-site && pnpm audit)
+      - name: 🔒 Subpackage Dependency Audit (landing/, docs-site/)
+        run: |
+          set +e
+          # Counts criticals from --json rather than trusting the exit code.
+          #
+          # `pnpm audit` exits non-zero both when it FINDS advisories and when it
+          # fails to run at all, and those are different facts. A gate that
+          # cannot tell them apart reports "a critical advisory is present"
+          # whenever the registry is unreachable, the audit endpoint changes, or
+          # the tool breaks — sending someone to hunt a vulnerability that does
+          # not exist while the real problem is infrastructure.
+          #
+          # So: parse the report. No parseable report means the scan did not
+          # run, which still fails the gate (a scan that did not look is not a
+          # clean result) but says so accurately.
+          audit_criticals() {
+            local dir="$1" out
+            out=$(cd "$dir" && pnpm audit --json 2>/dev/null)
+            printf '%s' "$out" | node -e '
+              let s = "";
+              process.stdin.on("data", (d) => (s += d)).on("end", () => {
+                try {
+                  const v = JSON.parse(s).metadata.vulnerabilities;
+                  if (typeof v.critical !== "number") process.exit(3);
+                  console.log(v.critical);
+                } catch { process.exit(3); }
+              });'
+          }
+
+          failed=0
+          for tree in landing docs-site; do
+            echo "🔍 Auditing $tree/ dependencies..."
+            criticals=$(audit_criticals "$tree")
+            if [ $? -ne 0 ]; then
+              echo "❌ $tree/: pnpm audit produced no usable report — the scan did NOT run."
+              echo "   This is an infrastructure failure, not a vulnerability. Check the"
+              echo "   registry and the pnpm audit client before reading anything into it."
+              failed=1
+            elif [ "$criticals" -ne 0 ]; then
+              echo "❌ $tree/: $criticals CRITICAL advisory/advisories present."
+              echo "   Fix it, or raise the pnpm override, before merging."
+              failed=1
+            else
+              echo "✅ $tree/: no critical advisories."
+            fi
+            echo ""
+          done
+          [ "$failed" -ne 0 ] && exit 1
+          echo "✅ No critical subpackage advisories."
+
       - name: 📊 ESLint Quality Report
         run: |
           echo "📊 Generating ESLint quality report..."
-          npx eslint src/ --format=json --output-file=eslint-report.json || true
-          npx eslint src/ --format=stylish
+          pnpm exec eslint src/ --format=json --output-file=eslint-report.json || true
+          pnpm exec eslint src/ --format=stylish
         continue-on-error: true
 
       - name: 📈 TypeScript Compiler Check
         run: |
           echo "📈 Running TypeScript compiler strict checks on source files..."
-          npx tsc --noEmit --strict --project tsconfig.json
-
-      - name: 🎯 Code Coverage Analysis
-        run: |
-          echo "🎯 Running tests with coverage..."
-          pnpm run test:run --coverage || echo "Tests completed with warnings"
-        continue-on-error: true
+          pnpm exec tsc --noEmit --strict --project tsconfig.json
 
       - name: 📋 Quality Summary
         run: |
@@ -280,30 +1598,44 @@ jobs:
 
   semantic-release-validation:
     runs-on: ubuntu-latest
-    needs: [test, build-check]
+    needs: [test, build-check, proxy-performance]
+    # Push to release only. On pull_request semantic-release returns early
+    # ("triggered by a pull request and therefore a new version won't be
+    # published"), so the job proved nothing there — while holding a
+    # `contents: write` token in .git/config during a `pnpm install` of the
+    # pull request's dependency tree. The trigger that exercises verifyAuth is
+    # the one a PR does not use, so nothing is lost by not running it on PRs.
+    if: github.event_name == 'push'
+    # The one documented exception to the workflow-level `contents: read`.
+    #
+    # semantic-release calls verifyAuth() unconditionally — index.js:88, NOT
+    # guarded by dryRun — which runs `git push --dry-run` and therefore needs
+    # push permission. The token is handed to that one step through env (the
+    # GITHUB_TOKEN semantic-release reads), not persisted into .git/config for
+    # the install that precedes it.
+    permissions:
+      contents: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup PNPM
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9
-
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "20"
+          node-version: "22.23.4"
           cache: "pnpm"
 
       - name: Install dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
 
       - name: Validate semantic-release configuration
         run: |
-          npx semantic-release --dry-run \
+          pnpm exec semantic-release --dry-run \
             --plugins "@semantic-release/commit-analyzer" \
             --plugins "@semantic-release/release-notes-generator"
         env:

@@ -1,4 +1,4 @@
-[**NeuroLink API Reference v8.32.0**](../README.md)
+[**NeuroLink API Reference**](../README.md)
 
 ---
 
@@ -8,19 +8,17 @@
 
 > **ToolDefinition**\<`TArgs`, `TResult`\> = `object`
 
-Defined in: [types/tools.ts:331](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L331)
-
 Tool definition type
 
 ## Type Parameters
 
 ### TArgs
 
-`TArgs` = `ToolArgs`
+`TArgs` = [`ToolArgs`](ToolArgs.md)
 
 ### TResult
 
-`TResult` = `JsonValue`
+`TResult` = [`JsonValue`](JsonValue.md)
 
 ## Properties
 
@@ -28,31 +26,23 @@ Tool definition type
 
 > **description**: `string`
 
-Defined in: [types/tools.ts:332](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L332)
-
 ---
 
 ### parameters?
 
-> `optional` **parameters**: `ToolParameterSchema`
-
-Defined in: [types/tools.ts:333](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L333)
+> `optional` **parameters?**: [`ToolParameterSchema`](ToolParameterSchema.md)
 
 ---
 
 ### metadata?
 
-> `optional` **metadata**: `ToolMetadata`
-
-Defined in: [types/tools.ts:334](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L334)
+> `optional` **metadata?**: [`ToolMetadata`](ToolMetadata.md)
 
 ---
 
-### execute()
+### execute
 
 > **execute**: (`params`, `context?`) => `Promise`\<[`ToolResult`](ToolResult.md)\<`TResult`\>\> \| [`ToolResult`](ToolResult.md)\<`TResult`\>
-
-Defined in: [types/tools.ts:335](https://github.com/juspay/neurolink/blob/1be79595b7d7307795c98da4267c1728cb50033d/src/lib/types/tools.ts#L335)
 
 #### Parameters
 

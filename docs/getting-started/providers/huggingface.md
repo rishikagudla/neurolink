@@ -6,20 +6,21 @@ keywords: hugging face, inference api, open source, AI models, provider setup
 
 # Hugging Face Provider Guide
 
-**Access 100,000+ open-source AI models through Hugging Face's free inference API**
+**Access open-source AI models through Hugging Face Inference Providers**
 
 ---
 
 ## Overview
 
-Hugging Face is the world's largest platform for open-source AI models, hosting over 100,000 models spanning text generation, code generation, translation, summarization, and more. NeuroLink's Hugging Face provider gives you free access to this vast ecosystem through a unified interface.
+Hugging Face is the world's largest platform for open-source AI models, hosting over 100,000 models spanning text generation, code generation, translation, summarization, and more. NeuroLink's Hugging Face provider reaches the chat models the Inference Providers router serves, through a unified interface.
 
-!!! tip "Free Tier Advantage"
-Hugging Face's inference API is completely free with no rate limits for most models. Perfect for development, testing, and low-to-medium production workloads without any cost concerns.
+:::tip[Free credits]
+Free accounts get a small monthly credit for Inference Providers, with no card required ([pricing](https://huggingface.co/docs/inference-providers/pricing)). Once it is spent, requests return `402` until you buy pre-paid credits or subscribe to PRO.
+:::
 
 ### Key Benefits
 
-- **🆓 Free Access**: No API costs - completely free to use
+- **🆓 Free Credits**: A small monthly allowance to start with
 - **🌍 100,000+ Models**: Largest collection of open-source models
 - **🔓 Open Source**: All models are open and transparent
 - **⚡ Quick Start**: No credit card required
@@ -56,8 +57,9 @@ Add to your `.env` file:
 HUGGINGFACE_API_KEY=hf_your_token_here
 ```
 
-!!! warning "Security Best Practice"
+:::warning[Security Best Practice]
 Never commit your API token to version control. Always use environment variables and add `.env` to your `.gitignore` file.
+:::
 
 ### 3. Test the Setup
 
@@ -66,7 +68,7 @@ Never commit your API token to version control. Always use environment variables
 npx @juspay/neurolink generate "Hello from Hugging Face!" --provider huggingface
 
 # CLI - Use specific model
-npx @juspay/neurolink generate "Write a poem" --provider huggingface --model "mistralai/Mistral-7B-Instruct-v0.2"
+npx @juspay/neurolink generate "Write a poem" --provider huggingface --model "Qwen/Qwen2.5-72B-Instruct"
 
 # SDK
 node -e "
@@ -90,28 +92,36 @@ const { NeuroLink } = require('@juspay/neurolink');
 
 #### 1. **General Text Generation**
 
-| Model                                | Size | Description                        | Best For                      |
-| ------------------------------------ | ---- | ---------------------------------- | ----------------------------- |
-| `mistralai/Mistral-7B-Instruct-v0.2` | 7B   | High-quality instruction following | General tasks, fast responses |
-| `meta-llama/Llama-2-7b-chat-hf`      | 7B   | Meta's open chat model             | Conversational AI             |
-| `tiiuae/falcon-7b-instruct`          | 7B   | Efficient, multilingual            | Multiple languages            |
-| `google/flan-t5-xxl`                 | 11B  | Google's instruction-tuned         | Q&A, summarization            |
+| Model                                       | Size    | Description                          | Best For                        |
+| ------------------------------------------- | ------- | ------------------------------------ | ------------------------------- |
+| `Qwen/Qwen2.5-72B-Instruct`                 | 72B     | Qwen 2.5 instruction-tuned (default) | General tasks, high quality     |
+| `Qwen/Qwen3-235B-A22B`                      | 235B    | Latest Qwen 3 MoE flagship           | Complex reasoning, multilingual |
+| `Qwen/Qwen3-32B`                            | 32B     | Qwen 3 dense model                   | Balanced quality and speed      |
+| `Qwen/Qwen3-8B`                             | 8B      | Qwen 3 efficient model               | Fast responses, low cost        |
+| `meta-llama/Llama-3.3-70B-Instruct`         | 70B     | Meta Llama 3.3 instruction-tuned     | Conversational AI, reasoning    |
+| `meta-llama/Llama-4-Scout-17B-16E-Instruct` | 17B MoE | Meta Llama 4 Scout                   | Efficient multimodal tasks      |
+| `deepseek-ai/DeepSeek-R1`                   | 671B    | DeepSeek reasoning model             | Math, logic, step-by-step       |
+| `deepseek-ai/DeepSeek-V3-0324`              | 671B    | DeepSeek V3 general-purpose          | General tasks, coding           |
+| `google/gemma-3-27b-it`                     | 27B     | Google Gemma 3 instruction-tuned     | General tasks, research         |
+| `google/gemma-3-12b-it`                     | 12B     | Google Gemma 3 mid-size              | Balanced performance            |
+| `google/gemma-3-4b-it`                      | 4B      | Google Gemma 3 lightweight           | Edge deployment, fast           |
+| `microsoft/phi-4`                           | 14B     | Microsoft Phi-4                      | Reasoning, STEM tasks           |
 
 #### 2. **Code Generation**
 
-| Model                           | Description                | Best For             |
-| ------------------------------- | -------------------------- | -------------------- |
-| `bigcode/starcoder`             | Code generation specialist | Writing code         |
-| `Salesforce/codegen-16B-mono`   | Python-focused             | Python development   |
-| `WizardLM/WizardCoder-15B-V1.0` | Code instruction following | Complex coding tasks |
+| Model                               | Description                       | Best For               |
+| ----------------------------------- | --------------------------------- | ---------------------- |
+| `Qwen/Qwen2.5-Coder-32B-Instruct`   | Qwen 2.5 code specialist          | Complex coding tasks   |
+| `deepseek-ai/DeepSeek-V3-0324`      | DeepSeek V3 with strong code perf | Full-stack development |
+| `meta-llama/Llama-3.3-70B-Instruct` | Llama 3.3 with code capabilities  | Code review, refactor  |
 
 #### 3. **Summarization**
 
-| Model                           | Description           | Best For             |
-| ------------------------------- | --------------------- | -------------------- |
-| `facebook/bart-large-cnn`       | News summarization    | Articles, news       |
-| `sshleifer/distilbart-cnn-12-6` | Faster BART variant   | Quick summaries      |
-| `google/pegasus-xsum`           | Extreme summarization | Very brief summaries |
+| Model                     | Description               | Best For             |
+| ------------------------- | ------------------------- | -------------------- |
+| `facebook/bart-large-cnn` | News summarization        | Articles, news       |
+| `Qwen/Qwen3-8B`           | Qwen 3 with summarization | General summaries    |
+| `google/pegasus-xsum`     | Extreme summarization     | Very brief summaries |
 
 #### 4. **Translation**
 
@@ -122,10 +132,10 @@ const { NeuroLink } = require('@juspay/neurolink');
 
 #### 5. **Question Answering**
 
-| Model                                   | Description   | Best For      |
-| --------------------------------------- | ------------- | ------------- |
-| `deepset/roberta-base-squad2`           | SQuAD-trained | Factual Q&A   |
-| `distilbert-base-cased-distilled-squad` | Faster QA     | Quick answers |
+| Model                         | Description         | Best For       |
+| ----------------------------- | ------------------- | -------------- |
+| `deepset/roberta-base-squad2` | SQuAD-trained       | Factual Q&A    |
+| `Qwen/Qwen2.5-72B-Instruct`   | General QA via chat | Open-ended Q&A |
 
 ### Model Selection by Use Case
 
@@ -134,14 +144,14 @@ const { NeuroLink } = require('@juspay/neurolink');
 const general = await ai.generate({
   input: { text: "Explain quantum computing" },
   provider: "huggingface",
-  model: "mistralai/Mistral-7B-Instruct-v0.2",
+  model: "Qwen/Qwen2.5-72B-Instruct",
 });
 
 // Code generation
 const code = await ai.generate({
   input: { text: "Write a Python function to sort a list" },
   provider: "huggingface",
-  model: "bigcode/starcoder",
+  model: "Qwen/Qwen2.5-Coder-32B-Instruct",
 });
 
 // Summarization
@@ -165,17 +175,15 @@ const translation = await ai.generate({
 
 ### What's Included
 
-- ✅ **Unlimited requests** to public models
-- ✅ **No cost** - completely free
-- ✅ **No credit card** required
-- ✅ **Rate limits**: 1,000 requests/day per model (generous)
-- ✅ **Access to 100,000+** public models
+- ✅ **Monthly credits** for Inference Providers on a free account
+- ✅ **No credit card** required for the free credits
+- ⚠️ **`402` once the credits are spent** — buy pre-paid credits or subscribe to PRO to continue
 
-### Rate Limits
+See [Hugging Face's pricing page](https://huggingface.co/docs/inference-providers/pricing) for the current allowance.
 
-- **Per Model**: ~1,000 requests/day
-- **Strategy**: Use different models to scale
-- **Best Practice**: Combine with other providers for production
+### Spending the credits
+
+- **Best Practice**: Combine with other providers so a spent allowance falls back instead of failing
 
 ```typescript
 // Rate limit friendly approach
@@ -225,18 +233,18 @@ console.log(result.content);
 ### With Specific Model
 
 ```typescript
-// Use Mistral for instruction following
-const mistral = await ai.generate({
+// Use Qwen 2.5 for instruction following
+const qwen = await ai.generate({
   input: { text: "Explain Docker in simple terms" },
   provider: "huggingface",
-  model: "mistralai/Mistral-7B-Instruct-v0.2",
+  model: "Qwen/Qwen2.5-72B-Instruct",
 });
 
-// Use StarCoder for code generation
-const starcoder = await ai.generate({
+// Use Qwen Coder for code generation
+const coder = await ai.generate({
   input: { text: "Create a REST API endpoint in Express.js" },
   provider: "huggingface",
-  model: "bigcode/starcoder",
+  model: "Qwen/Qwen2.5-Coder-32B-Instruct",
 });
 ```
 
@@ -245,9 +253,9 @@ const starcoder = await ai.generate({
 ```typescript
 // Try multiple models for best results
 const models = [
-  "mistralai/Mistral-7B-Instruct-v0.2",
-  "meta-llama/Llama-2-7b-chat-hf",
-  "tiiuae/falcon-7b-instruct",
+  "Qwen/Qwen2.5-72B-Instruct",
+  "meta-llama/Llama-3.3-70B-Instruct",
+  "google/gemma-3-27b-it",
 ];
 
 for (const model of models) {
@@ -268,11 +276,13 @@ for (const model of models) {
 
 ```typescript
 // Stream responses for better UX
-for await (const chunk of ai.stream({
+const result = await ai.stream({
   input: { text: "Write a long story about space exploration" },
   provider: "huggingface",
-  model: "mistralai/Mistral-7B-Instruct-v0.2",
-})) {
+  model: "Qwen/Qwen2.5-72B-Instruct",
+});
+
+for await (const chunk of result.stream) {
   process.stdout.write(chunk.content);
 }
 ```
@@ -310,7 +320,7 @@ try {
 npx @juspay/neurolink generate "Hello world" --provider huggingface
 
 # Use specific model
-npx @juspay/neurolink gen "Write code" --provider huggingface --model "bigcode/starcoder"
+npx @juspay/neurolink gen "Write code" --provider huggingface --model "Qwen/Qwen2.5-Coder-32B-Instruct"
 
 # Stream response
 npx @juspay/neurolink stream "Tell a story" --provider huggingface
@@ -325,14 +335,14 @@ npx @juspay/neurolink models --provider huggingface
 # With temperature control
 npx @juspay/neurolink gen "Creative story" \
   --provider huggingface \
-  --model "mistralai/Mistral-7B-Instruct-v0.2" \
+  --model "Qwen/Qwen2.5-72B-Instruct" \
   --temperature 0.9 \
   --max-tokens 1000
 
 # Save output to file
 npx @juspay/neurolink gen "Technical documentation" \
   --provider huggingface \
-  --model "tiiuae/falcon-7b-instruct" \
+  --model "google/gemma-3-27b-it" \
   > output.txt
 
 # Interactive mode
@@ -343,9 +353,9 @@ npx @juspay/neurolink loop --provider huggingface
 
 ```bash
 # Compare different models
-for model in "mistralai/Mistral-7B-Instruct-v0.2" \
-             "meta-llama/Llama-2-7b-chat-hf" \
-             "tiiuae/falcon-7b-instruct"; do
+for model in "Qwen/Qwen2.5-72B-Instruct" \
+             "meta-llama/Llama-3.3-70B-Instruct" \
+             "google/gemma-3-27b-it"; do
   echo "Testing $model:"
   npx @juspay/neurolink gen "What is AI?" \
     --provider huggingface \
@@ -366,7 +376,7 @@ HUGGINGFACE_API_KEY=hf_your_token_here
 
 # Optional
 HUGGINGFACE_BASE_URL=https://api-inference.huggingface.co  # Custom endpoint
-HUGGINGFACE_DEFAULT_MODEL=mistralai/Mistral-7B-Instruct-v0.2  # Default model
+HUGGINGFACE_MODEL=Qwen/Qwen2.5-72B-Instruct  # Default model
 HUGGINGFACE_TIMEOUT=60000  # Request timeout (ms)
 ```
 
@@ -379,7 +389,7 @@ const ai = new NeuroLink({
       name: "huggingface",
       config: {
         apiKey: process.env.HUGGINGFACE_API_KEY,
-        defaultModel: "mistralai/Mistral-7B-Instruct-v0.2",
+        defaultModel: "Qwen/Qwen2.5-72B-Instruct",
         timeout: 60000,
       },
     },
@@ -404,21 +414,21 @@ const ai = new NeuroLink({
 # Or use a popular model that's always loaded
 npx @juspay/neurolink gen "test" \
   --provider huggingface \
-  --model "mistralai/Mistral-7B-Instruct-v0.2"
+  --model "Qwen/Qwen2.5-72B-Instruct"
 ```
 
 #### 2. "Rate limit exceeded"
 
-**Problem**: Hit the ~1,000 requests/day limit for a model.
+**Problem**: Too many requests in a short window. A `402` instead means the monthly credits are spent — see [Free credits](#spending-the-credits).
 
 **Solution**:
 
 ```typescript
 // Switch to a different model
 const alternativeModels = [
-  "mistralai/Mistral-7B-Instruct-v0.2",
-  "tiiuae/falcon-7b-instruct",
-  "meta-llama/Llama-2-7b-chat-hf",
+  "Qwen/Qwen2.5-72B-Instruct",
+  "google/gemma-3-27b-it",
+  "meta-llama/Llama-3.3-70B-Instruct",
 ];
 
 // Or use multi-provider fallback
@@ -452,7 +462,7 @@ const ai = new NeuroLink({
 # Use exact model ID: username/model-name
 npx @juspay/neurolink gen "test" \
   --provider huggingface \
-  --model "mistralai/Mistral-7B-Instruct-v0.2"  # ✅ Correct format
+  --model "Qwen/Qwen2.5-72B-Instruct"  # ✅ Correct format
 ```
 
 #### 5. Slow Response Times
@@ -484,13 +494,13 @@ const result = await ai.generate({
 // ✅ Good: Use appropriate model for task
 const code = await ai.generate({
   input: { text: "Write a function" },
-  model: "bigcode/starcoder", // Code specialist
+  model: "Qwen/Qwen2.5-Coder-32B-Instruct", // Code specialist
 });
 
-// ❌ Avoid: Using general model for specialized tasks
+// ❌ Avoid: Using a task-specific model for unrelated tasks
 const badCode = await ai.generate({
   input: { text: "Write a function" },
-  model: "google/flan-t5-xxl", // General model
+  model: "facebook/bart-large-cnn", // Summarization model, not for code
 });
 ```
 
@@ -499,9 +509,9 @@ const badCode = await ai.generate({
 ```typescript
 // ✅ Good: Rotate between models
 const models = [
-  "mistralai/Mistral-7B-Instruct-v0.2",
-  "tiiuae/falcon-7b-instruct",
-  "meta-llama/Llama-2-7b-chat-hf",
+  "Qwen/Qwen2.5-72B-Instruct",
+  "google/gemma-3-27b-it",
+  "meta-llama/Llama-3.3-70B-Instruct",
 ];
 
 let requestCount = 0; // Track the number of requests
@@ -547,7 +557,7 @@ const ai = new NeuroLink({
       name: "huggingface",
       priority: 1,
       config: {
-        defaultModel: "mistralai/Mistral-7B-Instruct-v0.2",
+        defaultModel: "Qwen/Qwen2.5-72B-Instruct",
       },
     },
     {
@@ -574,7 +584,7 @@ setInterval(async () => {
   await ai.generate({
     input: { text: "ping" },
     provider: "huggingface",
-    model: "mistralai/Mistral-7B-Instruct-v0.2",
+    model: "Qwen/Qwen2.5-72B-Instruct",
     maxTokens: 1,
   });
 }, 300000); // Every 5 minutes
@@ -607,9 +617,9 @@ async function cachedGenerate(prompt) {
 // Use different models in parallel to avoid rate limits
 const prompts = ["prompt1", "prompt2", "prompt3"];
 const models = [
-  "mistralai/Mistral-7B-Instruct-v0.2",
-  "tiiuae/falcon-7b-instruct",
-  "meta-llama/Llama-2-7b-chat-hf",
+  "Qwen/Qwen2.5-72B-Instruct",
+  "google/gemma-3-27b-it",
+  "meta-llama/Llama-3.3-70B-Instruct",
 ];
 
 const results = await Promise.all(

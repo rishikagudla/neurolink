@@ -619,7 +619,12 @@ server.registerMiddleware(
     maxRequests: 1000,
     windowMs: 60 * 60 * 1000, // 1 hour
     keyGenerator: (ctx) =>
-      ctx.user?.id || ctx.headers["x-forwarded-for"] || "unknown",
+      // A shared identity (one API key for many callers) is not a person. Read
+      // x-forwarded-for only behind a trusted proxy that sets or overwrites
+      // it; otherwise the client chooses its own bucket by sending any value.
+      ctx.user && !ctx.user.shared
+        ? ctx.user.id
+        : ctx.headers["x-forwarded-for"] || "unknown",
   }),
 );
 ```
@@ -636,11 +641,11 @@ server.registerMiddleware(
 ### Custom Rate Limit Store (Redis)
 
 ```typescript
-import Redis from "ioredis";
+import { createClient, type RedisClientType } from "redis";
 import type { RateLimitStore, RateLimitEntry } from "@juspay/neurolink";
 
 class RedisRateLimitStore implements RateLimitStore {
-  constructor(private redis: Redis) {}
+  constructor(private redis: RedisClientType) {}
 
   async get(key: string): Promise<RateLimitEntry | undefined> {
     const data = await this.redis.get(`ratelimit:${key}`);
@@ -649,7 +654,9 @@ class RedisRateLimitStore implements RateLimitStore {
 
   async set(key: string, entry: RateLimitEntry): Promise<void> {
     const ttl = Math.ceil((entry.resetAt - Date.now()) / 1000);
-    await this.redis.setex(`ratelimit:${key}`, ttl, JSON.stringify(entry));
+    await this.redis.set(`ratelimit:${key}`, JSON.stringify(entry), {
+      EX: ttl,
+    });
   }
 
   async increment(key: string, windowMs: number): Promise<RateLimitEntry> {
@@ -658,7 +665,7 @@ class RedisRateLimitStore implements RateLimitStore {
     const count = await this.redis.incr(`ratelimit:${key}`);
 
     if (count === 1) {
-      await this.redis.pexpire(`ratelimit:${key}`, windowMs);
+      await this.redis.pExpire(`ratelimit:${key}`, windowMs);
     }
 
     return { count, resetAt };
@@ -669,7 +676,9 @@ class RedisRateLimitStore implements RateLimitStore {
   }
 }
 
-const redisStore = new RedisRateLimitStore(new Redis());
+const redisClient = createClient();
+await redisClient.connect();
+const redisStore = new RedisRateLimitStore(redisClient);
 server.registerMiddleware(
   createRateLimitMiddleware({
     maxRequests: 100,
@@ -708,7 +717,7 @@ type AuthConfig = {
   errorMessage?: string;
   /** Token extractor for custom auth schemes */
   extractToken?: (ctx: ServerContext) => string | null;
-  /** Skip auth for dev playground requests (default: true) */
+  /** Honour the dev playground header when NODE_ENV is "development" (default: true) */
   skipDevPlayground?: boolean;
 };
 
@@ -716,9 +725,25 @@ type AuthResult = {
   id: string;
   email?: string;
   roles?: string[];
+  /** true when this identity stands for every holder of one credential (a shared API key), not one person. */
+  shared?: boolean;
   metadata?: Record<string, unknown>;
 };
 ```
+
+The authenticated user is set on `ctx.user`. On the built-in adapters (Hono,
+Express, Fastify and Koa) it reaches later middleware and the route handler on
+every request only when the server is created with `carryMiddlewareState: true`.
+By default Express, Fastify and Koa, and Hono when the client sent no
+`X-Request-ID` of its own, hand each middleware step and the handler a fresh
+context, so a role guard registered after authentication refuses everyone there;
+only Hono with a client `X-Request-ID` shares the context. The option does not
+apply to a context you build yourself: a custom adapter, or a route handler you
+call directly, can supply a context that already has `ctx.user` set. See
+[Carrying middleware state](./security.md#carrying-middleware-state-to-guards-and-handlers-carrymiddlewarestate)
+in the security guide. Whether the agent routes treat `ctx.user` as the caller is
+a separate choice: see `perUserAuth` in the
+[security guide](./security.md#who-the-agent-routes-treat-as-the-user-peruserauth).
 
 ### Usage
 
@@ -756,7 +781,10 @@ server.registerMiddleware(
   }),
 );
 
-// Role-based access control (after authentication)
+// Role-based access control (after authentication). It reads ctx.user, so the
+// server needs carryMiddlewareState: true (see the note above), or the guard
+// refuses everyone on Express, Fastify and Koa, and on Hono without a client
+// X-Request-ID.
 server.registerMiddleware(
   createRoleMiddleware({
     requiredRoles: ["admin"],
@@ -775,7 +803,9 @@ server.registerMiddleware(
 
 ### Dev Playground Support
 
-In non-production environments, requests with `X-NeuroLink-Dev-Playground: true` header bypass authentication and receive a default developer user context.
+Requests with an `X-NeuroLink-Dev-Playground: true` (or `X-NeuroLink-Playground: true`) header bypass authentication and receive a default developer user context (`id: "playground"`, `roles: ["developer"]`), but only when **`NODE_ENV` is exactly `development`**. The variable is read on every request.
+
+With `NODE_ENV` unset, `production`, `test`, `staging` or any other value, the header is ignored and the request must carry a valid credential. The bypass is therefore off by default in a deployment that never sets `NODE_ENV`. Pass `skipDevPlayground: false` to refuse the header even in development.
 
 ### When to Use
 
@@ -1067,8 +1097,8 @@ for (const middleware of middlewares) {
 
 ## Next Steps
 
-- **[Configuration Reference](/reference/server-configuration)** - Full server configuration options
-- **[Security Best Practices](/guides/server-adapters/security)** - Authentication and authorization patterns
-- **[Deployment Guide](/guides/server-adapters/deployment)** - Production deployment strategies
-- **[Express Adapter](/guides/server-adapters/express)** - Express-specific middleware integration
-- **[Fastify Adapter](/guides/server-adapters/fastify)** - Fastify-specific hooks and plugins
+- **[Configuration Reference](../../reference/server-configuration.md)** - Full server configuration options
+- **[Security Best Practices](./security.md)** - Authentication and authorization patterns
+- **[Deployment Guide](./deployment.md)** - Production deployment strategies
+- **[Express Adapter](./express.md)** - Express-specific middleware integration
+- **[Fastify Adapter](./fastify.md)** - Fastify-specific hooks and plugins

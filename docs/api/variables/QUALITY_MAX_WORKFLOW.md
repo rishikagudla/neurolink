@@ -1,0 +1,34 @@
+[**NeuroLink API Reference**](../README.md)
+
+---
+
+[NeuroLink API Reference](../README.md) / QUALITY_MAX_WORKFLOW
+
+# Variable: QUALITY_MAX_WORKFLOW
+
+> `const` **QUALITY_MAX_WORKFLOW**: [`WorkflowConfig`](../type-aliases/WorkflowConfig.md)
+
+Quality-Max Adaptive Workflow
+
+Uses 3-tier layer-based execution:
+
+1. Validation tier (parallel): 2 fast models check complexity
+2. Premium tier (parallel): 2 high-quality models if validation uncertain
+3. Expert tier (sequential): Best model for final polish
+
+Each tier evaluates if next tier is needed based on confidence
+
+## Example
+
+```typescript
+import { runWorkflow } from "../core/workflowRunner.js";
+import { QUALITY_MAX_WORKFLOW } from "./adaptiveWorkflow.js";
+
+const result = await runWorkflow(QUALITY_MAX_WORKFLOW, {
+  prompt: "Design a scalable microservices architecture",
+  verbose: true,
+});
+
+console.log("Quality score:", result.score);
+console.log("Tiers executed:", result.ensembleResponses.length);
+```

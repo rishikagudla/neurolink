@@ -17,27 +17,19 @@ import chalk from "chalk";
 import ora from "ora";
 import { logger } from "../../lib/utils/logger.js";
 import { getTopModelChoices } from "../../lib/utils/modelChoices.js";
-import { AIProviderName } from "../../lib/types/index.js";
+import {
+  AIProviderName,
+  type ProviderSetupArgv,
+  type ProviderSetupConfig,
+  type ProviderSetupOptions,
+} from "../../lib/types/index.js";
+import { maskCredential } from "../utils/maskCredential.js";
 
-interface OpenAISetupOptions {
-  checkOnly?: boolean;
-  interactive?: boolean;
-}
-
-interface OpenAISetupArgv {
-  check?: boolean;
-  nonInteractive?: boolean;
-}
-
-interface OpenAIConfig {
-  apiKey?: string;
-  model?: string;
-  isReconfiguring?: boolean;
-}
-
-export async function handleOpenAISetup(argv: OpenAISetupArgv): Promise<void> {
+export async function handleOpenAISetup(
+  argv: ProviderSetupArgv,
+): Promise<void> {
   try {
-    const options: OpenAISetupOptions = {
+    const options: ProviderSetupOptions = {
       checkOnly: argv.check || false,
       interactive: !argv.nonInteractive,
     };
@@ -69,7 +61,7 @@ export async function handleOpenAISetup(argv: OpenAISetupArgv): Promise<void> {
       return;
     }
 
-    const config: OpenAIConfig = {};
+    const config: ProviderSetupConfig = {};
 
     // Step 2: Handle existing configuration
     if (hasApiKey && process.env.OPENAI_API_KEY) {
@@ -315,7 +307,7 @@ function validateApiKey(input: string): boolean | string {
 async function promptForModel(): Promise<string> {
   const { modelChoice } = await inquirer.prompt([
     {
-      type: "list",
+      type: "select",
       name: "modelChoice",
       message: "Select an OpenAI model:",
       choices: getTopModelChoices(AIProviderName.OPENAI, 5),
@@ -350,7 +342,7 @@ async function promptForModel(): Promise<string> {
 /**
  * Update .env file with OpenAI configuration
  */
-async function updateEnvFile(config: OpenAIConfig): Promise<void> {
+async function updateEnvFile(config: ProviderSetupConfig): Promise<void> {
   const envPath = path.join(process.cwd(), ".env");
   const spinner = ora("💾 Updating .env file...").start();
 
@@ -434,22 +426,6 @@ async function updateEnvFile(config: OpenAIConfig): Promise<void> {
     );
     throw error;
   }
-}
-
-/**
- * Mask API key for display
- */
-function maskCredential(credential: string): string {
-  if (!credential || credential.length < 8) {
-    return "****";
-  }
-  const knownPrefixes = ["sk-"];
-  const prefix =
-    knownPrefixes.find((p) => credential.startsWith(p)) ??
-    credential.slice(0, 3);
-  const end = credential.slice(-4);
-  const stars = "*".repeat(Math.max(4, credential.length - prefix.length - 4));
-  return `${prefix}${stars}${end}`;
 }
 
 /**

@@ -5,42 +5,17 @@
  * across the codebase, reducing duplication in CLI and providers.
  */
 
-/**
- * ThinkingLevel type for Gemini 3 models
- */
-export type ThinkingLevel = "minimal" | "low" | "medium" | "high";
-
-/**
- * ThinkingConfig interface matching the SDK's expected structure
- */
-export interface ThinkingConfig {
-  enabled?: boolean;
-  type?: "enabled" | "disabled";
-  /** Token budget for thinking (Anthropic models: 5000-100000) */
-  budgetTokens?: number;
-  /** Thinking level for Gemini 3 models */
-  thinkingLevel?: ThinkingLevel;
-}
-
-/**
- * Options for creating a thinkingConfig from CLI-style options
- */
-export interface CreateThinkingConfigOptions {
-  /** Enable thinking mode */
-  thinking?: boolean;
-  /** Token budget for thinking (defaults to 10000) */
-  thinkingBudget?: number;
-  /** Thinking level for Gemini 3 models */
-  thinkingLevel?: ThinkingLevel;
-}
-
-/**
- * Native SDK thinkingConfig structure for Gemini native SDK.
- */
-export interface NativeThinkingConfig {
-  includeThoughts: boolean;
-  thinkingLevel: ThinkingLevel;
-}
+import type {
+  ThinkingLevel,
+  ThinkingConfig,
+  CreateThinkingConfigOptions,
+  NativeThinkingConfig,
+} from "../types/index.js";
+import {
+  getGemini25ThinkingBudgetRange,
+  isGemini3Model,
+} from "./modelDetection.js";
+import { logger } from "./logger.js";
 
 /**
  * Default token budget for thinking operations
@@ -115,6 +90,37 @@ export function createThinkingConfigFromRecord(
   });
 }
 
+// Where a ThinkingLevel falls within a model's verified thinkingBudget
+// range. This is a design choice (Vertex has no notion of "levels" for
+// Gemini 2.5 — only a numeric budget), not a vendor-specified mapping:
+// "minimal"/"high" pin the floor/ceiling of the model's own verified range,
+// "low"/"medium" split the middle so all four levels stay distinguishable.
+const THINKING_LEVEL_FRACTIONS: Record<ThinkingLevel, number> = {
+  minimal: 0,
+  low: 0.25,
+  medium: 0.55,
+  high: 1,
+};
+
+/**
+ * Maps a qualitative ThinkingLevel onto a numeric thinkingBudget within a
+ * model's verified [min, max] range (see `getGemini25ThinkingBudgetRange`).
+ * Exported for deterministic testing of the level->budget mapping.
+ */
+export function mapThinkingLevelToBudget(
+  level: ThinkingLevel,
+  range: { min: number; max: number },
+): number {
+  const fraction = THINKING_LEVEL_FRACTIONS[level];
+  return Math.round(range.min + fraction * (range.max - range.min));
+}
+
+// Models for which the "no verified budget range" WARN in
+// createNativeThinkingConfig has already fired. Keyed by model name so a
+// long-running process (or an agentic loop re-generating against the same
+// model) logs the silent-drop once per model instead of once per call.
+const warnedNoBudgetRangeModels = new Set<string>();
+
 /**
  * Creates thinkingConfig for native Gemini SDK (not AI SDK).
  *
@@ -122,11 +128,21 @@ export function createThinkingConfigFromRecord(
  * structure is different from the AI SDK providerOptions.
  *
  * @param config - The thinkingConfig from options
+ * @param modelName - Resolved model id, used to pick the right wire shape.
+ *   Gemini 3 accepts `thinkingLevel` directly. Gemini 2.5 rejects that field
+ *   with HTTP 400 INVALID_ARGUMENT "thinking_level not supported by this
+ *   model" (verified live against Vertex for gemini-2.5-pro, -flash and
+ *   -flash-lite) and needs a numeric `thinkingBudget` instead — so when
+ *   `modelName` identifies a Gemini 2.5 model, the requested level is
+ *   translated into a budget via `mapThinkingLevelToBudget` and
+ *   `thinkingLevel` is omitted from the result entirely. Omitting
+ *   `modelName` (or passing a Gemini 3 / unrecognized model) preserves the
+ *   original behavior of forwarding `thinkingLevel` as-is.
  * @returns NativeThinkingConfig object or undefined
  *
  * @example
  * ```typescript
- * const nativeConfig = createNativeThinkingConfig(options.thinkingConfig);
+ * const nativeConfig = createNativeThinkingConfig(options.thinkingConfig, modelName);
  * if (nativeConfig) {
  *   sdkConfig.thinkingConfig = nativeConfig;
  * }
@@ -134,14 +150,41 @@ export function createThinkingConfigFromRecord(
  */
 export function createNativeThinkingConfig(
   config: ThinkingConfig | undefined,
+  modelName?: string,
 ): NativeThinkingConfig | undefined {
   if (!config?.enabled && !config?.thinkingLevel) {
     return undefined;
   }
 
+  const level = config.thinkingLevel ?? DEFAULT_THINKING_LEVEL;
+
+  if (modelName && !isGemini3Model(modelName)) {
+    const budgetRange = getGemini25ThinkingBudgetRange(modelName);
+    if (budgetRange) {
+      return {
+        includeThoughts: true,
+        thinkingBudget: mapThinkingLevelToBudget(level, budgetRange),
+      };
+    }
+    // Not a Gemini 3 model and not a Gemini 2.5 model we have a verified
+    // budget range for: no evidence this model accepts either parameter, so
+    // omit thinkingConfig rather than guess a shape that might itself 400.
+    // The caller opted into thinking and gets none of it here, so surface it
+    // once per model instead of leaving it indistinguishable from "thinking
+    // is off".
+    if (!warnedNoBudgetRangeModels.has(modelName)) {
+      warnedNoBudgetRangeModels.add(modelName);
+      logger.warn(
+        `[thinkingConfig] "${modelName}" has no verified Gemini thinkingBudget range; ` +
+          "omitting thinkingConfig — requested thinkingLevel is silently disabled.",
+      );
+    }
+    return undefined;
+  }
+
   return {
     includeThoughts: true,
-    thinkingLevel: config.thinkingLevel ?? DEFAULT_THINKING_LEVEL,
+    thinkingLevel: level,
   };
 }
 

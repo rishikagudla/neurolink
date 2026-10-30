@@ -5,7 +5,7 @@ description: Comprehensive guide to NeuroLink analytics, metrics, and usage trac
 
 # Analytics Reference
 
-NeuroLink provides comprehensive analytics capabilities for tracking token usage, costs, performance metrics, and quality evaluation across all AI provider interactions.
+NeuroLink provides comprehensive analytics capabilities for tracking token usage, costs, performance metrics, and quality evaluation across your configured AI provider interactions.
 
 ## Overview
 
@@ -424,14 +424,23 @@ type EvaluationProvider =
 NeuroLink provides built-in analytics middleware:
 
 ```typescript
-import { createAnalyticsMiddleware } from "@juspay/neurolink/middleware";
+import { createAnalyticsMiddleware } from "@juspay/neurolink";
 
 const analyticsMiddleware = createAnalyticsMiddleware();
 
-const neurolink = new NeuroLink({
-  middleware: [analyticsMiddleware],
+const neurolink = new NeuroLink();
+
+const result = await neurolink.generate({
+  input: { text: "Explain quantum computing in simple terms" },
+  enableAnalytics: true,
+  middleware: {
+    middleware: [analyticsMiddleware],
+    enabledMiddleware: ["analytics"],
+  },
 });
 ```
+
+The same two fields attach your own middleware (see Custom Analytics Collection below): registering it with `middleware` does not switch it on, so list its `metadata.id` in `enabledMiddleware` as well.
 
 ### Middleware Metadata
 
@@ -494,53 +503,6 @@ function createCustomAnalyticsMiddleware(): NeuroLinkMiddleware {
 }
 ```
 
-## Analytics Utilities
-
-### Formatting Utilities
-
-```typescript
-import {
-  formatTokenUsage,
-  formatAnalyticsForDisplay,
-  getAnalyticsSummary,
-} from "@juspay/neurolink/utils/analyticsUtils";
-
-// Format token usage as string
-const usageString = formatTokenUsage(result.usage);
-// Output: "100 input / 50 output / 20 cache-read"
-
-// Format full analytics for display
-const display = formatAnalyticsForDisplay(result.analytics);
-// Output: "Provider: openai | Model: gpt-4o | Tokens: 100 input / 50 output | Cost: $0.00015 | Time: 1.2s"
-
-// Get analytics summary
-const summary = getAnalyticsSummary(result.analytics);
-console.log({
-  totalTokens: summary.totalTokens,
-  costPerToken: summary.costPerToken,
-  requestsPerSecond: summary.requestsPerSecond,
-});
-```
-
-### Validation Utilities
-
-```typescript
-import {
-  hasValidTokenUsage,
-  isTokenUsage,
-} from "@juspay/neurolink/utils/analyticsUtils";
-
-// Check if analytics has valid token usage
-if (hasValidTokenUsage(result.analytics)) {
-  // Safe to access token fields
-}
-
-// Type guard for token usage
-if (isTokenUsage(data)) {
-  console.log(data.total);
-}
-```
-
 ## Integration with Observability Tools
 
 ### OpenTelemetry Integration
@@ -550,10 +512,10 @@ Export analytics to OpenTelemetry:
 ```typescript
 import { trace, SpanStatusCode } from "@opentelemetry/api";
 
-const tracer = trace.getTracer("neurolink");
+const tracer = trace.getTracer("my-app");
 
 async function trackedGenerate(options: GenerateOptions) {
-  return tracer.startActiveSpan("neurolink.generate", async (span) => {
+  return tracer.startActiveSpan("tracked-generate", async (span) => {
     try {
       const result = await neurolink.generate({
         ...options,
@@ -706,7 +668,7 @@ async function loggedGenerate(options: GenerateOptions) {
 Build usage dashboards with aggregated statistics:
 
 ```typescript
-interface UsageStats {
+type UsageStats = {
   totalRequests: number;
   totalTokens: number;
   totalCost: number;
@@ -727,7 +689,7 @@ interface UsageStats {
       cost: number;
     }
   >;
-}
+};
 
 class UsageTracker {
   private stats: UsageStats = {

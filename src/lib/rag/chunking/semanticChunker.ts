@@ -15,7 +15,7 @@ import type {
   Chunker,
   ChunkerValidationResult,
   SemanticChunkerConfig,
-} from "../types.js";
+} from "../../types/index.js";
 
 /**
  * Semantic chunker implementation
@@ -202,10 +202,7 @@ export class SemanticChunker implements Chunker {
     );
 
     // Check if provider has embed method
-    if (
-      typeof (embeddingProvider as unknown as { embed?: unknown }).embed !==
-      "function"
-    ) {
+    if (typeof embeddingProvider.embed !== "function") {
       throw new Error(`Provider ${provider} does not support embeddings`);
     }
 
@@ -218,11 +215,7 @@ export class SemanticChunker implements Chunker {
 
       for (const segment of batch) {
         try {
-          const embedding = await (
-            embeddingProvider as unknown as {
-              embed: (s: string) => Promise<number[]>;
-            }
-          ).embed(segment);
+          const embedding = await embeddingProvider.embed(segment);
           embeddings.push(embedding);
         } catch (error) {
           logger.warn("[SemanticChunker] Failed to embed segment", {

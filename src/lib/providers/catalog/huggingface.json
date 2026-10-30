@@ -1,0 +1,406 @@
+{
+  "$schema": "./provider-catalog.schema.json",
+  "id": "huggingface",
+  "displayName": "HuggingFace",
+  "enumTypeName": "HuggingFaceModels",
+  "aliases": ["hf"],
+  "credentialsKey": "huggingFace",
+  "tier": 2,
+  "wire": {
+    "baseURL": "https://router.huggingface.co/v1",
+    "apiKeyFallbackEnvVars": ["HF_TOKEN"]
+  },
+  "models": {
+    "default": "Qwen/Qwen2.5-72B-Instruct",
+    "fallbackModelName": "meta-llama/Llama-3.1-8B-Instruct",
+    "fallbacks": ["meta-llama/Llama-3.1-8B-Instruct"],
+    "testModel": "meta-llama/Llama-3.1-8B-Instruct",
+    "topModels": [
+      "meta-llama/Llama-3.3-70B-Instruct",
+      "zai-org/GLM-5",
+      "deepseek-ai/DeepSeek-R1",
+      "Qwen/Qwen2.5-72B-Instruct",
+      "microsoft/phi-4",
+      "google/gemma-3-27b-it"
+    ],
+    "defaultContextWindow": 32000,
+    "defaultMaxOutputTokens": 32000,
+    "catalog": {
+      "meta-llama/Llama-3.3-70B-Instruct": {
+        "vision": false,
+        "status": "production",
+        "description": "Recommended - Latest Llama",
+        "enumMember": "LLAMA_3_3_70B_INSTRUCT"
+      },
+      "meta-llama/Llama-3.2-1B": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "LLAMA_3_2_1B"
+      },
+      "meta-llama/Llama-3.2-3B-Instruct": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "LLAMA_3_2_3B_INSTRUCT"
+      },
+      "meta-llama/Llama-3.1-8B": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "LLAMA_3_1_8B"
+      },
+      "meta-llama/Llama-3.1-8B-Instruct": {
+        "vision": false,
+        "status": "production",
+        "description": "Llama 3.1 8B, tool-calling capable",
+        "enumMember": "LLAMA_3_1_8B_INSTRUCT"
+      },
+      "meta-llama/Llama-3.1-70B-Instruct": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "LLAMA_3_1_70B_INSTRUCT"
+      },
+      "meta-llama/Llama-3.1-405B-Instruct": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "LLAMA_3_1_405B_INSTRUCT"
+      },
+      "meta-llama/Meta-Llama-3-8B-Instruct": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "LLAMA_3_8B_INSTRUCT"
+      },
+      "meta-llama/Meta-Llama-3-70B-Instruct": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "LLAMA_3_70B_INSTRUCT"
+      },
+      "mistralai/Mistral-Large-3-675B-Instruct-2512": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "MISTRAL_LARGE_3_675B"
+      },
+      "mistralai/Mistral-Small-3.1-24B-Instruct-2503": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "MISTRAL_SMALL_3_1_24B"
+      },
+      "mistralai/Mistral-Small-24B-Instruct-2501": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "MISTRAL_SMALL_24B"
+      },
+      "mistralai/Mistral-7B-Instruct-v0.2": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "MISTRAL_7B_INSTRUCT"
+      },
+      "mistralai/Mixtral-8x7B-Instruct-v0.1": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "MIXTRAL_8X7B_INSTRUCT"
+      },
+      "mistralai/Devstral-2": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "DEVSTRAL_2"
+      },
+      "Qwen/Qwen2.5-7B": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "QWEN_2_5_7B"
+      },
+      "Qwen/Qwen2.5-32B": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "QWEN_2_5_32B"
+      },
+      "Qwen/Qwen2.5-72B-Instruct": {
+        "vision": false,
+        "status": "production",
+        "description": "Qwen flagship",
+        "enumMember": "QWEN_2_5_72B_INSTRUCT"
+      },
+      "Qwen/Qwen2.5-Coder-7B": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "QWEN_2_5_CODER_7B"
+      },
+      "Qwen/Qwen2.5-Coder-32B-Instruct": {
+        "vision": false,
+        "status": "production",
+        "description": "Qwen 2.5 Coder — Qwen2.5-Coder-32B-Instruct",
+        "enumMember": "QWEN_2_5_CODER_32B_INSTRUCT"
+      },
+      "Qwen/QwQ-32B": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "QWQ_32B"
+      },
+      "Qwen/Qwen2.5-VL-32B-Instruct": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "QWEN_2_5_VL_32B"
+      },
+      "deepseek-ai/DeepSeek-R1": {
+        "vision": false,
+        "status": "production",
+        "description": "Advanced reasoning",
+        "enumMember": "DEEPSEEK_R1"
+      },
+      "deepseek-ai/DeepSeek-V3": {
+        "vision": false,
+        "status": "production",
+        "description": "DeepSeek — DeepSeek-V3",
+        "enumMember": "DEEPSEEK_V3"
+      },
+      "deepseek-ai/DeepSeek-V3.1": {
+        "vision": false,
+        "status": "production",
+        "description": "DeepSeek — DeepSeek-V3.1",
+        "enumMember": "DEEPSEEK_V3_1"
+      },
+      "deepseek-ai/DeepSeek-V3.2-Exp": {
+        "vision": false,
+        "status": "production",
+        "description": "DeepSeek — DeepSeek-V3.2-Exp",
+        "enumMember": "DEEPSEEK_V3_2_EXP"
+      },
+      "microsoft/phi-4": {
+        "vision": false,
+        "status": "production",
+        "description": "Microsoft Phi-4",
+        "enumMember": "PHI_4"
+      },
+      "microsoft/Phi-4-reasoning": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "PHI_4_REASONING"
+      },
+      "microsoft/Phi-4-mini-instruct": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "PHI_4_MINI_INSTRUCT"
+      },
+      "microsoft/Phi-4-mini-reasoning": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "PHI_4_MINI_REASONING"
+      },
+      "microsoft/Phi-3-mini-128k-instruct": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "PHI_3_MINI_128K_INSTRUCT"
+      },
+      "microsoft/Phi-3-vision-128k-instruct": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "PHI_3_VISION_128K_INSTRUCT"
+      },
+      "google/gemma-3-270m": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "GEMMA_3_270M"
+      },
+      "google/gemma-3-1b-it": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "GEMMA_3_1B_IT"
+      },
+      "google/gemma-3-4b-it": {
+        "vision": false,
+        "status": "production",
+        "description": "Google Gemma 3 — gemma-3-4b-it",
+        "enumMember": "GEMMA_3_4B_IT"
+      },
+      "google/gemma-3-12b-it": {
+        "vision": false,
+        "status": "production",
+        "description": "Google Gemma 3 — gemma-3-12b-it",
+        "enumMember": "GEMMA_3_12B_IT"
+      },
+      "google/gemma-3-27b-it": {
+        "vision": false,
+        "status": "production",
+        "description": "Google Gemma 3",
+        "enumMember": "GEMMA_3_27B_IT"
+      },
+      "google/gemma-2-9b": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "GEMMA_2_9B"
+      },
+      "google/gemma-2-27b": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "GEMMA_2_27B"
+      },
+      "google/gemma-2b": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "GEMMA_2B"
+      },
+      "google/gemma-7b": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "GEMMA_7B"
+      },
+      "tiiuae/falcon-40b-instruct": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "FALCON_40B_INSTRUCT"
+      },
+      "tiiuae/falcon-180B-chat": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "FALCON_180B_CHAT"
+      },
+      "bigcode/starcoder2-15b": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "STARCODER2_15B"
+      },
+      "codellama/CodeLlama-34b-Instruct-hf": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "CODELLAMA_34B_INSTRUCT"
+      },
+      "bigscience/bloom-7b1": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "BLOOM_7B1"
+      },
+      "bigscience/bloom-1b3": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "BLOOM_1B3"
+      },
+      "zai-org/GLM-5": {
+        "vision": false,
+        "status": "production",
+        "description": "Z.AI GLM-5 (February 2026) — GLM-5",
+        "enumMember": "GLM_5"
+      },
+      "Qwen/Qwen3.5-397B-A17B": {
+        "vision": false,
+        "status": "production",
+        "description": "Qwen 3.5 Multimodal (February 2026) — Qwen3.5-397B-A17B",
+        "enumMember": "QWEN_3_5_397B_A17B"
+      },
+      "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "NEMOTRON_3_NANO_30B"
+      },
+      "HuggingFaceTB/SmolLM3-3B": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "SMOLLM3_3B"
+      },
+      "tiiuae/Falcon3-7B-Instruct": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "FALCON_3_7B_INSTRUCT"
+      },
+      "tiiuae/Falcon3-10B-Instruct": {
+        "vision": false,
+        "status": "retired",
+        "description": "Retired 2026-09 — absent from the router's roster and rejected by a live call",
+        "enumMember": "FALCON_3_10B_INSTRUCT"
+      }
+    }
+  },
+  "capabilities": {
+    "text": true,
+    "streaming": true,
+    "tools": "model-dependent",
+    "toolsWithStreaming": false,
+    "structuredOutput": false,
+    "structuredOutputWithTools": false,
+    "embeddings": false,
+    "thinking": false
+  },
+  "errorRules": [
+    {
+      "pattern": "API_TOKEN_INVALID|Invalid token",
+      "class": "authentication",
+      "message": "Invalid HuggingFace API token. Please check your {apiKeyEnvVar} environment variable."
+    },
+    {
+      "pattern": "rate limit",
+      "class": "rate-limit",
+      "message": "HuggingFace rate limit exceeded. Consider using a paid plan or try again later."
+    },
+    {
+      "pattern": "model.*not found|not found.*model",
+      "class": "invalid-model",
+      "message": "HuggingFace model '{model}' not found.\n\nSuggestions:\n1. Check model name spelling\n2. Ensure an Inference Provider serves the model (https://huggingface.co/inference/models)\n3. For tool calling, use: meta-llama/Llama-3.3-70B-Instruct, zai-org/GLM-5 or Qwen/Qwen3.5-397B-A17B"
+    },
+    {
+      "pattern": "\\b(?:(?:tool|function)s?(?:\\s*/\\s*(?:tool|function)s?)?[ _-]?call(?:s|ing)?|tool_choice|tools? (?:is|are) not supported|(?:does|do) not support tools?)\\b",
+      "patternStatuses": [400, 422],
+      "class": "provider",
+      "message": "HuggingFace tool calling error: {message}\n\nNotes:\n1. Ensure you're using a tool-capable model, e.g. meta-llama/Llama-3.3-70B-Instruct, zai-org/GLM-5 or Qwen/Qwen3.5-397B-A17B\n2. Check that your model supports function calling\n3. Verify tool schema format is correct"
+    }
+  ],
+  "timeouts": {
+    "generateMs": 120000,
+    "streamMs": 120000
+  },
+  "autoSelectPriority": 10,
+  "setup": {
+    "url": "https://huggingface.co/settings/tokens",
+    "apiKeyFormat": "^hf_[A-Za-z0-9]{34,}$",
+    "billingPolicy": "free-tier",
+    "instructions": [
+      "1. Visit: https://huggingface.co/settings/tokens",
+      "2. Create or sign in to your HuggingFace account",
+      "3. Generate a new access token",
+      "4. Set {apiKeyEnvVar} in your .env file (HF_TOKEN also accepted)"
+    ]
+  },
+  "evidence": {
+    "rosterVerified": {
+      "date": "2026-09-24",
+      "method": "Live against router.huggingface.co on 2026-09-24. GET /v1/models returned 138 models; each of the 53 catalog ids was also sent a real chat call. 39 ids are absent from the roster AND rejected with 400 ('does not exist' / 'not supported by any provider'), so they are marked retired and keep their enumMember; the other 14 are on the roster and answered 402 (the test account's monthly credits are spent), which is a billing block, not a rejection, so they stay production. No id had the two signals disagree. topModels swaps the retired Mistral-Large-3 for zai-org/GLM-5, which is on the roster. billingPolicy is free-tier per https://huggingface.co/docs/inference-providers/pricing (free users get monthly credits, no card). apiKeyFormat accepts the hf_ + 34 characters a real token has; the previous hf_ + 37 pattern rejected it. structuredOutput, toolsWithStreaming and per-model vision are left unchanged: /v1/models reports them per serving provider, and the 402 prevented a live round trip that would prove them."
+    },
+    "liveMatrix": null,
+    "addedInPR": "https://github.com/juspay/neurolink/pull/1781"
+  }
+}
